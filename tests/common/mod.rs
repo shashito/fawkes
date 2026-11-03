@@ -245,11 +245,11 @@ impl Drop for Harness {
             let _ = daemon.wait();
         }
         // The daemon stops its app; if it died abnormally, a leftover app must not keep the port.
-        if let Ok(text) = std::fs::read_to_string(self.dir.join("s/state.json"))
-            && let Ok(state) = serde_json::from_str::<Value>(&text)
-            && let Some(pid) = state["app_pid"].as_i64()
+        if let Ok(text) = std::fs::read_to_string(self.dir.join("s/app.pid"))
+            && let Ok(pid) = text.trim().parse::<i32>()
+            && pid > 1
         {
-            unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }

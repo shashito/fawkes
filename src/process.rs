@@ -14,21 +14,32 @@ use std::time::{Duration, Instant};
 
 pub type Env = [(String, String)];
 
-/// Run `command` with `/bin/sh -c` in its own process group; stdout and stderr append to `log`.
+/// Run `command` with `/bin/sh -c` in its own process group; stdout and stderr append to `log`. With `pid_file`,
+/// the shell first writes its pid (the group's id) there and then `exec`s the command: the record exists before
+/// the app does anything, so a daemon that dies right after the spawn still leaves its successor a way to find it.
 pub fn spawn(
     command: &str,
     cwd: &Path,
     env: &Env,
     log: &Path,
     header: &str,
+    pid_file: Option<&Path>,
 ) -> std::io::Result<Child> {
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(log)?;
     writeln!(file, "=== {} {header} ===", state::now())?;
-    Command::new("/bin/sh")
-        .args(["-c", command])
+    let mut shell = Command::new("/bin/sh");
+    match pid_file {
+        // The paths go in as arguments, never into the script, so no quoting can go wrong.
+        Some(pid_file) => shell
+            .args(["-c", r#"echo $$ > "$0" && exec /bin/sh -c "$1""#])
+            .arg(pid_file)
+            .arg(command),
+        None => shell.args(["-c", command]),
+    };
+    shell
         .current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
@@ -52,6 +63,65 @@ fn signal_group(pgid: u32, signal: Signal) {
         // Fails only when the group is already gone (or never was ours), which leaves nothing to stop.
         let _ = kill_process_group(group, signal);
     }
+}
+
+/// When process `pid` started, in seconds since the epoch; None when there is no such process.
+#[cfg(target_os = "macos")]
+fn start_time(pid: u32) -> Option<f64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    // SAFETY: `proc_bsdinfo` is plain integers and byte arrays, for which zero is valid.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` is a live local of exactly `size` bytes, which is all `proc_pidinfo` writes.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then(|| info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1e6)
+}
+
+/// When process `pid` started, in seconds since the epoch; None when there is no such process.
+#[cfg(target_os = "linux")]
+fn start_time(pid: u32) -> Option<f64> {
+    // Field 22 of /proc/<pid>/stat, in clock ticks since boot; the fields after the command name (in parentheses,
+    // and free to contain spaces) start at field 3.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let ticks: f64 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    let boot: f64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf only reads a configuration value.
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (per_second > 0).then(|| boot + ticks / per_second as f64)
+}
+
+/// The app an earlier daemon left running, as named by the pid file its start wrapper wrote (`spawn`). Only a
+/// process that started just before the file was written is that app: a pid the system has reused since, after a
+/// reboot too, belongs to a process that started later, so it is never signalled.
+pub fn leftover(pid_file: &Path) -> Option<u32> {
+    let written = std::fs::metadata(pid_file)
+        .and_then(|meta| meta.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    let pid: u32 = std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let started = start_time(pid)?;
+    // The shell writes the file at once, so a minute is far more than it takes even on a loaded machine; the second
+    // after covers coarse timestamps.
+    (written - 60.0 <= started && started <= written + 1.0 && group_alive(pid)).then_some(pid)
 }
 
 /// Does any process of group `pgid` still exist?
@@ -198,4 +268,52 @@ fn http_get(url: &str) -> Result<(), String> {
         }
     }
     Err(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn a_leftover_is_only_the_process_that_wrote_its_pid_file() {
+        let dir = std::env::temp_dir().join(format!("fk-process-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("app.pid");
+        let mut app = spawn(
+            "exec sleep 30",
+            &dir,
+            &[],
+            &dir.join("app.log"),
+            "test",
+            Some(&pid_file),
+        )
+        .unwrap();
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&pid_file).map_or(true, |text| !text.ends_with('\n')) {
+            assert!(Instant::now() < give_up, "the wrapper never wrote its pid");
+            sleep(Duration::from_millis(10));
+        }
+        assert_eq!(leftover(&pid_file), Some(app.id()));
+
+        // A file older than the process: the pid was reused by a process started after the app wrote it.
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&pid_file)
+            .unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(leftover(&pid_file), None);
+        // Much newer than the process: not the process that wrote it either.
+        file.set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(leftover(&pid_file), None);
+
+        kill_group(app.id());
+        app.wait().unwrap();
+        file.set_modified(SystemTime::now()).unwrap();
+        assert_eq!(leftover(&pid_file), None, "a process that is gone");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

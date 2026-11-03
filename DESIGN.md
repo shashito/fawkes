@@ -157,18 +157,23 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 
 ### Daemon start
 
-1. Take an exclusive `flock` on `<state_dir>/lock`, held for the daemon's life; refuse to start when another daemon
+1. Create `state_dir` with mode `0700` (an existing one is set to it): it holds the app's logs and copies of its
+   storage.
+2. Take an exclusive `flock` on `<state_dir>/lock`, held for the daemon's life; refuse to start when another daemon
    holds it. The kernel releases it when the process ends, however it ends, so it is never stale.
-2. Bind the socket: refuse when a daemon of another state directory answers on it (a `--socket` shared by two
+3. Bind the socket: refuse when a daemon of another state directory answers on it (a `--socket` shared by two
    manifests); a socket file nobody answers on belongs to a dead daemon and is replaced.
-3. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event). Refuse to
+   Then link it into `<fawkes_home>/run/`. A startup that fails after this removes the socket and the link again.
+4. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event). Refuse to
    start when neither can be read.
-4. If `state.json` records a live pid from an earlier daemon that is still running, kill its process group (a crashed
-   daemon leaves its app running; pid reuse is accepted as a prototype risk).
-5. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
+5. If `app.pid` names an app an earlier daemon left running, stop its process group (a crashed daemon leaves its
+   app running). The live app's start wrapper writes its pid there before it runs the `start` command, so even an
+   app spawned an instant before its daemon died is found. Only a process that started at most a minute before the
+   file was written counts: a pid reused since, after a reboot too, belongs to a later process and is left alone.
+6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
    owns, and the worktrees git still lists for them (`git worktree prune`).
-6. If a switch is pending, roll it back (reason `daemon_restart`).
-7. Start the permanent generation, if there is one.
+7. If a switch is pending, roll it back (reason `daemon_restart`).
+8. Start the permanent generation, if there is one.
 
 ## Manifest
 
@@ -469,8 +474,9 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 <state_dir>/
   lock                   flock'ed by the running daemon; empty
   fawkes.sock            the daemon's socket
-  state.json             generations, permanent, current, pending switch, live pid; durable writes (temp file,
-                         fsync, rename, fsync of the directory)
+  state.json             generations, permanent, current, pending switch; durable writes (temp file, fsync,
+                         rename, fsync of the directory)
+  app.pid                pid (= process group) of the live app, written by its start wrapper
   state.json.bak         the same content, written after state.json; read when state.json is unreadable
   events.jsonl           append-only event log, one JSON object per line (what `log` reads)
   current -> generations/g3/code    symlink to the live worktree, for people (replaced atomically)
