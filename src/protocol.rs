@@ -59,6 +59,17 @@ pub fn err(code: ErrorCode, message: impl Into<String>) -> Error {
     }
 }
 
+pub fn invalid_state(message: impl Into<String>) -> Error {
+    err(ErrorCode::InvalidState, message)
+}
+
+pub fn not_found(id: &str) -> Error {
+    err(
+        ErrorCode::NotFound,
+        format!("there is no generation {id}; `fawkes history` lists them"),
+    )
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
         err(ErrorCode::Internal, e.to_string())

@@ -13,9 +13,11 @@ use crate::process;
 use crate::protocol::{
     Error, ErrorCode, Event, EventKind, Events, GenState, Generation, History, LastExit, Line, Out,
     Pending, Process, ProcessState, PruneResult, R, Reply, Request, RollbackResult, Status,
-    SwitchResult, TestInfo, err,
+    SwitchResult, TestInfo, err, invalid_state, not_found,
 };
-use crate::state::{self, EventLog, Paths, State, Txn, now, now_secs, parse_time};
+use crate::state::{
+    self, EventLog, Paths, State, Txn, allowed, now, now_secs, parse_time, refusal,
+};
 use crate::storage;
 use rustix::fs::{FlockOperation, Mode, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -221,48 +223,6 @@ fn restore_failed(id: &str) -> Error {
     invalid_state(format!(
         "{id} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore"
     ))
-}
-
-fn invalid_state(message: impl Into<String>) -> Error {
-    err(ErrorCode::InvalidState, message)
-}
-
-fn not_found(id: &str) -> Error {
-    err(
-        ErrorCode::NotFound,
-        format!("there is no generation {id}; `fawkes history` lists them"),
-    )
-}
-
-/// Why `action` (test, switch or confirm) is not possible for a generation in this state.
-fn refusal(g: &Generation, action: &str) -> Error {
-    let id = &g.id;
-    let state = g.state.as_str();
-    invalid_state(match g.state {
-        GenState::RolledBack => format!(
-            "{id} was rolled back at {} ({}); stage the ref again for a new generation",
-            g.rolled_back_at.as_deref().unwrap_or("?"),
-            g.rollback_reason.as_deref().unwrap_or("no reason recorded")
-        ),
-        GenState::Staging => {
-            format!("{id} is still being staged; try again when its stage has finished")
-        }
-        GenState::Staged if action == "switch" => {
-            format!("{id} is staged, not tested; run `fawkes test {id}` first")
-        }
-        GenState::TestFailed if action == "switch" => {
-            format!(
-                "{id} failed its last test; run `fawkes test {id}` again or stage the ref again"
-            )
-        }
-        GenState::Retired if action == "switch" => {
-            format!("{id} is retired; run `fawkes test {id}` first")
-        }
-        GenState::Current | GenState::Permanent if action != "confirm" => {
-            format!("{id} is {state}, it already is the live generation")
-        }
-        _ => format!("{id} is {state}, not pending; there is nothing to confirm"),
-    })
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -1365,10 +1325,7 @@ impl Daemon {
             return Err(e);
         }
         let mut inner = self.inner();
-        let g = inner.state.find_mut(&id).ok_or_else(|| not_found(&id))?;
-        g.state = GenState::Staged;
-        g.staged_at = now();
-        let record = g.clone();
+        let record = inner.state.transition(&id, GenState::Staged)?.clone();
         self.save(&inner);
         self.event(
             EventKind::Staged,
@@ -1524,11 +1481,8 @@ impl Daemon {
         let g = {
             let inner = self.inner();
             let g = inner.state.find(id).ok_or_else(|| not_found(id))?;
-            if !matches!(
-                g.state,
-                GenState::Staged | GenState::TestFailed | GenState::Tested | GenState::Retired
-            ) {
-                return Err(refusal(g, "test"));
+            if !allowed(g.state, GenState::Tested) {
+                return Err(refusal(g, GenState::Tested));
             }
             g.clone()
         };
@@ -1608,15 +1562,14 @@ impl Daemon {
                 .map_or_else(Clone::clone, |_| "healthy".into()),
         };
         let mut inner = self.inner();
-        let g = inner
-            .state
-            .find_mut(id)
-            .expect("generations are never removed");
-        g.state = if passed {
-            GenState::Tested
-        } else {
-            GenState::TestFailed
-        };
+        let g = inner.state.transition(
+            id,
+            if passed {
+                GenState::Tested
+            } else {
+                GenState::TestFailed
+            },
+        )?;
         g.test = Some(info.clone());
         let record = g.clone();
         self.save(&inner);
@@ -1662,8 +1615,8 @@ impl Daemon {
                 None => {}
             }
             let g = inner.state.find(id).ok_or_else(|| not_found(id))?;
-            if g.state != GenState::Tested {
-                return Err(refusal(g, "switch"));
+            if !allowed(g.state, GenState::Current) {
+                return Err(refusal(g, GenState::Current));
             }
             inner.state.permanent.clone()
         };
@@ -1731,16 +1684,13 @@ impl Daemon {
         // already says the switch is pending, so a daemon that dies from here on rolls it back at its next start.
         let mut inner = self.inner();
         let mut next = inner.state.clone();
-        if let Some(g) = next.find_mut(id) {
-            g.state = GenState::Current;
-            g.switched_at = Some(now());
-        }
+        let switched = next.transition(id, GenState::Current).map(|_| ());
         next.txn = Some(Txn::Pending(Pending {
             generation: id.into(),
             previous: previous.clone(),
             deadline: deadline.clone(),
         }));
-        if let Err(e) = self.persist(&next) {
+        if let Err(e) = switched.and_then(|()| self.persist(&next)) {
             drop(inner);
             resume(self);
             return Err(err(
@@ -1807,7 +1757,7 @@ impl Daemon {
                 Some(id) => inner
                     .state
                     .find(id)
-                    .map_or_else(|| not_found(id), |g| refusal(g, "confirm")),
+                    .map_or_else(|| not_found(id), |g| refusal(g, GenState::Permanent)),
                 None => invalid_state("no switch is pending; there is nothing to confirm"),
             });
         };
@@ -1815,7 +1765,7 @@ impl Daemon {
             && id != pending.generation
         {
             return Err(match inner.state.find(id) {
-                Some(g) if g.state == GenState::RolledBack => refusal(g, "confirm"),
+                Some(g) if g.state == GenState::RolledBack => refusal(g, GenState::Permanent),
                 Some(g) => invalid_state(format!(
                     "{id} is {}, not pending; {} is the one waiting for confirm",
                     g.state.as_str(),
@@ -1846,17 +1796,12 @@ impl Daemon {
         // Applied to a copy and kept only once it is on disk: a confirm the daemon could not write is not one, and
         // the switch stays pending (a daemon restart would roll it back).
         let mut next = inner.state.clone();
-        if let Some(old) = next.permanent.clone()
-            && let Some(g) = next.find_mut(&old)
-        {
-            g.state = GenState::Retired;
+        if let Some(old) = next.permanent.clone() {
+            next.transition(&old, GenState::Retired)?;
         }
-        let g = next
-            .find_mut(&pending.generation)
-            .ok_or_else(|| not_found(&pending.generation))?;
-        g.state = GenState::Permanent;
-        g.confirmed_at = Some(now());
-        let record = g.clone();
+        let record = next
+            .transition(&pending.generation, GenState::Permanent)?
+            .clone();
         next.permanent = Some(pending.generation.clone());
         next.txn = None;
         self.persist(&next).map_err(|e| {
