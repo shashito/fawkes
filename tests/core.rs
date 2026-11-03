@@ -954,3 +954,64 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
     assert_eq!(h.generation("g2")["state"], "tested");
     assert!(!h.versions().contains(&"v2".to_string()));
 }
+
+/// A crash backoff shows as `restart_at` while `state` stays `stopped`, and `stop` during it cancels the restart and
+/// answers ok: the app stays stopped once the backoff has passed.
+#[test]
+fn stop_during_a_crash_backoff_cancels_the_restart_and_answers_ok() {
+    use std::io::Write;
+    let mut h = Harness::new(4960, "max_failed_starts = 5");
+    // Two failed starts in a row: the second restart waits 2 s, the window `stop` lands in.
+    h.edit_manifest("min_uptime = 1", "min_uptime = 60");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    assert_eq!(h.status()["process"]["restart_at"], Value::Null);
+
+    let crash = |h: &Harness| {
+        h.wait("the app to listen", 10, || h.get().is_some());
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", h.port)).unwrap();
+        stream
+            .write_all(b"GET /crash HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        h.wait("the crash to be reaped", 5, || {
+            h.status()["process"]["state"] == "stopped"
+        });
+    };
+    crash(&h);
+    h.wait("the first crash restart", 10, || {
+        h.status()["process"]["state"] == "running"
+    });
+    crash(&h);
+    let process = h.status()["process"].clone();
+    assert_eq!(process["state"], "stopped", "{process}");
+    let restart_at = process["restart_at"].as_str().expect("a scheduled restart");
+    // `2026-11-03T14:00:01Z`
+    let shape: Vec<bool> = restart_at.chars().map(|c| c.is_ascii_digit()).collect();
+    assert!(
+        restart_at.len() == 20 && restart_at.ends_with('Z') && shape[..4].iter().all(|d| *d),
+        "{restart_at}"
+    );
+
+    let stopped = h.ok(&["stop"]);
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    assert_eq!(stopped["restart_at"], Value::Null, "{stopped}");
+    assert!(
+        messages(&h, "stopped")
+            .last()
+            .is_some_and(|message| message.contains("scheduled restart")),
+    );
+    // Past the 2 s backoff: nothing restarted the app.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let process = h.status()["process"].clone();
+    assert_eq!(process["state"], "stopped", "{process}");
+    assert_eq!(process["restart_at"], Value::Null, "{process}");
+    // Stopped and not scheduled: still refused.
+    let (code, error) = h.fk(&["stop"]);
+    assert_eq!((code, error["code"].as_str()), (1, Some("invalid_state")));
+}

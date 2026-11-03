@@ -1,7 +1,7 @@
 //! The `start`, `stop` and `restart` commands.
 
 use super::transactions::restore_failed;
-use super::{Daemon, Inner, Slot, Why};
+use super::{Daemon, Inner, Live, Slot, Why};
 use crate::protocol::{ErrorCode, EventKind, Out, Process, R, err, invalid_state};
 use crate::state::Txn;
 use std::sync::Arc;
@@ -53,9 +53,23 @@ impl Daemon {
         let app = {
             let mut inner = self.inner();
             let id = self.current_generation(&inner)?;
-            inner.take_running_alive()?.ok_or_else(|| {
-                invalid_state(format!("{id} is not running; `fawkes start` starts it"))
-            })?
+            let scheduled = matches!(inner.live, Live::Backoff { .. });
+            let Some(app) = inner.take_running_alive()? else {
+                if !scheduled {
+                    return Err(invalid_state(format!(
+                        "{id} is not running; `fawkes start` starts it"
+                    )));
+                }
+                // `take_running_alive` cancelled the scheduled crash restart: that is what was asked for.
+                drop(inner);
+                self.event(
+                    EventKind::Stopped,
+                    Some(&id),
+                    "stopped on request; the scheduled restart after the crash is cancelled",
+                );
+                return Ok(self.process(&self.inner()));
+            };
+            app
         };
         self.say(out, &app.generation, format!("stopping {}", app.generation));
         let id = app.generation.clone();

@@ -546,6 +546,15 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
     } else {
         first.push(Span::raw(format!("  restarts {}", process.restarts)));
     }
+    if let Some(at) = process.restart_at.as_deref().and_then(parse_time) {
+        first.push(Span::styled(
+            format!(
+                "  restarting in {}",
+                duration(at.saturating_sub(now) as f64)
+            ),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     let mut second = vec![Span::styled("   last exit ", dim())];
     second.push(Span::styled(
         process.last_exit.as_ref().map_or("-".into(), last_exit),

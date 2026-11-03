@@ -5,7 +5,7 @@ use crate::process;
 use crate::protocol::{
     ErrorCode, EventKind, History, LastExit, Out, Process, ProcessState, R, Status, err, not_found,
 };
-use crate::state::{Txn, now, now_secs, parse_time};
+use crate::state::{Txn, format_time, now, now_secs, parse_time};
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
@@ -110,7 +110,7 @@ impl Daemon {
 
     fn restart_due(&self, inner: &Inner) -> bool {
         inner.store.state().txn.is_none()
-            && matches!(inner.live, Live::Backoff { until } if Instant::now() >= until)
+            && matches!(inner.live, Live::Backoff { until, .. } if Instant::now() >= until)
     }
 
     /// Decide the rollback of a pending switch that missed its deadline.
@@ -164,6 +164,7 @@ impl Daemon {
                 let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
                 inner.live = Live::Backoff {
                     until: Instant::now() + Duration::from_secs(backoff),
+                    at: format_time(now_secs() + backoff),
                 };
                 message += &format!("; restarting in {backoff}s");
             }
@@ -350,6 +351,10 @@ impl Daemon {
             uptime,
             restarts: inner.restarts,
             last_exit: inner.last_exit.clone(),
+            restart_at: match &inner.live {
+                Live::Backoff { at, .. } => Some(at.clone()),
+                _ => None,
+            },
         }
     }
 

@@ -154,7 +154,9 @@ deadline or storage; only `switch`, `confirm` and rollback do.
 - **stop:** SIGTERM to the app's process group, SIGKILL after `stop_timeout` seconds of grace. The app stays stopped:
   no automatic restart until `start` or `restart`. Stopping a pending generation does not stop its deadline, and it
   cannot be confirmed while stopped; if it is
-  not started and confirmed in time it is rolled back like any other.
+  not started and confirmed in time it is rolled back like any other. While the app waits out a crash backoff,
+  `stop` cancels the scheduled restart and answers ok (`state` `stopped`, `restart_at` null); an app that is
+  stopped and not scheduled is `invalid_state`.
 - **restart:** stop (with the same grace), then start the same generation. It resets the backoff and does not count
   as a failed start.
 
@@ -171,7 +173,8 @@ generation gets no retries: its first crash rolls it back. The permanent generat
 backoff of 1, 1, 2, 4, … s for the first, second, third, … failed start in a row (at most 30 s; a crash after a run
 longer than `min_uptime` waits 1 s); a run longer than `min_uptime` resets its counter and the backoff; after
 `max_failed_starts` consecutive failed starts it is no longer restarted and `status` reports `"state": "failed"` until
-`start`, `restart`, the next `switch` or a daemon start.
+`start`, `restart`, the next `switch` or a daemon start. While a restart is scheduled, `status` shows
+`"state": "stopped"` with `restart_at` set to its time; `stop` cancels it.
 
 A cold start of the daemon always runs the permanent generation; `start` and `restart` run the current one.
 
@@ -380,7 +383,7 @@ Results per command:
 | Command | Args | Result |
 |---|---|---|
 | `start` | — | the `process` object of `status` |
-| `stop` | — | the `process` object, with `last_exit` of the stop |
+| `stop` | — | the `process` object, with `last_exit` of the stop; during a crash backoff, with `restart_at` null |
 | `restart` | — | the `process` object |
 | `stage` | `ref` | the generation record |
 | `test` | `generation` | the generation record (its `test` field holds port, outcome, duration) |
@@ -421,13 +424,14 @@ A generation record:
  "previous": "g2", "deadline": "…"}, "busy": null,
  "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
              "uptime": 42.5, "restarts": 1,
-             "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}}}
+             "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}, "restart_at": null}}
 ```
 
 `process.state` is `running`, `stopped` or `failed`; `uptime` is seconds, null when not running; `restarts` counts
 starts of the current generation after its first (crash restarts and `restart`) since it became current or the daemon
 started; `last_exit` is the most recent exit of the app (exit `code` or terminating `signal`, and whether Fawkes asked
-for it), null before the first. `busy` names the step in progress: a transaction step (`stage`, `test g3`,
+for it), null before the first. `restart_at` is the UTC time of the scheduled crash restart while the app waits out
+its backoff (`state` is `stopped` then), null otherwise. `busy` names the step in progress: a transaction step (`stage`, `test g3`,
 `switch g3`, `rollback`, `prune`), else one that moves the live process (`start`, `stop`, `restart`, or the
 supervisor's `reap`, `restart` and `rollback`).
 

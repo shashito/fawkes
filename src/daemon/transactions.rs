@@ -512,7 +512,7 @@ impl Daemon {
         let (old, backoff) = {
             let mut inner = self.inner();
             let backoff = match inner.live {
-                Live::Backoff { until } => Some(until),
+                Live::Backoff { until, ref at } => Some((until, at.clone())),
                 _ => None,
             };
             (inner.take_running(), backoff)
@@ -533,9 +533,9 @@ impl Daemon {
                     inner.live = Live::Failed;
                     daemon.event(EventKind::Failed, Some(previous), e.message);
                 }
-            } else if let Some(until) = backoff {
+            } else if let Some((until, at)) = backoff {
                 // The backoff and the failed-start count stay as the crash left them.
-                inner.live = Live::Backoff { until };
+                inner.live = Live::Backoff { until, at };
             }
         };
 

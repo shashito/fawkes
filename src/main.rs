@@ -362,6 +362,9 @@ fn render_process(p: &Process) -> String {
         );
     }
     line += &format!("  restarts {}", p.restarts);
+    if let Some(at) = &p.restart_at {
+        line += &format!("  restart at {at}");
+    }
     if let Some(exit) = &p.last_exit {
         let how = match (exit.code, exit.signal) {
             (Some(code), _) => format!("exit {code}"),
