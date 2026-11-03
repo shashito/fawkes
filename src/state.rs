@@ -50,16 +50,18 @@ pub fn parse_time(text: &str) -> Option<u64> {
     (format_time(secs) == text).then_some(secs)
 }
 
-/// The arithmetic behind `parse_time`, which accepts any field values.
+/// The arithmetic behind `parse_time`, which accepts any field values of up to four digits: longer ones are
+/// refused before the arithmetic, which they could overflow.
 fn parse_fields(text: &str) -> Option<u64> {
+    let field = |text: &str| text.parse::<i64>().ok().filter(|_| text.len() <= 4);
     let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
+    let mut d = date.split('-').map(field);
     let (year, month, day) = (d.next()??, d.next()??, d.next()??);
     // Keeps the arithmetic below far from overflow; `format_time` writes four-digit years.
     if !(0..=9999).contains(&year) {
         return None;
     }
-    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
+    let mut t = time.split(':').map(field);
     let (h, m, s) = (t.next()??, t.next()??, t.next()??);
     let y = year - i64::from(month <= 2);
     let era = y.div_euclid(400);
@@ -791,6 +793,7 @@ mod tests {
             "2026-11-3T14:00:01Z",
             "1969-12-31T23:59:59Z",
             "99999999999999999-01-01T00:00:00Z",
+            "2026-11-03T1000000000000000000:00:00Z",
             "",
         ] {
             assert_eq!(parse_time(text), None, "{text}");

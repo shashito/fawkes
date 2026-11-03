@@ -336,6 +336,10 @@ Output: readable text by default, progress lines on stderr while a step runs. Wi
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
 Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` the daemon is unreachable.
 
+`start`, `confirm`, `status`, `history` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
+fail with exit 1, "the daemon did not answer in time". The other commands wait as long as their step runs, which the
+manifest's timeouts bound, and `log --follow` waits for ever.
+
 Errors read as a sentence that says what to do next, for example:
 
 ```

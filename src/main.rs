@@ -19,6 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <command>
 
@@ -38,6 +39,9 @@ const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <c
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
+
+/// How long a quick command waits for the daemon's next line; the TUI's `REQUEST_TIMEOUT` is the same.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the command line asks for: one of the two local programs, or a request to a daemon.
 enum Command {
@@ -233,7 +237,36 @@ fn client(cli: &Cli, request: &Request, socket: &Path, manifest_path: &Path) -> 
         return EXIT_UNREACHABLE;
     }
     let follow = matches!(request, Request::Log { follow: true, .. });
-    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+    // A daemon that accepts and then never answers must not hang `fawkes confirm`, which the app itself calls. Only
+    // quick commands get the limit: a stage, test, switch, stop, restart, rollback or prune can stay silent for as
+    // long as an install, a health check, a stop timeout or a removal takes, which the daemon bounds by the
+    // manifest's timeouts, and a followed log is silent between events by design.
+    if matches!(
+        request,
+        Request::Start
+            | Request::Confirm { .. }
+            | Request::Status
+            | Request::History
+            | Request::Log { follow: false, .. }
+    ) && stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
+    {
+        eprintln!("error: cannot set a read timeout on the connection");
+        return EXIT_FAILED;
+    }
+    for line in BufReader::new(stream).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                eprintln!("error: the daemon did not answer in time");
+                return EXIT_FAILED;
+            }
+            Err(_) => break,
+        };
         // `--json` shows what the daemon sent, not what this client understood of it.
         let Ok(raw) = serde_json::from_str::<Value>(&line) else {
             continue;
