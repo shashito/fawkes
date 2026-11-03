@@ -26,6 +26,14 @@ the `pending` save (1:§5.2); manifest validation unit tests; a huge `--deadline
 
 ## Phase 2: races, stalls and leaks
 
+**Done:** every row below, 2.1 to 2.13, with its tests, and decisions 2 and 3 (`rollback_on_unhealthy`, `keep` and
+`prune`). Where the build differs from the row: 2.6 identifies a leftover app by a pid file the start wrapper writes
+before the app runs, and accepts it only if the process started within a minute before the file was written, which
+also rules out a pid reused after a reboot, so no separate boot id is stored; 2.7 caps `app.log` by copy and
+truncate every 10 s (lines written during the copy are lost); 2.13's tzset is declared by hand, since the `libc`
+crate has no binding for it on macOS. Found on the way and fixed: accepted sockets inherited the listener's
+non-blocking mode on macOS, so a request that arrived in pieces was refused.
+
 | # | Fix | From |
 |---|---|---|
 | 2.1 | `confirm` racing a crash rollback: `reap` decides the outcome where the facts are (`RollBack(reason)`, `RestartAt`, `Failed`) and records the rollback intent in the same critical section. `confirm` refuses when the pending generation is not running. | 1:M1, 2:1.5, 2:5.3 |
@@ -89,9 +97,10 @@ event for an unreadable deadline (2:1.9). The rest moved to phase 2 rows 2.10–
    instead of always rolling back. This contradicts the settled rule "a cold start always runs the last permanent
    generation". It is safe for storage, since the snapshot was taken before the new generation ran, but it changes
    the OTP semantics.
-2. **Roll back early on a failed health check (2:5.8):** add `rollback_on_unhealthy`, off by default?
+2. **Roll back early on a failed health check (2:5.8):** add `rollback_on_unhealthy`, off by default? *Decided:
+   yes, built in phase 2.*
 3. **Generation pruning (2:5.7):** `keep = N` with a `prune` command after each confirm, now or still later? It
-   matters once the Ultimate extension upgrades often.
+   matters once the Ultimate extension upgrades often. *Decided: now, built in phase 2.*
 4. **New crates:** `thiserror` for error types, `signal-hook` instead of hand-written signals, and `rustix` to
    replace most `unsafe` libc calls. Each needs its justification in `DESIGN.md`; the reviews also say the
    hand-written alternatives are fine.

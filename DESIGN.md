@@ -13,8 +13,8 @@ implements all of it except where a section says **later**.
 
 `fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive). It is the parent of the
 app's live process and the only writer of the state directory. Every other command (`start`, `stop`, `restart`,
-`stage`, `test`, `switch`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `tui`) is a thin client that sends
-requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
+`stage`, `test`, `switch`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `tui`) is a thin client that
+sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
 manifest.
 
 The daemon runs one transaction step (stage, test, switch, rollback) at a time; a second one gets `busy`. `start`,
@@ -29,8 +29,9 @@ state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload i
 - `name`, `repo`, `state_dir`, `home` and `storage` never change by reload; they need a daemon restart. (A changed
   `home` would restore a snapshot into another directory than the one it was taken from.)
 - `port` does not change while the app runs; `stop` it first.
-- Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`, `spare_ports`, `deadline`,
-  the timeouts and the restart policy) applies from the next stage, test, switch or start on. An invalid manifest is not reloaded.
+- Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`, `spare_ports`,
+  `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch or start on. An invalid
+  manifest is not reloaded.
 
 Change `home` or `storage` only while no switch is pending: a daemon start rolls a pending switch back into the
 `home` of the manifest it reads.
@@ -191,8 +192,8 @@ TOML, one file per app. Relative paths resolve against the manifest's directory.
 | `{state}` | Fawkes's state directory |
 
 Expansion is one pass: a substituted value is never scanned again, and an unknown `{...}` stays as written. In
-`install`, `start` and `health.command` each value is shell-quoted (bare when it only has `A-Z a-z 0-9 _ - . / : , + = @ %`,
-otherwise in single quotes with `'\''` for a single quote), so a path with a space or a `'` stays one word. In `[env]`
+`install`, `start` and `health.command` each value is shell-quoted (bare when it only has
+`A-Z a-z 0-9 _ - . / : , + = @ %`, otherwise in single quotes with `'\''` for a single quote), so a path with a space or a `'` stays one word. In `[env]`
 values and `health.url` values are substituted as is. A manifest that quotes a template itself (`'{home}'`) only keeps
 working for paths without special characters, so commands use the bare template, or the `[env]` variable
 (`"$APP_HOME"`).
