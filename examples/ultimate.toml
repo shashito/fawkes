@@ -1,0 +1,19 @@
+# The Ultimate manifest (first user of Fawkes). The paths are placeholders.
+name = "ultimate"
+repo = "/path/to/ultimate"
+home = "/path/to/.ultimate/projects/ultimate-<hash>"
+storage = ["state.sqlite", "trace.sqlite"]
+port = 4747
+spare_ports = [4790, 4799]
+install = "pnpm install --frozen-lockfile"
+reuse = ["node_modules"]
+start = "node bin/ultimate.ts --no-open"
+deadline = 120
+
+[health]
+url = "http://127.0.0.1:{port}/"
+timeout = 120
+
+[env]
+ULTIMATE_HOME = "{home}"
+ULTIMATE_PORT = "{port}"

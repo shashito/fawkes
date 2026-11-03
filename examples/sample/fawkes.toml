@@ -1,0 +1,24 @@
+# Try it: put app.js, a VERSION file and optionally a MODE file in a git repo at ../sample-repo, then
+#   fawkes daemon --manifest fawkes.toml &
+#   fawkes stage HEAD && fawkes test g1 && fawkes switch g1
+name = "sample"
+repo = "../sample-repo"            # git repository generations are cut from
+state_dir = "/tmp/fawkes-sample"   # keep it short: the socket path is limited to about 100 bytes
+home = "/tmp/sample-home"          # the app's own state directory
+storage = ["app.sqlite"]           # SQLite files relative to home, snapshotted at every switch
+port = 4790                        # live port
+spare_ports = [4791, 4799]         # inclusive range for `test`
+start = "node app.js"
+deadline = 30                      # seconds to confirm after a switch
+stop_timeout = 5
+min_uptime = 5
+max_failed_starts = 3
+
+[health]
+url = "http://127.0.0.1:{port}/"
+interval = 0.5
+timeout = 20
+
+[env]
+APP_PORT = "{port}"
+APP_HOME = "{home}"
