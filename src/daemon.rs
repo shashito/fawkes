@@ -14,7 +14,6 @@ use crate::state::{
 use crate::storage;
 use serde_json::{Value, json};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -133,6 +132,8 @@ pub struct Daemon {
     hub: Mutex<Vec<Sender<Msg>>>,
     /// Process groups of running tests, killed on shutdown.
     test_pgids: Mutex<Vec<u32>>,
+    /// `<fawkes_home>/run/<name>.sock`, removed on shutdown.
+    run_link: PathBuf,
 }
 
 // ------------------------------------------------------------- errors
@@ -207,8 +208,10 @@ impl Daemon {
         };
         std::fs::create_dir_all(&paths.root)
             .map_err(|e| format!("cannot create {}: {e}", paths.root.display()))?;
-        let socket = socket.unwrap_or_else(|| paths.socket());
+        let socket = std::path::absolute(socket.unwrap_or_else(|| paths.socket()))
+            .map_err(|e| e.to_string())?;
         let listener = bind(&socket)?;
+        let run_link = register(&manifest.name, &socket)?;
         let mut state = State::load(&paths.state_json())?;
         let stale_app = state.app_pid.take();
         state.daemon_pid = Some(std::process::id());
@@ -237,6 +240,7 @@ impl Daemon {
             log: Mutex::new(log),
             hub: Mutex::new(Vec::new()),
             test_pgids: Mutex::new(Vec::new()),
+            run_link,
         });
         install_signal_handlers();
         daemon.event(
@@ -327,6 +331,13 @@ impl Daemon {
 
     /// Stop the live app and any test and clean up; the generations keep their state.
     fn shutdown(&self) {
+        // A switch, rollback or restart in flight finishes first (start_live refuses from now on), so no app it
+        // starts outlives the daemon.
+        let give_up =
+            Instant::now() + Duration::from_secs_f64(2.0 * self.manifest().stop_timeout + 5.0);
+        while self.inner().moving.is_some() && Instant::now() < give_up {
+            sleep(Duration::from_millis(20));
+        }
         let app = self.inner().app.take();
         if let Some(app) = app {
             self.stop_app(app);
@@ -345,7 +356,29 @@ impl Daemon {
         drop(inner);
         self.event("daemon", None, "stopped");
         let _ = std::fs::remove_file(&self.socket);
+        if std::fs::read_link(&self.run_link).is_ok_and(|target| target == self.socket) {
+            let _ = std::fs::remove_file(&self.run_link);
+        }
     }
+}
+
+/// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes tui` finds every daemon.
+fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
+    let dir = crate::manifest::fawkes_home()?.join("run");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let link = dir.join(format!("{name}.sock"));
+    if std::fs::read_link(&link).is_ok_and(|target| target != socket)
+        && UnixStream::connect(&link).is_ok()
+    {
+        return Err(format!(
+            "another daemon named {name} already runs ({} answers); give this app another name",
+            link.display()
+        ));
+    }
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(socket, &link)
+        .map_err(|e| format!("cannot link {}: {e}", link.display()))?;
+    Ok(link)
 }
 
 /// Bind the socket; refuse when another daemon answers, replace a stale file.
@@ -366,11 +399,11 @@ fn bind(socket: &Path) -> Result<UnixListener, String> {
         std::fs::remove_file(socket)
             .map_err(|e| format!("cannot remove stale socket {}: {e}", socket.display()))?;
     }
-    let listener =
-        UnixListener::bind(socket).map_err(|e| format!("cannot bind {}: {e}", socket.display()))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| e.to_string())?;
-    Ok(listener)
+    // Created 0600 from the start: no moment in which the umask's permissions apply.
+    let umask = unsafe { libc::umask(0o177) };
+    let bound = UnixListener::bind(socket);
+    unsafe { libc::umask(umask) };
+    bound.map_err(|e| format!("cannot bind {}: {e}", socket.display()))
 }
 
 // ---------------------------------------------------- shared helpers
@@ -491,6 +524,9 @@ impl Daemon {
 
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
     fn start_live(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) -> R<()> {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return Err(err("start_failed", "the daemon is shutting down"));
+        }
         let m = self.manifest();
         let g = inner.state.find(id).cloned().ok_or_else(|| not_found(id))?;
         let vars = self.vars(m.port, &m.home, &g);
@@ -726,6 +762,8 @@ impl Daemon {
             }
             self.reap(&mut inner);
             match &inner.state.pending {
+                // Rolled back, but its storage restore failed: retried by `rollback` or the next daemon start.
+                Some(pending) if inner.state.restore_failed(pending) => None,
                 Some(pending) if now_secs() >= parse_time(&pending.deadline).unwrap_or(0) => {
                     Some("missed confirm deadline".to_string())
                 }
@@ -775,8 +813,18 @@ impl Daemon {
             return;
         };
         let app = inner.app.take().expect("checked above");
-        let m = self.manifest();
         let ran = app.started.elapsed().as_secs_f64();
+        let m = self.manifest();
+        // The leader is gone; end the rest of its group too, so nothing of it lives on unsupervised or keeps the
+        // storage open while a rollback restores it.
+        let pgid = app.child.id();
+        if process::group_alive(pgid) {
+            process::stop_group(pgid, 1.0, None);
+            let give_up = Instant::now() + Duration::from_secs(2);
+            while process::group_alive(pgid) && Instant::now() < give_up {
+                sleep(Duration::from_millis(10));
+            }
+        }
         let exit = LastExit::new(Some(status), false);
         inner.state.app_pid = None;
         let pending = inner
@@ -826,6 +874,14 @@ impl Daemon {
 
 impl Daemon {
     fn current_generation(&self, inner: &Inner) -> R<String> {
+        if let Some(pending) = &inner.state.pending
+            && inner.state.restore_failed(pending)
+        {
+            return Err(invalid_state(format!(
+                "{} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore",
+                pending.generation
+            )));
+        }
         inner.state.current().map(String::from).ok_or_else(|| {
             invalid_state(
                 "there is no generation to run yet; `fawkes stage`, `test` and `switch` one first",
@@ -1217,6 +1273,15 @@ impl Daemon {
                 "the pending switch is being rolled back and can no longer be confirmed",
             ));
         }
+        if let Some(pending) = &inner.state.pending
+            && (inner.state.restore_failed(pending)
+                || now_secs() >= parse_time(&pending.deadline).unwrap_or(0))
+        {
+            return Err(invalid_state(format!(
+                "{} missed its confirm deadline ({}) and is being rolled back",
+                pending.generation, pending.deadline
+            )));
+        }
         let Some(pending) = inner.state.pending.clone() else {
             return Err(match id {
                 Some(id) => inner
@@ -1282,18 +1347,22 @@ impl Daemon {
         let restored = storage::restore(&m.home, &self.paths.snapshot(&id));
 
         let mut inner = self.inner();
-        if let Some(g) = inner.state.find_mut(&id) {
+        // A retried restore keeps the first rollback's time and reason.
+        if let Some(g) = inner.state.find_mut(&id)
+            && g.state != GenState::RolledBack
+        {
             g.state = GenState::RolledBack;
             g.rolled_back_at = Some(now());
             g.rollback_reason = Some(reason.into());
         }
-        inner.state.pending = None;
         inner.rolling_back = false;
         let permanent = inner.state.permanent.clone();
-        self.save(&inner);
         if let Err(e) = restored {
-            // Starting the permanent generation on storage in an unknown state could do more harm.
+            // Starting the permanent generation on storage in an unknown state could do more harm. `pending` stays
+            // in state.json, so `rollback` or the next daemon start retries the restore (the code is not retried:
+            // the generation is rolled_back for good).
             inner.app_failed = true;
+            self.save(&inner);
             self.event(
                 "rolled_back",
                 Some(&id),
@@ -1306,6 +1375,8 @@ impl Daemon {
                 ),
             ));
         }
+        inner.state.pending = None;
+        self.save(&inner);
         self.event(
             "rolled_back",
             Some(&id),

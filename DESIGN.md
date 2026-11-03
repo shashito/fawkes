@@ -72,6 +72,11 @@ Code and storage roll back together:
 3. Mark the pending generation `rolled_back` with the reason, then start the permanent generation again (none on a
    first-ever switch).
 
+If the restore fails, the generation is still `rolled_back` (its code never runs again), but the pending switch
+stays in `state.json` and nothing is started on storage in an unknown state: `status` shows `failed`, and
+`fawkes rollback` or the next daemon start retries the restore. A confirm after the deadline is refused, even if the
+rollback has not begun yet.
+
 Rollback happens at most once per generation and only ever goes to the permanent generation. If that one then fails
 too, Fawkes does not roll further back; the restart policy below applies and the failure is reported in `status`.
 
@@ -92,7 +97,8 @@ deadline or storage; only `switch`, `confirm` and rollback do.
 - **restart:** stop (with the same grace), then start the same generation. It resets the backoff and does not count
   as a failed start.
 
-A requested stop is never a crash. Every other exit is:
+A requested stop is never a crash. Every other exit of the app's main process is, and Fawkes then ends the rest of
+its process group (SIGTERM, SIGKILL after 1 s), so nothing the app started lives on unsupervised:
 
 ### Crashes, failed-start counter and backoff
 
@@ -128,7 +134,7 @@ TOML, one file per app. Relative paths resolve against the manifest's directory.
 ```toml
 name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
-state_dir = "/tmp/fawkes-sample"   # default ~/.fawkes/<name>
+state_dir = "/tmp/fawkes-sample"   # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes
 home = "/tmp/sample-home"      # the app's own state directory
 storage = ["app.sqlite"]       # SQLite files relative to home, snapshotted at switch
 port = 4790                    # live port
@@ -285,9 +291,19 @@ for it), null before the first. `busy` names the transaction step in progress.
 
 ## TUI
 
-`fawkes tui` is a full-screen terminal client of the same socket: one `subscribe` connection for everything it
-shows, and ordinary one-shot requests for the actions. It holds no state of its own and works against a daemon
-started elsewhere; quitting it never affects the app.
+`fawkes tui` is a full-screen terminal client of the same socket. One window shows every supervised app: a narrow
+app list on the left (name, process state, a countdown while a switch awaits confirm) and the selected app's full
+view on the right, as sketched below. It holds one `subscribe` connection per daemon, so every row stays live, and
+sends ordinary one-shot requests for the actions, always to the selected app. It holds no state of its own and works
+against daemons started elsewhere; quitting it never affects an app. `fawkes tui --socket PATH` (or `--manifest`)
+shows that one app only.
+
+**Discovery:** each daemon links its socket as `<fawkes_home>/run/<name>.sock` when it starts and removes the link
+when it stops (a daemon with a custom `state_dir` is found the same way). `fawkes_home` is `$FAWKES_HOME`, default
+`~/.fawkes`. The TUI lists that folder, skips links nobody answers on, and rescans every few seconds so daemons
+started later appear. Two daemons with the same `name` are refused at start (the link already answers).
+
+The right-hand view:
 
 ```
 ┌ fawkes · ultimate ───────────────────────────────────────────────────────────┐

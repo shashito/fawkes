@@ -123,3 +123,53 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
         "{message}"
     );
 }
+
+/// Found in review: a crash only reaped the group leader, so processes the app had started lived on, unsupervised,
+/// while the rollback restored the storage under them.
+#[test]
+fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
+    let mut h = Harness::new(4810, "");
+    let manifest = h.dir.join("fawkes.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        r#"start = "node app.js""#,
+        r#"start = "sleep 6$(cut -c2 VERSION)1 & node app.js""#,
+    );
+    std::fs::write(&manifest, text).unwrap();
+    h.commit("v1", "confirm");
+    h.commit("v2", "crash-live");
+    h.start_daemon();
+    let alive = |pattern: &str| {
+        std::process::Command::new("pgrep")
+            .args(["-f", pattern])
+            .output()
+            .is_ok_and(|o| !o.stdout.is_empty())
+    };
+
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2"]);
+    h.wait("g2's crash to roll it back", 15, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert!(
+        h.generation("g2")["rollback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("exited before confirm")
+    );
+    assert!(
+        !alive("sleep 621"),
+        "g2's background process outlived its crash"
+    );
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    assert!(
+        alive("sleep 611"),
+        "g1 runs again, with its own background process"
+    );
+}

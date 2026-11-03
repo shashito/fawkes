@@ -197,6 +197,12 @@ impl State {
     }
 
     /// The generation `start`, `stop` and `restart` act on: the pending one, else the permanent one.
+    /// The pending generation is already rolled back: only its storage restore failed and awaits a retry.
+    pub fn restore_failed(&self, pending: &Pending) -> bool {
+        self.find(&pending.generation)
+            .is_some_and(|g| g.state == GenState::RolledBack)
+    }
+
     pub fn current(&self) -> Option<&str> {
         self.pending
             .as_ref()

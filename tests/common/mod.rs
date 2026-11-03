@@ -99,6 +99,7 @@ APP_HOME = "{{home}}"
         let child = Command::new(BIN)
             .args(["daemon", "--manifest"])
             .arg(&self.manifest)
+            .env("FAWKES_HOME", self.manifest.parent().unwrap())
             .stderr(log)
             .spawn()
             .unwrap();

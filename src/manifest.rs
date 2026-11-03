@@ -4,6 +4,15 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links the TUI discovers.
+pub fn fawkes_home() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("FAWKES_HOME") {
+        return Ok(dir.into());
+    }
+    let home = std::env::var_os("HOME").ok_or("neither FAWKES_HOME nor HOME is set")?;
+    Ok(Path::new(&home).join(".fawkes"))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -112,11 +121,7 @@ impl Manifest {
         m.home = base.join(&m.home);
         m.state_dir = Some(match &m.state_dir {
             Some(dir) => base.join(dir),
-            None => {
-                let user_home = std::env::var("HOME")
-                    .map_err(|_| "HOME is not set; set state_dir in the manifest")?;
-                Path::new(&user_home).join(".fawkes").join(&m.name)
-            }
+            None => fawkes_home()?.join(&m.name),
         });
         Ok(m)
     }
