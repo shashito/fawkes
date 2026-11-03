@@ -114,6 +114,26 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// `take_running` for `stop` and `restart`, which act on what is running. An app that has already exited stays
+    /// in place and the request is `busy`: the exit is a crash for the supervisor's `reap` to decide (a pending
+    /// generation gets no retries), not a stop that was asked for.
+    fn take_running_alive(&mut self) -> R<Option<App>> {
+        if let Some(app) = self.running_mut()
+            && matches!(app.child.try_wait(), Ok(Some(_)))
+        {
+            return Err(err(
+                ErrorCode::Busy,
+                format!(
+                    "{} exited; the supervisor is handling it, try again in a moment",
+                    app.generation
+                ),
+            ));
+        }
+        Ok(self.take_running())
+    }
+}
+
 /// Which slots a step occupies.
 #[derive(Clone, Copy)]
 enum Slot {

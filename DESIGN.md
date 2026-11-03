@@ -150,6 +150,9 @@ deadline or storage; only `switch`, `confirm` and rollback do.
 - **restart:** stop (with the same grace), then start the same generation. It resets the backoff and does not count
   as a failed start.
 
+`stop` and `restart` of an app that has already exited, before the supervisor has reaped it, are `busy`: the exit is a
+crash for the supervisor to decide (a pending generation gets no retries), never a requested stop.
+
 A requested stop is never a crash. Every other exit of the app's main process is, and Fawkes then ends the rest of
 its process group (SIGTERM, SIGKILL after 1 s), so nothing the app started lives on unsupervised:
 
