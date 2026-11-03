@@ -25,8 +25,10 @@ pub(super) type Active = Arc<Mutex<HashSet<String>>>;
 /// answered is not listed at all.
 pub(super) fn reader(key: &str, socket: &Path, active: Option<&Active>, tx: &Sender<Msg>) {
     let mut seen = false;
+    // The `seq` of the last event passed on: a reconnect asks for what came after it instead of starting over.
+    let mut last_seq = None;
     loop {
-        let (up, why) = follow(key, socket, tx);
+        let (up, why) = follow(key, socket, &mut last_seq, tx);
         seen |= up;
         let msg = match active {
             None => Some(Msg::Down(key.into(), why)),
@@ -50,11 +52,19 @@ pub(super) fn reader(key: &str, socket: &Path, active: Option<&Active>, tx: &Sen
     }
 }
 
-/// Fetch the recent events, then follow `subscribe`. The error says whether the app had answered.
-fn follow(key: &str, socket: &Path, tx: &Sender<Msg>) -> (bool, String) {
+/// Fetch the recent events (those after `last_seq`, once there is one), then follow `subscribe`. The error says
+/// whether the app had answered.
+fn follow(
+    key: &str,
+    socket: &Path,
+    last_seq: &mut Option<u64>,
+    tx: &Sender<Msg>,
+) -> (bool, String) {
     let request = Request::Subscribe {
         limit: Some(BACKLOG),
+        since: *last_seq,
     };
+    let resumed = last_seq.is_some();
     let stream = match open(socket, &request) {
         Ok(stream) => stream,
         Err(e) => return (false, e),
@@ -63,14 +73,23 @@ fn follow(key: &str, socket: &Path, tx: &Sender<Msg>) -> (bool, String) {
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
         if !up {
             up = true;
-            if tx.send(Msg::Up(key.into(), socket.into())).is_err() {
+            if tx
+                .send(Msg::Up(key.into(), socket.into(), resumed))
+                .is_err()
+            {
                 return (true, "the screen is gone".into());
             }
         }
-        if let Ok(line) = serde_json::from_str(&line)
-            && tx.send(Msg::Line(key.into(), line)).is_err()
-        {
-            return (true, "the screen is gone".into());
+        if let Ok(line) = serde_json::from_str::<Line>(&line) {
+            let seq = match &line {
+                Line::Event { event } => Some(event.seq),
+                _ => None,
+            };
+            if tx.send(Msg::Line(key.into(), line)).is_err() {
+                return (true, "the screen is gone".into());
+            }
+            // Not a maximum: a daemon whose log started over numbers from 1 again.
+            *last_seq = seq.or(*last_seq);
         }
     }
     if up {

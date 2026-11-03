@@ -111,6 +111,8 @@ pub enum Request {
     Subscribe {
         /// How many recent events to replay first.
         limit: Option<u64>,
+        /// Replay the events after this `seq` instead of the last `limit`.
+        since: Option<u64>,
     },
 }
 
@@ -156,6 +158,7 @@ impl Request {
             },
             "subscribe" => Request::Subscribe {
                 limit: args.get("limit").and_then(Value::as_u64),
+                since: args.get("since").and_then(Value::as_u64),
             },
             other => {
                 return Err(err(ErrorCode::Usage, format!("unknown command `{other}`")));
@@ -194,7 +197,7 @@ impl Serialize for Request {
             } => json!({ "generation": generation, "deadline": deadline }),
             Request::Confirm { generation } => json!({ "generation": generation }),
             Request::Log { limit, follow } => json!({ "limit": limit, "follow": follow }),
-            Request::Subscribe { limit } => json!({ "limit": limit }),
+            Request::Subscribe { limit, since } => json!({ "limit": limit, "since": since }),
             Request::Start
             | Request::Stop
             | Request::Restart
@@ -369,6 +372,9 @@ impl EventKind {
 /// One entry of the event log (`events.jsonl`), and one `event` line of a stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// Daemon-wide, increasing; 0 for a line written before events were numbered.
+    #[serde(default)]
+    pub seq: u64,
     pub at: String,
     pub kind: EventKind,
     pub generation: Option<String>,
@@ -720,11 +726,24 @@ mod tests {
         }
         assert_eq!(
             parse(r#"{"command":"subscribe","args":{"limit":100}}"#).unwrap(),
-            Request::Subscribe { limit: Some(100) }
+            Request::Subscribe {
+                limit: Some(100),
+                since: None
+            }
+        );
+        assert_eq!(
+            parse(r#"{"command":"subscribe","args":{"since":42,"limit":null}}"#).unwrap(),
+            Request::Subscribe {
+                limit: None,
+                since: Some(42)
+            }
         );
         assert_eq!(
             parse(r#"{"command":"subscribe"}"#).unwrap(),
-            Request::Subscribe { limit: None }
+            Request::Subscribe {
+                limit: None,
+                since: None
+            }
         );
     }
 
@@ -788,7 +807,10 @@ mod tests {
         // What is written is read back as the same request.
         for request in [
             Request::Confirm { generation: None },
-            Request::Subscribe { limit: Some(100) },
+            Request::Subscribe {
+                limit: Some(100),
+                since: Some(7),
+            },
             Request::Rollback,
         ] {
             assert_eq!(parse(&wire(request.clone())).unwrap(), request);

@@ -857,3 +857,50 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     // The first rollback's reason stays; the retries only finished it.
     assert_eq!(h.generation("g2")["rollback_reason"], "rollback requested");
 }
+
+/// Every event carries a `seq`, and `subscribe {since}` replays exactly the events after it, in order, before the
+/// `status` and `history` lines.
+#[test]
+fn subscribe_since_replays_the_events_after_a_sequence_number() {
+    use std::io::{BufRead, Write};
+    let mut h = Harness::new(4940, "");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+
+    let events = h.ok(&["log", "-n", "1000"])["events"].clone();
+    let seqs: Vec<u64> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["seq"].as_u64().unwrap())
+        .collect();
+    assert!(seqs.len() >= 4, "{events}");
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+    let middle = seqs[seqs.len() / 2];
+
+    let mut stream = std::os::unix::net::UnixStream::connect(h.dir.join("s/fawkes.sock")).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    writeln!(
+        stream,
+        r#"{{"command": "subscribe", "args": {{"since": {middle}}}}}"#
+    )
+    .unwrap();
+    let mut lines = std::io::BufReader::new(&stream).lines();
+    let mut replayed = Vec::new();
+    let first_other = loop {
+        let line: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        match line.get("event") {
+            Some(event) => replayed.push(event["seq"].as_u64().unwrap()),
+            None => break line,
+        }
+    };
+    let later: Vec<u64> = seqs.iter().copied().filter(|&n| n > middle).collect();
+    assert_eq!(replayed, later);
+    assert!(first_other.get("status").is_some(), "{first_other}");
+    let next: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+    assert!(next.get("history").is_some(), "{next}");
+}

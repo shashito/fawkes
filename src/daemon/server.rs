@@ -122,7 +122,7 @@ impl Daemon {
             Request::Log { limit, follow } => {
                 let limit = limit.map_or(20, |n| usize::try_from(n).unwrap_or(usize::MAX));
                 if follow {
-                    self.stream(out, Some(limit), false);
+                    self.stream(out, None, Some(limit), false);
                     return Ok(Reply::Streamed);
                 }
                 Ok(Events {
@@ -130,22 +130,23 @@ impl Daemon {
                 }
                 .into())
             }
-            Request::Subscribe { limit } => {
+            Request::Subscribe { limit, since } => {
                 let limit = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
-                self.stream(out, limit, true);
+                self.stream(out, since, limit, true);
                 Ok(Reply::Streamed)
             }
         }
     }
 
     /// Send events (and, for `subscribe`, status and history) to a client until it closes.
-    fn stream(&self, out: &mut Out, tail: Option<usize>, snapshots: bool) {
-        let rx = self.hub.join();
-        let mut ok = true;
-        if let Some(n) = tail {
-            let events = lock(&self.log).tail(n);
-            ok = events.iter().all(|e| out.event(e));
-        }
+    fn stream(&self, out: &mut Out, since: Option<u64>, limit: Option<usize>, snapshots: bool) {
+        // Join and read the replay under one hold of the log, the lock `event` broadcasts under: an event logged
+        // before it is in the replay, one logged after it is on the channel.
+        let (rx, replay) = {
+            let log = lock(&self.log);
+            (self.hub.join(), log.replay(since, limit))
+        };
+        let mut ok = replay.iter().all(|e| out.event(e));
         ok = ok && (!snapshots || self.send_snapshot(out));
         while ok && !self.shutting_down() {
             let first = match rx.recv_timeout(Duration::from_millis(500)) {

@@ -31,8 +31,9 @@ pub enum Target {
 /// Everything the UI thread hears about. `String`s named `app` are the app's key (see `AppView::key`).
 enum Msg {
     Key(KeyEvent),
-    /// A daemon answered: the app exists from now on.
-    Up(String, PathBuf),
+    /// A daemon answered: the app exists from now on. The flag says the connection resumed after the events the
+    /// screen already has.
+    Up(String, PathBuf, bool),
     /// A line of the `subscribe` stream: `status`, `history` or `event`.
     Line(String, Line),
     /// The connection dropped; it will be retried.
@@ -253,7 +254,7 @@ impl App {
     fn apply(&mut self, msg: Msg) -> Option<Cmd> {
         match msg {
             Msg::Key(key) => return self.key(key),
-            Msg::Up(key, socket) => {
+            Msg::Up(key, socket, resumed) => {
                 // Pin what is on screen, so an app that sorts before it does not take the selection.
                 self.current = self
                     .current
@@ -267,9 +268,12 @@ impl App {
                 let follow = self.follow;
                 if let Some(view) = self.view_mut(&key) {
                     view.link = Link::Up;
-                    view.events.clear();
-                    // A paused pane stays paused: the replayed events arrive after this.
-                    view.frozen = (!follow).then_some(0);
+                    // A resumed connection sends only what came after these events. A fresh one replays the
+                    // backlog, and a paused pane stays paused while it arrives.
+                    if !resumed {
+                        view.events.clear();
+                        view.frozen = (!follow).then_some(0);
+                    }
                 }
             }
             Msg::Down(key, why) => {
@@ -623,6 +627,7 @@ mod tests {
             app.apply(Msg::Up(
                 key.into(),
                 format!("/tmp/fk/run/{key}.sock").into(),
+                false,
             ));
             app.apply(Msg::Line(
                 key.into(),
@@ -885,7 +890,7 @@ mod tests {
         // unasked `c` went to another daemon. It stays on what is shown; a selected app that leaves selects nothing.
         app.current = None;
         assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
-        app.apply(Msg::Up("aaa".into(), "/tmp/fk/run/aaa.sock".into()));
+        app.apply(Msg::Up("aaa".into(), "/tmp/fk/run/aaa.sock".into(), false));
         assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
         app.apply(Msg::Gone("blog".into()));
         assert_eq!(app.apps.len(), 2);
