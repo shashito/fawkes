@@ -326,7 +326,7 @@ impl State {
 
     /// Write `state.json` durably, then the same content to `state.json.bak`. A crash leaves at least one of them
     /// whole, and `load` takes `state.json` whenever it can.
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    fn save(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self)?;
         write_durably(path, &bytes)?;
         write_durably(&backup_path(path), &bytes)
@@ -434,6 +434,56 @@ impl State {
         self.pending()
             .map(|p| p.generation.as_str())
             .or(self.permanent.as_deref())
+    }
+}
+
+// --------------------------------------------------------------- store
+
+/// Why `Store::modify` kept the old state.
+#[derive(Debug)]
+pub enum Unchanged {
+    /// The change refused itself.
+    Refused(Error),
+    /// The change was made, but state.json could not be written.
+    Unsaved(std::io::Error),
+}
+
+/// Owns state.json: the only way to change the state is through it, and every change is saved.
+pub struct Store {
+    path: PathBuf,
+    state: State,
+}
+
+impl Store {
+    /// `State::load`, with its migration and its fall back to the copy.
+    pub fn load(path: PathBuf) -> Result<(Store, Option<String>), String> {
+        let (state, recovered) = State::load(&path)?;
+        Ok((Store { path, state }, recovered))
+    }
+
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// An intent (a switch, a confirm, the end of a rollback): applied to a copy and kept only once it is on disk,
+    /// because a daemon restart acts on what is on disk, not on what was meant. When `change` refuses or the save
+    /// fails, nothing changed.
+    pub fn modify<T>(&mut self, change: impl FnOnce(&mut State) -> R<T>) -> Result<T, Unchanged> {
+        let mut next = self.state.clone();
+        let value = change(&mut next).map_err(Unchanged::Refused)?;
+        next.save(&self.path).map_err(Unchanged::Unsaved)?;
+        self.state = next;
+        Ok(value)
+    }
+
+    /// Bookkeeping (pids, counters, a test result, a decided rollback): kept in memory even when the save fails,
+    /// which is returned for the caller to report; a later save repeats it.
+    pub fn update<T>(
+        &mut self,
+        change: impl FnOnce(&mut State) -> T,
+    ) -> (T, Option<std::io::Error>) {
+        let value = change(&mut self.state);
+        (value, self.state.save(&self.path).err())
     }
 }
 
@@ -837,6 +887,48 @@ mod tests {
                 .map(|e| e.code),
             Some(ErrorCode::NotFound)
         );
+    }
+
+    #[test]
+    fn a_store_keeps_an_intent_only_once_it_is_on_disk() {
+        let root = std::env::temp_dir().join(format!("fk-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        let (mut store, warning) = Store::load(path.clone()).unwrap();
+        assert!(warning.is_none());
+
+        store
+            .modify(|state| {
+                state.next_id = 7;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(Store::load(path).unwrap().0.state().next_id, 7);
+
+        // A directory that does not exist: nothing can be written there.
+        let (mut store, _) = Store::load(root.join("missing").join("state.json")).unwrap();
+        let saved = store.modify(|state| {
+            state.next_id = 1;
+            Ok(())
+        });
+        assert!(matches!(saved, Err(Unchanged::Unsaved(_))));
+        assert_eq!(store.state().next_id, 0);
+
+        let refused = store.modify(|state| -> R<()> {
+            state.next_id = 2;
+            Err(not_found("g9"))
+        });
+        assert!(matches!(refused, Err(Unchanged::Refused(_))));
+        assert_eq!(store.state().next_id, 0);
+
+        let (value, failed) = store.update(|state| {
+            state.next_id = 3;
+            "done"
+        });
+        assert_eq!((value, store.state().next_id), ("done", 3));
+        assert!(failed.is_some());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

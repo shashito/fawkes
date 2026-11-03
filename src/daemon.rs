@@ -16,7 +16,8 @@ use crate::protocol::{
     SwitchResult, TestInfo, err, invalid_state, not_found,
 };
 use crate::state::{
-    self, EventLog, Paths, State, Txn, allowed, now, now_secs, parse_time, refusal,
+    self, EventLog, Paths, State, Store, Txn, Unchanged, allowed, now, now_secs, parse_time,
+    refusal,
 };
 use crate::storage;
 use rustix::fs::{FlockOperation, Mode, flock};
@@ -75,7 +76,7 @@ enum Live {
 }
 
 struct Inner {
-    state: State,
+    store: Store,
     live: Live,
     last_exit: Option<LastExit>,
     /// Generation of the latest start and the number of restarts since it became current.
@@ -268,8 +269,7 @@ impl Daemon {
             run_link: None,
         };
         published.run_link = Some(register(&manifest.name, &socket)?);
-        let (mut state, recovered) = State::load(&paths.state_json())?;
-        state.daemon_pid = Some(std::process::id());
+        let (store, recovered) = Store::load(paths.state_json())?;
         let log = EventLog::open(paths.events())
             .map_err(|e| format!("cannot open the event log: {e}"))?;
         let bin = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -283,7 +283,7 @@ impl Daemon {
             socket,
             bin,
             inner: Mutex::new(Inner {
-                state,
+                store,
                 live: Live::Stopped,
                 last_exit: None,
                 last_started: None,
@@ -318,12 +318,14 @@ impl Daemon {
                 format!("stopped the app (pid {pid}) left by an earlier daemon"),
             );
         }
-        daemon.save(&daemon.inner());
+        daemon.update(&mut daemon.inner().store, |state| {
+            state.daemon_pid = Some(std::process::id());
+        });
         daemon.sweep_generations();
 
         // What the last daemon was doing when it ended, from the step it saved before each side effect. A
         // pending switch is never resumed: it rolls back, and so does a rollback that was under way.
-        let txn = daemon.inner().state.txn.clone();
+        let txn = daemon.inner().store.state().txn.clone();
         match txn {
             None => daemon.start_permanent(),
             Some(Txn::Switching { generation, .. }) => {
@@ -334,10 +336,7 @@ impl Daemon {
                         "the switch to {generation} was cut short by the end of the last daemon; it stays tested"
                     ),
                 );
-                let mut inner = daemon.inner();
-                inner.state.txn = None;
-                daemon.save(&inner);
-                drop(inner);
+                daemon.update(&mut daemon.inner().store, |state| state.txn = None);
                 daemon.start_permanent();
             }
             Some(Txn::Pending(_)) => daemon.roll_back_at_start("daemon_restart")?,
@@ -391,7 +390,7 @@ impl Daemon {
 
     fn start_permanent(self: &Arc<Self>) {
         let mut inner = self.inner();
-        if let Some(id) = inner.state.permanent.clone()
+        if let Some(id) = inner.store.state().permanent.clone()
             && let Err(e) = self.start_live(&mut inner, &id, Why::Fresh)
         {
             inner.live = Live::Failed;
@@ -460,10 +459,7 @@ impl Daemon {
         for pgid in lock(&self.step_pgids).drain(..) {
             process::kill_group(pgid);
         }
-        let mut inner = self.inner();
-        inner.state.daemon_pid = None;
-        self.save(&inner);
-        drop(inner);
+        self.update(&mut self.inner().store, |state| state.daemon_pid = None);
         self.event(EventKind::Daemon, None, "stopped");
     }
 }
@@ -584,30 +580,36 @@ impl Daemon {
         lock(&self.manifest).clone()
     }
 
-    /// Save bookkeeping (the live pid, counters, a test result): a failure is reported and a later save repeats it.
-    fn save(&self, inner: &Inner) {
-        if let Err(e) = inner.state.save(&self.paths.state_json()) {
+    /// Change bookkeeping (the live pid, counters, a test result, a decided rollback) and save it. A failed save is
+    /// reported and the change stands in memory: a later save repeats it.
+    fn update<T>(&self, store: &mut Store, change: impl FnOnce(&mut State) -> T) -> T {
+        let (value, failed) = store.update(change);
+        if let Some(e) = failed {
             self.event(
                 EventKind::Error,
                 None,
                 format!("cannot write state.json: {e}"),
             );
         }
+        value
     }
 
-    /// Save the intent of a transaction step (a pending switch, a confirm, the end of a rollback). The step fails
-    /// when this fails: a daemon restart acts on what is on disk, not on what was meant.
-    fn persist(&self, state: &State) -> R<()> {
-        state.save(&self.paths.state_json()).map_err(|e| {
-            self.event(
-                EventKind::Error,
-                None,
-                format!("cannot write state.json: {e}"),
-            );
-            err(
-                ErrorCode::Internal,
-                format!("cannot write {}: {e}", self.paths.state_json().display()),
-            )
+    /// Change the state by the intent of a transaction step (a pending switch, a confirm, the end of a rollback).
+    /// The step fails when the save does: a daemon restart acts on what is on disk, not on what was meant.
+    fn modify<T>(&self, store: &mut Store, change: impl FnOnce(&mut State) -> R<T>) -> R<T> {
+        store.modify(change).map_err(|unchanged| match unchanged {
+            Unchanged::Refused(e) => e,
+            Unchanged::Unsaved(e) => {
+                self.event(
+                    EventKind::Error,
+                    None,
+                    format!("cannot write state.json: {e}"),
+                );
+                err(
+                    ErrorCode::Internal,
+                    format!("cannot write {}: {e}", self.paths.state_json().display()),
+                )
+            }
         })
     }
 
@@ -724,7 +726,12 @@ impl Daemon {
             return Err(err(ErrorCode::StartFailed, "the daemon is shutting down"));
         }
         let m = self.manifest();
-        let g = inner.state.find(id).cloned().ok_or_else(|| not_found(id))?;
+        let g = inner
+            .store
+            .state()
+            .find(id)
+            .cloned()
+            .ok_or_else(|| not_found(id))?;
         let vars = self.vars(m.port, &m.home, &g);
         let env = self.app_env(&m, &vars, "live");
         std::fs::create_dir_all(&m.home)?;
@@ -746,11 +753,6 @@ impl Daemon {
         } else {
             inner.restarts += 1;
         }
-        if why != Why::Crash
-            && let Some(g) = inner.state.find_mut(id)
-        {
-            g.failed_starts = 0;
-        }
         inner.last_started = Some(id.into());
         inner.live = Live::Running(App {
             child,
@@ -758,7 +760,13 @@ impl Daemon {
             started: Instant::now(),
             started_at: now(),
         });
-        self.save(inner);
+        self.update(&mut inner.store, |state| {
+            if why != Why::Crash
+                && let Some(g) = state.find_mut(id)
+            {
+                g.failed_starts = 0;
+            }
+        });
         self.point_current_link(&g.dir);
         self.event(
             EventKind::Started,
@@ -799,8 +807,7 @@ impl Daemon {
     /// changed since (confirmed, restarted, already rolling back); the next supervision pass carries it out.
     fn roll_back_unhealthy(&self, id: &str, pid: u32) {
         let mut inner = self.inner();
-        let pending =
-            matches!(&inner.state.txn, Some(Txn::Pending(pending)) if pending.generation == id);
+        let pending = matches!(&inner.store.state().txn, Some(Txn::Pending(pending)) if pending.generation == id);
         let running = inner.running().is_some_and(|app| app.child.id() == pid);
         if pending && running {
             self.decide_rollback(&mut inner, "health check failed");
@@ -811,8 +818,8 @@ impl Daemon {
     /// caller holds `inner` from learning why, so no confirm fits in between. The save is bookkeeping: the decision
     /// stands in memory, and a daemon that restarts rolls a pending switch back either way.
     fn decide_rollback(&self, inner: &mut Inner, reason: &str) {
-        if inner.state.decide_rollback(reason) {
-            self.save(inner);
+        if matches!(inner.store.state().txn, Some(Txn::Pending(_))) {
+            self.update(&mut inner.store, |state| state.decide_rollback(reason));
         }
     }
 
@@ -854,7 +861,7 @@ impl Daemon {
                 } else {
                     ProcessState::Stopped
                 },
-                inner.state.current().map(String::from),
+                inner.store.state().current().map(String::from),
                 None,
                 None,
                 None,
@@ -877,9 +884,9 @@ impl Daemon {
         Status {
             name: self.manifest().name.clone(),
             daemon_pid: std::process::id(),
-            permanent: inner.state.permanent.clone(),
-            current: inner.state.current().map(String::from),
-            pending: inner.state.pending().cloned(),
+            permanent: inner.store.state().permanent.clone(),
+            current: inner.store.state().current().map(String::from),
+            pending: inner.store.state().pending().cloned(),
             busy: inner.busy.clone().or_else(|| inner.moving.clone()),
             process: self.process(&inner),
         }
@@ -887,7 +894,7 @@ impl Daemon {
 
     fn history(&self) -> History {
         History {
-            generations: self.inner().state.generations.clone(),
+            generations: self.inner().store.state().generations.clone(),
         }
     }
 }
@@ -1027,7 +1034,10 @@ impl Daemon {
             }
             let stragglers = self.reap(&mut inner);
             self.decide_overdue(&mut inner);
-            (stragglers, inner.state.rolling_back().map(String::from))
+            (
+                stragglers,
+                inner.store.state().rolling_back().map(String::from),
+            )
         };
         // The leader is gone; end the rest of its group too, so nothing of it lives on unsupervised or keeps the
         // storage open while a rollback restores it.
@@ -1043,7 +1053,7 @@ impl Daemon {
         }
         let mut inner = self.inner();
         if self.restart_due(&inner)
-            && let Some(id) = inner.state.permanent.clone()
+            && let Some(id) = inner.store.state().permanent.clone()
             && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
         {
             inner.live = Live::Failed;
@@ -1060,7 +1070,7 @@ impl Daemon {
         let exited = inner
             .running_mut()
             .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_))));
-        let rollback = match &inner.state.txn {
+        let rollback = match &inner.store.state().txn {
             Some(Txn::Pending(pending)) => {
                 exited
                     || parse_time(&pending.deadline).is_none_or(|deadline| now_secs() >= deadline)
@@ -1104,13 +1114,13 @@ impl Daemon {
     }
 
     fn restart_due(&self, inner: &Inner) -> bool {
-        inner.state.txn.is_none()
+        inner.store.state().txn.is_none()
             && matches!(inner.live, Live::Backoff { until } if Instant::now() >= until)
     }
 
     /// Decide the rollback of a pending switch that missed its deadline.
     fn decide_overdue(&self, inner: &mut Inner) {
-        if let Some(Txn::Pending(pending)) = &inner.state.txn
+        if let Some(Txn::Pending(pending)) = &inner.store.state().txn
             && now_secs() >= self.deadline_secs(pending)
         {
             self.decide_rollback(inner, "missed confirm deadline");
@@ -1130,34 +1140,38 @@ impl Daemon {
         let m = self.manifest();
         let pgid = app.child.id();
         let exit = LastExit::new(Some(status), false);
-        let pending = inner
-            .state
-            .pending()
-            .is_some_and(|p| p.generation == app.generation);
-        let failed_starts = inner.state.find_mut(&app.generation).map_or(0, |g| {
-            g.failed_starts = if ran < m.min_uptime {
-                g.failed_starts + 1
-            } else {
-                0
-            };
-            g.failed_starts
+        // The crash count and the decision to roll back are one save. A reason decided earlier (a failed health
+        // check) stays the reason.
+        let (pending, failed_starts) = self.update(&mut inner.store, |state| {
+            let pending = state
+                .pending()
+                .is_some_and(|p| p.generation == app.generation);
+            let failed_starts = state.find_mut(&app.generation).map_or(0, |g| {
+                g.failed_starts = if ran < m.min_uptime {
+                    g.failed_starts + 1
+                } else {
+                    0
+                };
+                g.failed_starts
+            });
+            if pending {
+                state.decide_rollback(&format!("exited before confirm ({})", exit.describe()));
+            }
+            (pending, failed_starts)
         });
         let mut message = format!("{} after {ran:.1}s", exit.describe());
         let gave_up = !pending && failed_starts >= m.max_failed_starts;
-        if pending {
-            // A reason decided earlier (a failed health check) stays the reason.
-            self.decide_rollback(
-                inner,
-                &format!("exited before confirm ({})", exit.describe()),
-            );
-        } else if gave_up {
-            inner.live = Live::Failed;
-        } else {
-            let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
-            inner.live = Live::Backoff {
-                until: Instant::now() + Duration::from_secs(backoff),
-            };
-            message += &format!("; restarting in {backoff}s");
+        // A pending generation is not restarted: the next supervision pass carries the rollback out.
+        if !pending {
+            if gave_up {
+                inner.live = Live::Failed;
+            } else {
+                let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
+                inner.live = Live::Backoff {
+                    until: Instant::now() + Duration::from_secs(backoff),
+                };
+                message += &format!("; restarting in {backoff}s");
+            }
         }
         inner.last_exit = Some(exit);
         self.event(EventKind::Exited, Some(&app.generation), message);
@@ -1168,7 +1182,6 @@ impl Daemon {
                 format!("{failed_starts} failed starts in a row; not restarting"),
             );
         }
-        self.save(inner);
         Some(pgid)
     }
 }
@@ -1177,7 +1190,7 @@ impl Daemon {
 
 impl Daemon {
     fn current_generation(&self, inner: &Inner) -> R<String> {
-        match &inner.state.txn {
+        match &inner.store.state().txn {
             Some(Txn::RollingBack {
                 pending,
                 restore_failed: true,
@@ -1196,7 +1209,7 @@ impl Daemon {
             }
             _ => {}
         }
-        inner.state.current().map(String::from).ok_or_else(|| {
+        inner.store.state().current().map(String::from).ok_or_else(|| {
             invalid_state(
                 "there is no generation to run yet; `fawkes stage`, `test` and `switch` one first",
             )
@@ -1285,29 +1298,29 @@ impl Daemon {
         // daemon start cleans it up.
         let (id, reuse_from) = {
             let mut inner = self.inner();
-            inner.state.next_id += 1;
-            let id = format!("g{}", inner.state.next_id);
-            let reuse_from = inner
-                .state
-                .permanent
-                .as_ref()
-                .map_or(m.repo.clone(), |p| self.paths.code(p));
-            inner.state.generations.push(Generation {
-                id: id.clone(),
-                git_ref: git_ref.into(),
-                commit: commit.clone(),
-                state: GenState::Staging,
-                dir: self.paths.code(&id),
-                staged_at: now(),
-                test: None,
-                switched_at: None,
-                confirmed_at: None,
-                rolled_back_at: None,
-                rollback_reason: None,
-                failed_starts: 0,
-            });
-            self.save(&inner);
-            (id, reuse_from)
+            self.update(&mut inner.store, |state| {
+                state.next_id += 1;
+                let id = format!("g{}", state.next_id);
+                let reuse_from = state
+                    .permanent
+                    .as_ref()
+                    .map_or(m.repo.clone(), |p| self.paths.code(p));
+                state.generations.push(Generation {
+                    id: id.clone(),
+                    git_ref: git_ref.into(),
+                    commit: commit.clone(),
+                    state: GenState::Staging,
+                    dir: self.paths.code(&id),
+                    staged_at: now(),
+                    test: None,
+                    switched_at: None,
+                    confirmed_at: None,
+                    rolled_back_at: None,
+                    rollback_reason: None,
+                    failed_starts: 0,
+                });
+                (id, reuse_from)
+            })
         };
         if let Err(e) = self.build(out, &m, &id, git_ref, &commit, &reuse_from) {
             // A failed install's log outlives the generation, for the agent to read.
@@ -1325,8 +1338,9 @@ impl Daemon {
             return Err(e);
         }
         let mut inner = self.inner();
-        let record = inner.state.transition(&id, GenState::Staged)?.clone();
-        self.save(&inner);
+        let record = self.update(&mut inner.store, |state| {
+            state.transition(&id, GenState::Staged).map(|g| g.clone())
+        })?;
         self.event(
             EventKind::Staged,
             Some(&id),
@@ -1470,8 +1484,9 @@ impl Daemon {
         }
         let _ = git(&m.repo, &["worktree", "prune"]);
         let mut inner = self.inner();
-        inner.state.generations.retain(|g| g.id != id);
-        self.save(&inner);
+        self.update(&mut inner.store, |state| {
+            state.generations.retain(|g| g.id != id)
+        });
         Ok(())
     }
 
@@ -1480,7 +1495,7 @@ impl Daemon {
         let m = self.manifest();
         let g = {
             let inner = self.inner();
-            let g = inner.state.find(id).ok_or_else(|| not_found(id))?;
+            let g = inner.store.state().find(id).ok_or_else(|| not_found(id))?;
             if !allowed(g.state, GenState::Tested) {
                 return Err(refusal(g, GenState::Tested));
             }
@@ -1562,17 +1577,17 @@ impl Daemon {
                 .map_or_else(Clone::clone, |_| "healthy".into()),
         };
         let mut inner = self.inner();
-        let g = inner.state.transition(
-            id,
-            if passed {
+        let record = self.update(&mut inner.store, |state| {
+            let to = if passed {
                 GenState::Tested
             } else {
                 GenState::TestFailed
-            },
-        )?;
-        g.test = Some(info.clone());
-        let record = g.clone();
-        self.save(&inner);
+            };
+            state.transition(id, to).map(|g| {
+                g.test = Some(info.clone());
+                g.clone()
+            })
+        })?;
         match result {
             Ok(()) => {
                 self.event(
@@ -1600,7 +1615,7 @@ impl Daemon {
         let m = self.manifest();
         let previous = {
             let inner = self.inner();
-            match &inner.state.txn {
+            match &inner.store.state().txn {
                 Some(Txn::RollingBack {
                     pending,
                     restore_failed: true,
@@ -1614,29 +1629,30 @@ impl Daemon {
                 }
                 None => {}
             }
-            let g = inner.state.find(id).ok_or_else(|| not_found(id))?;
+            let g = inner.store.state().find(id).ok_or_else(|| not_found(id))?;
             if !allowed(g.state, GenState::Current) {
                 return Err(refusal(g, GenState::Current));
             }
-            inner.state.permanent.clone()
+            inner.store.state().permanent.clone()
         };
 
         // The intent goes to disk before the old app is stopped: a daemon that dies from here on finds the switch
         // cut short at its next start and runs the permanent generation again.
         {
             let mut inner = self.inner();
-            let mut next = inner.state.clone();
-            next.txn = Some(Txn::Switching {
-                generation: id.into(),
-                previous: previous.clone(),
-            });
-            self.persist(&next).map_err(|e| {
+            self.modify(&mut inner.store, |state| {
+                state.txn = Some(Txn::Switching {
+                    generation: id.into(),
+                    previous: previous.clone(),
+                });
+                Ok(())
+            })
+            .map_err(|e| {
                 err(
                     e.code,
                     format!("{}; {id} stays tested and nothing changed", e.message),
                 )
             })?;
-            inner.state = next;
         }
 
         // Stop first: no write of the old generation can land after the snapshot.
@@ -1649,8 +1665,7 @@ impl Daemon {
         // The switch did not happen: no step in flight, and the old generation runs again.
         let resume = |daemon: &Arc<Self>| {
             let mut inner = daemon.inner();
-            inner.state.txn = None;
-            daemon.save(&inner);
+            daemon.update(&mut inner.store, |state| state.txn = None);
             if let (true, Some(previous)) = (had_app, &previous)
                 && let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh)
             {
@@ -1683,14 +1698,16 @@ impl Daemon {
         // The intent goes to disk before the side effect: once a process of the new generation exists, state.json
         // already says the switch is pending, so a daemon that dies from here on rolls it back at its next start.
         let mut inner = self.inner();
-        let mut next = inner.state.clone();
-        let switched = next.transition(id, GenState::Current).map(|_| ());
-        next.txn = Some(Txn::Pending(Pending {
-            generation: id.into(),
-            previous: previous.clone(),
-            deadline: deadline.clone(),
-        }));
-        if let Err(e) = switched.and_then(|()| self.persist(&next)) {
+        let switched = self.modify(&mut inner.store, |state| {
+            state.transition(id, GenState::Current)?;
+            state.txn = Some(Txn::Pending(Pending {
+                generation: id.into(),
+                previous: previous.clone(),
+                deadline: deadline.clone(),
+            }));
+            Ok(())
+        });
+        if let Err(e) = switched {
             drop(inner);
             resume(self);
             return Err(err(
@@ -1698,7 +1715,6 @@ impl Daemon {
                 format!("{}; {id} stays tested and nothing changed", e.message),
             ));
         }
-        inner.state = next;
         if let Err(e) = self.start_live(&mut inner, id, Why::Fresh) {
             drop(inner);
             // The ordinary rollback undoes the recorded switch and starts the permanent generation again.
@@ -1730,7 +1746,7 @@ impl Daemon {
 
     fn confirm(&self, id: Option<&str>) -> R<Generation> {
         let mut inner = self.inner();
-        match &inner.state.txn {
+        match &inner.store.state().txn {
             Some(Txn::RollingBack {
                 pending,
                 restore_failed: true,
@@ -1752,10 +1768,11 @@ impl Daemon {
             }
             _ => {}
         }
-        let Some(Txn::Pending(pending)) = inner.state.txn.clone() else {
+        let Some(Txn::Pending(pending)) = inner.store.state().txn.clone() else {
             return Err(match id {
                 Some(id) => inner
-                    .state
+                    .store
+                    .state()
                     .find(id)
                     .map_or_else(|| not_found(id), |g| refusal(g, GenState::Permanent)),
                 None => invalid_state("no switch is pending; there is nothing to confirm"),
@@ -1764,7 +1781,7 @@ impl Daemon {
         if let Some(id) = id
             && id != pending.generation
         {
-            return Err(match inner.state.find(id) {
+            return Err(match inner.store.state().find(id) {
                 Some(g) if g.state == GenState::RolledBack => refusal(g, GenState::Permanent),
                 Some(g) => invalid_state(format!(
                     "{id} is {}, not pending; {} is the one waiting for confirm",
@@ -1795,25 +1812,27 @@ impl Daemon {
         }
         // Applied to a copy and kept only once it is on disk: a confirm the daemon could not write is not one, and
         // the switch stays pending (a daemon restart would roll it back).
-        let mut next = inner.state.clone();
-        if let Some(old) = next.permanent.clone() {
-            next.transition(&old, GenState::Retired)?;
-        }
-        let record = next
-            .transition(&pending.generation, GenState::Permanent)?
-            .clone();
-        next.permanent = Some(pending.generation.clone());
-        next.txn = None;
-        self.persist(&next).map_err(|e| {
-            err(
-                e.code,
-                format!(
-                    "{}; {} is still pending, confirm again",
-                    e.message, pending.generation
-                ),
-            )
-        })?;
-        inner.state = next;
+        let record = self
+            .modify(&mut inner.store, |state| {
+                if let Some(old) = state.permanent.clone() {
+                    state.transition(&old, GenState::Retired)?;
+                }
+                let record = state
+                    .transition(&pending.generation, GenState::Permanent)?
+                    .clone();
+                state.permanent = Some(pending.generation.clone());
+                state.txn = None;
+                Ok(record)
+            })
+            .map_err(|e| {
+                err(
+                    e.code,
+                    format!(
+                        "{}; {} is still pending, confirm again",
+                        e.message, pending.generation
+                    ),
+                )
+            })?;
         self.event(
             EventKind::Confirmed,
             Some(&pending.generation),
@@ -1834,7 +1853,7 @@ impl Daemon {
             self.decide_rollback(&mut inner, reason);
             let Some(Txn::RollingBack {
                 pending, reason, ..
-            }) = &inner.state.txn
+            }) = &inner.store.state().txn
             else {
                 return Err(invalid_state(
                     "no switch is pending, so there is nothing to roll back; to go back past a confirm, `test` and `switch` to a retired generation",
@@ -1850,14 +1869,13 @@ impl Daemon {
         let restored = storage::restore(&m.home, &self.paths.snapshot(&id));
 
         let mut inner = self.inner();
-        let permanent = inner.state.permanent.clone();
+        let permanent = inner.store.state().permanent.clone();
         if let Err(e) = restored {
             // Starting the permanent generation on storage in an unknown state could do more harm. The step stays
             // in state.json, so `rollback` or the next daemon start retries the restore (the code is not retried:
             // the generation is rolled_back for good).
-            inner.state.fail_restore();
+            self.update(&mut inner.store, State::fail_restore);
             inner.live = Live::Failed;
-            self.save(&inner);
             self.event(
                 EventKind::RolledBack,
                 Some(&id),
@@ -1872,10 +1890,12 @@ impl Daemon {
         }
         // Until the end of the switch is on disk the app stays stopped and the step stays, like a failed restore:
         // `rollback` or the next daemon start finishes it (restoring the same snapshot again is harmless).
-        let mut next = inner.state.clone();
-        next.txn = None;
-        if let Err(e) = self.persist(&next) {
-            inner.state.fail_restore();
+        if let Err(e) = self.modify(&mut inner.store, |state| {
+            state.txn = None;
+            Ok(())
+        }) {
+            // The save that just failed is reported; this one only records that the restore awaits a retry.
+            let _ = inner.store.update(State::fail_restore);
             inner.live = Live::Failed;
             self.event(
                 EventKind::RolledBack,
@@ -1890,7 +1910,6 @@ impl Daemon {
                 ),
             ));
         }
-        inner.state = next;
         self.event(
             EventKind::RolledBack,
             Some(&id),
@@ -1928,7 +1947,8 @@ impl Daemon {
         })?;
         let doomed = self
             .inner()
-            .state
+            .store
+            .state()
             .prunable(usize::try_from(keep).unwrap_or(usize::MAX));
         let mut removed = Vec::new();
         for id in doomed {
@@ -1958,7 +1978,8 @@ impl Daemon {
         }
         let kept: Vec<String> = self
             .inner()
-            .state
+            .store
+            .state()
             .generations
             .iter()
             .map(|g| g.id.clone())
@@ -1991,7 +2012,8 @@ impl Daemon {
         let staging: Vec<String> = {
             let inner = self.inner();
             inner
-                .state
+                .store
+                .state()
                 .generations
                 .iter()
                 .filter(|g| g.state == GenState::Staging)
@@ -2017,7 +2039,7 @@ impl Daemon {
             .flatten();
         for dir in dirs.flatten() {
             let name = dir.file_name().to_string_lossy().into_owned();
-            if self.inner().state.find(&name).is_none() {
+            if self.inner().store.state().find(&name).is_none() {
                 match std::fs::remove_dir_all(dir.path()) {
                     Ok(()) => self.event(
                         EventKind::Daemon,
