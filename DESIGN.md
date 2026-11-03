@@ -157,7 +157,8 @@ its process group (SIGTERM, SIGKILL after 1 s), so nothing the app started lives
 
 Each generation counts `failed_starts`: unrequested exits within `min_uptime` seconds of a start. The pending
 generation gets no retries: its first crash rolls it back. The permanent generation is restarted after a crash with a
-backoff of 1, 2, 4, … s (at most 30 s); a run longer than `min_uptime` resets its counter and the backoff; after
+backoff of 1, 1, 2, 4, … s for the first, second, third, … failed start in a row (at most 30 s; a crash after a run
+longer than `min_uptime` waits 1 s); a run longer than `min_uptime` resets its counter and the backoff; after
 `max_failed_starts` consecutive failed starts it is no longer restarted and `status` reports `"state": "failed"` until
 `start`, `restart`, the next `switch` or a daemon start.
 
@@ -335,7 +336,7 @@ Request:
 {"command": "switch", "args": {"generation": "g3", "deadline": 60}}
 ```
 
-A request line longer than 64 KiB is refused with `usage`. Response: zero or more progress lines, then exactly one
+A request line longer than 64 KiB, or one that has not arrived whole within 5 s, is refused with `usage`. Response: zero or more progress lines, then exactly one
 final line, then the daemon closes the connection.
 
 The daemon never waits on a client that stops reading: a write that blocks for 2 s ends that connection (a step in
@@ -349,7 +350,8 @@ dropped, so its stream simply ends. Live clients reconnect.
 ```
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` is produced by the client only.) A client treats a code it does not know as a failed command.
+`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` is produced by the client only.)
+A client treats a code it does not know as a failed command.
 
 Results per command:
 
@@ -365,7 +367,7 @@ Results per command:
 | `rollback` | — | `from`, `to`, `reason` |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
-| `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead streams every new event as an `event` line until the client closes |
+| `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes |
 | `history` | — | `generations`, oldest first |
 | `subscribe` | `limit?` | never ends; see below |
 
@@ -397,7 +399,9 @@ A generation record:
 `process.state` is `running`, `stopped` or `failed`; `uptime` is seconds, null when not running; `restarts` counts
 starts of the current generation after its first (crash restarts and `restart`) since it became current or the daemon
 started; `last_exit` is the most recent exit of the app (exit `code` or terminating `signal`, and whether Fawkes asked
-for it), null before the first. `busy` names the transaction step in progress.
+for it), null before the first. `busy` names the step in progress: a transaction step (`stage`, `test g3`,
+`switch g3`, `rollback`, `prune`), else one that moves the live process (`start`, `stop`, `restart`, or the
+supervisor's `reap`, `restart` and `rollback`).
 
 ## TUI
 
@@ -507,10 +511,10 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
       0.sqlite
     test-home/           storage copy the test run used (removed after the test)
     logs/install.log     install output
-  install-failed.log     install output of the latest stage that failed (its generation is removed)
     logs/app.log         stdout and stderr of every run, live and test, with a header line per start; past
                          10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines
                          written during the copy are lost)
+  install-failed.log     install output of the latest stage that failed (its generation is removed)
 ```
 
 `state.json` is the source of truth; the deadline is an absolute time so it survives a daemon restart.
@@ -530,7 +534,9 @@ Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replaci
   group. Already in the tree through ratatui's crossterm.
 - **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags, installed with `sigaction` and
   `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
-- **libc:** `localtime_r` for the TUI's local clock (neither std nor rustix has it).
+- **libc:** what neither std nor rustix has: `localtime_r` (and `tzset`, declared by hand because the crate has no
+  binding for it on macOS) for the TUI's local clock, and a process's start time for the leftover-app check
+  (`proc_pidinfo` on macOS, `sysconf` for the clock tick on Linux).
 
 Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
 `std::net::TcpStream` to localhost), UTC timestamps (days-to-civil conversion), threads instead of an async runtime.

@@ -34,5 +34,7 @@ last good version back. Process managers (launchd, supervisord, PM2) restart a c
 
 ## Status
 
-Design and prototype. The first prototype covers `stage`, `switch`, and rollback after a missed confirm deadline,
-tested against a copy of an Ultimate fork, never a live install.
+Prototype. Everything in [DESIGN.md](DESIGN.md) is built except its **Later** section: the transaction (`stage`,
+`test`, `switch`, `confirm`, automatic and manual `rollback`), `start`/`stop`/`restart` with crash restarts and
+backoff, `prune`, manifest reload on SIGHUP, and the `tui`. It is tested against a copy of an Ultimate fork, never a
+live install.
