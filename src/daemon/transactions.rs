@@ -66,10 +66,11 @@ impl Daemon {
             )
         })?;
         // Recorded before the slow work, so a stage cut short by a daemon restart shows in history and the next
-        // daemon start cleans it up.
+        // daemon start cleans it up. An intent: the id it spends must be on disk before any worktree carries it, or
+        // a daemon that dies now would hand the same id out again.
         let (id, reuse_from) = {
             let mut inner = self.inner();
-            self.update(&mut inner.store, |state| {
+            self.modify(&mut inner.store, |state| {
                 state.next_id += 1;
                 let id = format!("g{}", state.next_id);
                 let reuse_from = state
@@ -90,8 +91,9 @@ impl Daemon {
                     rollback_reason: None,
                     failed_starts: 0,
                 });
-                (id, reuse_from)
+                Ok((id, reuse_from))
             })
+            .map_err(|e| err(e.code, format!("{}; nothing was staged", e.message)))?
         };
         if let Err(e) = self.build(out, &m, &id, git_ref, &commit, &reuse_from) {
             // A failed install's log outlives the generation, for the agent to read.
