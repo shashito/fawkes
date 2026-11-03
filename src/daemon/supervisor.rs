@@ -253,29 +253,34 @@ impl Daemon {
                 || daemon.is_running(pid),
             );
             match result {
-                Ok(()) => daemon.event(EventKind::Healthy, Some(&id), "health check passed"),
-                Err(e) if daemon.is_running(pid) => {
-                    let event = daemon.event(EventKind::Unhealthy, Some(&id), e);
-                    if m.rollback_on_unhealthy {
-                        daemon.roll_back_unhealthy(&id, pid);
-                    }
-                    event
+                Ok(()) => {
+                    daemon.event(EventKind::Healthy, Some(&id), "health check passed");
                 }
-                Err(_) => return,
-            };
+                Err(e) if daemon.judge_unhealthy(&id, pid, m.rollback_on_unhealthy) => {
+                    daemon.event(EventKind::Unhealthy, Some(&id), e);
+                }
+                Err(_) => {}
+            }
         });
         Ok(())
     }
 
-    /// Decide the rollback of the pending generation `id` whose process `pid` never became healthy, unless it has
-    /// changed since (confirmed, restarted, already rolling back); the next supervision pass carries it out.
-    fn roll_back_unhealthy(&self, id: &str, pid: u32) {
+    /// Whether process `pid` of generation `id` is still the live one when its health check gives up, i.e. whether
+    /// `unhealthy` is news. If so and `roll_back` is set, the rollback of the pending generation is decided in the same
+    /// section that looked at the process (unless the switch has changed since: confirmed, already rolling back), and
+    /// the caller logs `unhealthy` only afterwards, so a confirm never finds the failure known but the rollback not
+    /// decided. The next supervision pass carries the rollback out.
+    fn judge_unhealthy(&self, id: &str, pid: u32, roll_back: bool) -> bool {
         let mut inner = self.inner();
-        let pending = matches!(&inner.store.state().txn, Some(Txn::Pending(pending)) if pending.generation == id);
-        let running = inner.running().is_some_and(|app| app.child.id() == pid);
-        if pending && running {
+        if !inner.running().is_some_and(|app| app.child.id() == pid) {
+            return false;
+        }
+        if roll_back
+            && matches!(&inner.store.state().txn, Some(Txn::Pending(pending)) if pending.generation == id)
+        {
             self.decide_rollback(&mut inner, "health check failed");
         }
+        true
     }
 
     /// Decide to roll back the pending switch for `reason` (`State::decide_rollback`), and save the decision. The
