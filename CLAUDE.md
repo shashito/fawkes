@@ -45,7 +45,8 @@ not built yet. Don't start one unless asked.
   daemon code paths, return `protocol::Error` with `?` and don't add `unwrap`/`expect`. They are fine in tests.
 - **A generation rolls back at most once.** Never add a path that rolls back a rolled-back generation.
 - **Locking** (see the header of `daemon/mod.rs`): never hold `inner` across a slow step (install, health check,
-  process stop). The lock order is `inner` → `log` → `hub`, and no thread waits on another while holding one.
+  process stop). The lock order is `inner` → `manifest` → `log` → `hub` (`step_pgids` is only ever taken alone), and no
+  thread waits on another while holding one.
 - **Processes:** the app runs in its own process group, and stopping or crash handling signals the whole group
   (`process::kill_group`, rustix's `kill_process_group`), never just the child pid.
 - **Storage snapshots** use the SQLite online backup API (`storage.rs`), never a file copy, because a copy can miss
@@ -69,8 +70,8 @@ too. Update a single dependency with `cargo update --precise`, never everything 
   `// ------------------------------------------------ name` dividers.
 - Comments explain *why*, invariants and locking, not what the next line does. Write them for a future reader:
   never mention the conversation, a review or a previous version ("now", "no longer", "fixed").
-- Errors: use `protocol::err(ErrorCode::Busy, "message")` and `R<T>` in the daemon and `Result<_, String>` in the CLI. Write
-  messages for an agent: say what is wrong and what to do next (e.g. point at `rollback`).
+- Errors: use `protocol::err(ErrorCode::Busy, "message")` and `R<T>` in the daemon and `Result<_, String>` in the CLI.
+  Write messages for an agent: say what is wrong and what to do next (e.g. point at `rollback`).
 - Don't drop a fallible result with `let _ =` unless failure really doesn't matter (best-effort cleanup). If it's
   not obvious, say why in a short comment.
 - `unsafe` is only for libc calls. Put a `// SAFETY:` comment on any `unsafe` block you add or touch.
