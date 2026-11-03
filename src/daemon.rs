@@ -321,16 +321,23 @@ impl Daemon {
             daemon.event("error", None, warning);
         }
 
-        // A crashed daemon leaves its app running. The state lock proves that daemon is gone, so the app it started
-        // has no other supervisor; `leftover` makes sure the pid still names that app.
-        if let Some(pid) = process::leftover(&daemon.paths.app_pid()) {
-            process::stop_group(pid, daemon.manifest().stop_timeout, None);
-            daemon.event(
-                "daemon",
-                None,
-                format!("stopped the app (pid {pid}) left by an earlier daemon"),
-            );
+        // A crashed daemon leaves its app, and the install or test it was running, behind. The state lock proves that
+        // daemon is gone, so what it started has no other supervisor; `leftover` makes sure the pid still names it.
+        // The step goes before the sweep removes the directory it runs in.
+        for (what, pid_file) in [
+            ("the app", daemon.paths.app_pid()),
+            ("the install or test", daemon.paths.step_pid()),
+        ] {
+            if let Some(pid) = process::leftover(&pid_file) {
+                process::stop_group(pid, daemon.manifest().stop_timeout, None);
+                daemon.event(
+                    "daemon",
+                    None,
+                    format!("stopped {what} (pid {pid}) left by an earlier daemon"),
+                );
+            }
         }
+        daemon.forget_step_pid_file();
         daemon.save(&daemon.inner());
         daemon.sweep_generations();
 
@@ -797,6 +804,11 @@ impl Daemon {
     /// never mistakes a stale file for a live app.
     fn forget_pid_file(&self) {
         let _ = std::fs::remove_file(self.paths.app_pid());
+    }
+
+    /// The same for the install or test that just ended.
+    fn forget_step_pid_file(&self) {
+        let _ = std::fs::remove_file(self.paths.step_pid());
     }
 
     fn process_value(&self, inner: &Inner) -> Value {
@@ -1367,7 +1379,7 @@ impl Daemon {
             &[],
             log,
             &format!("install: {command}"),
-            None,
+            Some(&self.paths.step_pid()),
         )
         .map_err(|e| e.to_string())?;
         let pgid = child.id();
@@ -1387,6 +1399,7 @@ impl Daemon {
         // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
         // outlives the stage.
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
+        self.forget_step_pid_file();
         lock(&self.step_pgids).retain(|p| *p != pgid);
         result
     }
@@ -1465,7 +1478,7 @@ impl Daemon {
             &env,
             &log,
             &format!("start {id} test port {port}"),
-            None,
+            Some(&self.paths.step_pid()),
         )
         .map_err(|e| {
             err(
@@ -1486,6 +1499,7 @@ impl Daemon {
             || matches!(child.try_wait(), Ok(None)),
         );
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
+        self.forget_step_pid_file();
         lock(&self.step_pgids).retain(|p| *p != pgid);
         let _ = std::fs::remove_dir_all(&test_home);
         // Our test process is gone, so a port that is still taken was taken by someone else, most likely between
@@ -1564,11 +1578,11 @@ impl Daemon {
             inner.state.permanent.clone()
         };
 
-        // Stop first: no write of the old generation can land after the snapshot.
-        let old = {
+        // Stop first: no write of the old generation can land after the snapshot. A crash restart the old generation
+        // was waiting for is held back too, and given back if the switch fails before its point of no return.
+        let (old, restart_at) = {
             let mut inner = self.inner();
-            inner.restart_at = None;
-            inner.app.take()
+            (inner.app.take(), inner.restart_at.take())
         };
         let had_app = old.is_some();
         if let Some(app) = old {
@@ -1576,12 +1590,16 @@ impl Daemon {
             self.stop_app(app);
         }
         let resume = |daemon: &Arc<Self>| {
-            if let (true, Some(previous)) = (had_app, &previous) {
-                let mut inner = daemon.inner();
+            let Some(previous) = &previous else { return };
+            let mut inner = daemon.inner();
+            if had_app {
                 if let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh) {
                     inner.app_failed = true;
                     daemon.event("failed", Some(previous), e.message);
                 }
+            } else {
+                // The backoff and the failed-start count stay as the crash left them.
+                inner.restart_at = restart_at;
             }
         };
 
