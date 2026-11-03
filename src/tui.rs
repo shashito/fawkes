@@ -33,15 +33,6 @@ pub enum Target {
     Discover(PathBuf),
 }
 
-/// `$FAWKES_HOME/run`, with `~/.fawkes` as the default home: where daemons link their sockets.
-pub fn run_dir() -> PathBuf {
-    let home = std::env::var_os("FAWKES_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".fawkes")))
-        .unwrap_or_else(|| PathBuf::from(".fawkes"));
-    home.join("run")
-}
-
 /// Everything the UI thread hears about. `String`s named `app` are the app's key (see `AppView::key`).
 enum Msg {
     Key(KeyEvent),

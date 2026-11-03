@@ -134,7 +134,14 @@ fn main() -> ExitCode {
         && cli.manifest.is_none()
         && std::env::var_os("FAWKES_SOCKET").is_none()
     {
-        return ExitCode::from(tui::run(tui::Target::Discover(tui::run_dir())));
+        let home = match manifest::fawkes_home() {
+            Ok(home) => home,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
+        return ExitCode::from(tui::run(tui::Target::Discover(home.join("run"))));
     }
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
