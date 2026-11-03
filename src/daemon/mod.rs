@@ -419,7 +419,23 @@ impl Daemon {
         };
         // Held across the swap, so no app starts between the check of `port` and the swap.
         let inner = self.inner();
-        match self.manifest().reload(&new, inner.running().is_some()) {
+        let current = self.manifest();
+        let reloaded = current.reload(&new, inner.running().is_some());
+        // A step that holds the live slot has no app in `live` between stopping the old process and starting the
+        // new one, yet it announces the port it reads from the manifest and must start on the same one.
+        let reloaded = match &inner.moving {
+            Some(step) if current.port != new.port && inner.running().is_none() => {
+                let moving = format!(
+                    "port cannot change while {step} is in progress: reload again when it has finished"
+                );
+                Err(match reloaded {
+                    Err(problems) => format!("{problems}; {moving}"),
+                    Ok(_) => moving,
+                })
+            }
+            _ => reloaded,
+        };
+        match reloaded {
             Ok(changed) if changed.is_empty() => {
                 self.event(
                     EventKind::Daemon,

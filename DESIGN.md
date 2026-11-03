@@ -28,7 +28,10 @@ state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload i
 
 - `name`, `repo`, `state_dir`, `home` and `storage` never change by reload; they need a daemon restart. (A changed
   `home` would restore a snapshot into another directory than the one it was taken from.)
-- `port` does not change while the app runs; `stop` it first.
+- `port` does not change while the app runs (`stop` it first), nor while a step holds the live process (a switch,
+  restart, rollback or the supervisor's own restart: between stopping the old process and starting the new one no app
+  runs, yet the step announces the port it starts on). The reload is refused whole; send `SIGHUP` again once the step
+  has finished.
 - Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`, `spare_ports`,
   `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch or start on. An invalid
   manifest is not reloaded.
