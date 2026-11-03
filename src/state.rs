@@ -1,6 +1,6 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
-use crate::protocol::{Event, GenState, Generation, Pending};
+use crate::protocol::{Error, Event, GenState, Generation, Pending, R, invalid_state, not_found};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -222,6 +222,56 @@ impl From<StateFile> for State {
     }
 }
 
+/// The edges of the generation diagram (DESIGN.md → Generations and states). A stage that fails and `prune` remove
+/// the record instead, which is not a transition; nothing leaves `rolled_back`, and nothing returns to `staging`.
+pub fn allowed(from: GenState, to: GenState) -> bool {
+    use GenState::*;
+    matches!(
+        (from, to),
+        (Staging, Staged)
+            | (Staged | TestFailed | Tested | Retired, Tested | TestFailed)
+            | (Tested, Current)
+            | (Current, Permanent | RolledBack)
+            | (Permanent, Retired)
+    )
+}
+
+/// Why a generation in this state cannot become `to`: the answer to a refused test (`tested`), switch (`current`)
+/// or confirm (`permanent`).
+pub fn refusal(g: &Generation, to: GenState) -> Error {
+    let id = &g.id;
+    let state = g.state.as_str();
+    invalid_state(match (g.state, to) {
+        (GenState::RolledBack, _) => format!(
+            "{id} was rolled back at {} ({}); stage the ref again for a new generation",
+            g.rolled_back_at.as_deref().unwrap_or("?"),
+            g.rollback_reason.as_deref().unwrap_or("no reason recorded")
+        ),
+        (GenState::Staging, _) => {
+            format!("{id} is still being staged; try again when its stage has finished")
+        }
+        (GenState::Staged, GenState::Current) => {
+            format!("{id} is staged, not tested; run `fawkes test {id}` first")
+        }
+        (GenState::TestFailed, GenState::Current) => {
+            format!(
+                "{id} failed its last test; run `fawkes test {id}` again or stage the ref again"
+            )
+        }
+        (GenState::Retired, GenState::Current) => {
+            format!("{id} is retired; run `fawkes test {id}` first")
+        }
+        (
+            GenState::Current | GenState::Permanent,
+            GenState::Tested | GenState::TestFailed | GenState::Current,
+        ) => format!("{id} is {state}, it already is the live generation"),
+        (_, GenState::Permanent) => {
+            format!("{id} is {state}, not pending; there is nothing to confirm")
+        }
+        (_, to) => format!("{id} is {state}, it cannot become {}", to.as_str()),
+    })
+}
+
 /// `state.json.bak` next to `state.json`.
 fn backup_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
@@ -310,6 +360,25 @@ impl State {
         }
     }
 
+    /// The only way a generation changes state: refuses an edge `allowed` does not list (`invalid_state`, with the
+    /// reason the command gives), otherwise sets the state and the timestamp of the edge. The caller sets
+    /// `rollback_reason` and `test`.
+    pub fn transition(&mut self, id: &str, to: GenState) -> R<&mut Generation> {
+        let g = self.find_mut(id).ok_or_else(|| not_found(id))?;
+        if !allowed(g.state, to) {
+            return Err(refusal(g, to));
+        }
+        g.state = to;
+        match to {
+            GenState::Staged => g.staged_at = now(),
+            GenState::Current => g.switched_at = Some(now()),
+            GenState::Permanent => g.confirmed_at = Some(now()),
+            GenState::RolledBack => g.rolled_back_at = Some(now()),
+            _ => {}
+        }
+        Ok(g)
+    }
+
     /// Decide to roll back the pending switch for `reason`: the generation becomes `rolled_back` and the step
     /// `RollingBack`. Does nothing when no switch is pending, so the first reason sticks and a generation rolls back
     /// at most once. Says whether it decided.
@@ -317,11 +386,12 @@ impl State {
         let Some(Txn::Pending(pending)) = self.txn.clone() else {
             return false;
         };
-        if let Some(g) = self.find_mut(&pending.generation)
-            && g.state != GenState::RolledBack
+        // A retried rollback finds the generation rolled back already and keeps its first time and reason.
+        if self
+            .find(&pending.generation)
+            .is_some_and(|g| g.state != GenState::RolledBack)
+            && let Ok(g) = self.transition(&pending.generation, GenState::RolledBack)
         {
-            g.state = GenState::RolledBack;
-            g.rolled_back_at = Some(now());
             g.rollback_reason = Some(reason.into());
         }
         self.txn = Some(Txn::RollingBack {
@@ -468,7 +538,7 @@ impl EventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::EventKind;
+    use crate::protocol::{ErrorCode, EventKind};
 
     #[test]
     fn time_round_trips() {
@@ -696,6 +766,77 @@ mod tests {
         state.fail_restore();
         assert_eq!(state.rolling_back(), None);
         assert!(state.pending().is_some());
+    }
+
+    #[test]
+    fn a_generation_changes_state_only_along_the_edges_of_the_diagram() {
+        use GenState::*;
+        let all = [
+            Staging, Staged, TestFailed, Tested, Current, Permanent, Retired, RolledBack,
+        ];
+        let legal = [
+            (Staging, Staged),
+            (Staged, Tested),
+            (Staged, TestFailed),
+            (TestFailed, Tested),
+            (TestFailed, TestFailed),
+            (Tested, Tested),
+            (Tested, TestFailed),
+            (Retired, Tested),
+            (Retired, TestFailed),
+            (Tested, Current),
+            (Current, Permanent),
+            (Current, RolledBack),
+            (Permanent, Retired),
+        ];
+        for from in all {
+            for to in all {
+                let mut state = State {
+                    generations: vec![Generation {
+                        id: "g1".into(),
+                        git_ref: "main".into(),
+                        commit: "0".into(),
+                        state: from,
+                        dir: PathBuf::new(),
+                        staged_at: "then".into(),
+                        test: None,
+                        switched_at: None,
+                        confirmed_at: None,
+                        rolled_back_at: None,
+                        rollback_reason: None,
+                        failed_starts: 0,
+                    }],
+                    ..State::default()
+                };
+                let before = serde_json::to_value(&state).unwrap();
+                let result = state.transition("g1", to);
+                let case = format!("{from:?} -> {to:?}");
+                assert_eq!(allowed(from, to), legal.contains(&(from, to)), "{case}");
+                if legal.contains(&(from, to)) {
+                    let g = result.unwrap_or_else(|e| panic!("{case}: {}", e.message));
+                    assert_eq!(g.state, to, "{case}");
+                    let stamped = match to {
+                        Staged => g.staged_at != "then",
+                        Current => g.switched_at.is_some(),
+                        Permanent => g.confirmed_at.is_some(),
+                        RolledBack => g.rolled_back_at.is_some(),
+                        _ => true,
+                    };
+                    assert!(stamped, "{case} sets its timestamp");
+                } else {
+                    let e = result.err().unwrap_or_else(|| panic!("{case} was allowed"));
+                    assert_eq!(e.code, ErrorCode::InvalidState, "{case}");
+                    assert_eq!(serde_json::to_value(&state).unwrap(), before, "{case}");
+                }
+            }
+        }
+        assert_eq!(
+            State::default()
+                .transition("g9", Staged)
+                .err()
+                .map(|e| e.code),
+            Some(ErrorCode::NotFound)
+        );
     }
 
     #[test]
