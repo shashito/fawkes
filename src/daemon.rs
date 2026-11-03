@@ -26,7 +26,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
@@ -117,6 +117,28 @@ enum Msg {
     Changed,
 }
 
+/// The longest request line a client may send, in bytes.
+const MAX_REQUEST: u64 = 64 * 1024;
+
+/// How many messages a subscriber may fall behind before it is dropped.
+const SUBSCRIBER_QUEUE: usize = 1024;
+
+/// The subscribers' queues. Bounded: a subscriber that falls `SUBSCRIBER_QUEUE` messages behind (its client stopped
+/// reading) is dropped, which ends its stream, instead of growing the daemon's memory for as long as it lives.
+struct Hub(Mutex<Vec<SyncSender<Msg>>>);
+
+impl Hub {
+    fn join(&self) -> Receiver<Msg> {
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_QUEUE);
+        lock(&self.0).push(tx);
+        rx
+    }
+
+    fn send(&self, msg: &Msg) {
+        lock(&self.0).retain(|tx| tx.try_send(msg.clone()).is_ok());
+    }
+}
+
 pub struct Daemon {
     /// Set by SIGTERM and SIGINT.
     shutdown: Arc<AtomicBool>,
@@ -129,7 +151,7 @@ pub struct Daemon {
     bin: PathBuf,
     inner: Mutex<Inner>,
     log: Mutex<EventLog>,
-    hub: Mutex<Vec<Sender<Msg>>>,
+    hub: Hub,
     /// Process groups of running tests, killed on shutdown.
     test_pgids: Mutex<Vec<u32>>,
     /// `<fawkes_home>/run/<name>.sock`, removed on shutdown.
@@ -258,7 +280,7 @@ impl Daemon {
                 rollback: None,
             }),
             log: Mutex::new(log),
-            hub: Mutex::new(Vec::new()),
+            hub: Hub(Mutex::new(Vec::new())),
             test_pgids: Mutex::new(Vec::new()),
             run_link,
         });
@@ -539,7 +561,7 @@ impl Daemon {
     }
 
     fn broadcast(&self, msg: Msg) {
-        lock(&self.hub).retain(|tx| tx.send(msg.clone()).is_ok());
+        self.hub.send(&msg);
     }
 
     /// Record an event: stderr, events.jsonl, every subscriber. Anything but progress also changes the picture.
@@ -787,12 +809,17 @@ impl Daemon {
     fn handle(self: Arc<Self>, stream: UnixStream) {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut line = String::new();
+        // Bounded, so a client cannot make the daemon allocate without limit.
         let read = stream.try_clone().and_then(|s| {
-            use std::io::BufRead;
-            std::io::BufReader::new(s).read_line(&mut line)
+            use std::io::{BufRead, Read};
+            std::io::BufReader::new(s.take(MAX_REQUEST)).read_line(&mut line)
         });
         let mut out = Out::new(stream);
         let result = match read {
+            Ok(n) if n as u64 >= MAX_REQUEST && !line.ends_with('\n') => Err(err(
+                "usage",
+                format!("the request is longer than {MAX_REQUEST} bytes"),
+            )),
             Ok(n) if n > 0 => match serde_json::from_str::<Request>(&line) {
                 Ok(request) => self.dispatch(&mut out, request),
                 Err(e) => Err(err("usage", format!("malformed request: {e}"))),
@@ -840,8 +867,7 @@ impl Daemon {
 
     /// Send events (and, for `subscribe`, status and history) to a client until it closes.
     fn stream(&self, out: &mut Out, tail: Option<usize>, snapshots: bool) {
-        let (tx, rx) = mpsc::channel();
-        lock(&self.hub).push(tx);
+        let rx = self.hub.join();
         let mut ok = true;
         if let Some(n) = tail {
             let events = lock(&self.log).tail(n);
@@ -1677,5 +1703,29 @@ fn run_install(command: &str, code: &Path, log: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(status.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_subscriber_that_falls_behind_is_dropped_not_buffered_without_limit() {
+        let hub = Hub(Mutex::new(Vec::new()));
+        let stuck = hub.join();
+        for _ in 0..SUBSCRIBER_QUEUE * 3 {
+            hub.send(&Msg::Changed);
+        }
+        assert!(lock(&hub.0).is_empty(), "the stuck subscriber was kept");
+        assert_eq!(stuck.try_iter().count(), SUBSCRIBER_QUEUE);
+        assert!(matches!(
+            stuck.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+
+        let reading = hub.join();
+        hub.send(&Msg::Changed);
+        assert!(reading.try_recv().is_ok() && lock(&hub.0).len() == 1);
     }
 }

@@ -294,7 +294,12 @@ Request:
 {"command": "switch", "args": {"generation": "g3", "deadline": 60}}
 ```
 
-Response: zero or more progress lines, then exactly one final line, then the daemon closes the connection.
+A request line longer than 64 KiB is refused with `usage`. Response: zero or more progress lines, then exactly one
+final line, then the daemon closes the connection.
+
+The daemon never waits on a client that stops reading: a write that blocks for 2 s ends that connection (a step in
+progress carries on without it), and a `subscribe` or `log --follow` client that falls 1024 messages behind is
+dropped, so its stream simply ends. Live clients reconnect.
 
 ```json
 {"event": {"at": "2026-11-03T14:00:01Z", "kind": "progress", "generation": "g3", "message": "stopping g2"}}

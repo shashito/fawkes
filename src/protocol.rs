@@ -7,6 +7,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
+
+/// How long one write to a client may block. A client that stops reading (a suspended TUI, a paused pager) then counts
+/// as gone, instead of stalling the step or the stream that writes to it.
+pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -57,28 +62,49 @@ impl From<std::io::Error> for Error {
 }
 
 /// The client connection of one request; `Out::none()` for work nobody is waiting on.
-pub struct Out(Option<UnixStream>);
+pub struct Out {
+    stream: Option<UnixStream>,
+    /// A write failed or timed out: nothing more is sent, so a client that stopped reading costs one timeout, not
+    /// one per line.
+    gone: bool,
+}
 
 impl Out {
     pub fn new(stream: UnixStream) -> Out {
-        Out(Some(stream))
+        // Fails only for a zero duration.
+        let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+        Out {
+            stream: Some(stream),
+            gone: false,
+        }
     }
 
     pub fn none() -> Out {
-        Out(None)
+        Out {
+            stream: None,
+            gone: false,
+        }
     }
 
     /// Send one JSON line; false when the client is gone.
     pub fn line(&mut self, value: &Value) -> bool {
-        match &mut self.0 {
-            Some(stream) => stream.write_all(format!("{value}\n").as_bytes()).is_ok(),
-            None => true,
+        if self.gone {
+            return false;
         }
+        if let Some(stream) = &mut self.stream {
+            self.gone = stream.write_all(format!("{value}\n").as_bytes()).is_err();
+        }
+        !self.gone
     }
 
     /// Has the client closed its end? Streams use this to notice a client that left while nothing was sent.
     pub fn closed(&self) -> bool {
-        let Some(stream) = &self.0 else { return false };
+        if self.gone {
+            return true;
+        }
+        let Some(stream) = &self.stream else {
+            return false;
+        };
         let mut byte = [0u8];
         matches!(
             recv(stream, &mut byte[..], RecvFlags::PEEK | RecvFlags::DONTWAIT),
@@ -96,5 +122,34 @@ impl Out {
             Err(e) => json!({ "ok": false, "error": { "code": e.code, "message": e.message } }),
         };
         self.line(&line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    /// The timeout applies to each system call, so the line in flight may wait for it twice (a partial write, then
+    /// the rest); after that nothing is sent at all.
+    fn a_client_that_stops_reading_costs_a_bounded_wait_once() {
+        let (daemon_end, _client_end) = UnixStream::pair().unwrap();
+        let mut out = Out::new(daemon_end);
+        let line = json!({ "event": "x".repeat(4096) });
+        let started = Instant::now();
+        let mut sent = 0;
+        while out.line(&line) {
+            sent += 1;
+            assert!(sent < 100_000, "the socket buffer never filled");
+        }
+        assert!(
+            started.elapsed() < WRITE_TIMEOUT * 3,
+            "{:?}",
+            started.elapsed()
+        );
+        let again = Instant::now();
+        assert!(!out.line(&line) && out.closed());
+        assert!(again.elapsed() < Duration::from_millis(100));
     }
 }
