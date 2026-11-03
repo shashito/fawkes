@@ -1,0 +1,10 @@
+{
+  "isolates": {
+    "worktree": {
+      "setup": [
+        "cargo fetch --locked",
+        "[ -d target ] || [ ! -d \"$ULTIMATE_SOURCE/target\" ] || cp -cR \"$ULTIMATE_SOURCE/target\" target"
+      ]
+    }
+  }
+}
