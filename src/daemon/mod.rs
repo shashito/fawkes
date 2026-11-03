@@ -283,16 +283,23 @@ impl Daemon {
             daemon.event(EventKind::Error, None, warning);
         }
 
-        // A crashed daemon leaves its app running. The state lock proves that daemon is gone, so the app it started
-        // has no other supervisor; `leftover` makes sure the pid still names that app.
-        if let Some(pid) = process::leftover(&daemon.paths.app_pid()) {
-            process::stop_group(pid, daemon.manifest().stop_timeout, None);
-            daemon.event(
-                EventKind::Daemon,
-                None,
-                format!("stopped the app (pid {pid}) left by an earlier daemon"),
-            );
+        // A crashed daemon leaves its app, and the install or test it was running, behind. The state lock proves that
+        // daemon is gone, so what it started has no other supervisor; `leftover` makes sure the pid still names it.
+        // The step goes before the sweep removes the directory it runs in.
+        for (what, pid_file) in [
+            ("the app", daemon.paths.app_pid()),
+            ("the install or test", daemon.paths.step_pid()),
+        ] {
+            if let Some(pid) = process::leftover(&pid_file) {
+                process::stop_group(pid, daemon.manifest().stop_timeout, None);
+                daemon.event(
+                    EventKind::Daemon,
+                    None,
+                    format!("stopped {what} (pid {pid}) left by an earlier daemon"),
+                );
+            }
         }
+        daemon.forget_step_pid_file();
         daemon.update(&mut daemon.inner().store, |state| {
             state.daemon_pid = Some(std::process::id());
         });
