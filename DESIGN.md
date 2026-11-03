@@ -18,8 +18,9 @@ requests over the daemon's Unix socket and renders the answer. One daemon superv
 manifest.
 
 The daemon runs one transaction step (stage, test, switch, rollback) at a time; a second one gets `busy`. `start`,
-`stop` and `restart` get `busy` only while a switch or rollback moves the live process. `status`, `log`, `history`
-and `confirm` are always answered.
+`stop` and `restart` get `busy` only while a switch or rollback moves the live process, or while the supervisor does
+(`reap` after a crash, `restart` after its backoff, an automatic `rollback`). `status`, `log`, `history` and
+`confirm` are always answered.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
@@ -28,8 +29,8 @@ state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload i
 - `name`, `repo`, `state_dir`, `home` and `storage` never change by reload; they need a daemon restart. (A changed
   `home` would restore a snapshot into another directory than the one it was taken from.)
 - `port` does not change while the app runs; `stop` it first.
-- Everything else (`start`, `env`, `health`, `install`, `reuse`, `spare_ports`, `deadline`, the timeouts and the
-  restart policy) applies from the next stage, test, switch or start on. An invalid manifest is not reloaded.
+- Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `spare_ports`, `deadline`,
+  the timeouts and the restart policy) applies from the next stage, test, switch or start on. An invalid manifest is not reloaded.
 
 Change `home` or `storage` only while no switch is pending: a daemon start rolls a pending switch back into the
 `home` of the manifest it reads.
@@ -69,6 +70,9 @@ staged ──test──▶ tested ──switch──▶ current ──confirm─
    that dies from here on rolls the switch back at its next start. If the target cannot be started, the switch is
    rolled back at once (below).
 5. Health-check it in the background and log `healthy` when it passes. Health never confirms: only `confirm` does.
+   A check that gives up after `health.timeout` logs `unhealthy`; with `rollback_on_unhealthy = true` in the
+   manifest the switch then rolls back at once (reason `health check failed`) instead of at its deadline. It is off
+   by default, for apps that are slow to warm up.
 
 A switch whose `state.json` cannot be written fails before step 4 and starts the previous generation again; a
 confirm that cannot be written fails and stays pending.
@@ -77,11 +81,16 @@ confirm that cannot be written fails and stays pending.
 
 `fawkes confirm [<gen>]`, normally called by the new generation itself once it knows it is healthy (Fawkes gives it
 `FAWKES_BIN`, `FAWKES_SOCKET` and `FAWKES_GENERATION`). The pending generation becomes `permanent`, the previous
-permanent becomes `retired`, the deadline is cleared. Confirming a generation that is not pending is `invalid_state`.
+permanent becomes `retired`, the deadline is cleared. Confirming a generation that is not pending is `invalid_state`,
+and so is confirming the pending generation while its process is not running (stopped, or exited and about to be
+rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The supervisor
+records a rollback (crash, missed deadline, failed health check) in the same step that learns of it, so a confirm
+never slips in between.
 
 ### Rollback
 
-Triggered by a missed deadline, by the pending generation's process exiting before confirm (a failed start), by a
+Triggered by a missed deadline, by the pending generation's process exiting before confirm (a failed start), by its
+health check giving up when `rollback_on_unhealthy` is set, by a
 switch that cannot start the target's process, by `fawkes rollback`, or by a daemon start that finds a pending switch
 in `state.json` (Fawkes itself died mid-switch). A deadline in `state.json` that cannot be parsed counts as passed
 and is reported as an `error` event.
@@ -114,7 +123,8 @@ deadline or storage; only `switch`, `confirm` and rollback do.
 - **start:** start the current generation if it is not running (also clears `failed`). Already running is
   `invalid_state`.
 - **stop:** SIGTERM to the app's process group, SIGKILL after `stop_timeout` seconds of grace. The app stays stopped:
-  no automatic restart until `start` or `restart`. Stopping a pending generation does not stop its deadline; if it is
+  no automatic restart until `start` or `restart`. Stopping a pending generation does not stop its deadline, and it
+  cannot be confirmed while stopped; if it is
   not started and confirmed in time it is rolled back like any other.
 - **restart:** stop (with the same grace), then start the same generation. It resets the backoff and does not count
   as a failed start.
@@ -180,6 +190,7 @@ deadline = 120                 # seconds to confirm after switch; `switch --dead
 stop_timeout = 10              # seconds between SIGTERM and SIGKILL
 min_uptime = 10                # seconds a start must survive to not count as failed
 max_failed_starts = 3
+rollback_on_unhealthy = false  # roll a pending switch back as soon as its health check gives up
 
 [health]                       # exactly one of url or command
 url = "http://127.0.0.1:{port}/"   # healthy on a 2xx or 3xx answer

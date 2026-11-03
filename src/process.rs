@@ -63,7 +63,12 @@ pub fn kill_group(pgid: u32) {
     signal_group(pgid, Signal::KILL);
 }
 
-/// SIGTERM the group `pgid`, wait up to `timeout` seconds for all of it to end, then SIGKILL it.
+/// How long `stop_group` waits for a SIGKILLed group to disappear. Bounded, because a process stuck in the kernel
+/// (uninterruptible sleep) outlives even SIGKILL for as long as it is stuck.
+const KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// SIGTERM the group `pgid`, wait up to `timeout` seconds for all of it to end, then SIGKILL it and wait until it is
+/// gone, so a caller that snapshots or restores storage, or starts the next process, never races a straggler.
 /// With the group leader as `leader` (our child) its exit status is returned; a leftover group of an earlier
 /// daemon has no leader to reap and gives `None`.
 pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Option<ExitStatus> {
@@ -80,10 +85,15 @@ pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Op
         }
         if Instant::now() >= give_up {
             kill_group(pgid);
+            // The leader first: until it is reaped it stays a zombie, and a zombie still counts as alive.
             if let Some(child) = leader {
-                return child.wait().ok();
+                status = child.wait().ok();
             }
-            return None;
+            let give_up = Instant::now() + KILL_WAIT;
+            while group_alive(pgid) && Instant::now() < give_up {
+                sleep(Duration::from_millis(10));
+            }
+            return status;
         }
         sleep(Duration::from_millis(20));
     }

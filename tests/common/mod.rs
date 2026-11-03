@@ -65,6 +65,13 @@ APP_HOME = "{{home}}"
         h
     }
 
+    /// Replace `from`, which must occur in the manifest, with `to`.
+    pub fn edit_manifest(&self, from: &str, to: &str) {
+        let text = std::fs::read_to_string(&self.manifest).unwrap();
+        assert!(text.contains(from), "{from:?} is not in the manifest");
+        std::fs::write(&self.manifest, text.replacen(from, to, 1)).unwrap();
+    }
+
     fn git(&self, args: &[&str]) {
         let status = Command::new("git")
             .args([
