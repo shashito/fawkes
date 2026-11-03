@@ -25,7 +25,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, sleep};
@@ -234,7 +234,9 @@ impl Daemon {
         };
         create_private_dir(&paths.root)?;
         let _lock = lock_state_dir(&paths)?;
-        log_panics(paths.events());
+        let log = EventLog::open(paths.events())
+            .map_err(|e| format!("cannot open the event log: {e}"))?;
+        log_panics(paths.events(), log.sequence());
         let socket = std::path::absolute(socket.unwrap_or_else(|| paths.socket()))
             .map_err(|e| e.to_string())?;
         let listener = bind(&socket)?;
@@ -245,8 +247,6 @@ impl Daemon {
         };
         published.run_link = Some(register(&manifest.name, &socket)?);
         let (store, recovered) = Store::load(paths.state_json())?;
-        let log = EventLog::open(paths.events())
-            .map_err(|e| format!("cannot open the event log: {e}"))?;
         let bin = std::env::current_exe().map_err(|e| e.to_string())?;
 
         let daemon = Arc::new(Daemon {
@@ -481,13 +481,15 @@ fn lock_state_dir(paths: &Paths) -> Result<File, String> {
 }
 
 /// Append an `error` event for every panic before the default hook reports it and the process aborts.
-fn log_panics(events: PathBuf) {
+fn log_panics(events: PathBuf, sequence: Arc<AtomicU64>) {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // A file handle of its own: the panicking thread may hold the daemon's event log.
         EventLog::append_once(
             &events,
-            &Event {
+            &sequence,
+            Event {
+                seq: 0,
                 at: now(),
                 kind: EventKind::Error,
                 generation: None,
@@ -569,6 +571,7 @@ impl Daemon {
         message: impl Into<String>,
     ) -> Event {
         let event = Event {
+            seq: 0,
             at: now(),
             kind,
             generation: generation.map(String::from),
@@ -581,8 +584,15 @@ impl Daemon {
             event.generation.as_deref().unwrap_or("-"),
             event.message
         );
-        lock(&self.log).append(&event);
-        self.broadcast(Msg::Event(event.clone()));
+        // Subscribers get the event while the log is still held: `stream` joins the hub and reads its replay under
+        // the same lock, so an event is in the replay or on the channel, never both and never neither, and the
+        // channel carries events in `seq` order. `hub.send` only `try_send`s, so holding the log across it is cheap.
+        let event = {
+            let mut log = lock(&self.log);
+            let event = log.append(event);
+            self.broadcast(Msg::Event(event.clone()));
+            event
+        };
         if kind != EventKind::Progress {
             self.broadcast(Msg::Changed);
         }

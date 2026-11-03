@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------- time
@@ -507,6 +509,9 @@ pub struct EventLog {
     bytes: u64,
     limit: u64,
     recent: VecDeque<Event>,
+    /// The `seq` of the newest event, written or about to be. Shared with the panic hook, which numbers its event
+    /// without taking the log.
+    last_seq: Arc<AtomicU64>,
 }
 
 /// `events.1.jsonl` next to `events.jsonl`.
@@ -527,9 +532,14 @@ impl EventLog {
         let file = open_append(&path)?;
         let bytes = file.metadata()?.len();
         let mut recent = VecDeque::with_capacity(RECENT_EVENTS);
+        let mut last_seq = 0;
         for file in [rotated_path(&path), path.clone()] {
             let text = std::fs::read_to_string(file).unwrap_or_default();
-            for event in text.lines().filter_map(|l| serde_json::from_str(l).ok()) {
+            for event in text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+            {
+                last_seq = last_seq.max(event.seq);
                 if recent.len() == RECENT_EVENTS {
                     recent.pop_front();
                 }
@@ -542,20 +552,35 @@ impl EventLog {
             bytes,
             limit,
             recent,
+            last_seq: Arc::new(AtomicU64::new(last_seq)),
         })
     }
 
+    /// The counter `append_once` numbers events with.
+    pub fn sequence(&self) -> Arc<AtomicU64> {
+        self.last_seq.clone()
+    }
+
     /// Append one event to the file at `path` without keeping it open: for the panic hook, which must not wait for
-    /// the daemon's log, and must not read it either.
-    pub fn append_once(path: &Path, event: &Event) {
+    /// the daemon's log, and must not read it either. It takes the next number from the log's counter, so it never
+    /// repeats one.
+    pub fn append_once(path: &Path, sequence: &AtomicU64, mut event: Event) {
+        event.seq = sequence.fetch_add(1, Ordering::SeqCst) + 1;
         if let Ok(mut file) = open_append(path) {
             // Best effort: the process is about to abort.
-            let _ = writeln!(file, "{}", serde_json::to_string(event).unwrap_or_default());
+            let _ = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&event).unwrap_or_default()
+            );
         }
     }
 
-    pub fn append(&mut self, event: &Event) {
-        let line = format!("{}\n", serde_json::to_string(event).unwrap_or_default());
+    /// Number `event` (the next `seq`), write it and keep it in memory; returns it as recorded. The caller sends it
+    /// to the subscribers before it releases the log, so they see events in `seq` order.
+    pub fn append(&mut self, mut event: Event) -> Event {
+        event.seq = self.last_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let line = format!("{}\n", serde_json::to_string(&event).unwrap_or_default());
         // A full disk must not take the supervisor down; the event still reaches live clients.
         if self.file.write_all(line.as_bytes()).is_ok() {
             self.bytes += line.len() as u64;
@@ -567,6 +592,7 @@ impl EventLog {
         if self.bytes >= self.limit {
             self.rotate();
         }
+        event
     }
 
     /// Move the full file aside and start a new one. On failure the log keeps growing and the next event tries again.
@@ -586,6 +612,27 @@ impl EventLog {
             .skip(self.recent.len().saturating_sub(n))
             .cloned()
             .collect()
+    }
+
+    /// What a `subscribe` or `log --follow` client gets before the live events. With `since`, the events after it that
+    /// are still in memory (the newest `limit` of them). A `since` that no event can reach, because the log started
+    /// over, is ignored: the client would wait for a number that never comes. Without `since`, the last `limit`
+    /// events, or none without a limit.
+    pub fn replay(&self, since: Option<u64>, limit: Option<usize>) -> Vec<Event> {
+        let next = self.last_seq.load(Ordering::SeqCst) + 1;
+        let Some(since) = since.filter(|&since| since < next) else {
+            return limit.map_or_else(Vec::new, |n| self.tail(n));
+        };
+        let mut newer: Vec<Event> = self
+            .recent
+            .iter()
+            .rev()
+            .take_while(|e| e.seq > since)
+            .take(limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        newer.reverse();
+        newer
     }
 }
 
@@ -651,6 +698,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("events.jsonl");
         let event = |n: usize| Event {
+            seq: 0,
             at: now(),
             kind: EventKind::Progress,
             generation: None,
@@ -658,7 +706,7 @@ mod tests {
         };
         let mut log = EventLog::with_limit(path.clone(), 4096).unwrap();
         for n in 0..RECENT_EVENTS + 10 {
-            log.append(&event(n));
+            log.append(event(n));
         }
         assert!(std::fs::metadata(&path).unwrap().len() < 4096);
         assert!(std::fs::metadata(rotated_path(&path)).unwrap().len() >= 4096);
@@ -675,6 +723,62 @@ mod tests {
         let tail = reopened.tail(3);
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[2].message, format!("event {}", RECENT_EVENTS + 9));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn events_are_numbered_across_reopens_and_rotations() {
+        let root = std::env::temp_dir().join(format!("fk-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.jsonl");
+        let event = |n: usize| Event {
+            seq: 0,
+            at: now(),
+            kind: EventKind::Progress,
+            generation: None,
+            message: format!("event {n}"),
+        };
+        // A line from before events were numbered loads as 0, and the first numbered event is 1.
+        std::fs::write(
+            &path,
+            r#"{"at":"2026-11-03T14:00:01Z","kind":"daemon","generation":null,"message":"old"}"#
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let mut log = EventLog::with_limit(path.clone(), 4096).unwrap();
+        assert_eq!(log.tail(1)[0].seq, 0);
+        let seqs: Vec<u64> = (0..3).map(|n| log.append(event(n)).seq).collect();
+        assert_eq!(seqs, [1, 2, 3]);
+
+        // Enough events to rotate: the numbers go on one by one, and a reopened log goes on after the last.
+        for n in 3..60 {
+            assert_eq!(log.append(event(n)).seq, n as u64 + 1);
+        }
+        assert!(rotated_path(&path).exists());
+        drop(log);
+        let mut reopened = EventLog::with_limit(path.clone(), 4096).unwrap();
+        assert_eq!(reopened.append(event(60)).seq, 61);
+
+        // The panic hook shares the counter.
+        EventLog::append_once(&path, &reopened.sequence(), event(61));
+        assert_eq!(reopened.append(event(62)).seq, 63);
+
+        // The newest events are reachable by `seq`; a `since` beyond the log (it started over) is ignored.
+        let after = |since, limit| -> Vec<u64> {
+            reopened
+                .replay(since, limit)
+                .iter()
+                .map(|e| e.seq)
+                .collect()
+        };
+        assert_eq!(after(Some(60), None), [61, 63]);
+        assert_eq!(after(Some(60), Some(1)), [63]);
+        assert_eq!(after(Some(63), None), Vec::<u64>::new());
+        assert_eq!(after(Some(64), Some(2)), [61, 63]);
+        assert_eq!(after(None, None), Vec::<u64>::new());
+        assert_eq!(after(None, Some(1)), [63]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

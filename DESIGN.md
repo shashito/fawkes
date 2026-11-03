@@ -344,7 +344,7 @@ progress carries on without it), and a `subscribe` or `log --follow` client that
 dropped, so its stream simply ends. Live clients reconnect.
 
 ```json
-{"event": {"at": "2026-11-03T14:00:01Z", "kind": "progress", "generation": "g3", "message": "stopping g2"}}
+{"event": {"seq": 42, "at": "2026-11-03T14:00:01Z", "kind": "progress", "generation": "g3", "message": "stopping g2"}}
 {"ok": true, "result": {"generation": "g3", "previous": "g2", "deadline": "2026-11-03T14:02:01Z"}}
 {"ok": false, "error": {"code": "invalid_state", "message": "g3 is staged, not tested; run `fawkes test g3` first"}}
 ```
@@ -369,14 +369,20 @@ Results per command:
 | `status` | — | see below |
 | `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes |
 | `history` | — | `generations`, oldest first |
-| `subscribe` | `limit?` | never ends; see below |
+| `subscribe` | `limit?`, `since?` | never ends; see below |
 
 `subscribe` is the stream for live clients such as the TUI. With `limit` it first replays that many recent events as
-`{"event": …}` lines (joined to the stream before the replay, so none falls in a gap). Then one `{"status": …}` line (the
+`{"event": …}` lines. With `since` (a `seq`) it instead replays the events after that number that are still in memory
+(the newest 1000), at most `limit` of them when both are given; a client that lost its connection resumes with the last
+`seq` it saw. A `since` at or above the next `seq` (the daemon's log started over) is ignored, so a client never waits
+for a number that will not come. Then one `{"status": …}` line (the
 `status` result) and one `{"history": …}` line (the `history` result), then, until the client closes, every event as
 an `{"event": …}` line, followed by fresh `status` and `history` lines whenever a generation or the live app changed
 state. Clients never poll; a countdown to the confirm deadline is computed client-side from `pending.deadline`.
-Every event, including progress lines of a step another client started, reaches every subscriber.
+Every event, including progress lines of a step another client started, reaches every subscriber exactly once and in
+`seq` order: the replay and the live stream are cut at one point, so none repeats and none falls in a gap. `seq` is the
+first field of an event, a number the daemon counts across all its events: it increases by one, continues after a
+daemon restart, and is `0` for lines written before events were numbered.
 
 A generation record:
 
@@ -500,7 +506,8 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
   app.pid                pid (= process group) of the live app, written by its start wrapper
   step.pid               the same for the install or test in progress
   state.json.bak         the same content, written after state.json; read when state.json is unreadable
-  events.jsonl           append-only event log, one JSON object per line; at 10 MiB it becomes events.1.jsonl
+  events.jsonl           append-only event log, one JSON object per line, each with its `seq`; at 10 MiB it
+                         becomes events.1.jsonl
                          (replacing the one before). `log` and `subscribe` answer from the newest 1000 kept in
                          memory
   current -> generations/g3/code    symlink to the live worktree, for people (replaced atomically)
