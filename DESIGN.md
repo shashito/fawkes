@@ -81,8 +81,9 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    manifest the switch then rolls back at once (reason `health check failed`) instead of at its deadline. It is off
    by default, for apps that are slow to warm up.
 
-A switch whose `state.json` cannot be written fails before step 4 and starts the previous generation again; a
-confirm that cannot be written fails and stays pending.
+A switch that fails before step 4 (its snapshot or its `state.json` cannot be written) starts the previous generation
+again, or, when that one was waiting out a crash backoff, leaves its restart scheduled as it was; a confirm that cannot
+be written fails and stays pending.
 
 ### Confirm
 
@@ -173,6 +174,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    app running). The live app's start wrapper writes its pid there before it runs the `start` command, so even an
    app spawned an instant before its daemon died is found. Only a process that started at most a minute before the
    file was written counts: a pid reused since, after a reboot too, belongs to a later process and is left alone.
+   The install or test that daemon was running is found and stopped the same way, through `step.pid`, before the
+   next step removes the directory it runs in.
 6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
    owns, and the worktrees git still lists for them (`git worktree prune`).
 7. If a switch is pending, roll it back (reason `daemon_restart`).
@@ -480,6 +483,7 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
   state.json             generations, permanent, current, pending switch; durable writes (temp file, fsync,
                          rename, fsync of the directory)
   app.pid                pid (= process group) of the live app, written by its start wrapper
+  step.pid               the same for the install or test in progress
   state.json.bak         the same content, written after state.json; read when state.json is unreadable
   events.jsonl           append-only event log, one JSON object per line; at 10 MiB it becomes events.1.jsonl
                          (replacing the one before). `log` and `subscribe` answer from the newest 1000 kept in

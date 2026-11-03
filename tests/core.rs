@@ -78,14 +78,14 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     });
     assert_eq!(h.status()["process"]["restarts"], 1);
 
-    // A second generation that never confirms: the 2 s deadline passes and everything goes back.
+    // A second generation that never confirms: the 5 s deadline passes and everything goes back.
     assert_eq!(h.ok(&["stage", "v2"])["id"], "g2");
     assert_eq!(h.ok(&["test", "g2"])["state"], "tested");
-    let switched = h.ok(&["switch", "g2", "--deadline", "2"]);
+    let switched = h.ok(&["switch", "g2", "--deadline", "5"]);
     assert_eq!(switched["previous"], "g1");
-    h.wait("v2's row in the storage", 5, || {
-        h.versions().contains(&"v2".to_string())
-    });
+    // v2 writes its row before it listens, so serving means both.
+    h.wait("v2 to serve", 5, || h.get().as_deref() == Some("v2"));
+    assert!(h.versions().contains(&"v2".to_string()));
     assert_eq!(h.status()["pending"]["generation"], "g2");
 
     h.wait("the deadline to roll g2 back", 20, || {
@@ -321,6 +321,12 @@ fn a_confirm_racing_a_crash_of_the_pending_generation_is_refused() {
         !confirm.is_null()
     });
     assert_eq!(confirm["code"], "invalid_state", "{confirm}");
+    // Refused because of the crash, not merely because the rollback had already finished.
+    let message = confirm["message"].as_str().unwrap();
+    assert!(
+        message.contains("before it was confirmed") || message.contains("is being rolled back"),
+        "{message}"
+    );
     h.wait("g2's crash to roll it back", 15, || {
         h.generation("g2")["state"] == "rolled_back"
     });
@@ -561,4 +567,99 @@ fn a_request_that_arrives_in_pieces_is_answered() {
         .unwrap();
     let answer: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(answer["ok"], true, "{answer}");
+}
+
+/// A daemon that dies mid-stage leaves its install running; the next daemon stops it before it removes the cut-short
+/// generation, so nothing of the stage outlives the daemon that started it. Tests are recorded the same way.
+#[test]
+fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
+    let mut h = Harness::new(
+        4900,
+        r#"install = '''echo $$ > {state}/install.pid; exec sleep 600'''"#,
+    );
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    let mut stage = std::process::Command::new(common::BIN)
+        .args(["--json", "--manifest"])
+        .arg(h.dir.join("fawkes.toml"))
+        .args(["stage", "v1"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid_file = h.dir.join("s/install.pid");
+    h.wait("the install to run", 10, || {
+        std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n'))
+    });
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    h.kill_daemon();
+    stage.wait().unwrap();
+
+    h.start_daemon();
+    // SAFETY: signal 0 only asks whether the process group exists.
+    let alive = unsafe { libc::kill(-pid, 0) } == 0;
+    if alive {
+        // SAFETY: the group is the orphaned install this test started.
+        unsafe { libc::killpg(pid, libc::SIGKILL) };
+    }
+    assert!(!alive, "the install outlived the daemon that started it");
+    assert_eq!(h.ok(&["history"])["generations"], serde_json::json!([]));
+}
+
+/// A switch that fails while the permanent generation waits out a crash backoff keeps that restart: the live app
+/// comes back as it would have without the switch.
+#[test]
+fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
+    let mut h = Harness::new(4910, "max_failed_starts = 5");
+    h.edit_manifest("min_uptime = 1", "min_uptime = 60");
+    h.edit_manifest(
+        r#"storage = ["app.sqlite"]"#,
+        r#"storage = ["app.sqlite", "other.sqlite"]"#,
+    );
+    h.commit("v1", "confirm");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    // A storage file that is not a database: the next switch cannot snapshot it.
+    std::fs::write(h.dir.join("home/other.sqlite"), "not a database").unwrap();
+
+    // Two crashes within min_uptime: the second restart waits 2 s, the window the switch lands in.
+    let crash = |h: &Harness| {
+        let pid = h.status()["process"]["pid"].to_string();
+        let killed = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        h.wait("the crash to be reaped", 5, || {
+            h.status()["process"]["state"] == "stopped"
+        });
+    };
+    crash(&h);
+    h.wait("the first crash restart", 10, || {
+        h.status()["process"]["state"] == "running"
+    });
+    crash(&h);
+    let (code, error) = h.fk(&["switch", "g2"]);
+    assert_eq!(
+        (code, error["code"].as_str()),
+        (1, Some("storage_failed")),
+        "{error}"
+    );
+    h.wait("g1 to be restarted after its backoff", 10, || {
+        h.status()["process"]["state"] == "running"
+    });
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    assert_eq!(h.generation("g2")["state"], "tested");
 }

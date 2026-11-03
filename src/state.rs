@@ -86,6 +86,10 @@ impl Paths {
     pub fn app_pid(&self) -> PathBuf {
         self.root.join("app.pid")
     }
+    /// The same for the install or test in progress (one step runs at a time).
+    pub fn step_pid(&self) -> PathBuf {
+        self.root.join("step.pid")
+    }
     pub fn state_json(&self) -> PathBuf {
         self.root.join("state.json")
     }
