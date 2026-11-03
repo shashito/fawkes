@@ -637,7 +637,7 @@ impl Daemon {
         let env = self.app_env(&m, &vars, "live");
         std::fs::create_dir_all(&m.home)?;
         let child = process::spawn(
-            &vars.expand(&m.start),
+            &vars.expand_command(&m.start),
             &g.dir,
             &env,
             &self.paths.app_log(id),
@@ -1131,8 +1131,12 @@ impl Daemon {
                 state: self.paths.root.clone(),
             };
             let log = self.paths.install_log(&id);
-            self.say(out, &id, format!("installing: {}", vars.expand(install)));
-            let result = run_install(&vars.expand(install), &code, &log);
+            self.say(
+                out,
+                &id,
+                format!("installing: {}", vars.expand_command(install)),
+            );
+            let result = run_install(&vars.expand_command(install), &code, &log);
             if let Err(e) = result {
                 let _ = git(&m.repo, &["worktree", "remove", "--force", &code_arg]);
                 return Err(err(
@@ -1204,7 +1208,7 @@ impl Daemon {
         let env = self.app_env(&m, &vars, "test");
         let log = self.paths.app_log(id);
         let mut child = process::spawn(
-            &vars.expand(&m.start),
+            &vars.expand_command(&m.start),
             &g.dir,
             &env,
             &log,
