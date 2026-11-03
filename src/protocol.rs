@@ -444,6 +444,8 @@ pub struct Process {
     pub uptime: Option<f64>,
     pub restarts: u32,
     pub last_exit: Option<LastExit>,
+    /// When the supervisor restarts a crashed app; null unless one is scheduled. `state` is `stopped` until then.
+    pub restart_at: Option<String>,
 }
 
 /// The result of `status`, and the `status` line of a `subscribe` stream.
@@ -923,6 +925,7 @@ mod tests {
                     signal: Some(15),
                     requested: true,
                 }),
+                restart_at: None,
             },
         };
         let text = serde_json::to_string(&Line::<Reply>::Status {
@@ -931,7 +934,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"busy":null,"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true}}}}"#
+            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"busy":null,"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
         );
         let Line::Status { status } = serde_json::from_str::<Line>(&text).unwrap() else {
             panic!("a status line reads as one");

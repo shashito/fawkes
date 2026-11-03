@@ -63,9 +63,11 @@ enum Live {
     /// Not running and not scheduled: never started, stopped on request, or stopped for a switch or rollback.
     Stopped,
     Running(App),
-    /// Crashed; the supervisor restarts the permanent generation at `until`.
+    /// Crashed; the supervisor restarts the permanent generation at `until`. `at` is the same moment as wall time,
+    /// computed once when the backoff is scheduled, for `restart_at`.
     Backoff {
         until: Instant,
+        at: String,
     },
     /// Given up: `max_failed_starts` crashes in a row, a start that failed, or a rollback whose restore failed.
     /// Cleared by `start`, `restart`, the next switch or a daemon start.
