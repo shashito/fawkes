@@ -291,41 +291,83 @@ for it), null before the first. `busy` names the transaction step in progress.
 
 ## TUI
 
-`fawkes tui` is a full-screen terminal client of the same socket. One window shows every supervised app: a narrow
-app list on the left (name, process state, a countdown while a switch awaits confirm) and the selected app's full
-view on the right, as sketched below. It holds one `subscribe` connection per daemon, so every row stays live, and
-sends ordinary one-shot requests for the actions, always to the selected app. It holds no state of its own and works
-against daemons started elsewhere; quitting it never affects an app. `fawkes tui --socket PATH` (or `--manifest`)
-shows that one app only.
+`fawkes tui` is a full-screen terminal client of the same socket. One window shows every supervised app: a table with
+one row per app, and below it the selected app's detail, generations and events, as sketched below. It holds one
+`subscribe` connection per daemon, so every row stays live, and sends ordinary one-shot requests for the actions,
+always to the selected app. It holds no state of its own and works against daemons started elsewhere; quitting it
+never affects an app. `fawkes tui --socket PATH` (or `--manifest`) shows that one app only.
 
 **Discovery:** each daemon links its socket as `<fawkes_home>/run/<name>.sock` when it starts and removes the link
 when it stops (a daemon with a custom `state_dir` is found the same way). `fawkes_home` is `$FAWKES_HOME`, default
 `~/.fawkes`. The TUI lists that folder, skips links nobody answers on, and rescans every few seconds so daemons
 started later appear. Two daemons with the same `name` are refused at start (the link already answers).
 
-The right-hand view:
+The screen, at 80 columns, during an upgrade (the clock and times are UTC, like the events):
 
 ```
-┌ fawkes · ultimate ───────────────────────────────────────────────────────────┐
-│ live    g7  main@238c447f  current   confirm in 01:42   pid 9001  :4747      │
-│ perm.   g6  main@bf0ad442  permanent                                         │
-│ staged  g8  feat@91aa2c01  tested ✓ 2.1s on :4791                            │
-├ generations ─────────────────────────┬ log ──────────────────────────────────┤
-│ g8  tested       feat@91aa2c01       │ 14:02:01 switch g7 (deadline 120s)    │
-│ g7  current      main@238c447f       │ 14:02:03 g7 healthy                   │
-│ g6  permanent    main@bf0ad442       │ 14:02:40 g8 test passed on :4791      │
-│ g5  rolled_back  main@0c1d2e3f       │                                       │
-├──────────────────────────────────────┴───────────────────────────────────────┤
-│ s stage t test w switch c confirm r rollback  S start X stop R restart  q quit│
-└──────────────────────────────────────────────────────────────────────────────┘
+ fawkes  3 apps                                                     14:02:31
+ ST         APP        LIVE  PERM  STAGED  CONFIRM    PID    PORT  UP     RST
+▌● running  ultimate   g7    g6    g8      ⏱ 01:42    9001   4747  3m12s  1  ▐
+ ● running  blog       g3    g3    -       -          4188   3000  5d     0
+ ✘ failed   worker     g5    g5    -       -          -      -     -      4
+─ ultimate ────────────────────────────────────────────────────────────────────
+ ● running  g7 main@238c447f  pid 9001  :4747  up 3m12s  restarts 1
+   last exit SIGTERM (requested) · health ✔ 14:02:03
+ ⏱ confirm g7 within 01:42, or it rolls back to g6 (code + storage)
+ GEN  REF             STATE        AGE   INFO
+ g8   feat@91aa2c01   tested       1m    ✔ test 2.1s on :4791
+ g7   main@238c447f   current      3m    live · awaiting confirm
+ g6   main@bf0ad442   permanent    2d    rollback target
+ g5   main@0c1d2e3f   rolled_back  3d    ✖ missed confirm deadline
+─ events ──────────────────────────────────────────────────────────────────────
+ 14:02:01 switched  g7  switched from g6; confirm before 14:04:01
+ 14:02:03 healthy   g7  health check passed
+ 14:02:40 tested    g8  test passed on port 4791 in 2.1s
+ c confirm  ? help  b rollback  n stage  t test  w switch  s/x/r start/stop/restart
 ```
 
-- The header shows the live, permanent and newest staged generation, the deadline countdown (red under 15 s) and the
-  app's pid and port; `failed` and `busy` show there too.
-- The generations list is the history; the selected row is the target of `t`, `w` and `c`. `s` asks for a ref.
-- `w`, `r`, `X` and `R` ask for a `y` confirmation; a failed action shows its error message in the footer.
-- The header's live row also shows uptime, restarts and the last exit (`exit 1` or `SIGKILL`).
-- The log pane tails the event stream, progress lines included.
+- **Layout:** no boxes around panes. A one-line header (app count, `N disconnected` when daemons dropped, the clock),
+  the apps table, then one-line title rules (`─ name ───`) over the selected app's detail, generations and events,
+  and a one-line footer. Only dialogs and the help overlay are boxed. The selection is a full-width reverse bar with
+  `▌ ▐` marks at both ends (dimmed while the other list has focus).
+- **State** is always symbol and word: `● running` green, `○ stopped` grey, `✘ failed` red (the whole row is red),
+  `◌ disconnected` red (the row shows the last known picture, dimmed) and `⟳ <step>` yellow while the daemon is busy
+  with a transaction step (`switch`, `rollback`, …).
+- **Countdown:** `⏱ mm:ss` while a switch awaits confirm, in the table and in the detail line; yellow, red and bold
+  under 15 s. The detail line says what a missed deadline does (`rolls back to g6 (code + storage)`). While a switch
+  is pending the footer puts `c confirm` first, highlighted.
+- **Generations**, newest first, with a relative AGE (since its last state change) and an Argo-style INFO: the test
+  result, `live · awaiting confirm`, `rollback target` for the permanent generation while a switch is pending,
+  `✖ <reason>` for `rolled_back` rows (red) and `✖ test failed: …` for `test_failed` ones.
+- **Events** follow the newest line by default (kinds coloured: `switched` yellow; `rolled_back`, `failed`, `error`,
+  `unhealthy`, an unrequested `exited` and `test_failed` red; `healthy`, `confirmed`, `tested` green; `progress`
+  grey). `f` pauses the pane (the title says `paused`), `z` zooms it to full screen and back, `/` filters events by
+  text (any case; Enter keeps the filter, Esc clears it).
+- **Narrow terminals:** columns go in this order: PERM, RST, STAGED, UP, PID, PORT, LIVE (ST, APP and CONFIRM stay;
+  the generations list drops AGE). The footer drops whole items from the end, never part of a label. Nothing panics
+  on a tiny terminal; panes simply get no room.
+- **Notices:** the last action's result (`✓ switch g3`, or the daemon's error in red) sits at the right end of the
+  footer until the next key.
+
+Keys:
+
+| Key | Does |
+|---|---|
+| `↑` `↓` `j` `k` | select an app; a generation while the generations list has focus |
+| `Tab` | move focus between the apps table and the generations list (the focused list's header is highlighted); `t` and `w` act on the selected generation |
+| `s` `x` `r` | start, stop, restart the app |
+| `n` | stage: type a ref inline, Enter stages it |
+| `t` | test the selected generation |
+| `w` | switch to the selected generation |
+| `c` | confirm the pending generation |
+| `b` | roll back the pending generation |
+| `f` `z` `/` | pause/follow, zoom, filter the events |
+| `?` | help overlay listing every key |
+| `q`, Ctrl-C | quit |
+| Esc | close the prompt, dialog, help or filter |
+
+`w`, `b`, `x` and `r` ask first in a small centered dialog naming the target (`Switch demo to g4? y/N`); only `y`
+confirms. A failed action shows the daemon's error message in the footer.
 
 Crate: **ratatui** (with its re-exported `crossterm` backend, so one dependency), the standard Rust TUI library;
 hand-written ANSI would need its own diffing, resize and raw-mode handling.
