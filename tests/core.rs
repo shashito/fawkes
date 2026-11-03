@@ -124,6 +124,124 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     );
 }
 
+/// The daemon dies (SIGKILL) while a switch awaits confirm: its next start ends the app it left behind, restores the
+/// storage and runs the permanent generation again. Before that, a switch with an out-of-range deadline is refused
+/// before anything stops, and a second daemon for the same state directory is refused.
+#[test]
+fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
+    let mut h = Harness::new(4820, "");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+
+    let (code, stderr) = h.run_second_daemon();
+    assert_eq!(code, 1, "a second daemon must refuse to start: {stderr}");
+    assert!(stderr.contains("another daemon"), "{stderr}");
+    assert_eq!(h.get().as_deref(), Some("v1"));
+
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    for deadline in ["0", "99999999999999"] {
+        let (code, error) = h.fk(&["switch", "g2", "--deadline", deadline]);
+        assert_eq!(
+            (code, error["code"].as_str()),
+            (2, Some("usage")),
+            "--deadline {deadline}: {error}"
+        );
+    }
+    assert_eq!(h.generation("g2")["state"], "tested");
+    assert_eq!(
+        h.get().as_deref(),
+        Some("v1"),
+        "a refused switch never stops the live app"
+    );
+
+    h.ok(&["switch", "g2"]);
+    h.wait("v2's row in the storage", 5, || {
+        h.versions().contains(&"v2".to_string())
+    });
+    h.kill_daemon();
+    assert_eq!(
+        h.get().as_deref(),
+        Some("v2"),
+        "the app outlives a killed daemon"
+    );
+
+    h.start_daemon();
+    h.wait("the restarted daemon to roll g2 back", 20, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert_eq!(h.generation("g2")["rollback_reason"], "daemon_restart");
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    assert!(
+        !h.versions().contains(&"v2".to_string()),
+        "v2's storage row must be gone: {:?}",
+        h.versions()
+    );
+    let status = h.status();
+    assert_eq!(
+        (status["permanent"].as_str(), status["pending"].clone()),
+        (Some("g1"), Value::Null)
+    );
+}
+
+/// The new generation's first process starts only once state.json says the switch is pending, so a daemon that dies
+/// right after spawning it still rolls the switch back at its next start.
+#[test]
+fn a_switch_records_its_intent_before_the_new_generation_starts() {
+    let mut h = Harness::new(4830, "");
+    // v2, started live, keeps a copy of the state.json it finds and kills the daemon, its parent, on the spot.
+    let manifest = h.dir.join("fawkes.toml");
+    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+        r#"start = "node app.js""#,
+        r#"start = 'if [ "$(cat VERSION)" = v2 ] && [ "$FAWKES_PHASE" = live ]; then cp {state}/state.json {home}/at-start.json; kill -9 $PPID; exit 1; fi; exec node app.js'"#,
+    );
+    std::fs::write(&manifest, text).unwrap();
+    h.commit("v1", "confirm");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+
+    // Whether the answer reaches the client before the daemon dies is a race; the state on disk is not.
+    h.fk(&["switch", "g2"]);
+    h.wait("v2 to kill the daemon", 10, || {
+        h.dir.join("home/at-start.json").exists() && h.fk(&["status"]).0 == 3
+    });
+    let at_start: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.dir.join("home/at-start.json")).unwrap())
+            .unwrap();
+    assert_eq!(at_start["pending"]["generation"], "g2", "{at_start}");
+    let g2 = at_start["generations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "g2")
+        .unwrap();
+    assert_eq!(g2["state"], "current");
+
+    h.kill_daemon();
+    h.start_daemon();
+    h.wait("the restarted daemon to roll g2 back", 20, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert_eq!(h.generation("g2")["rollback_reason"], "daemon_restart");
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    assert_eq!(h.status()["permanent"], "g1");
+}
+
 /// Found in review: a crash only reaped the group leader, so processes the app had started lived on, unsupervised,
 /// while the rollback restored the storage under them.
 #[test]

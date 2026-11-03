@@ -2,18 +2,26 @@
 //!
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
-//! Lock order is `inner` before `log` before `hub`, and nothing waits for another thread while holding one.
+//! Lock order is `inner` before `manifest` before `log` before `hub`, and nothing waits for another thread while
+//! holding one.
+//!
+//! Panics abort the process (`Cargo.toml`): the init system restarts the daemon and its startup recovers a pending
+//! switch, so no thread ever carries on past a broken invariant and no mutex is ever poisoned.
 
 use crate::manifest::{Manifest, Vars};
 use crate::process;
-use crate::protocol::{Error, Out, R, Request, err};
+use crate::protocol::{self, Error, Out, R, Request, err};
 use crate::state::{
     self, Event, EventLog, GenState, Generation, LastExit, Paths, Pending, State, TestInfo, now,
     now_secs, parse_time,
 };
 use crate::storage;
+use rustix::fs::{FlockOperation, Mode, flock};
 use serde_json::{Value, json};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -23,23 +31,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static RELOAD: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_signal(signal: libc::c_int) {
-    let flag = if signal == libc::SIGHUP {
-        &RELOAD
-    } else {
-        &SHUTDOWN
-    };
-    flag.store(true, Ordering::SeqCst);
-}
-
-fn install_signal_handlers() {
-    let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-        unsafe { libc::signal(signal, handler) };
-    }
+/// Lock a mutex. Under `panic = "abort"` no mutex is ever poisoned, so the error arm cannot run.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|_| std::process::abort())
 }
 
 // ---------------------------------------------------------------- types
@@ -122,6 +116,10 @@ enum Msg {
 }
 
 pub struct Daemon {
+    /// Set by SIGTERM and SIGINT.
+    shutdown: Arc<AtomicBool>,
+    /// Set by SIGHUP.
+    reload: Arc<AtomicBool>,
     manifest_path: PathBuf,
     manifest: Mutex<Arc<Manifest>>,
     paths: Paths,
@@ -208,19 +206,29 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 impl Daemon {
     /// Run the daemon until SIGTERM or SIGINT.
     pub fn run(manifest_path: PathBuf, socket: Option<PathBuf>) -> Result<(), String> {
+        // First of all, so a SIGTERM during startup still ends in `shutdown`'s cleanup. signal-hook installs them
+        // with sigaction and SA_RESTART; the handlers only set a flag.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reload = Arc::new(AtomicBool::new(false));
+        for (signal, flag) in [(SIGTERM, &shutdown), (SIGINT, &shutdown), (SIGHUP, &reload)] {
+            signal_hook::flag::register(signal, flag.clone())
+                .map_err(|e| format!("cannot install the signal handlers: {e}"))?;
+        }
         let manifest = Manifest::load(&manifest_path)?;
         let paths = Paths {
             root: manifest.state_dir().to_path_buf(),
         };
         std::fs::create_dir_all(&paths.root)
             .map_err(|e| format!("cannot create {}: {e}", paths.root.display()))?;
+        let _lock = lock_state_dir(&paths)?;
+        log_panics(paths.events());
         let socket = std::path::absolute(socket.unwrap_or_else(|| paths.socket()))
             .map_err(|e| e.to_string())?;
         let listener = bind(&socket)?;
         let run_link = register(&manifest.name, &socket).inspect_err(|_| {
             let _ = std::fs::remove_file(&socket);
         })?;
-        let mut state = State::load(&paths.state_json())?;
+        let (mut state, recovered) = State::load(&paths.state_json())?;
         let stale_app = state.app_pid.take();
         state.daemon_pid = Some(std::process::id());
         let log = EventLog::open(paths.events())
@@ -228,6 +236,8 @@ impl Daemon {
         let bin = std::env::current_exe().map_err(|e| e.to_string())?;
 
         let daemon = Arc::new(Daemon {
+            shutdown,
+            reload,
             manifest_path,
             manifest: Mutex::new(Arc::new(manifest)),
             paths,
@@ -250,7 +260,6 @@ impl Daemon {
             test_pgids: Mutex::new(Vec::new()),
             run_link,
         });
-        install_signal_handlers();
         daemon.event(
             "daemon",
             None,
@@ -260,8 +269,12 @@ impl Daemon {
                 daemon.socket.display()
             ),
         );
+        if let Some(warning) = recovered {
+            daemon.event("error", None, warning);
+        }
 
-        // A crashed daemon leaves its app running (pid reuse is accepted as a prototype risk).
+        // A crashed daemon leaves its app running (pid reuse is accepted as a prototype risk). The state lock
+        // proves that daemon is gone, so the app it recorded has no other supervisor.
         if let Some(pid) = stale_app
             && process::group_alive(pid)
         {
@@ -287,15 +300,15 @@ impl Daemon {
 
         let watcher = daemon.clone();
         thread::spawn(move || {
-            while !SHUTDOWN.load(Ordering::SeqCst) {
+            while !watcher.shutting_down() {
                 sleep(Duration::from_millis(100));
                 watcher.tick();
             }
         });
 
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        while !SHUTDOWN.load(Ordering::SeqCst) {
-            if RELOAD.swap(false, Ordering::SeqCst) {
+        while !daemon.shutting_down() {
+            if daemon.reload.swap(false, Ordering::SeqCst) {
                 daemon.reload_manifest();
             }
             match listener.accept() {
@@ -325,11 +338,32 @@ impl Daemon {
         }
     }
 
+    fn shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// SIGHUP: apply what may change while the daemon runs (`Manifest::reload`), or keep the old manifest whole.
     fn reload_manifest(&self) {
-        match Manifest::load(&self.manifest_path) {
-            Ok(m) => {
-                *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(m);
-                self.event("daemon", None, "manifest reloaded");
+        let new = match Manifest::load(&self.manifest_path) {
+            Ok(new) => new,
+            Err(e) => {
+                self.event("error", None, format!("manifest not reloaded: {e}"));
+                return;
+            }
+        };
+        // Held across the swap, so no app starts between the check of `port` and the swap.
+        let inner = self.inner();
+        match self.manifest().reload(&new, inner.app.is_some()) {
+            Ok(changed) if changed.is_empty() => {
+                self.event("daemon", None, "manifest reloaded, nothing changed");
+            }
+            Ok(changed) => {
+                *lock(&self.manifest) = Arc::new(new);
+                self.event(
+                    "daemon",
+                    None,
+                    format!("manifest reloaded, changed: {}", changed.join(", ")),
+                );
             }
             Err(e) => {
                 self.event("error", None, format!("manifest not reloaded: {e}"));
@@ -350,12 +384,7 @@ impl Daemon {
         if let Some(app) = app {
             self.stop_app(app);
         }
-        for pgid in self
-            .test_pgids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-        {
+        for pgid in lock(&self.test_pgids).drain(..) {
             process::kill_group(pgid);
         }
         let mut inner = self.inner();
@@ -389,7 +418,46 @@ fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
     Ok(link)
 }
 
-/// Bind the socket; refuse when another daemon answers, replace a stale file.
+/// Take the exclusive `flock` on `<state_dir>/lock`, held as long as the returned file lives: one daemon per state
+/// directory, decided by the kernel. It ends with the process however the process ends, so it is never stale, and
+/// std opens files close-on-exec, so no app inherits it.
+fn lock_state_dir(paths: &Paths) -> Result<File, String> {
+    let path = paths.lock();
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(format!(
+            "another daemon already runs for {}; stop it first, or give this app another state_dir",
+            paths.root.display()
+        )),
+        Err(e) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
+}
+
+/// Append an `error` event for every panic before the default hook reports it and the process aborts.
+fn log_panics(events: PathBuf) {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A file of its own: the panicking thread may hold the daemon's event log.
+        if let Ok(mut log) = EventLog::open(events.clone()) {
+            log.append(&Event {
+                at: now(),
+                kind: "error".into(),
+                generation: None,
+                message: format!("panic: {info}; the daemon aborts, and its next start recovers"),
+            });
+        }
+        report(info);
+    }));
+}
+
+/// Bind the socket. The caller holds the state lock, so a socket file left there belongs to a dead daemon.
 fn bind(socket: &Path) -> Result<UnixListener, String> {
     if socket.as_os_str().len() >= 100 {
         return Err(format!(
@@ -397,20 +465,21 @@ fn bind(socket: &Path) -> Result<UnixListener, String> {
             socket.display()
         ));
     }
-    if socket.exists() {
-        if UnixStream::connect(socket).is_ok() {
+    match std::fs::remove_file(socket) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
             return Err(format!(
-                "another daemon already answers on {}",
+                "cannot remove the old socket {}: {e}",
                 socket.display()
             ));
         }
-        std::fs::remove_file(socket)
-            .map_err(|e| format!("cannot remove stale socket {}: {e}", socket.display()))?;
     }
-    // Created 0600 from the start: no moment in which the umask's permissions apply.
-    let umask = unsafe { libc::umask(0o177) };
+    // Created 0600 from the start: no moment in which the umask's permissions apply. The umask is process-wide, so
+    // this must run before the daemon starts its first thread.
+    let umask = rustix::process::umask(Mode::from_raw_mode(0o177));
     let bound = UnixListener::bind(socket);
-    unsafe { libc::umask(umask) };
+    rustix::process::umask(umask);
     bound.map_err(|e| format!("cannot bind {}: {e}", socket.display()))
 }
 
@@ -418,27 +487,49 @@ fn bind(socket: &Path) -> Result<UnixListener, String> {
 
 impl Daemon {
     fn inner(&self) -> MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.inner)
     }
 
     fn manifest(&self) -> Arc<Manifest> {
-        self.manifest
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        lock(&self.manifest).clone()
     }
 
+    /// Save bookkeeping (the live pid, counters, a test result): a failure is reported and a later save repeats it.
     fn save(&self, inner: &Inner) {
         if let Err(e) = inner.state.save(&self.paths.state_json()) {
             self.event("error", None, format!("cannot write state.json: {e}"));
         }
     }
 
+    /// Save the intent of a transaction step (a pending switch, a confirm, the end of a rollback). The step fails
+    /// when this fails: a daemon restart acts on what is on disk, not on what was meant.
+    fn persist(&self, state: &State) -> R<()> {
+        state.save(&self.paths.state_json()).map_err(|e| {
+            self.event("error", None, format!("cannot write state.json: {e}"));
+            err(
+                "internal",
+                format!("cannot write {}: {e}", self.paths.state_json().display()),
+            )
+        })
+    }
+
+    /// The pending switch's deadline. An unreadable one counts as passed, so the switch rolls back, and says so.
+    fn deadline_secs(&self, pending: &Pending) -> u64 {
+        parse_time(&pending.deadline).unwrap_or_else(|| {
+            self.event(
+                "error",
+                Some(&pending.generation),
+                format!(
+                    "the confirm deadline `{}` in state.json is unreadable; it counts as passed",
+                    pending.deadline
+                ),
+            );
+            0
+        })
+    }
+
     fn broadcast(&self, msg: Msg) {
-        self.hub
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|tx| tx.send(msg.clone()).is_ok());
+        lock(&self.hub).retain(|tx| tx.send(msg.clone()).is_ok());
     }
 
     /// Record an event: stderr, events.jsonl, every subscriber. Anything but progress also changes the picture.
@@ -456,10 +547,7 @@ impl Daemon {
             event.generation.as_deref().unwrap_or("-"),
             event.message
         );
-        self.log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append(&event);
+        lock(&self.log).append(&event);
         self.broadcast(Msg::Event(event.clone()));
         if kind != "progress" {
             self.broadcast(Msg::Changed);
@@ -532,7 +620,7 @@ impl Daemon {
 
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
     fn start_live(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) -> R<()> {
-        if SHUTDOWN.load(Ordering::SeqCst) {
+        if self.shutting_down() {
             return Err(err("start_failed", "the daemon is shutting down"));
         }
         let m = self.manifest();
@@ -692,11 +780,7 @@ impl Daemon {
             "restart" => self.restart_command(out),
             "stage" => self.stage(out, arg(args, "ref")?),
             "test" => self.test(out, arg(args, "generation")?),
-            "switch" => self.switch(
-                out,
-                arg(args, "generation")?,
-                args.get("deadline").and_then(Value::as_u64),
-            ),
+            "switch" => self.switch(out, arg(args, "generation")?, protocol::deadline_arg(args)?),
             "confirm" => self.confirm(args.get("generation").and_then(Value::as_str)),
             "rollback" => {
                 let _busy = self.begin("rollback", Slot::Both)?;
@@ -710,9 +794,7 @@ impl Daemon {
                     self.stream(out, Some(limit), false);
                     return Ok(Value::Null);
                 }
-                Ok(
-                    json!({ "events": self.log.lock().unwrap_or_else(|e| e.into_inner()).tail(limit) }),
-                )
+                Ok(json!({ "events": lock(&self.log).tail(limit) }))
             }
             "subscribe" => {
                 let limit = args
@@ -729,14 +811,14 @@ impl Daemon {
     /// Send events (and, for `subscribe`, status and history) to a client until it closes.
     fn stream(&self, out: &mut Out, tail: Option<usize>, snapshots: bool) {
         let (tx, rx) = mpsc::channel();
-        self.hub.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+        lock(&self.hub).push(tx);
         let mut ok = true;
         if let Some(n) = tail {
-            let events = self.log.lock().unwrap_or_else(|e| e.into_inner()).tail(n);
+            let events = lock(&self.log).tail(n);
             ok = events.iter().all(|e| out.event(e));
         }
         ok = ok && (!snapshots || self.send_snapshot(out));
-        while ok && !SHUTDOWN.load(Ordering::SeqCst) {
+        while ok && !self.shutting_down() {
             let first = match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => {
@@ -769,14 +851,14 @@ impl Daemon {
     fn tick(self: &Arc<Self>) {
         let rollback_reason = {
             let mut inner = self.inner();
-            if SHUTDOWN.load(Ordering::SeqCst) {
+            if self.shutting_down() {
                 return;
             }
             self.reap(&mut inner);
             match &inner.state.pending {
                 // Rolled back, but its storage restore failed: retried by `rollback` or the next daemon start.
                 Some(pending) if inner.state.restore_failed(pending) => None,
-                Some(pending) if now_secs() >= parse_time(&pending.deadline).unwrap_or(0) => {
+                Some(pending) if now_secs() >= self.deadline_secs(pending) => {
                     Some("missed confirm deadline".to_string())
                 }
                 Some(_) if inner.app.is_none() => inner
@@ -958,6 +1040,8 @@ impl Daemon {
                 "rev-parse",
                 "--verify",
                 "--quiet",
+                // A ref starting with `-` is a name, never an option.
+                "--end-of-options",
                 &format!("{git_ref}^{{commit}}"),
             ],
         )
@@ -1125,10 +1209,7 @@ impl Daemon {
             )
         })?;
         let pgid = child.id();
-        self.test_pgids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(pgid);
+        lock(&self.test_pgids).push(pgid);
 
         let check = m.health_check(&vars);
         let result = process::wait_healthy(
@@ -1140,10 +1221,7 @@ impl Daemon {
             || matches!(child.try_wait(), Ok(None)),
         );
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
-        self.test_pgids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|p| *p != pgid);
+        lock(&self.test_pgids).retain(|p| *p != pgid);
         let _ = std::fs::remove_dir_all(&test_home);
 
         let passed = result.is_ok();
@@ -1242,7 +1320,10 @@ impl Daemon {
             ));
         }
 
-        let deadline = state::format_time(state::now_secs() + 1 + deadline.unwrap_or(m.deadline));
+        // The request and the manifest both bound the deadline by MAX_DEADLINE, so this never saturates; saturating
+        // only so that no arithmetic can panic halfway through a switch.
+        let deadline =
+            state::format_time(now_secs().saturating_add(1 + deadline.unwrap_or(m.deadline)));
         self.say(
             out,
             id,
@@ -1251,21 +1332,41 @@ impl Daemon {
                 m.port
             ),
         );
+        // The intent goes to disk before the side effect: once a process of the new generation exists, state.json
+        // already says the switch is pending, so a daemon that dies from here on rolls it back at its next start.
         let mut inner = self.inner();
-        if let Err(e) = self.start_live(&mut inner, id, Why::Fresh) {
-            drop(inner);
-            resume(self);
-            return Err(e);
+        let mut next = inner.state.clone();
+        if let Some(g) = next.find_mut(id) {
+            g.state = GenState::Current;
+            g.switched_at = Some(now());
         }
-        let g = inner.state.find_mut(id).expect("checked above");
-        g.state = GenState::Current;
-        g.switched_at = Some(now());
-        inner.state.pending = Some(Pending {
+        next.pending = Some(Pending {
             generation: id.into(),
             previous: previous.clone(),
             deadline: deadline.clone(),
         });
-        self.save(&inner);
+        if let Err(e) = self.persist(&next) {
+            drop(inner);
+            resume(self);
+            return Err(err(
+                e.code,
+                format!("{}; {id} stays tested and nothing changed", e.message),
+            ));
+        }
+        inner.state = next;
+        if let Err(e) = self.start_live(&mut inner, id, Why::Fresh) {
+            drop(inner);
+            // The ordinary rollback undoes the recorded switch and starts the permanent generation again.
+            let message = match self.rollback_pending(out, &format!("start failed: {}", e.message))
+            {
+                Ok(_) => format!("{}; {id} is rolled back", e.message),
+                Err(rollback) => format!(
+                    "{}; rolling {id} back failed too: {}",
+                    e.message, rollback.message
+                ),
+            };
+            return Err(err(e.code, message));
+        }
         drop(inner);
         self.event(
             "switched",
@@ -1291,7 +1392,7 @@ impl Daemon {
             return Err(restore_failed(&pending.generation));
         }
         if let Some(pending) = &inner.state.pending
-            && now_secs() >= parse_time(&pending.deadline).unwrap_or(0)
+            && now_secs() >= self.deadline_secs(pending)
         {
             return Err(invalid_state(format!(
                 "{} missed its confirm deadline ({}) and is being rolled back",
@@ -1320,21 +1421,32 @@ impl Daemon {
                 None => not_found(id),
             });
         }
-        if let Some(old) = inner.state.permanent.clone()
-            && let Some(g) = inner.state.find_mut(&old)
+        // Applied to a copy and kept only once it is on disk: a confirm the daemon could not write is not one, and
+        // the switch stays pending (a daemon restart would roll it back).
+        let mut next = inner.state.clone();
+        if let Some(old) = next.permanent.clone()
+            && let Some(g) = next.find_mut(&old)
         {
             g.state = GenState::Retired;
         }
-        let g = inner
-            .state
+        let g = next
             .find_mut(&pending.generation)
-            .expect("pending generations exist");
+            .ok_or_else(|| not_found(&pending.generation))?;
         g.state = GenState::Permanent;
         g.confirmed_at = Some(now());
         let record = json!(g);
-        inner.state.permanent = Some(pending.generation.clone());
-        inner.state.pending = None;
-        self.save(&inner);
+        next.permanent = Some(pending.generation.clone());
+        next.pending = None;
+        self.persist(&next).map_err(|e| {
+            err(
+                e.code,
+                format!(
+                    "{}; {} is still pending, confirm again",
+                    e.message, pending.generation
+                ),
+            )
+        })?;
+        inner.state = next;
         self.event(
             "confirmed",
             Some(&pending.generation),
@@ -1391,8 +1503,26 @@ impl Daemon {
                 ),
             ));
         }
-        inner.state.pending = None;
-        self.save(&inner);
+        // Until the end of the switch is on disk the app stays stopped and the switch pending, like a failed restore:
+        // `rollback` or the next daemon start finishes it (restoring the same snapshot again is harmless).
+        let mut next = inner.state.clone();
+        next.pending = None;
+        if let Err(e) = self.persist(&next) {
+            inner.app_failed = true;
+            self.event(
+                "rolled_back",
+                Some(&id),
+                format!("{reason}; state.json could not be written"),
+            );
+            return Err(err(
+                e.code,
+                format!(
+                    "{id} was rolled back but {}; the app stays stopped and `fawkes rollback` retries",
+                    e.message
+                ),
+            ));
+        }
+        inner.state = next;
         self.event(
             "rolled_back",
             Some(&id),

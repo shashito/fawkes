@@ -225,10 +225,6 @@ impl Manifest {
     /// Decide whether `new` may replace `self` while the daemon runs. Ok: the TOML names of the changed fields,
     /// possibly none. Err: a message naming every refused field and what to do instead. Both manifests are the loaded
     /// ones, so paths are compared after resolution.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired into the daemon's SIGHUP handling")
-    )]
     pub fn reload(&self, new: &Manifest, app_running: bool) -> Result<Vec<&'static str>, String> {
         // The daemon's identity, its state and the files a restore overwrites are fixed for its lifetime: a changed
         // `home` would restore a snapshot into a different directory than the one it was taken from.

@@ -379,8 +379,10 @@ dependencies = [
  "libc",
  "ratatui",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
+ "signal-hook",
  "toml",
 ]
 

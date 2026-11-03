@@ -1,6 +1,8 @@
 //! Socket protocol types: requests, errors and the writer that sends response lines.
 
+use crate::manifest::MAX_DEADLINE;
 use crate::state::Event;
+use rustix::net::{RecvFlags, recv};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -20,6 +22,26 @@ pub struct Error {
 }
 
 pub type R<T> = Result<T, Error>;
+
+/// The `deadline` argument of `switch`: absent, or whole seconds in `1..=MAX_DEADLINE`. Checked at the boundary, so
+/// a switch with a deadline it cannot keep is refused before anything is stopped.
+pub fn deadline_arg(args: &Value) -> R<Option<u64>> {
+    match args.get("deadline") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|seconds| (1..=MAX_DEADLINE).contains(seconds))
+            .map(Some)
+            .ok_or_else(|| {
+                err(
+                    "usage",
+                    format!(
+                        "the deadline must be whole seconds from 1 to {MAX_DEADLINE} (a week), not {value}"
+                    ),
+                )
+            }),
+    }
+}
 
 pub fn err(code: &'static str, message: impl Into<String>) -> Error {
     Error {
@@ -56,18 +78,12 @@ impl Out {
 
     /// Has the client closed its end? Streams use this to notice a client that left while nothing was sent.
     pub fn closed(&self) -> bool {
-        use std::os::fd::AsRawFd;
         let Some(stream) = &self.0 else { return false };
-        let mut byte = 0u8;
-        let n = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                (&raw mut byte).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        n == 0
+        let mut byte = [0u8];
+        matches!(
+            recv(stream, &mut byte[..], RecvFlags::PEEK | RecvFlags::DONTWAIT),
+            Ok((0, _))
+        )
     }
 
     pub fn event(&mut self, event: &Event) -> bool {

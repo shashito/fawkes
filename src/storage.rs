@@ -61,8 +61,9 @@ pub fn snapshot(home: &Path, storage: &[String], dir: &Path) -> Result<(), Strin
         }
         index.push(entry);
     }
+    // Written last and durably: a rollback trusts a snapshot only through its index.
     let json = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("index.json"), json)
+    crate::state::write_durably(&dir.join("index.json"), &json)
         .map_err(|e| format!("cannot write index.json: {e}"))
 }
 

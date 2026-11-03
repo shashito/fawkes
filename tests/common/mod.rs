@@ -74,6 +74,8 @@ APP_HOME = "{{home}}"
                 "user.email=t@t",
                 "-c",
                 "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
             ])
             .args(args)
             .current_dir(self.dir.join("repo"))
@@ -95,7 +97,12 @@ APP_HOME = "{{home}}"
     }
 
     pub fn start_daemon(&mut self) {
-        let log = std::fs::File::create(self.dir.join("daemon.log")).unwrap();
+        // Appended, so a test that restarts the daemon keeps the log of each one.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("daemon.log"))
+            .unwrap();
         let child = Command::new(BIN)
             .args(["daemon", "--manifest"])
             .arg(&self.manifest)
@@ -105,6 +112,28 @@ APP_HOME = "{{home}}"
             .unwrap();
         self.daemon = Some(child);
         self.wait("the daemon to answer", 10, || self.fk(&["status"]).0 == 0);
+    }
+
+    /// SIGKILL the daemon, as a crash or an OOM kill would: no cleanup runs and its app keeps running.
+    pub fn kill_daemon(&mut self) {
+        let mut daemon = self.daemon.take().expect("the daemon was started");
+        // Already dead is fine: some tests make the app kill the daemon.
+        let _ = daemon.kill();
+        daemon.wait().unwrap();
+    }
+
+    /// Run `fawkes daemon` for this manifest in the foreground; its exit code and stderr.
+    pub fn run_second_daemon(&self) -> (i32, String) {
+        let output = Command::new(BIN)
+            .args(["daemon", "--manifest"])
+            .arg(&self.manifest)
+            .env("FAWKES_HOME", self.manifest.parent().unwrap())
+            .output()
+            .unwrap();
+        (
+            output.status.code().unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
     }
 
     /// Run `fawkes --json <args>`; the exit code and the single JSON document it printed.

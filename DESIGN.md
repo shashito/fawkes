@@ -22,7 +22,20 @@ The daemon runs one transaction step (stage, test, switch, rollback) at a time; 
 and `confirm` are always answered.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
-state, so the next start resumes it), `SIGHUP` re-reads the manifest (applies to the next start of any process).
+state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
+`daemon` event naming the changed fields, or an `error` event saying why it was refused:
+
+- `name`, `repo`, `state_dir`, `home` and `storage` never change by reload; they need a daemon restart. (A changed
+  `home` would restore a snapshot into another directory than the one it was taken from.)
+- `port` does not change while the app runs; `stop` it first.
+- Everything else (`start`, `env`, `health`, `install`, `reuse`, `spare_ports`, `deadline`, the timeouts and the
+  restart policy) applies from the next stage, test, switch or start on. An invalid manifest is not reloaded.
+
+Change `home` or `storage` only while no switch is pending: a daemon start rolls a pending switch back into the
+`home` of the manifest it reads.
+
+**Panics** abort the daemon (`panic = "abort"`) after an `error` event with the message. The init system restarts
+it, and the daemon start below recovers whatever was in flight; no thread carries on past a broken invariant.
 
 ## Generations and states
 
@@ -51,8 +64,14 @@ staged ──test──▶ tested ──switch──▶ current ──confirm─
 2. Stop the running generation (SIGTERM to its process group, SIGKILL after `stop_timeout`).
 3. Snapshot every storage file into the target's `snapshot/` (SQLite online backup API). Stopping first means no
    write of the old generation lands after the snapshot, so a rollback loses nothing the old generation wrote.
-4. Start the target on the live port, mark it `current`, write the deadline (absolute time) to `state.json`.
+4. Mark the target `current` and write the pending switch with its deadline (absolute time) to `state.json`, then
+   start the target on the live port. The intent is on disk before any process of the target exists, so a daemon
+   that dies from here on rolls the switch back at its next start. If the target cannot be started, the switch is
+   rolled back at once (below).
 5. Health-check it in the background and log `healthy` when it passes. Health never confirms: only `confirm` does.
+
+A switch whose `state.json` cannot be written fails before step 4 and starts the previous generation again; a
+confirm that cannot be written fails and stays pending.
 
 ### Confirm
 
@@ -62,8 +81,10 @@ permanent becomes `retired`, the deadline is cleared. Confirming a generation th
 
 ### Rollback
 
-Triggered by a missed deadline, by the pending generation's process exiting before confirm (a failed start), by
-`fawkes rollback`, or by a daemon start that finds a pending switch in `state.json` (Fawkes itself died mid-switch).
+Triggered by a missed deadline, by the pending generation's process exiting before confirm (a failed start), by a
+switch that cannot start the target's process, by `fawkes rollback`, or by a daemon start that finds a pending switch
+in `state.json` (Fawkes itself died mid-switch). A deadline in `state.json` that cannot be parsed counts as passed
+and is reported as an `error` event.
 Code and storage roll back together:
 
 1. Stop the pending generation.
@@ -74,8 +95,9 @@ Code and storage roll back together:
 
 If the restore fails, the generation is still `rolled_back` (its code never runs again), but the pending switch
 stays in `state.json` and nothing is started on storage in an unknown state: `status` shows `failed`, and
-`fawkes rollback` or the next daemon start retries the restore. A confirm after the deadline is refused, even if the
-rollback has not begun yet.
+`fawkes rollback` or the next daemon start retries the restore. The same holds when the restore worked but the end
+of the switch could not be written to `state.json`. A confirm after the deadline is refused, even if the rollback has
+not begun yet.
 
 Rollback happens at most once per generation and only ever goes to the permanent generation. If that one then fails
 too, Fawkes does not roll further back; the restart policy below applies and the failure is reported in `status`.
@@ -112,11 +134,15 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 
 ### Daemon start
 
-1. Bind the socket (refuse if another daemon answers on it; remove a stale socket file).
-2. If `state.json` records a live pid from an earlier daemon that is still running, kill its process group (a crashed
+1. Take an exclusive `flock` on `<state_dir>/lock`, held for the daemon's life; refuse to start when another daemon
+   holds it. The kernel releases it when the process ends, however it ends, so it is never stale.
+2. Bind the socket (a socket file left there belongs to a dead daemon and is replaced).
+3. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event). Refuse to
+   start when neither can be read.
+4. If `state.json` records a live pid from an earlier daemon that is still running, kill its process group (a crashed
    daemon leaves its app running; pid reuse is accepted as a prototype risk).
-3. If a switch is pending, roll it back (reason `daemon_restart`).
-4. Start the permanent generation, if there is one.
+5. If a switch is pending, roll it back (reason `daemon_restart`).
+6. Start the permanent generation, if there is one.
 
 ## Manifest
 
@@ -157,6 +183,21 @@ timeout = 60                   # seconds until `test` gives up
 APP_PORT = "{port}"
 APP_HOME = "{home}"
 ```
+
+**Validation:** the daemon refuses to start with (and does not reload) a manifest where:
+
+- `name` is not made of letters, digits, `_` and `-` (it becomes a file name);
+- a `storage` or `reuse` entry is empty, absolute or contains `..` (they are joined onto `home` and the worktree,
+  and a restore deletes files at those paths);
+- `port` lies inside `spare_ports`, or `spare_ports` is not `[low, high]`;
+- `deadline` is not between 1 and 604800 seconds (a week);
+- `stop_timeout`, `min_uptime`, `health.interval` or `health.timeout` is not a number of seconds above 0 and at
+  most 86400;
+- `max_failed_starts` is 0;
+- `[health]` does not have exactly one of `url` and `command`, or `url` is not `http://` with an explicit port
+  after the host (`:4790` or `:{port}`).
+
+The error names every problem at once.
 
 `install` runs with Fawkes's own environment so package managers find their real caches. `start` and
 `health.command` get the inherited environment plus `[env]` plus `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION`
@@ -210,6 +251,8 @@ fawkes tui
 Global options, before or after the command: `--json`, `--manifest FILE` (default `./fawkes.toml`), `--socket PATH`.
 A client finds the daemon by `--socket`, else `FAWKES_SOCKET`, else `<state_dir>/fawkes.sock` from the manifest.
 
+`--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped.
+
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
 Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` the daemon is unreachable.
@@ -252,7 +295,7 @@ Results per command:
 | `restart` | — | the `process` object |
 | `stage` | `ref` | the generation record |
 | `test` | `generation` | the generation record (its `test` field holds port, outcome, duration) |
-| `switch` | `generation`, `deadline?` | `generation`, `previous`, `deadline` |
+| `switch` | `generation`, `deadline?` (seconds, `1..=604800`, else `usage`) | `generation`, `previous`, `deadline` |
 | `confirm` | `generation?` | the generation record, now permanent |
 | `rollback` | — | `from`, `to`, `reason` |
 | `status` | — | see below |
@@ -377,14 +420,17 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 
 ```
 <state_dir>/
+  lock                   flock'ed by the running daemon; empty
   fawkes.sock            the daemon's socket
-  state.json             generations, permanent, current, pending switch, live pid; atomic writes (temp + rename)
+  state.json             generations, permanent, current, pending switch, live pid; durable writes (temp file,
+                         fsync, rename, fsync of the directory)
+  state.json.bak         the same content, written after state.json; read when state.json is unreadable
   events.jsonl           append-only event log, one JSON object per line (what `log` reads)
   current -> generations/g3/code    symlink to the live worktree, for people (replaced atomically)
   generations/<id>/
     code/                git worktree at the ref (`git worktree add --detach`)
     snapshot/            storage of the previous generation, taken when switching to <id>
-      index.json         [{"path": "state.sqlite", "file": "0.sqlite", "present": true}]
+      index.json         [{"path": "state.sqlite", "file": "0.sqlite", "present": true}], written last and durably
       0.sqlite
     test-home/           storage copy the test run used (removed after the test)
     logs/install.log     install output
@@ -395,15 +441,20 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 
 ## Crates
 
-Five for the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
+Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
 - **rusqlite** (features `bundled`, `backup`): the SQLite online backup API for consistent snapshots of live
   databases, including WAL contents. `bundled` builds a known SQLite instead of depending on the system one.
-- **libc:** `kill(2)` on a process group (std only sends SIGKILL to one pid) and installing SIGTERM/SIGINT/SIGHUP
-  handlers.
+- **rustix** (features `fs`, `net`, `process`): safe wrappers for the system calls std lacks: `flock` for the state
+  lock, signalling a process group (std only sends SIGKILL to one pid), `umask` around binding the socket and a
+  peeking `recv` to notice a closed client. Its typed `Pid` refuses 0, so a corrupt pid never signals our own
+  group. Already in the tree through ratatui's crossterm.
+- **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags, installed with `sigaction` and
+  `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
+- **libc:** `localtime_r` for the TUI's local clock (neither std nor rustix has it).
 
 Hand-written instead of a crate: argument parsing (nine commands, three flags), the HTTP health check (one GET over
 `std::net::TcpStream` to localhost), UTC timestamps (days-to-civil conversion), threads instead of an async runtime.
