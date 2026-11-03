@@ -302,7 +302,7 @@ when it stops (a daemon with a custom `state_dir` is found the same way). `fawke
 `~/.fawkes`. The TUI lists that folder, skips links nobody answers on, and rescans every few seconds so daemons
 started later appear. Two daemons with the same `name` are refused at start (the link already answers).
 
-The screen, at 80 columns, during an upgrade (the clock and times are UTC, like the events):
+The screen, at 80 columns, during an upgrade (the clock and event times are local; the daemon stores UTC):
 
 ```
  fawkes  3 apps                                                     14:02:31

@@ -4,7 +4,7 @@
 //! detail, its generations and its events, and a one-line footer. Dialogs and the help overlay are the only boxes.
 
 use super::{App, AppView, Focus, Link, Mode};
-use crate::state::{format_time, parse_time};
+use crate::state::parse_time;
 use crate::{short, text};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -109,12 +109,20 @@ fn label(g: &Value) -> String {
     format!("{}@{}", text(&g["ref"]), short(&g["commit"]))
 }
 
-/// `HH:MM:SS` of an RFC 3339 time.
+/// `HH:MM:SS` of an RFC 3339 time, in the local time zone: people read the screen, not the log files.
 fn clock(at: &Value) -> String {
     at.as_str()
-        .and_then(|s| s.get(11..19))
-        .unwrap_or("--:--:--")
-        .to_string()
+        .and_then(parse_time)
+        .map_or_else(|| "--:--:--".to_string(), local_clock)
+}
+
+pub fn local_clock(secs: u64) -> String {
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return "--:--:--".into();
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 fn mmss(secs: u64) -> String {
@@ -220,8 +228,7 @@ fn draw_header(frame: &mut Frame, app: &App, now: u64, area: Rect) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    let time = format_time(now);
-    let clock = format!("{} ", time.get(11..19).unwrap_or(""));
+    let clock = format!("{} ", local_clock(now));
     frame.render_widget(
         Paragraph::new(Span::styled(clock, dim())).alignment(Alignment::Right),
         area,

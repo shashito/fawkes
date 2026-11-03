@@ -757,6 +757,11 @@ mod tests {
             .join("\n")
     }
 
+    /// The screen shows local times.
+    fn local(at: &str) -> String {
+        draw::local_clock(crate::state::parse_time(at).unwrap())
+    }
+
     #[test]
     fn the_screen_lists_every_app_and_shows_the_selected_ones_switch() {
         let now = 1_000_000;
@@ -774,7 +779,7 @@ mod tests {
             "9001",
             "4747",
             "SIGKILL (requested)",
-            "health ✔ 14:02:03",
+            format!("health ✔ {}", local("2026-11-03T14:02:03Z")).as_str(),
             "⏱ confirm g7 within 01:42, or it rolls back to g6 (code + storage)",
             "g8   feat@91aa2c01  tested",
             "✔ test 2.1s on :4791",
@@ -782,7 +787,7 @@ mod tests {
             "rollback target",
             "g5   main@0c1d2e3f  rolled_back",
             "✖ missed confirm deadline",
-            "14:02:40 tested",
+            format!("{} tested", local("2026-11-03T14:02:40Z")).as_str(),
         ] {
             assert!(
                 screen.contains(expected),
