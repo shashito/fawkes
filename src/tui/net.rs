@@ -44,7 +44,10 @@ pub(super) fn reader(key: &str, socket: &Path, active: Option<&Active>, tx: &Sen
         }
         if !retry {
             if let Some(active) = active {
-                active.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+                active
+                    .lock()
+                    .unwrap_or_else(|_| std::process::abort())
+                    .remove(key);
             }
             return;
         }
@@ -118,7 +121,7 @@ pub(super) fn scan(dir: &Path, active: &Active, tx: &Sender<Msg>) {
             };
             if active
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|_| std::process::abort())
                 .insert(key.clone())
             {
                 let (active, tx) = (active.clone(), tx.clone());

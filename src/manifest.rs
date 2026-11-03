@@ -13,50 +13,83 @@ pub fn fawkes_home() -> Result<PathBuf, String> {
     Ok(Path::new(&home).join(".fawkes"))
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The manifest as validated and resolved by `load`: paths absolute, `state_dir` decided, the health check one of
+/// its two kinds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Manifest {
     pub name: String,
     pub repo: PathBuf,
-    pub state_dir: Option<PathBuf>,
+    state_dir: PathBuf,
     pub home: PathBuf,
-    #[serde(default)]
     pub storage: Vec<String>,
     pub port: u16,
     pub spare_ports: [u16; 2],
     pub install: Option<String>,
-    #[serde(default = "default_install_timeout")]
     pub install_timeout: f64,
-    #[serde(default)]
     pub reuse: Vec<String>,
     /// How many generations `prune` keeps; without it nothing is pruned.
     pub keep: Option<u32>,
     pub start: String,
-    #[serde(default = "default_deadline")]
     pub deadline: u64,
-    #[serde(default = "default_stop_timeout")]
     pub stop_timeout: f64,
-    #[serde(default = "default_min_uptime")]
     pub min_uptime: f64,
-    #[serde(default = "default_max_failed_starts")]
     pub max_failed_starts: u32,
     /// Roll a pending generation back as soon as its health check gives up, instead of at the deadline.
-    #[serde(default)]
     pub rollback_on_unhealthy: bool,
     pub health: Health,
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Health {
-    pub url: Option<String>,
-    pub command: Option<String>,
-    #[serde(default = "default_interval")]
+    pub check: Check,
     pub interval: f64,
-    #[serde(default = "default_health_timeout")]
     pub timeout: f64,
+}
+
+/// The manifest as written in the TOML file, before `load` has validated and resolved it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Written {
+    name: String,
+    repo: PathBuf,
+    state_dir: Option<PathBuf>,
+    home: PathBuf,
+    #[serde(default)]
+    storage: Vec<String>,
+    port: u16,
+    spare_ports: [u16; 2],
+    install: Option<String>,
+    #[serde(default = "default_install_timeout")]
+    install_timeout: f64,
+    #[serde(default)]
+    reuse: Vec<String>,
+    keep: Option<u32>,
+    start: String,
+    #[serde(default = "default_deadline")]
+    deadline: u64,
+    #[serde(default = "default_stop_timeout")]
+    stop_timeout: f64,
+    #[serde(default = "default_min_uptime")]
+    min_uptime: f64,
+    #[serde(default = "default_max_failed_starts")]
+    max_failed_starts: u32,
+    #[serde(default)]
+    rollback_on_unhealthy: bool,
+    health: WrittenHealth,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WrittenHealth {
+    url: Option<String>,
+    command: Option<String>,
+    #[serde(default = "default_interval")]
+    interval: f64,
+    #[serde(default = "default_health_timeout")]
+    timeout: f64,
 }
 
 /// The longest confirm window, in seconds. A `deadline` in the manifest and `switch --deadline` are both held to it,
@@ -89,7 +122,9 @@ fn default_health_timeout() -> f64 {
     60.0
 }
 
-/// What a health check does, with templates already expanded.
+/// What a health check does: the URL to fetch or the command to run, as written in the manifest (templates are
+/// expanded by `health_check`).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Check {
     Url(String),
     Command(String),
@@ -192,94 +227,53 @@ impl Manifest {
     pub fn load(path: &Path) -> Result<Manifest, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
-        let mut m: Manifest = toml::from_str(&text)
+        let written: Written = toml::from_str(&text)
             .map_err(|e| format!("invalid manifest {}: {e}", path.display()))?;
-        let problems = m.problems();
-        if !problems.is_empty() {
+        // Without exactly one of url and command there is no check, and `problems` says so among the rest.
+        let problems = written.problems();
+        let check = match (&written.health.url, &written.health.command) {
+            (Some(url), None) => Some(Check::Url(url.clone())),
+            (None, Some(command)) => Some(Check::Command(command.clone())),
+            _ => None,
+        };
+        let (true, Some(check)) = (problems.is_empty(), check) else {
             return Err(format!(
                 "invalid manifest {}: {}",
                 path.display(),
                 problems.join("; ")
             ));
-        }
+        };
         let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
         let base = absolute.parent().unwrap_or(Path::new("/")).to_path_buf();
-        m.repo = base.join(&m.repo);
-        m.home = base.join(&m.home);
-        m.state_dir = Some(match &m.state_dir {
+        let state_dir = match &written.state_dir {
             Some(dir) => base.join(dir),
-            None => fawkes_home()?.join(&m.name),
-        });
-        Ok(m)
-    }
-
-    /// Everything wrong with the manifest as written, each saying what is allowed. Empty when valid.
-    fn problems(&self) -> Vec<String> {
-        let mut problems = Vec::new();
-        if self.name.is_empty()
-            || !self
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            problems.push(format!(
-                "name {:?} must be non-empty and use only letters, digits, '_' and '-' (it becomes a file name)",
-                self.name
-            ));
-        }
-        if self.health.url.is_some() == self.health.command.is_some() {
-            problems.push("[health] needs exactly one of url or command".into());
-        }
-        if self.spare_ports[0] > self.spare_ports[1] {
-            problems.push("spare_ports must be [low, high]".into());
-        } else if (self.spare_ports[0]..=self.spare_ports[1]).contains(&self.port) {
-            problems.push(format!(
-                "port {} must lie outside spare_ports {:?}: the spare range is for staged generations",
-                self.port, self.spare_ports
-            ));
-        }
-        if !(1..=MAX_DEADLINE).contains(&self.deadline) {
-            problems.push(format!(
-                "deadline {} must be between 1 and {MAX_DEADLINE} seconds",
-                self.deadline
-            ));
-        }
-        if self.max_failed_starts < 1 {
-            problems.push("max_failed_starts must be at least 1".into());
-        }
-        if self.keep == Some(0) {
-            problems.push("keep must be at least 1 (leave it out to keep every generation)".into());
-        }
-        for (field, seconds) in [
-            ("install_timeout", self.install_timeout),
-            ("stop_timeout", self.stop_timeout),
-            ("min_uptime", self.min_uptime),
-            ("health.interval", self.health.interval),
-            ("health.timeout", self.health.timeout),
-        ] {
-            if !(seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS) {
-                problems.push(format!(
-                    "{field} {seconds} must be a number of seconds above 0 and at most {MAX_SECONDS}"
-                ));
-            }
-        }
-        for (field, entries) in [("storage", &self.storage), ("reuse", &self.reuse)] {
-            for entry in entries {
-                if !is_inside(entry) {
-                    problems.push(format!(
-                        "{field} entry {entry:?} must be a non-empty relative path without '..' (it is joined onto a directory that a restore may delete from)"
-                    ));
-                }
-            }
-        }
-        if let Some(url) = &self.health.url
-            && !has_port(url)
-        {
-            problems.push(format!(
-                "health.url {url:?} must start with http:// and end its host with :<port> or :{{port}}, for example http://127.0.0.1:{{port}}/"
-            ));
-        }
-        problems
+            None => fawkes_home()?.join(&written.name),
+        };
+        Ok(Manifest {
+            name: written.name,
+            repo: base.join(&written.repo),
+            state_dir,
+            home: base.join(&written.home),
+            storage: written.storage,
+            port: written.port,
+            spare_ports: written.spare_ports,
+            install: written.install,
+            install_timeout: written.install_timeout,
+            reuse: written.reuse,
+            keep: written.keep,
+            start: written.start,
+            deadline: written.deadline,
+            stop_timeout: written.stop_timeout,
+            min_uptime: written.min_uptime,
+            max_failed_starts: written.max_failed_starts,
+            rollback_on_unhealthy: written.rollback_on_unhealthy,
+            health: Health {
+                check,
+                interval: written.health.interval,
+                timeout: written.health.timeout,
+            },
+            env: written.env,
+        })
     }
 
     /// Decide whether `new` may replace `self` while the daemon runs. Ok: the TOML names of the changed fields,
@@ -348,17 +342,85 @@ impl Manifest {
     }
 
     pub fn state_dir(&self) -> &Path {
-        self.state_dir
-            .as_deref()
-            .expect("state_dir is resolved by load")
+        &self.state_dir
     }
 
     pub fn health_check(&self, vars: &Vars) -> Check {
-        match (&self.health.url, &self.health.command) {
-            (Some(url), _) => Check::Url(vars.expand(url)),
-            (_, Some(command)) => Check::Command(vars.expand_command(command)),
-            _ => unreachable!("load requires exactly one health check"),
+        match &self.health.check {
+            Check::Url(url) => Check::Url(vars.expand(url)),
+            Check::Command(command) => Check::Command(vars.expand_command(command)),
         }
+    }
+}
+
+impl Written {
+    /// Everything wrong with the manifest as written, each saying what is allowed. Empty when valid.
+    fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.name.is_empty()
+            || !self
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            problems.push(format!(
+                "name {:?} must be non-empty and use only letters, digits, '_' and '-' (it becomes a file name)",
+                self.name
+            ));
+        }
+        if self.health.url.is_some() == self.health.command.is_some() {
+            problems.push("[health] needs exactly one of url or command".into());
+        }
+        if self.spare_ports[0] > self.spare_ports[1] {
+            problems.push("spare_ports must be [low, high]".into());
+        } else if (self.spare_ports[0]..=self.spare_ports[1]).contains(&self.port) {
+            problems.push(format!(
+                "port {} must lie outside spare_ports {:?}: the spare range is for staged generations",
+                self.port, self.spare_ports
+            ));
+        }
+        if !(1..=MAX_DEADLINE).contains(&self.deadline) {
+            problems.push(format!(
+                "deadline {} must be between 1 and {MAX_DEADLINE} seconds",
+                self.deadline
+            ));
+        }
+        if self.max_failed_starts < 1 {
+            problems.push("max_failed_starts must be at least 1".into());
+        }
+        if self.keep == Some(0) {
+            problems.push("keep must be at least 1 (leave it out to keep every generation)".into());
+        }
+        for (field, seconds) in [
+            ("install_timeout", self.install_timeout),
+            ("stop_timeout", self.stop_timeout),
+            ("min_uptime", self.min_uptime),
+            ("health.interval", self.health.interval),
+            ("health.timeout", self.health.timeout),
+        ] {
+            if !(seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS) {
+                problems.push(format!(
+                    "{field} {seconds} must be a number of seconds above 0 and at most {MAX_SECONDS}"
+                ));
+            }
+        }
+        for (field, entries) in [("storage", &self.storage), ("reuse", &self.reuse)] {
+            for entry in entries {
+                if !is_inside(entry) {
+                    problems.push(format!(
+                        "{field} entry {entry:?} must be a non-empty relative path without '..' (it is joined onto a directory that a restore may delete from)"
+                    ));
+                }
+            }
+        }
+        if let Some(url) = &self.health.url
+            && !has_port(url)
+        {
+            problems.push(format!(
+                "health.url {url:?} must start with http:// and end its host with :<port> or :{{port}}, for example http://127.0.0.1:{{port}}/"
+            ));
+        }
+        problems
     }
 }
 
