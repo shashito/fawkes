@@ -91,21 +91,53 @@ fn start_time(pid: u32) -> Option<f64> {
         .nth(19)?
         .parse()
         .ok()?;
-    let boot: f64 = std::fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))?
-        .trim()
-        .parse()
-        .ok()?;
+    let boot = boot_time()?;
     // SAFETY: sysconf only reads a configuration value.
     let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     (per_second > 0).then(|| boot + ticks / per_second as f64)
 }
 
+/// When the machine booted, in seconds since the epoch; None when the system does not say.
+#[cfg(target_os = "macos")]
+fn boot_time() -> Option<f64> {
+    // SAFETY: `timeval` is two integers, for which zero is valid.
+    let mut boot: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `boot` is a live local of exactly `size` bytes, which is all `sysctlbyname` writes for this key; the
+    // name is a NUL-terminated literal and no new value is set.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&raw mut boot).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && size == std::mem::size_of::<libc::timeval>())
+        .then(|| boot.tv_sec as f64 + f64::from(boot.tv_usec) / 1e6)
+}
+
+/// When the machine booted, in seconds since the epoch; None when the system does not say.
+#[cfg(target_os = "linux")]
+fn boot_time() -> Option<f64> {
+    std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The app an earlier daemon left running, as named by the pid file its start wrapper wrote (`spawn`). Only a
 /// process that started just before the file was written is that app: a pid the system has reused since, after a
 /// reboot too, belongs to a process that started later, so it is never signalled.
+///
+/// When the leader is gone but its group still has members (`start = "npm start"`, the shell exited and its
+/// children did not), there is no start time to compare. The group is the app's all the same if the file was
+/// written after the machine booted: a process group id cannot be reused while the group has members, and before
+/// a boot nothing survives. Without a boot time that case is not recognised.
 pub fn leftover(pid_file: &Path) -> Option<u32> {
     let written = std::fs::metadata(pid_file)
         .and_then(|meta| meta.modified())
@@ -118,7 +150,9 @@ pub fn leftover(pid_file: &Path) -> Option<u32> {
         .trim()
         .parse()
         .ok()?;
-    let started = start_time(pid)?;
+    let Some(started) = start_time(pid) else {
+        return (boot_time()? <= written && group_alive(pid)).then_some(pid);
+    };
     // The shell writes the file at once, so a minute is far more than it takes even on a loaded machine; the second
     // after covers coarse timestamps.
     (written - 60.0 <= started && started <= written + 1.0 && group_alive(pid)).then_some(pid)
@@ -155,15 +189,19 @@ pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Op
         }
         if Instant::now() >= give_up {
             kill_group(pgid);
-            // The leader first: until it is reaped it stays a zombie, and a zombie still counts as alive.
-            if let Some(child) = leader {
-                status = child.wait().ok();
-            }
+            // The leader is reaped inside the same bound: until it is, it stays a zombie, and a zombie still
+            // counts as alive.
             let give_up = Instant::now() + KILL_WAIT;
-            while group_alive(pgid) && Instant::now() < give_up {
+            loop {
+                if let Some(child) = leader.as_deref_mut() {
+                    status = status.or(child.try_wait().ok().flatten());
+                }
+                let leader_gone = leader.is_none() || status.is_some();
+                if (leader_gone && !group_alive(pgid)) || Instant::now() >= give_up {
+                    return status;
+                }
                 sleep(Duration::from_millis(10));
             }
-            return status;
         }
         sleep(Duration::from_millis(20));
     }
@@ -314,6 +352,32 @@ mod tests {
         app.wait().unwrap();
         file.set_modified(SystemTime::now()).unwrap();
         assert_eq!(leftover(&pid_file), None, "a process that is gone");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_group_whose_leader_has_exited_is_still_a_leftover() {
+        let dir = std::env::temp_dir().join(format!("fk-orphan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("app.pid");
+        let mut leader = spawn(
+            "sleep 30 & exit",
+            &dir,
+            &[],
+            &dir.join("app.log"),
+            "test",
+            Some(&pid_file),
+        )
+        .unwrap();
+        // Reaping the leader leaves the sleeping member alone in the group.
+        leader.wait().unwrap();
+        let pgid = leader.id();
+        assert!(group_alive(pgid), "the member outlives its leader");
+        assert_eq!(leftover(&pid_file), Some(pgid));
+
+        stop_group(pgid, 1.0, None);
+        assert_eq!(leftover(&pid_file), None, "the group is gone");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
