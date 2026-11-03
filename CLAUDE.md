@@ -27,7 +27,7 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   short because socket paths have a length limit. Tests run in parallel, so **give a new test an unused block**
   (4800 to 4890 are taken; use 4900, 4910, …).
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
-  `process.rs`, `protocol.rs`, `daemon.rs`, `tui.rs`).
+  `process.rs`, `protocol.rs`, `daemon/mod.rs`, `tui.rs`).
 - To fix a bug, first write a test that reproduces it.
 - Never point a test or a manual run at a live app or a real `~/.fawkes`. Use a temp directory and a manifest in it.
 
@@ -44,7 +44,7 @@ not built yet. Don't start one unless asked.
   `return` or a half-written `state.json` partway through a switch, confirm or rollback breaks that promise. In
   daemon code paths, return `protocol::Error` with `?` and don't add `unwrap`/`expect`. They are fine in tests.
 - **A generation rolls back at most once.** Never add a path that rolls back a rolled-back generation.
-- **Locking** (see the header of `daemon.rs`): never hold `inner` across a slow step (install, health check,
+- **Locking** (see the header of `daemon/mod.rs`): never hold `inner` across a slow step (install, health check,
   process stop). The lock order is `inner` → `log` → `hub`, and no thread waits on another while holding one.
 - **Processes:** the app runs in its own process group, and stopping or crash handling signals the whole group
   (`process::kill_group`, rustix's `kill_process_group`), never just the child pid.
