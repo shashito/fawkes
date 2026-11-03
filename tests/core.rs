@@ -224,7 +224,8 @@ fn a_switch_records_its_intent_before_the_new_generation_starts() {
     let at_start: Value =
         serde_json::from_str(&std::fs::read_to_string(h.dir.join("home/at-start.json")).unwrap())
             .unwrap();
-    assert_eq!(at_start["pending"]["generation"], "g2", "{at_start}");
+    assert_eq!(at_start["txn"]["step"], "pending", "{at_start}");
+    assert_eq!(at_start["txn"]["generation"], "g2", "{at_start}");
     let g2 = at_start["generations"]
         .as_array()
         .unwrap()

@@ -15,7 +15,7 @@ use crate::protocol::{
     Pending, Process, ProcessState, PruneResult, R, Reply, Request, RollbackResult, Status,
     SwitchResult, TestInfo, err,
 };
-use crate::state::{self, EventLog, Paths, State, now, now_secs, parse_time};
+use crate::state::{self, EventLog, Paths, State, Txn, now, now_secs, parse_time};
 use crate::storage;
 use rustix::fs::{FlockOperation, Mode, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -72,10 +72,6 @@ struct Inner {
     busy: Option<String>,
     /// A step that moves the live process (switch, rollback, start, stop, restart): one at a time.
     moving: Option<String>,
-    /// A rollback of the pending generation is decided or under way, with its reason: it can no longer be confirmed.
-    /// Set in the same critical section that learns why (a crash, the deadline, a failed health check), so no
-    /// confirm fits between the decision and the rollback.
-    rollback: Option<String>,
 }
 
 /// Which slots a step occupies.
@@ -296,7 +292,6 @@ impl Daemon {
                 restarts: 0,
                 busy: None,
                 moving: None,
-                rollback: None,
             }),
             log: Mutex::new(log),
             hub: Hub(Mutex::new(Vec::new())),
@@ -328,15 +323,27 @@ impl Daemon {
         daemon.save(&daemon.inner());
         daemon.sweep_generations();
 
-        if daemon.inner().state.pending.is_some() {
-            let _busy = daemon
-                .begin("rollback", Slot::Both)
-                .map_err(|e| e.message)?;
-            if let Err(e) = daemon.rollback_pending(&mut Out::none(), "daemon_restart") {
-                daemon.event(EventKind::Error, None, e.message);
+        // What the last daemon was doing when it ended, from the step it saved before each side effect. A
+        // pending switch is never resumed: it rolls back, and so does a rollback that was under way.
+        let txn = daemon.inner().state.txn.clone();
+        match txn {
+            None => daemon.start_permanent(),
+            Some(Txn::Switching { generation, .. }) => {
+                daemon.event(
+                    EventKind::Daemon,
+                    Some(&generation),
+                    format!(
+                        "the switch to {generation} was cut short by the end of the last daemon; it stays tested"
+                    ),
+                );
+                let mut inner = daemon.inner();
+                inner.state.txn = None;
+                daemon.save(&inner);
+                drop(inner);
+                daemon.start_permanent();
             }
-        } else {
-            daemon.start_permanent();
+            Some(Txn::Pending(_)) => daemon.roll_back_at_start("daemon_restart")?,
+            Some(Txn::RollingBack { reason, .. }) => daemon.roll_back_at_start(&reason)?,
         }
 
         let watcher = daemon.clone();
@@ -372,6 +379,15 @@ impl Daemon {
             }
         }
         daemon.shutdown();
+        Ok(())
+    }
+
+    /// Carry out the rollback that startup found pending or under way; `reason` applies when it was not decided yet.
+    fn roll_back_at_start(self: &Arc<Self>, reason: &str) -> Result<(), String> {
+        let _busy = self.begin("rollback", Slot::Both).map_err(|e| e.message)?;
+        if let Err(e) = self.rollback_pending(&mut Out::none(), reason) {
+            self.event(EventKind::Error, None, e.message);
+        }
         Ok(())
     }
 
@@ -786,16 +802,24 @@ impl Daemon {
         Ok(())
     }
 
-    /// Record the rollback of the pending generation `id` whose process `pid` never became healthy, unless it has
+    /// Decide the rollback of the pending generation `id` whose process `pid` never became healthy, unless it has
     /// changed since (confirmed, restarted, already rolling back); the next supervision pass carries it out.
     fn roll_back_unhealthy(&self, id: &str, pid: u32) {
         let mut inner = self.inner();
-        let pending = inner.state.pending.as_ref().is_some_and(|pending| {
-            pending.generation == id && !inner.state.restore_failed(pending)
-        });
+        let pending =
+            matches!(&inner.state.txn, Some(Txn::Pending(pending)) if pending.generation == id);
         let running = inner.app.as_ref().is_some_and(|app| app.child.id() == pid);
-        if pending && running && inner.rollback.is_none() {
-            inner.rollback = Some("health check failed".into());
+        if pending && running {
+            self.decide_rollback(&mut inner, "health check failed");
+        }
+    }
+
+    /// Decide to roll back the pending switch for `reason` (`State::decide_rollback`), and save the decision. The
+    /// caller holds `inner` from learning why, so no confirm fits in between. The save is bookkeeping: the decision
+    /// stands in memory, and a daemon that restarts rolls a pending switch back either way.
+    fn decide_rollback(&self, inner: &mut Inner, reason: &str) {
+        if inner.state.decide_rollback(reason) {
+            self.save(inner);
         }
     }
 
@@ -862,7 +886,7 @@ impl Daemon {
             daemon_pid: std::process::id(),
             permanent: inner.state.permanent.clone(),
             current: inner.state.current().map(String::from),
-            pending: inner.state.pending.clone(),
+            pending: inner.state.pending().cloned(),
             busy: inner.busy.clone().or_else(|| inner.moving.clone()),
             process: self.process(&inner),
         }
@@ -1009,7 +1033,8 @@ impl Daemon {
                 return;
             }
             let stragglers = self.reap(&mut inner);
-            (stragglers, self.decide_rollback(&mut inner))
+            self.decide_overdue(&mut inner);
+            (stragglers, inner.state.rolling_back().map(String::from))
         };
         // The leader is gone; end the rest of its group too, so nothing of it lives on unsupervised or keeps the
         // storage open while a rollback restores it.
@@ -1043,15 +1068,15 @@ impl Daemon {
             .app
             .as_mut()
             .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_))));
-        let pending = inner
-            .state
-            .pending
-            .as_ref()
-            .filter(|pending| !inner.state.restore_failed(pending));
-        let overdue = pending.is_some_and(|pending| {
-            parse_time(&pending.deadline).is_none_or(|deadline| now_secs() >= deadline)
-        });
-        if pending.is_some() && (exited || overdue || inner.rollback.is_some()) {
+        let rollback = match &inner.state.txn {
+            Some(Txn::Pending(pending)) => {
+                exited
+                    || parse_time(&pending.deadline).is_none_or(|deadline| now_secs() >= deadline)
+            }
+            Some(Txn::RollingBack { restore_failed, .. }) => !restore_failed,
+            _ => false,
+        };
+        if rollback {
             Some("rollback")
         } else if exited {
             Some("reap")
@@ -1087,28 +1112,23 @@ impl Daemon {
     }
 
     fn restart_due(&self, inner: &Inner) -> bool {
-        inner.state.pending.is_none()
+        inner.state.txn.is_none()
             && inner.app.is_none()
             && !inner.app_failed
             && inner.restart_at.is_some_and(|at| Instant::now() >= at)
     }
 
-    /// Whether the pending switch must roll back, and why. A reason is recorded in `inner.rollback` before the lock
-    /// is released, so from here on a confirm is refused.
-    fn decide_rollback(&self, inner: &mut Inner) -> Option<String> {
-        let pending = inner.state.pending.as_ref()?;
-        // Rolled back, but its storage restore failed: retried by `rollback` or the next daemon start.
-        if inner.state.restore_failed(pending) {
-            return None;
+    /// Decide the rollback of a pending switch that missed its deadline.
+    fn decide_overdue(&self, inner: &mut Inner) {
+        if let Some(Txn::Pending(pending)) = &inner.state.txn
+            && now_secs() >= self.deadline_secs(pending)
+        {
+            self.decide_rollback(inner, "missed confirm deadline");
         }
-        if inner.rollback.is_none() && now_secs() >= self.deadline_secs(pending) {
-            inner.rollback = Some("missed confirm deadline".into());
-        }
-        inner.rollback.clone()
     }
 
     /// If the app exited without being asked to, take it out and decide what follows where the facts are: the pending
-    /// generation gets no retries and is rolled back (recorded in `inner.rollback`, so no confirm slips in), any
+    /// generation gets no retries and its rollback is decided (so no confirm slips in), any
     /// other is restarted after a backoff or, after too many failed starts, given up. Returns the process group, which
     /// the caller ends once it has released `inner`.
     fn reap(&self, inner: &mut Inner) -> Option<u32> {
@@ -1123,8 +1143,7 @@ impl Daemon {
         let exit = LastExit::new(Some(status), false);
         let pending = inner
             .state
-            .pending
-            .as_ref()
+            .pending()
             .is_some_and(|p| p.generation == app.generation);
         let failed_starts = inner.state.find_mut(&app.generation).map_or(0, |g| {
             g.failed_starts = if ran < m.min_uptime {
@@ -1138,9 +1157,10 @@ impl Daemon {
         let gave_up = !pending && failed_starts >= m.max_failed_starts;
         if pending {
             // A reason decided earlier (a failed health check) stays the reason.
-            inner
-                .rollback
-                .get_or_insert_with(|| format!("exited before confirm ({})", exit.describe()));
+            self.decide_rollback(
+                inner,
+                &format!("exited before confirm ({})", exit.describe()),
+            );
         } else if gave_up {
             inner.app_failed = true;
         } else {
@@ -1166,19 +1186,24 @@ impl Daemon {
 
 impl Daemon {
     fn current_generation(&self, inner: &Inner) -> R<String> {
-        if let Some(pending) = &inner.state.pending
-            && inner.state.restore_failed(pending)
-        {
-            return Err(restore_failed(&pending.generation));
-        }
-        if let (Some(pending), Some(reason)) = (&inner.state.pending, &inner.rollback) {
-            return Err(err(
-                ErrorCode::Busy,
-                format!(
-                    "{} is being rolled back ({reason}); try again when the rollback has finished",
-                    pending.generation
-                ),
-            ));
+        match &inner.state.txn {
+            Some(Txn::RollingBack {
+                pending,
+                restore_failed: true,
+                ..
+            }) => return Err(restore_failed(&pending.generation)),
+            Some(Txn::RollingBack {
+                pending, reason, ..
+            }) => {
+                return Err(err(
+                    ErrorCode::Busy,
+                    format!(
+                        "{} is being rolled back ({reason}); try again when the rollback has finished",
+                        pending.generation
+                    ),
+                ));
+            }
+            _ => {}
         }
         inner.state.current().map(String::from).ok_or_else(|| {
             invalid_state(
@@ -1592,14 +1617,19 @@ impl Daemon {
         let m = self.manifest();
         let previous = {
             let inner = self.inner();
-            if let Some(pending) = &inner.state.pending {
-                if inner.state.restore_failed(pending) {
-                    return Err(restore_failed(&pending.generation));
+            match &inner.state.txn {
+                Some(Txn::RollingBack {
+                    pending,
+                    restore_failed: true,
+                    ..
+                }) => return Err(restore_failed(&pending.generation)),
+                Some(txn) => {
+                    return Err(invalid_state(format!(
+                        "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
+                        txn.generation()
+                    )));
                 }
-                return Err(invalid_state(format!(
-                    "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
-                    pending.generation
-                )));
+                None => {}
             }
             let g = inner.state.find(id).ok_or_else(|| not_found(id))?;
             if g.state != GenState::Tested {
@@ -1607,6 +1637,24 @@ impl Daemon {
             }
             inner.state.permanent.clone()
         };
+
+        // The intent goes to disk before the old app is stopped: a daemon that dies from here on finds the switch
+        // cut short at its next start and runs the permanent generation again.
+        {
+            let mut inner = self.inner();
+            let mut next = inner.state.clone();
+            next.txn = Some(Txn::Switching {
+                generation: id.into(),
+                previous: previous.clone(),
+            });
+            self.persist(&next).map_err(|e| {
+                err(
+                    e.code,
+                    format!("{}; {id} stays tested and nothing changed", e.message),
+                )
+            })?;
+            inner.state = next;
+        }
 
         // Stop first: no write of the old generation can land after the snapshot.
         let old = {
@@ -1619,13 +1667,16 @@ impl Daemon {
             self.say(out, id, format!("stopping {}", app.generation));
             self.stop_app(app);
         }
+        // The switch did not happen: no step in flight, and the old generation runs again.
         let resume = |daemon: &Arc<Self>| {
-            if let (true, Some(previous)) = (had_app, &previous) {
-                let mut inner = daemon.inner();
-                if let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh) {
-                    inner.app_failed = true;
-                    daemon.event(EventKind::Failed, Some(previous), e.message);
-                }
+            let mut inner = daemon.inner();
+            inner.state.txn = None;
+            daemon.save(&inner);
+            if let (true, Some(previous)) = (had_app, &previous)
+                && let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh)
+            {
+                inner.app_failed = true;
+                daemon.event(EventKind::Failed, Some(previous), e.message);
             }
         };
 
@@ -1658,11 +1709,11 @@ impl Daemon {
             g.state = GenState::Current;
             g.switched_at = Some(now());
         }
-        next.pending = Some(Pending {
+        next.txn = Some(Txn::Pending(Pending {
             generation: id.into(),
             previous: previous.clone(),
             deadline: deadline.clone(),
-        });
+        }));
         if let Err(e) = self.persist(&next) {
             drop(inner);
             resume(self);
@@ -1703,26 +1754,29 @@ impl Daemon {
 
     fn confirm(&self, id: Option<&str>) -> R<Generation> {
         let mut inner = self.inner();
-        if let Some(pending) = &inner.state.pending
-            && inner.state.restore_failed(pending)
-        {
-            return Err(restore_failed(&pending.generation));
+        match &inner.state.txn {
+            Some(Txn::RollingBack {
+                pending,
+                restore_failed: true,
+                ..
+            }) => return Err(restore_failed(&pending.generation)),
+            Some(Txn::RollingBack {
+                pending, reason, ..
+            }) => {
+                return Err(invalid_state(format!(
+                    "{} is being rolled back ({reason}) and can no longer be confirmed",
+                    pending.generation
+                )));
+            }
+            Some(Txn::Pending(pending)) if now_secs() >= self.deadline_secs(pending) => {
+                return Err(invalid_state(format!(
+                    "{} missed its confirm deadline ({}) and is being rolled back",
+                    pending.generation, pending.deadline
+                )));
+            }
+            _ => {}
         }
-        if let (Some(pending), Some(reason)) = (&inner.state.pending, &inner.rollback) {
-            return Err(invalid_state(format!(
-                "{} is being rolled back ({reason}) and can no longer be confirmed",
-                pending.generation
-            )));
-        }
-        if let Some(pending) = &inner.state.pending
-            && now_secs() >= self.deadline_secs(pending)
-        {
-            return Err(invalid_state(format!(
-                "{} missed its confirm deadline ({}) and is being rolled back",
-                pending.generation, pending.deadline
-            )));
-        }
-        let Some(pending) = inner.state.pending.clone() else {
+        let Some(Txn::Pending(pending)) = inner.state.txn.clone() else {
             return Err(match id {
                 Some(id) => inner
                     .state
@@ -1778,7 +1832,7 @@ impl Daemon {
         g.confirmed_at = Some(now());
         let record = g.clone();
         next.permanent = Some(pending.generation.clone());
-        next.pending = None;
+        next.txn = None;
         self.persist(&next).map_err(|e| {
             err(
                 e.code,
@@ -1797,19 +1851,28 @@ impl Daemon {
         Ok(record)
     }
 
-    /// Roll the pending generation back (the caller holds the rollback slots).
+    /// Roll the pending generation back (the caller holds the rollback slots). A rollback already decided, or
+    /// retried after a failed restore, keeps its first reason and time; `reason` applies when none is decided yet.
     fn rollback_pending(self: &Arc<Self>, out: &mut Out, reason: &str) -> R<RollbackResult> {
         let m = self.manifest();
-        let (pending, app) = {
+        let (id, reason, app) = {
             let mut inner = self.inner();
-            let pending = inner.state.pending.clone().ok_or_else(|| {
-                invalid_state("no switch is pending, so there is nothing to roll back; to go back past a confirm, `test` and `switch` to a retired generation")
-            })?;
-            inner.rollback.get_or_insert_with(|| reason.into());
+            // Saved with the generation's `rolled_back` state before anything is stopped. Only a best-effort
+            // save: rolling back is the safe direction and a disk that still says pending rolls back at the next
+            // start, so a full disk must not stop it.
+            self.decide_rollback(&mut inner, reason);
+            let Some(Txn::RollingBack {
+                pending, reason, ..
+            }) = &inner.state.txn
+            else {
+                return Err(invalid_state(
+                    "no switch is pending, so there is nothing to roll back; to go back past a confirm, `test` and `switch` to a retired generation",
+                ));
+            };
+            let (id, reason) = (pending.generation.clone(), reason.clone());
             inner.restart_at = None;
-            (pending, inner.app.take())
+            (id, reason, inner.app.take())
         };
-        let id = pending.generation;
         self.say(out, &id, format!("rolling back {id}: {reason}"));
         if let Some(app) = app {
             self.stop_app(app);
@@ -1817,20 +1880,12 @@ impl Daemon {
         let restored = storage::restore(&m.home, &self.paths.snapshot(&id));
 
         let mut inner = self.inner();
-        // A retried restore keeps the first rollback's time and reason.
-        if let Some(g) = inner.state.find_mut(&id)
-            && g.state != GenState::RolledBack
-        {
-            g.state = GenState::RolledBack;
-            g.rolled_back_at = Some(now());
-            g.rollback_reason = Some(reason.into());
-        }
-        inner.rollback = None;
         let permanent = inner.state.permanent.clone();
         if let Err(e) = restored {
-            // Starting the permanent generation on storage in an unknown state could do more harm. `pending` stays
+            // Starting the permanent generation on storage in an unknown state could do more harm. The step stays
             // in state.json, so `rollback` or the next daemon start retries the restore (the code is not retried:
             // the generation is rolled_back for good).
+            inner.state.fail_restore();
             inner.app_failed = true;
             self.save(&inner);
             self.event(
@@ -1845,11 +1900,12 @@ impl Daemon {
                 ),
             ));
         }
-        // Until the end of the switch is on disk the app stays stopped and the switch pending, like a failed restore:
+        // Until the end of the switch is on disk the app stays stopped and the step stays, like a failed restore:
         // `rollback` or the next daemon start finishes it (restoring the same snapshot again is harmless).
         let mut next = inner.state.clone();
-        next.pending = None;
+        next.txn = None;
         if let Err(e) = self.persist(&next) {
+            inner.state.fail_restore();
             inner.app_failed = true;
             self.event(
                 EventKind::RolledBack,
@@ -1882,7 +1938,7 @@ impl Daemon {
         Ok(RollbackResult {
             from: id,
             to: permanent,
-            reason: reason.into(),
+            reason,
         })
     }
 }
