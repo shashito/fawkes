@@ -118,7 +118,10 @@ fn clock(at: &Value) -> String {
 
 pub fn local_clock(secs: u64) -> String {
     let t = secs as libc::time_t;
+    // SAFETY: `tm` is plain integers (and a pointer) that zero is valid for.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers refer to live locals; `localtime_r` keeps no state of its own beyond the zone data that
+    // `tzset` loaded in `tui::run` before any thread started.
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
         return "--:--:--".into();
     }
@@ -177,8 +180,16 @@ fn last_exit(exit: &Value) -> String {
     format!("{how}{requested}")
 }
 
+/// Terminal columns `text` takes, the measure ratatui itself lays out with: `chars().count()` is wrong for wide and
+/// zero-width characters.
 fn width_of(text: &str) -> u16 {
-    text.chars().count() as u16
+    Span::raw(text).width() as u16
+}
+
+/// `text` padded with spaces to `width` terminal columns.
+fn pad_to(text: &str, width: u16) -> String {
+    let fill = width.saturating_sub(width_of(text)) as usize;
+    format!("{text}{}", " ".repeat(fill))
 }
 
 /// `─ title  extras ─────────`, one line over the full width.
@@ -781,7 +792,7 @@ fn draw_events(frame: &mut Frame, app: &App, view: &AppView, area: Rect) {
             Line::from(vec![
                 Span::styled(format!(" {} ", clock(&e["at"])), dim()),
                 Span::styled(
-                    format!("{kind:<width$} ", width = kind_width as usize),
+                    format!("{} ", pad_to(&kind, kind_width)),
                     Style::new().fg(color),
                 ),
                 Span::styled(format!("{generation:<3} "), dim()),

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 const TICK: Duration = Duration::from_millis(250);
 const RETRY: Duration = Duration::from_secs(1);
 const RESCAN: Duration = Duration::from_secs(3);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKLOG: usize = 100;
 const MAX_EVENTS: usize = 500;
 
@@ -576,7 +577,18 @@ fn open(socket: &Path, request: &Value) -> Result<UnixStream, String> {
 /// One request: progress lines are skipped (they reach the screen through `subscribe`), the answer is the result.
 fn request(socket: &Path, request: &Value) -> Result<Value, String> {
     let stream = open(socket, request)?;
-    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+    // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever. The
+    // limit applies to each read, so a long action that keeps sending progress lines is not cut off.
+    stream
+        .set_read_timeout(Some(REQUEST_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    for line in BufReader::new(stream).lines() {
+        let line = line.map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                "the daemon did not answer in time".to_string()
+            }
+            _ => e.to_string(),
+        })?;
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -591,7 +603,15 @@ fn request(socket: &Path, request: &Value) -> Result<Value, String> {
 
 // ------------------------------------------------------------ the loop
 
+unsafe extern "C" {
+    /// Not in the `libc` crate; POSIX, and in the C library on every platform Fawkes runs on.
+    fn tzset();
+}
+
 pub fn run(target: Target) -> u8 {
+    // SAFETY: this runs before the TUI starts its threads, so none can be inside `localtime_r`; `draw::local_clock` relies on
+    // the zone data this loads once, as `localtime_r` is not required to.
+    unsafe { tzset() };
     let (tx, rx) = mpsc::channel();
     match &target {
         Target::One(socket) => {
