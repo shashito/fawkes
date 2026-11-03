@@ -12,12 +12,14 @@ implements all of it except where a section says **later**.
 ## Process model
 
 `fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive). It is the parent of the
-app's live process and the only writer of the state directory. Every other command (`stage`, `test`, `switch`,
-`confirm`, `rollback`, `status`, `log`, `history`) is a thin client that sends one request over the daemon's Unix
-socket and renders the answer. One daemon supervises one app; run one daemon per manifest.
+app's live process and the only writer of the state directory. Every other command (`start`, `stop`, `restart`,
+`stage`, `test`, `switch`, `confirm`, `rollback`, `status`, `log`, `history`, `tui`) is a thin client that sends
+requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
+manifest.
 
-The daemon runs one transaction step (stage, test, switch, rollback) at a time; a second one gets `busy`. `status`,
-`log`, `history` and `confirm` are always answered.
+The daemon runs one transaction step (stage, test, switch, rollback) at a time; a second one gets `busy`. `start`,
+`stop` and `restart` get `busy` only while a switch or rollback moves the live process. `status`, `log`, `history`
+and `confirm` are always answered.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest (applies to the next start of any process).
@@ -76,12 +78,31 @@ too, Fawkes does not roll further back; the restart policy below applies and the
 `fawkes rollback` with no pending switch is `invalid_state`; to go back past a confirm, `test` and `switch` to a
 retired generation.
 
-### Failed-start counter and restarts
+### Lifecycle: start, stop, restart
 
-Each generation counts `failed_starts`: exits within `min_uptime` seconds of a start. The pending generation gets no
-retries: its first exit rolls it back. The permanent generation is restarted after an exit with a backoff of 1, 2, 4 s;
-a run longer than `min_uptime` resets its counter; after `max_failed_starts` consecutive failed starts it is no longer
-restarted and `status` reports `"app": "failed"` until the next `switch` or daemon start.
+The usual supervisor actions, the same in the CLI, the socket and the TUI. They act on the *current* generation:
+the pending one while a switch awaits confirm, else the permanent one. They never change generations, the confirm
+deadline or storage; only `switch`, `confirm` and rollback do.
+
+- **start:** start the current generation if it is not running (also clears `failed`). Already running is
+  `invalid_state`.
+- **stop:** SIGTERM to the app's process group, SIGKILL after `stop_timeout` seconds of grace. The app stays stopped:
+  no automatic restart until `start` or `restart`. Stopping a pending generation does not stop its deadline; if it is
+  not started and confirmed in time it is rolled back like any other.
+- **restart:** stop (with the same grace), then start the same generation. It resets the backoff and does not count
+  as a failed start.
+
+A requested stop is never a crash. Every other exit is:
+
+### Crashes, failed-start counter and backoff
+
+Each generation counts `failed_starts`: unrequested exits within `min_uptime` seconds of a start. The pending
+generation gets no retries: its first crash rolls it back. The permanent generation is restarted after a crash with a
+backoff of 1, 2, 4, … s (at most 30 s); a run longer than `min_uptime` resets its counter and the backoff; after
+`max_failed_starts` consecutive failed starts it is no longer restarted and `status` reports `"state": "failed"` until
+`start`, `restart`, the next `switch` or a daemon start.
+
+A cold start of the daemon always runs the permanent generation; `start` and `restart` run the current one.
 
 ### Daemon start
 
@@ -166,6 +187,9 @@ ULTIMATE_PORT = "{port}"
 
 ```
 fawkes daemon   [--manifest FILE]
+fawkes start
+fawkes stop
+fawkes restart
 fawkes stage    <ref>
 fawkes test     <gen>
 fawkes switch   <gen> [--deadline SECS]
@@ -217,6 +241,9 @@ Results per command:
 
 | Command | Args | Result |
 |---|---|---|
+| `start` | — | the `process` object of `status` |
+| `stop` | — | the `process` object, with `last_exit` of the stop |
+| `restart` | — | the `process` object |
 | `stage` | `ref` | the generation record |
 | `test` | `generation` | the generation record (its `test` field holds port, outcome, duration) |
 | `switch` | `generation`, `deadline?` | `generation`, `previous`, `deadline` |
@@ -245,10 +272,16 @@ A generation record:
 
 ```json
 {"name": "sample", "daemon_pid": 812, "permanent": "g2", "current": "g3", "pending": {"generation": "g3",
- "previous": "g2", "deadline": "…"}, "app": "running", "pid": 9001, "port": 4790, "busy": null}
+ "previous": "g2", "deadline": "…"}, "busy": null,
+ "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
+             "uptime": 42.5, "restarts": 1,
+             "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}}}
 ```
 
-`app` is `running`, `stopped` or `failed`; `busy` names the transaction step in progress.
+`process.state` is `running`, `stopped` or `failed`; `uptime` is seconds, null when not running; `restarts` counts
+starts of the current generation after its first (crash restarts and `restart`) since it became current or the daemon
+started; `last_exit` is the most recent exit of the app (exit `code` or terminating `signal`, and whether Fawkes asked
+for it), null before the first. `busy` names the transaction step in progress.
 
 ## TUI
 
@@ -267,14 +300,15 @@ started elsewhere; quitting it never affects the app.
 │ g6  permanent    main@bf0ad442       │ 14:02:40 g8 test passed on :4791      │
 │ g5  rolled_back  main@0c1d2e3f       │                                       │
 ├──────────────────────────────────────┴───────────────────────────────────────┤
-│ s stage  t test  w switch  c confirm  r rollback  ↑↓ select  q quit          │
+│ s stage t test w switch c confirm r rollback  S start X stop R restart  q quit│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - The header shows the live, permanent and newest staged generation, the deadline countdown (red under 15 s) and the
   app's pid and port; `failed` and `busy` show there too.
 - The generations list is the history; the selected row is the target of `t`, `w` and `c`. `s` asks for a ref.
-- `w` and `r` ask for a `y` confirmation; a failed action shows its error message in the footer.
+- `w`, `r`, `X` and `R` ask for a `y` confirmation; a failed action shows its error message in the footer.
+- The header's live row also shows uptime, restarts and the last exit (`exit 1` or `SIGKILL`).
 - The log pane tails the event stream, progress lines included.
 
 Crate: **ratatui** (with its re-exported `crossterm` backend, so one dependency), the standard Rust TUI library;
