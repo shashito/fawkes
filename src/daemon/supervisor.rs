@@ -310,6 +310,11 @@ impl Daemon {
         let _ = std::fs::remove_file(self.paths.app_pid());
     }
 
+    /// The same for the install or test that just ended.
+    pub(super) fn forget_step_pid_file(&self) {
+        let _ = std::fs::remove_file(self.paths.step_pid());
+    }
+
     pub(super) fn process(&self, inner: &Inner) -> Process {
         let (state, generation, pid, started_at, uptime) = match &inner.live {
             Live::Running(app) => (

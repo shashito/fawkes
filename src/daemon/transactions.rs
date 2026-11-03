@@ -207,7 +207,7 @@ impl Daemon {
             &[],
             log,
             &format!("install: {command}"),
-            None,
+            Some(&self.paths.step_pid()),
         )
         .map_err(|e| e.to_string())?;
         let pgid = child.id();
@@ -227,6 +227,7 @@ impl Daemon {
         // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
         // outlives the stage.
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
+        self.forget_step_pid_file();
         lock(&self.step_pgids).retain(|p| *p != pgid);
         result
     }
@@ -304,7 +305,7 @@ impl Daemon {
             &env,
             &log,
             &format!("start {id} test port {port}"),
-            None,
+            Some(&self.paths.step_pid()),
         )
         .map_err(|e| {
             err(
@@ -325,6 +326,7 @@ impl Daemon {
             || matches!(child.try_wait(), Ok(None)),
         );
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
+        self.forget_step_pid_file();
         lock(&self.step_pgids).retain(|p| *p != pgid);
         let _ = std::fs::remove_dir_all(&test_home);
         // Our test process is gone, so a port that is still taken was taken by someone else, most likely between
@@ -431,8 +433,16 @@ impl Daemon {
             })?;
         }
 
-        // Stop first: no write of the old generation can land after the snapshot.
-        let old = self.inner().take_running();
+        // Stop first: no write of the old generation can land after the snapshot. A crash restart the old generation
+        // was waiting for is held back too, and given back if the switch fails before its point of no return.
+        let (old, backoff) = {
+            let mut inner = self.inner();
+            let backoff = match inner.live {
+                Live::Backoff { until } => Some(until),
+                _ => None,
+            };
+            (inner.take_running(), backoff)
+        };
         let had_app = old.is_some();
         if let Some(app) = old {
             self.say(out, id, format!("stopping {}", app.generation));
@@ -442,11 +452,15 @@ impl Daemon {
         let resume = |daemon: &Arc<Self>| {
             let mut inner = daemon.inner();
             daemon.update(&mut inner.store, |state| state.txn = None);
-            if let (true, Some(previous)) = (had_app, &previous)
-                && let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh)
-            {
-                inner.live = Live::Failed;
-                daemon.event(EventKind::Failed, Some(previous), e.message);
+            let Some(previous) = &previous else { return };
+            if had_app {
+                if let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh) {
+                    inner.live = Live::Failed;
+                    daemon.event(EventKind::Failed, Some(previous), e.message);
+                }
+            } else if let Some(until) = backoff {
+                // The backoff and the failed-start count stay as the crash left them.
+                inner.live = Live::Backoff { until };
             }
         };
 
