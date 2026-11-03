@@ -270,6 +270,10 @@ APP_HOME = "{home}"
 
 The error names every problem at once.
 
+`git` and `cp` run in their own process group with a bound: `git worktree add` and the `reuse` copies get
+`install_timeout` seconds, the other git calls 60. Past it the group is killed and the step fails with "timed out".
+`git worktree add` skips the repository's hooks (`core.hooksPath=/dev/null`); the install is the place for setup.
+
 `install` runs with Fawkes's own environment so package managers find their real caches, in its own process group.
 After `install_timeout` seconds it is stopped like the app (SIGTERM, SIGKILL after `stop_timeout`) and the stage
 fails; whatever it left running in its group is ended when it finishes; a stopping daemon kills it. A failed

@@ -9,9 +9,11 @@ use crate::protocol::{
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, refusal};
 use crate::storage;
+use std::io::Read;
 use std::net::TcpListener;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
@@ -22,18 +24,72 @@ pub(super) fn restore_failed(id: &str) -> Error {
     ))
 }
 
+/// How long the quick git calls (rev-parse, prune, remove) get.
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(|e| format!("cannot run git: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    git_within(repo, args, GIT_TIMEOUT)
+}
+
+/// Run git in `repo` for at most `timeout`; its stdout, trimmed, on success and its stderr on failure.
+fn git_within(repo: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    let (status, stdout, stderr) = run_bounded(command, timeout, "git")?;
+    if status.success() {
+        Ok(stdout.trim().to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        Err(stderr.trim().to_string())
     }
+}
+
+/// Read `pipe` to its end on a thread: a child that writes more than a pipe holds would otherwise wait for a reader
+/// that only reads once it has exited.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(mut pipe) = pipe {
+            // A read error ends the capture; what came before is still the useful part.
+            let _ = pipe.read_to_end(&mut text);
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    })
+}
+
+/// Run `command` in its own process group for at most `timeout`, so a hanging child (a git hook, a huge copy) can
+/// neither hold the step slot for ever nor outlive its group: on a timeout the whole group is ended, and a child
+/// that left processes behind takes them with it. Gives its exit status, stdout and stderr.
+fn run_bounded(
+    mut command: Command,
+    timeout: Duration,
+    what: &str,
+) -> Result<(ExitStatus, String, String), String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| format!("cannot run {what}: {e}"))?;
+    let pgid = child.id();
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let give_up = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("{what}: {e}"))? {
+            Some(status) => break status,
+            None if Instant::now() >= give_up => {
+                // The readers are left to finish on their own: a group stuck in the kernel keeps its pipes open.
+                process::stop_group(pgid, 0.0, Some(&mut child));
+                return Err(format!("{what} timed out after {}s", timeout.as_secs()));
+            }
+            None => sleep(Duration::from_millis(20)),
+        }
+    };
+    // Whatever the child left running would keep the pipes open, and the readers waiting.
+    process::stop_group(pgid, 0.0, Some(&mut child));
+    let output = |reader: thread::JoinHandle<String>| reader.join().unwrap_or_default();
+    Ok((status, output(stdout), output(stderr)))
 }
 
 impl Daemon {
@@ -144,7 +200,23 @@ impl Daemon {
             ),
         );
         let code_arg = code.to_string_lossy().into_owned();
-        git(&m.repo, &["worktree", "add", "--detach", &code_arg, commit]).map_err(|e| {
+        let install_timeout = Duration::from_secs_f64(m.install_timeout);
+        // The repository's hooks never run here: the generation's own install is the place for setup, and a
+        // hanging `post-checkout` would hold the step slot.
+        git_within(
+            &m.repo,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "--detach",
+                &code_arg,
+                commit,
+            ],
+            install_timeout,
+        )
+        .map_err(|e| {
             err(
                 ErrorCode::GitFailed,
                 format!("cannot create the worktree for {id}: {e}"),
@@ -159,7 +231,7 @@ impl Daemon {
                     id,
                     format!("cloning {dir} from {}", reuse_from.display()),
                 );
-                if let Err(e) = clone_directory(&from, &to) {
+                if let Err(e) = clone_directory(&from, &to, install_timeout) {
                     self.say(
                         out,
                         id,
@@ -875,19 +947,16 @@ fn port_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
-/// Copy-on-write clone of a directory (APFS `clonefile` on macOS, reflinks elsewhere).
-fn clone_directory(from: &Path, to: &Path) -> Result<(), String> {
+/// Copy-on-write clone of a directory (APFS `clonefile` on macOS, reflinks elsewhere), for at most `timeout`.
+fn clone_directory(from: &Path, to: &Path, timeout: Duration) -> Result<(), String> {
     let flags: &[&str] = if cfg!(target_os = "macos") {
         &["-cR"]
     } else {
         &["-R", "--reflink=auto"]
     };
-    let status = Command::new("cp")
-        .args(flags)
-        .arg(from)
-        .arg(to)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let mut command = Command::new("cp");
+    command.args(flags).arg(from).arg(to);
+    let (status, _, _) = run_bounded(command, timeout, "cp")?;
     if status.success() {
         Ok(())
     } else {
