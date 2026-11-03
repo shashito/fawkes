@@ -57,13 +57,24 @@ enum Why {
     Restart,
 }
 
+/// What the live process is doing. Exactly one of these holds, so an app that runs is never also given up on or
+/// scheduled for a restart.
+enum Live {
+    /// Not running and not scheduled: never started, stopped on request, or stopped for a switch or rollback.
+    Stopped,
+    Running(App),
+    /// Crashed; the supervisor restarts the permanent generation at `until`.
+    Backoff {
+        until: Instant,
+    },
+    /// Given up: `max_failed_starts` crashes in a row, a start that failed, or a rollback whose restore failed.
+    /// Cleared by `start`, `restart`, the next switch or a daemon start.
+    Failed,
+}
+
 struct Inner {
     state: State,
-    app: Option<App>,
-    /// The app crashed `max_failed_starts` times in a row and is no longer restarted.
-    app_failed: bool,
-    /// When the supervisor restarts a crashed process.
-    restart_at: Option<Instant>,
+    live: Live,
     last_exit: Option<LastExit>,
     /// Generation of the latest start and the number of restarts since it became current.
     last_started: Option<String>,
@@ -72,6 +83,35 @@ struct Inner {
     busy: Option<String>,
     /// A step that moves the live process (switch, rollback, start, stop, restart): one at a time.
     moving: Option<String>,
+}
+
+impl Inner {
+    fn running(&self) -> Option<&App> {
+        match &self.live {
+            Live::Running(app) => Some(app),
+            _ => None,
+        }
+    }
+
+    fn running_mut(&mut self) -> Option<&mut App> {
+        match &mut self.live {
+            Live::Running(app) => Some(app),
+            _ => None,
+        }
+    }
+
+    /// Take the app out for a step that moves the live process. A scheduled crash restart is cancelled; a process
+    /// given up on stays given up until something starts it.
+    fn take_running(&mut self) -> Option<App> {
+        match std::mem::replace(&mut self.live, Live::Stopped) {
+            Live::Running(app) => Some(app),
+            Live::Failed => {
+                self.live = Live::Failed;
+                None
+            }
+            Live::Stopped | Live::Backoff { .. } => None,
+        }
+    }
 }
 
 /// Which slots a step occupies.
@@ -284,9 +324,7 @@ impl Daemon {
             bin,
             inner: Mutex::new(Inner {
                 state,
-                app: None,
-                app_failed: false,
-                restart_at: None,
+                live: Live::Stopped,
                 last_exit: None,
                 last_started: None,
                 restarts: 0,
@@ -396,7 +434,7 @@ impl Daemon {
         if let Some(id) = inner.state.permanent.clone()
             && let Err(e) = self.start_live(&mut inner, &id, Why::Fresh)
         {
-            inner.app_failed = true;
+            inner.live = Live::Failed;
             self.event(EventKind::Failed, Some(&id), e.message);
         }
     }
@@ -420,7 +458,7 @@ impl Daemon {
         };
         // Held across the swap, so no app starts between the check of `port` and the swap.
         let inner = self.inner();
-        match self.manifest().reload(&new, inner.app.is_some()) {
+        match self.manifest().reload(&new, inner.running().is_some()) {
             Ok(changed) if changed.is_empty() => {
                 self.event(
                     EventKind::Daemon,
@@ -455,7 +493,7 @@ impl Daemon {
         while self.inner().moving.is_some() && Instant::now() < give_up {
             sleep(Duration::from_millis(20));
         }
-        let app = self.inner().app.take();
+        let app = self.inner().take_running();
         if let Some(app) = app {
             self.stop_app(app);
         }
@@ -717,10 +755,7 @@ impl Daemon {
     }
 
     fn is_running(&self, pid: u32) -> bool {
-        self.inner()
-            .app
-            .as_ref()
-            .is_some_and(|a| a.child.id() == pid)
+        self.inner().running().is_some_and(|a| a.child.id() == pid)
     }
 
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
@@ -757,14 +792,12 @@ impl Daemon {
             g.failed_starts = 0;
         }
         inner.last_started = Some(id.into());
-        inner.app = Some(App {
+        inner.live = Live::Running(App {
             child,
             generation: id.into(),
             started: Instant::now(),
             started_at: now(),
         });
-        inner.app_failed = false;
-        inner.restart_at = None;
         self.save(inner);
         self.point_current_link(&g.dir);
         self.event(
@@ -808,7 +841,7 @@ impl Daemon {
         let mut inner = self.inner();
         let pending =
             matches!(&inner.state.txn, Some(Txn::Pending(pending)) if pending.generation == id);
-        let running = inner.app.as_ref().is_some_and(|app| app.child.id() == pid);
+        let running = inner.running().is_some_and(|app| app.child.id() == pid);
         if pending && running {
             self.decide_rollback(&mut inner, "health check failed");
         }
@@ -847,16 +880,16 @@ impl Daemon {
     }
 
     fn process(&self, inner: &Inner) -> Process {
-        let (state, generation, pid, started_at, uptime) = match &inner.app {
-            Some(app) => (
+        let (state, generation, pid, started_at, uptime) = match &inner.live {
+            Live::Running(app) => (
                 ProcessState::Running,
                 Some(app.generation.clone()),
                 Some(app.child.id()),
                 Some(app.started_at.clone()),
                 Some((app.started.elapsed().as_secs_f64() * 10.0).round() / 10.0),
             ),
-            None => (
-                if inner.app_failed {
+            Live::Stopped | Live::Backoff { .. } | Live::Failed => (
+                if matches!(inner.live, Live::Failed) {
                     ProcessState::Failed
                 } else {
                     ProcessState::Stopped
@@ -1053,7 +1086,7 @@ impl Daemon {
             && let Some(id) = inner.state.permanent.clone()
             && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
         {
-            inner.app_failed = true;
+            inner.live = Live::Failed;
             self.event(EventKind::Failed, Some(&id), e.message);
         }
     }
@@ -1065,8 +1098,7 @@ impl Daemon {
             return None;
         }
         let exited = inner
-            .app
-            .as_mut()
+            .running_mut()
             .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_))));
         let rollback = match &inner.state.txn {
             Some(Txn::Pending(pending)) => {
@@ -1091,7 +1123,7 @@ impl Daemon {
     /// app's descriptor appends, so its next write lands at the new end; what it writes during the copy is lost, the
     /// price of capping a log the daemon does not sit between.
     fn cap_app_log(&self) {
-        let Some(id) = self.inner().app.as_ref().map(|app| app.generation.clone()) else {
+        let Some(id) = self.inner().running().map(|app| app.generation.clone()) else {
             return;
         };
         let log = self.paths.app_log(&id);
@@ -1113,9 +1145,7 @@ impl Daemon {
 
     fn restart_due(&self, inner: &Inner) -> bool {
         inner.state.txn.is_none()
-            && inner.app.is_none()
-            && !inner.app_failed
-            && inner.restart_at.is_some_and(|at| Instant::now() >= at)
+            && matches!(inner.live, Live::Backoff { until } if Instant::now() >= until)
     }
 
     /// Decide the rollback of a pending switch that missed its deadline.
@@ -1133,10 +1163,9 @@ impl Daemon {
     /// the caller ends once it has released `inner`.
     fn reap(&self, inner: &mut Inner) -> Option<u32> {
         let status = inner
-            .app
-            .as_mut()
+            .running_mut()
             .and_then(|a| a.child.try_wait().ok().flatten())?;
-        let app = inner.app.take()?;
+        let app = inner.take_running()?;
         let ran = app.started.elapsed().as_secs_f64();
         let m = self.manifest();
         let pgid = app.child.id();
@@ -1162,10 +1191,12 @@ impl Daemon {
                 &format!("exited before confirm ({})", exit.describe()),
             );
         } else if gave_up {
-            inner.app_failed = true;
+            inner.live = Live::Failed;
         } else {
             let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
-            inner.restart_at = Some(Instant::now() + Duration::from_secs(backoff));
+            inner.live = Live::Backoff {
+                until: Instant::now() + Duration::from_secs(backoff),
+            };
             message += &format!("; restarting in {backoff}s");
         }
         inner.last_exit = Some(exit);
@@ -1216,7 +1247,7 @@ impl Daemon {
         let _busy = self.begin("start", Slot::Live)?;
         let mut inner = self.inner();
         let id = self.current_generation(&inner)?;
-        if let Some(app) = &inner.app {
+        if let Some(app) = inner.running() {
             return Err(invalid_state(format!(
                 "{id} is already running (pid {})",
                 app.child.id()
@@ -1231,8 +1262,7 @@ impl Daemon {
         let app = {
             let mut inner = self.inner();
             let id = self.current_generation(&inner)?;
-            inner.restart_at = None;
-            inner.app.take().ok_or_else(|| {
+            inner.take_running().ok_or_else(|| {
                 invalid_state(format!("{id} is not running; `fawkes start` starts it"))
             })?
         };
@@ -1247,8 +1277,8 @@ impl Daemon {
         let _busy = self.begin("restart", Slot::Live)?;
         let (id, app) = {
             let mut inner = self.inner();
-            inner.restart_at = None;
-            (self.current_generation(&inner)?, inner.app.take())
+            let id = self.current_generation(&inner)?;
+            (id, inner.take_running())
         };
         if let Some(app) = app {
             self.say(out, &id, format!("stopping {id}"));
@@ -1657,11 +1687,7 @@ impl Daemon {
         }
 
         // Stop first: no write of the old generation can land after the snapshot.
-        let old = {
-            let mut inner = self.inner();
-            inner.restart_at = None;
-            inner.app.take()
-        };
+        let old = self.inner().take_running();
         let had_app = old.is_some();
         if let Some(app) = old {
             self.say(out, id, format!("stopping {}", app.generation));
@@ -1675,7 +1701,7 @@ impl Daemon {
             if let (true, Some(previous)) = (had_app, &previous)
                 && let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh)
             {
-                inner.app_failed = true;
+                inner.live = Live::Failed;
                 daemon.event(EventKind::Failed, Some(previous), e.message);
             }
         };
@@ -1800,7 +1826,7 @@ impl Daemon {
         }
         // Only a generation that runs can vouch for itself. One whose process just exited is about to be rolled back
         // by the supervisor; making it permanent would keep crashed code.
-        match inner.app.as_mut() {
+        match inner.running_mut() {
             Some(app) if app.generation == pending.generation => {
                 if let Ok(Some(status)) = app.child.try_wait() {
                     return Err(invalid_state(format!(
@@ -1870,8 +1896,7 @@ impl Daemon {
                 ));
             };
             let (id, reason) = (pending.generation.clone(), reason.clone());
-            inner.restart_at = None;
-            (id, reason, inner.app.take())
+            (id, reason, inner.take_running())
         };
         self.say(out, &id, format!("rolling back {id}: {reason}"));
         if let Some(app) = app {
@@ -1886,7 +1911,7 @@ impl Daemon {
             // in state.json, so `rollback` or the next daemon start retries the restore (the code is not retried:
             // the generation is rolled_back for good).
             inner.state.fail_restore();
-            inner.app_failed = true;
+            inner.live = Live::Failed;
             self.save(&inner);
             self.event(
                 EventKind::RolledBack,
@@ -1906,7 +1931,7 @@ impl Daemon {
         next.txn = None;
         if let Err(e) = self.persist(&next) {
             inner.state.fail_restore();
-            inner.app_failed = true;
+            inner.live = Live::Failed;
             self.event(
                 EventKind::RolledBack,
                 Some(&id),
@@ -1932,7 +1957,7 @@ impl Daemon {
         if let Some(permanent) = &permanent
             && let Err(e) = self.start_live(&mut inner, permanent, Why::Fresh)
         {
-            inner.app_failed = true;
+            inner.live = Live::Failed;
             self.event(EventKind::Failed, Some(permanent), e.message);
         }
         Ok(RollbackResult {
