@@ -10,14 +10,14 @@
 
 use crate::manifest::{Manifest, Vars};
 use crate::process;
-use crate::protocol::{self, Error, Out, R, Request, err};
-use crate::state::{
-    self, Event, EventLog, GenState, Generation, LastExit, Paths, Pending, State, TestInfo, now,
-    now_secs, parse_time,
+use crate::protocol::{
+    Error, ErrorCode, Event, EventKind, Events, GenState, Generation, History, LastExit, Line, Out,
+    Pending, Process, ProcessState, PruneResult, R, Reply, Request, RollbackResult, Status,
+    SwitchResult, TestInfo, err,
 };
+use crate::state::{self, EventLog, Paths, State, now, now_secs, parse_time};
 use crate::storage;
 use rustix::fs::{FlockOperation, Mode, flock};
-use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::fs::{File, OpenOptions};
 use std::net::TcpListener;
@@ -188,12 +188,12 @@ fn restore_failed(id: &str) -> Error {
 }
 
 fn invalid_state(message: impl Into<String>) -> Error {
-    err("invalid_state", message)
+    err(ErrorCode::InvalidState, message)
 }
 
 fn not_found(id: &str) -> Error {
     err(
-        "not_found",
+        ErrorCode::NotFound,
         format!("there is no generation {id}; `fawkes history` lists them"),
     )
 }
@@ -227,12 +227,6 @@ fn refusal(g: &Generation, action: &str) -> Error {
         }
         _ => format!("{id} is {state}, not pending; there is nothing to confirm"),
     })
-}
-
-fn arg<'a>(args: &'a Value, key: &str) -> R<&'a str> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| err("usage", format!("missing argument `{key}`")))
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -309,7 +303,7 @@ impl Daemon {
             step_pgids: Mutex::new(Vec::new()),
         });
         daemon.event(
-            "daemon",
+            EventKind::Daemon,
             None,
             format!(
                 "started, pid {}, socket {}",
@@ -318,7 +312,7 @@ impl Daemon {
             ),
         );
         if let Some(warning) = recovered {
-            daemon.event("error", None, warning);
+            daemon.event(EventKind::Error, None, warning);
         }
 
         // A crashed daemon leaves its app running. The state lock proves that daemon is gone, so the app it started
@@ -326,7 +320,7 @@ impl Daemon {
         if let Some(pid) = process::leftover(&daemon.paths.app_pid()) {
             process::stop_group(pid, daemon.manifest().stop_timeout, None);
             daemon.event(
-                "daemon",
+                EventKind::Daemon,
                 None,
                 format!("stopped the app (pid {pid}) left by an earlier daemon"),
             );
@@ -339,7 +333,7 @@ impl Daemon {
                 .begin("rollback", Slot::Both)
                 .map_err(|e| e.message)?;
             if let Err(e) = daemon.rollback_pending(&mut Out::none(), "daemon_restart") {
-                daemon.event("error", None, e.message);
+                daemon.event(EventKind::Error, None, e.message);
             }
         } else {
             daemon.start_permanent();
@@ -373,7 +367,7 @@ impl Daemon {
                     sleep(Duration::from_millis(20))
                 }
                 Err(e) => {
-                    daemon.event("error", None, format!("accept failed: {e}"));
+                    daemon.event(EventKind::Error, None, format!("accept failed: {e}"));
                 }
             }
         }
@@ -387,7 +381,7 @@ impl Daemon {
             && let Err(e) = self.start_live(&mut inner, &id, Why::Fresh)
         {
             inner.app_failed = true;
-            self.event("failed", Some(&id), e.message);
+            self.event(EventKind::Failed, Some(&id), e.message);
         }
     }
 
@@ -400,7 +394,11 @@ impl Daemon {
         let new = match Manifest::load(&self.manifest_path) {
             Ok(new) => new,
             Err(e) => {
-                self.event("error", None, format!("manifest not reloaded: {e}"));
+                self.event(
+                    EventKind::Error,
+                    None,
+                    format!("manifest not reloaded: {e}"),
+                );
                 return;
             }
         };
@@ -408,18 +406,26 @@ impl Daemon {
         let inner = self.inner();
         match self.manifest().reload(&new, inner.app.is_some()) {
             Ok(changed) if changed.is_empty() => {
-                self.event("daemon", None, "manifest reloaded, nothing changed");
+                self.event(
+                    EventKind::Daemon,
+                    None,
+                    "manifest reloaded, nothing changed",
+                );
             }
             Ok(changed) => {
                 *lock(&self.manifest) = Arc::new(new);
                 self.event(
-                    "daemon",
+                    EventKind::Daemon,
                     None,
                     format!("manifest reloaded, changed: {}", changed.join(", ")),
                 );
             }
             Err(e) => {
-                self.event("error", None, format!("manifest not reloaded: {e}"));
+                self.event(
+                    EventKind::Error,
+                    None,
+                    format!("manifest not reloaded: {e}"),
+                );
             }
         }
     }
@@ -444,7 +450,7 @@ impl Daemon {
         inner.state.daemon_pid = None;
         self.save(&inner);
         drop(inner);
-        self.event("daemon", None, "stopped");
+        self.event(EventKind::Daemon, None, "stopped");
     }
 }
 
@@ -510,7 +516,7 @@ fn log_panics(events: PathBuf) {
             &events,
             &Event {
                 at: now(),
-                kind: "error".into(),
+                kind: EventKind::Error,
                 generation: None,
                 message: format!("panic: {info}; the daemon aborts, and its next start recovers"),
             },
@@ -567,7 +573,11 @@ impl Daemon {
     /// Save bookkeeping (the live pid, counters, a test result): a failure is reported and a later save repeats it.
     fn save(&self, inner: &Inner) {
         if let Err(e) = inner.state.save(&self.paths.state_json()) {
-            self.event("error", None, format!("cannot write state.json: {e}"));
+            self.event(
+                EventKind::Error,
+                None,
+                format!("cannot write state.json: {e}"),
+            );
         }
     }
 
@@ -575,9 +585,13 @@ impl Daemon {
     /// when this fails: a daemon restart acts on what is on disk, not on what was meant.
     fn persist(&self, state: &State) -> R<()> {
         state.save(&self.paths.state_json()).map_err(|e| {
-            self.event("error", None, format!("cannot write state.json: {e}"));
+            self.event(
+                EventKind::Error,
+                None,
+                format!("cannot write state.json: {e}"),
+            );
             err(
-                "internal",
+                ErrorCode::Internal,
                 format!("cannot write {}: {e}", self.paths.state_json().display()),
             )
         })
@@ -587,7 +601,7 @@ impl Daemon {
     fn deadline_secs(&self, pending: &Pending) -> u64 {
         parse_time(&pending.deadline).unwrap_or_else(|| {
             self.event(
-                "error",
+                EventKind::Error,
                 Some(&pending.generation),
                 format!(
                     "the confirm deadline `{}` in state.json is unreadable; it counts as passed",
@@ -603,23 +617,28 @@ impl Daemon {
     }
 
     /// Record an event: stderr, events.jsonl, every subscriber. Anything but progress also changes the picture.
-    fn event(&self, kind: &str, generation: Option<&str>, message: impl Into<String>) -> Event {
+    fn event(
+        &self,
+        kind: EventKind,
+        generation: Option<&str>,
+        message: impl Into<String>,
+    ) -> Event {
         let event = Event {
             at: now(),
-            kind: kind.into(),
+            kind,
             generation: generation.map(String::from),
             message: message.into(),
         };
         eprintln!(
             "{} {} {} {}",
             event.at,
-            event.kind,
+            event.kind.as_str(),
             event.generation.as_deref().unwrap_or("-"),
             event.message
         );
         lock(&self.log).append(&event);
         self.broadcast(Msg::Event(event.clone()));
-        if kind != "progress" {
+        if kind != EventKind::Progress {
             self.broadcast(Msg::Changed);
         }
         event
@@ -627,7 +646,7 @@ impl Daemon {
 
     /// A progress line: logged, and sent to the client waiting for this step.
     fn say(&self, out: &mut Out, generation: &str, message: impl Into<String>) {
-        let event = self.event("progress", Some(generation), message);
+        let event = self.event(EventKind::Progress, Some(generation), message);
         out.event(&event);
     }
 
@@ -642,7 +661,7 @@ impl Daemon {
         });
         if let Some(other) = taken {
             return Err(err(
-                "busy",
+                ErrorCode::Busy,
                 format!("{other} is in progress; try again when it has finished"),
             ));
         }
@@ -691,7 +710,7 @@ impl Daemon {
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
     fn start_live(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) -> R<()> {
         if self.shutting_down() {
-            return Err(err("start_failed", "the daemon is shutting down"));
+            return Err(err(ErrorCode::StartFailed, "the daemon is shutting down"));
         }
         let m = self.manifest();
         let g = inner.state.find(id).cloned().ok_or_else(|| not_found(id))?;
@@ -706,7 +725,7 @@ impl Daemon {
             &format!("start {id} live port {}", m.port),
             Some(&self.paths.app_pid()),
         )
-        .map_err(|e| err("start_failed", format!("cannot start {id}: {e}")))?;
+        .map_err(|e| err(ErrorCode::StartFailed, format!("cannot start {id}: {e}")))?;
         let pid = child.id();
 
         if why == Why::Fresh {
@@ -732,7 +751,11 @@ impl Daemon {
         inner.restart_at = None;
         self.save(inner);
         self.point_current_link(&g.dir);
-        self.event("started", Some(id), format!("pid {pid} on port {}", m.port));
+        self.event(
+            EventKind::Started,
+            Some(id),
+            format!("pid {pid} on port {}", m.port),
+        );
 
         // Health never confirms: only `confirm` makes a generation permanent. With `rollback_on_unhealthy` a pending
         // generation that gives up is rolled back by the supervisor without waiting for its deadline.
@@ -749,9 +772,9 @@ impl Daemon {
                 || daemon.is_running(pid),
             );
             match result {
-                Ok(()) => daemon.event("healthy", Some(&id), "health check passed"),
+                Ok(()) => daemon.event(EventKind::Healthy, Some(&id), "health check passed"),
                 Err(e) if daemon.is_running(pid) => {
-                    let event = daemon.event("unhealthy", Some(&id), e);
+                    let event = daemon.event(EventKind::Unhealthy, Some(&id), e);
                     if m.rollback_on_unhealthy {
                         daemon.roll_back_unhealthy(&id, pid);
                     }
@@ -799,10 +822,10 @@ impl Daemon {
         let _ = std::fs::remove_file(self.paths.app_pid());
     }
 
-    fn process_value(&self, inner: &Inner) -> Value {
+    fn process(&self, inner: &Inner) -> Process {
         let (state, generation, pid, started_at, uptime) = match &inner.app {
             Some(app) => (
-                "running",
+                ProcessState::Running,
                 Some(app.generation.clone()),
                 Some(app.child.id()),
                 Some(app.started_at.clone()),
@@ -810,9 +833,9 @@ impl Daemon {
             ),
             None => (
                 if inner.app_failed {
-                    "failed"
+                    ProcessState::Failed
                 } else {
-                    "stopped"
+                    ProcessState::Stopped
                 },
                 inner.state.current().map(String::from),
                 None,
@@ -820,27 +843,35 @@ impl Daemon {
                 None,
             ),
         };
-        json!({
-            "state": state, "generation": generation, "pid": pid, "port": self.manifest().port,
-            "started_at": started_at, "uptime": uptime, "restarts": inner.restarts, "last_exit": inner.last_exit,
-        })
+        Process {
+            state,
+            generation,
+            pid,
+            port: self.manifest().port,
+            started_at,
+            uptime,
+            restarts: inner.restarts,
+            last_exit: inner.last_exit.clone(),
+        }
     }
 
-    fn status(&self) -> Value {
+    fn status(&self) -> Status {
         let inner = self.inner();
-        json!({
-            "name": self.manifest().name,
-            "daemon_pid": std::process::id(),
-            "permanent": inner.state.permanent,
-            "current": inner.state.current(),
-            "pending": inner.state.pending,
-            "busy": inner.busy.as_ref().or(inner.moving.as_ref()),
-            "process": self.process_value(&inner),
-        })
+        Status {
+            name: self.manifest().name.clone(),
+            daemon_pid: std::process::id(),
+            permanent: inner.state.permanent.clone(),
+            current: inner.state.current().map(String::from),
+            pending: inner.state.pending.clone(),
+            busy: inner.busy.clone().or_else(|| inner.moving.clone()),
+            process: self.process(&inner),
+        }
     }
 
-    fn history(&self) -> Value {
-        json!({ "generations": self.inner().state.generations })
+    fn history(&self) -> History {
+        History {
+            generations: self.inner().state.generations.clone(),
+        }
     }
 }
 
@@ -851,7 +882,11 @@ impl Daemon {
         // Blocking, with timeouts: on macOS an accepted socket inherits the listener's non-blocking mode, which would
         // fail a request that arrives in pieces and every write that finds the socket buffer full.
         if let Err(e) = stream.set_nonblocking(false) {
-            self.event("error", None, format!("cannot serve a client: {e}"));
+            self.event(
+                EventKind::Error,
+                None,
+                format!("cannot serve a client: {e}"),
+            );
             return;
         }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -864,56 +899,57 @@ impl Daemon {
         let mut out = Out::new(stream);
         let result = match read {
             Ok(n) if n as u64 >= MAX_REQUEST && !line.ends_with('\n') => Err(err(
-                "usage",
+                ErrorCode::Usage,
                 format!("the request is longer than {MAX_REQUEST} bytes"),
             )),
-            Ok(n) if n > 0 => match serde_json::from_str::<Request>(&line) {
-                Ok(request) => self.dispatch(&mut out, request),
-                Err(e) => Err(err("usage", format!("malformed request: {e}"))),
-            },
-            _ => Err(err("usage", "no request received")),
+            Ok(n) if n > 0 => {
+                Request::parse(&line).and_then(|request| self.dispatch(&mut out, request))
+            }
+            _ => Err(err(ErrorCode::Usage, "no request received")),
         };
         out.finish(result);
     }
 
-    fn dispatch(self: &Arc<Self>, out: &mut Out, request: Request) -> R<Value> {
-        let args = &request.args;
-        match request.command.as_str() {
-            "start" => self.start_command(),
-            "stop" => self.stop_command(out),
-            "restart" => self.restart_command(out),
-            "stage" => self.stage(out, arg(args, "ref")?),
-            "test" => self.test(out, arg(args, "generation")?),
-            "switch" => self.switch(out, arg(args, "generation")?, protocol::deadline_arg(args)?),
-            "confirm" => {
-                let record = self.confirm(args.get("generation").and_then(Value::as_str))?;
+    fn dispatch(self: &Arc<Self>, out: &mut Out, request: Request) -> R<Reply> {
+        match request {
+            Request::Start => self.start_command().map(Reply::from),
+            Request::Stop => self.stop_command(out).map(Reply::from),
+            Request::Restart => self.restart_command(out).map(Reply::from),
+            Request::Stage { git_ref } => self.stage(out, &git_ref).map(Reply::from),
+            Request::Test { generation } => self.test(out, &generation).map(Reply::from),
+            Request::Switch {
+                generation,
+                deadline,
+            } => self.switch(out, &generation, deadline).map(Reply::from),
+            Request::Confirm { generation } => {
+                let record = self.confirm(generation.as_deref())?;
                 self.prune_soon();
-                Ok(record)
+                Ok(record.into())
             }
-            "prune" => self.prune(out),
-            "rollback" => {
+            Request::Prune => self.prune(out).map(Reply::from),
+            Request::Rollback => {
                 let _busy = self.begin("rollback", Slot::Both)?;
                 self.rollback_pending(out, "rollback requested")
+                    .map(Reply::from)
             }
-            "status" => Ok(self.status()),
-            "history" => Ok(self.history()),
-            "log" => {
-                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
-                if args.get("follow").and_then(Value::as_bool) == Some(true) {
+            Request::Status => Ok(self.status().into()),
+            Request::History => Ok(self.history().into()),
+            Request::Log { limit, follow } => {
+                let limit = limit.map_or(20, |n| usize::try_from(n).unwrap_or(usize::MAX));
+                if follow {
                     self.stream(out, Some(limit), false);
-                    return Ok(Value::Null);
+                    return Ok(Reply::Streamed);
                 }
-                Ok(json!({ "events": lock(&self.log).tail(limit) }))
+                Ok(Events {
+                    events: lock(&self.log).tail(limit),
+                }
+                .into())
             }
-            "subscribe" => {
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .map(|n| n as usize);
+            Request::Subscribe { limit } => {
+                let limit = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                 self.stream(out, limit, true);
-                Ok(Value::Null)
+                Ok(Reply::Streamed)
             }
-            other => Err(err("usage", format!("unknown command `{other}`"))),
         }
     }
 
@@ -947,8 +983,11 @@ impl Daemon {
     }
 
     fn send_snapshot(&self, out: &mut Out) -> bool {
-        out.line(&json!({ "status": self.status() }))
-            && out.line(&json!({ "history": self.history() }))
+        out.line(&Line::<Reply>::Status {
+            status: Box::new(self.status()),
+        }) && out.line(&Line::<Reply>::History {
+            history: self.history(),
+        })
     }
 }
 
@@ -980,7 +1019,7 @@ impl Daemon {
         }
         if let Some(reason) = rollback {
             if let Err(e) = self.rollback_pending(&mut Out::none(), &reason) {
-                self.event("error", None, e.message);
+                self.event(EventKind::Error, None, e.message);
             }
             return;
         }
@@ -990,7 +1029,7 @@ impl Daemon {
             && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
         {
             inner.app_failed = true;
-            self.event("failed", Some(&id), e.message);
+            self.event(EventKind::Failed, Some(&id), e.message);
         }
     }
 
@@ -1039,7 +1078,7 @@ impl Daemon {
                 .and_then(|file| file.set_len(0));
             if let Err(e) = capped {
                 self.event(
-                    "error",
+                    EventKind::Error,
                     Some(&id),
                     format!("cannot cap {}: {e}", log.display()),
                 );
@@ -1110,10 +1149,10 @@ impl Daemon {
             message += &format!("; restarting in {backoff}s");
         }
         inner.last_exit = Some(exit);
-        self.event("exited", Some(&app.generation), message);
+        self.event(EventKind::Exited, Some(&app.generation), message);
         if gave_up {
             self.event(
-                "failed",
+                EventKind::Failed,
                 Some(&app.generation),
                 format!("{failed_starts} failed starts in a row; not restarting"),
             );
@@ -1134,7 +1173,7 @@ impl Daemon {
         }
         if let (Some(pending), Some(reason)) = (&inner.state.pending, &inner.rollback) {
             return Err(err(
-                "busy",
+                ErrorCode::Busy,
                 format!(
                     "{} is being rolled back ({reason}); try again when the rollback has finished",
                     pending.generation
@@ -1148,7 +1187,7 @@ impl Daemon {
         })
     }
 
-    fn start_command(self: &Arc<Self>) -> R<Value> {
+    fn start_command(self: &Arc<Self>) -> R<Process> {
         let _busy = self.begin("start", Slot::Live)?;
         let mut inner = self.inner();
         let id = self.current_generation(&inner)?;
@@ -1159,10 +1198,10 @@ impl Daemon {
             )));
         }
         self.start_live(&mut inner, &id, Why::Fresh)?;
-        Ok(self.process_value(&inner))
+        Ok(self.process(&inner))
     }
 
-    fn stop_command(self: &Arc<Self>, out: &mut Out) -> R<Value> {
+    fn stop_command(self: &Arc<Self>, out: &mut Out) -> R<Process> {
         let _busy = self.begin("stop", Slot::Live)?;
         let app = {
             let mut inner = self.inner();
@@ -1175,11 +1214,11 @@ impl Daemon {
         self.say(out, &app.generation, format!("stopping {}", app.generation));
         let id = app.generation.clone();
         self.stop_app(app);
-        self.event("stopped", Some(&id), "stopped on request");
-        Ok(self.process_value(&self.inner()))
+        self.event(EventKind::Stopped, Some(&id), "stopped on request");
+        Ok(self.process(&self.inner()))
     }
 
-    fn restart_command(self: &Arc<Self>, out: &mut Out) -> R<Value> {
+    fn restart_command(self: &Arc<Self>, out: &mut Out) -> R<Process> {
         let _busy = self.begin("restart", Slot::Live)?;
         let (id, app) = {
             let mut inner = self.inner();
@@ -1192,14 +1231,14 @@ impl Daemon {
         }
         let mut inner = self.inner();
         self.start_live(&mut inner, &id, Why::Restart)?;
-        Ok(self.process_value(&inner))
+        Ok(self.process(&inner))
     }
 }
 
 // -------------------------------------------------------- transactions
 
 impl Daemon {
-    fn stage(self: &Arc<Self>, out: &mut Out, git_ref: &str) -> R<Value> {
+    fn stage(self: &Arc<Self>, out: &mut Out, git_ref: &str) -> R<Generation> {
         let _busy = self.begin("stage", Slot::Step)?;
         let m = self.manifest();
         let commit = git(
@@ -1215,7 +1254,7 @@ impl Daemon {
         )
         .map_err(|e| {
             err(
-                "git_failed",
+                ErrorCode::GitFailed,
                 format!(
                     "`{git_ref}` is not a commit, branch or tag in {}{}",
                     m.repo.display(),
@@ -1260,7 +1299,7 @@ impl Daemon {
             let _ = std::fs::rename(self.paths.install_log(&id), self.paths.failed_install_log());
             let removed = self.remove_generation(&m, &id);
             self.event(
-                "error",
+                EventKind::Error,
                 Some(&id),
                 format!(
                     "stage of {git_ref} failed: {}{}",
@@ -1274,9 +1313,13 @@ impl Daemon {
         let g = inner.state.find_mut(&id).ok_or_else(|| not_found(&id))?;
         g.state = GenState::Staged;
         g.staged_at = now();
-        let record = json!(g);
+        let record = g.clone();
         self.save(&inner);
-        self.event("staged", Some(&id), format!("{git_ref} staged as {id}"));
+        self.event(
+            EventKind::Staged,
+            Some(&id),
+            format!("{git_ref} staged as {id}"),
+        );
         Ok(record)
     }
 
@@ -1304,7 +1347,7 @@ impl Daemon {
         let code_arg = code.to_string_lossy().into_owned();
         git(&m.repo, &["worktree", "add", "--detach", &code_arg, commit]).map_err(|e| {
             err(
-                "git_failed",
+                ErrorCode::GitFailed,
                 format!("cannot create the worktree for {id}: {e}"),
             )
         })?;
@@ -1343,7 +1386,7 @@ impl Daemon {
         self.run_install(m, &command, &code, &self.paths.install_log(id))
             .map_err(|e| {
                 err(
-                    "install_failed",
+                    ErrorCode::InstallFailed,
                     format!(
                         "install for {id} failed ({e}); see {}",
                         self.paths.failed_install_log().display()
@@ -1420,7 +1463,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn test(self: &Arc<Self>, out: &mut Out, id: &str) -> R<Value> {
+    fn test(self: &Arc<Self>, out: &mut Out, id: &str) -> R<Generation> {
         let _busy = self.begin(&format!("test {id}"), Slot::Step)?;
         let m = self.manifest();
         let g = {
@@ -1438,7 +1481,7 @@ impl Daemon {
             .find(|&p| p != m.port && port_free(p))
             .ok_or_else(|| {
                 err(
-                    "start_failed",
+                    ErrorCode::StartFailed,
                     format!(
                         "no free spare port in {}..{}",
                         m.spare_ports[0], m.spare_ports[1]
@@ -1448,7 +1491,8 @@ impl Daemon {
         let test_home = self.paths.test_home(id);
         let _ = std::fs::remove_dir_all(&test_home);
         std::fs::create_dir_all(&test_home)?;
-        storage::copy(&m.home, &m.storage, &test_home).map_err(|e| err("storage_failed", e))?;
+        storage::copy(&m.home, &m.storage, &test_home)
+            .map_err(|e| err(ErrorCode::StorageFailed, e))?;
 
         self.say(
             out,
@@ -1469,7 +1513,7 @@ impl Daemon {
         )
         .map_err(|e| {
             err(
-                "start_failed",
+                ErrorCode::StartFailed,
                 format!("cannot start {id} for its test: {e}"),
             )
         })?;
@@ -1494,8 +1538,8 @@ impl Daemon {
             let message = format!(
                 "spare port {port} was taken by another process during the test of {id}; {id} is unchanged, run `fawkes test {id}` again"
             );
-            self.event("error", Some(id), &message);
-            return Err(err("port_in_use", message));
+            self.event(EventKind::Error, Some(id), &message);
+            return Err(err(ErrorCode::PortInUse, message));
         }
 
         let passed = result.is_ok();
@@ -1519,21 +1563,21 @@ impl Daemon {
             GenState::TestFailed
         };
         g.test = Some(info.clone());
-        let record = json!(g);
+        let record = g.clone();
         self.save(&inner);
         match result {
             Ok(()) => {
                 self.event(
-                    "tested",
+                    EventKind::Tested,
                     Some(id),
                     format!("test passed on port {port} in {}s", info.seconds),
                 );
                 Ok(record)
             }
             Err(e) => {
-                self.event("test_failed", Some(id), &e);
+                self.event(EventKind::TestFailed, Some(id), &e);
                 Err(err(
-                    "health_failed",
+                    ErrorCode::HealthFailed,
                     format!(
                         "{id} failed its test: {e}; see {}; fix the ref and stage it again, or `fawkes test {id}` to retry",
                         log.display()
@@ -1543,7 +1587,7 @@ impl Daemon {
         }
     }
 
-    fn switch(self: &Arc<Self>, out: &mut Out, id: &str, deadline: Option<u64>) -> R<Value> {
+    fn switch(self: &Arc<Self>, out: &mut Out, id: &str, deadline: Option<u64>) -> R<SwitchResult> {
         let _busy = self.begin(&format!("switch {id}"), Slot::Both)?;
         let m = self.manifest();
         let previous = {
@@ -1580,7 +1624,7 @@ impl Daemon {
                 let mut inner = daemon.inner();
                 if let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh) {
                     inner.app_failed = true;
-                    daemon.event("failed", Some(previous), e.message);
+                    daemon.event(EventKind::Failed, Some(previous), e.message);
                 }
             }
         };
@@ -1589,7 +1633,7 @@ impl Daemon {
         if let Err(e) = storage::snapshot(&m.home, &m.storage, &self.paths.snapshot(id)) {
             resume(self);
             return Err(err(
-                "storage_failed",
+                ErrorCode::StorageFailed,
                 format!("{e}; {id} stays tested and nothing changed"),
             ));
         }
@@ -1643,17 +1687,21 @@ impl Daemon {
         }
         drop(inner);
         self.event(
-            "switched",
+            EventKind::Switched,
             Some(id),
             format!(
                 "switched from {}; confirm before {deadline}",
                 previous.as_deref().unwrap_or("nothing")
             ),
         );
-        Ok(json!({ "generation": id, "previous": previous, "deadline": deadline }))
+        Ok(SwitchResult {
+            generation: id.into(),
+            previous,
+            deadline,
+        })
     }
 
-    fn confirm(&self, id: Option<&str>) -> R<Value> {
+    fn confirm(&self, id: Option<&str>) -> R<Generation> {
         let mut inner = self.inner();
         if let Some(pending) = &inner.state.pending
             && inner.state.restore_failed(pending)
@@ -1728,7 +1776,7 @@ impl Daemon {
             .ok_or_else(|| not_found(&pending.generation))?;
         g.state = GenState::Permanent;
         g.confirmed_at = Some(now());
-        let record = json!(g);
+        let record = g.clone();
         next.permanent = Some(pending.generation.clone());
         next.pending = None;
         self.persist(&next).map_err(|e| {
@@ -1742,7 +1790,7 @@ impl Daemon {
         })?;
         inner.state = next;
         self.event(
-            "confirmed",
+            EventKind::Confirmed,
             Some(&pending.generation),
             format!("{} is permanent", pending.generation),
         );
@@ -1750,7 +1798,7 @@ impl Daemon {
     }
 
     /// Roll the pending generation back (the caller holds the rollback slots).
-    fn rollback_pending(self: &Arc<Self>, out: &mut Out, reason: &str) -> R<Value> {
+    fn rollback_pending(self: &Arc<Self>, out: &mut Out, reason: &str) -> R<RollbackResult> {
         let m = self.manifest();
         let (pending, app) = {
             let mut inner = self.inner();
@@ -1786,12 +1834,12 @@ impl Daemon {
             inner.app_failed = true;
             self.save(&inner);
             self.event(
-                "rolled_back",
+                EventKind::RolledBack,
                 Some(&id),
                 format!("{reason}; storage restore failed"),
             );
             return Err(err(
-                "storage_failed",
+                ErrorCode::StorageFailed,
                 format!(
                     "{id} was rolled back but its storage could not be restored: {e}; the app stays stopped"
                 ),
@@ -1804,7 +1852,7 @@ impl Daemon {
         if let Err(e) = self.persist(&next) {
             inner.app_failed = true;
             self.event(
-                "rolled_back",
+                EventKind::RolledBack,
                 Some(&id),
                 format!("{reason}; state.json could not be written"),
             );
@@ -1818,7 +1866,7 @@ impl Daemon {
         }
         inner.state = next;
         self.event(
-            "rolled_back",
+            EventKind::RolledBack,
             Some(&id),
             format!(
                 "{reason}; back to {}",
@@ -1829,9 +1877,13 @@ impl Daemon {
             && let Err(e) = self.start_live(&mut inner, permanent, Why::Fresh)
         {
             inner.app_failed = true;
-            self.event("failed", Some(permanent), e.message);
+            self.event(EventKind::Failed, Some(permanent), e.message);
         }
-        Ok(json!({ "from": id, "to": permanent, "reason": reason }))
+        Ok(RollbackResult {
+            from: id,
+            to: permanent,
+            reason: reason.into(),
+        })
     }
 }
 
@@ -1840,7 +1892,7 @@ impl Daemon {
 impl Daemon {
     /// Remove the oldest generations so that the manifest's `keep` remain (`State::prunable` says which). It takes
     /// the step slot, so no stage, test or switch uses a generation while it goes.
-    fn prune(&self, out: &mut Out) -> R<Value> {
+    fn prune(&self, out: &mut Out) -> R<PruneResult> {
         let _busy = self.begin("prune", Slot::Step)?;
         let m = self.manifest();
         let keep = m.keep.ok_or_else(|| {
@@ -1856,9 +1908,9 @@ impl Daemon {
         for id in doomed {
             self.say(out, &id, format!("removing {id}"));
             if let Err(e) = self.remove_generation(&m, &id) {
-                self.event("error", Some(&id), format!("prune: {e}"));
+                self.event(EventKind::Error, Some(&id), format!("prune: {e}"));
                 return Err(err(
-                    "internal",
+                    ErrorCode::Internal,
                     format!(
                         "{e}; removed before it: {}; `fawkes prune` tries again",
                         if removed.is_empty() {
@@ -1873,7 +1925,7 @@ impl Daemon {
         }
         if !removed.is_empty() {
             self.event(
-                "pruned",
+                EventKind::Pruned,
                 None,
                 format!("removed {} (keep = {keep})", removed.join(", ")),
             );
@@ -1885,7 +1937,7 @@ impl Daemon {
             .iter()
             .map(|g| g.id.clone())
             .collect();
-        Ok(json!({ "removed": removed, "kept": kept }))
+        Ok(PruneResult { removed, kept })
     }
 
     /// After a confirm, prune in the background once no stage or test holds the step slot; the confirm itself never
@@ -1898,7 +1950,7 @@ impl Daemon {
         thread::spawn(move || {
             while !daemon.shutting_down() {
                 match daemon.prune(&mut Out::none()) {
-                    Err(e) if e.code == "busy" => sleep(Duration::from_secs(1)),
+                    Err(e) if e.code == ErrorCode::Busy => sleep(Duration::from_secs(1)),
                     // Reported as an event already, and the next confirm or `fawkes prune` tries again.
                     _ => return,
                 }
@@ -1923,11 +1975,15 @@ impl Daemon {
         for id in staging {
             match self.remove_generation(&m, &id) {
                 Ok(()) => self.event(
-                    "daemon",
+                    EventKind::Daemon,
                     Some(&id),
                     format!("removed {id}, whose stage the end of the last daemon cut short"),
                 ),
-                Err(e) => self.event("error", Some(&id), format!("cannot remove {id}: {e}")),
+                Err(e) => self.event(
+                    EventKind::Error,
+                    Some(&id),
+                    format!("cannot remove {id}: {e}"),
+                ),
             };
         }
         let dirs = std::fs::read_dir(self.paths.root.join("generations"))
@@ -1938,12 +1994,12 @@ impl Daemon {
             if self.inner().state.find(&name).is_none() {
                 match std::fs::remove_dir_all(dir.path()) {
                     Ok(()) => self.event(
-                        "daemon",
+                        EventKind::Daemon,
                         None,
                         format!("removed {}, which no generation owns", dir.path().display()),
                     ),
                     Err(e) => self.event(
-                        "error",
+                        EventKind::Error,
                         None,
                         format!("cannot remove {}: {e}", dir.path().display()),
                     ),

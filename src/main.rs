@@ -9,7 +9,12 @@ mod storage;
 mod tui;
 
 use manifest::Manifest;
-use serde_json::{Value, json};
+use protocol::{
+    ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
+    Request, RollbackResult, Status, SwitchResult, err,
+};
+use serde::Deserialize;
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -34,28 +39,24 @@ const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
 
+/// What the command line asks for: one of the two local programs, or a request to a daemon.
+enum Command {
+    Daemon,
+    Tui,
+    Send(Request),
+}
+
 struct Cli {
     json: bool,
     manifest: Option<PathBuf>,
     socket: Option<PathBuf>,
-    command: String,
-    positional: Vec<String>,
-    count: Option<u64>,
-    follow: bool,
-    deadline: Option<u64>,
+    command: Command,
 }
 
 fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
-    let mut cli = Cli {
-        json: false,
-        manifest: None,
-        socket: None,
-        command: String::new(),
-        positional: Vec::new(),
-        count: None,
-        follow: false,
-        deadline: None,
-    };
+    let (mut json, mut manifest, mut socket) = (false, None, None);
+    let (mut count, mut follow, mut deadline) = (None, false, None);
+    let mut positional = Vec::new();
     let mut args = args.into_iter();
     let number = |flag: &str, value: Option<String>| -> Result<u64, String> {
         let value = value.ok_or(format!("{flag} needs a value"))?;
@@ -65,46 +66,79 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--json" => cli.json = true,
-            "--follow" => cli.follow = true,
-            "--manifest" => {
-                cli.manifest = Some(args.next().ok_or("--manifest needs a file")?.into())
-            }
-            "--socket" => cli.socket = Some(args.next().ok_or("--socket needs a path")?.into()),
-            "--deadline" => cli.deadline = Some(number("--deadline", args.next())?),
-            "-n" => cli.count = Some(number("-n", args.next())?),
+            "--json" => json = true,
+            "--follow" => follow = true,
+            "--manifest" => manifest = Some(args.next().ok_or("--manifest needs a file")?.into()),
+            "--socket" => socket = Some(args.next().ok_or("--socket needs a path")?.into()),
+            "--deadline" => deadline = Some(number("--deadline", args.next())?),
+            "-n" => count = Some(number("-n", args.next())?),
             flag if flag.starts_with('-') => return Err(format!("unknown option `{flag}`")),
-            _ => cli.positional.push(arg),
+            _ => positional.push(arg),
         }
     }
-    if cli.positional.is_empty() {
+    if positional.is_empty() {
         return Err("missing command".into());
     }
-    cli.command = cli.positional.remove(0);
+    let name = positional.remove(0);
     let wants = |n: std::ops::RangeInclusive<usize>| {
-        if n.contains(&cli.positional.len()) {
+        if n.contains(&positional.len()) {
             Ok(())
         } else {
-            Err(format!(
-                "`{}` got the wrong number of arguments",
-                cli.command
-            ))
+            Err(format!("`{name}` got the wrong number of arguments"))
         }
     };
-    match cli.command.as_str() {
-        "daemon" | "start" | "stop" | "restart" | "rollback" | "prune" | "status" | "history"
-        | "log" | "tui" => wants(0..=0)?,
-        "stage" | "test" | "switch" => wants(1..=1)?,
-        "confirm" => wants(0..=1)?,
-        other => return Err(format!("unknown command `{other}`")),
-    }
-    if cli.deadline.is_some() && cli.command != "switch" {
+    // `positional[0]` is read only once `wants` has seen exactly one.
+    let command = match name.as_str() {
+        "daemon" => wants(0..=0).map(|()| Command::Daemon),
+        "tui" => wants(0..=0).map(|()| Command::Tui),
+        "start" => wants(0..=0).map(|()| Command::Send(Request::Start)),
+        "stop" => wants(0..=0).map(|()| Command::Send(Request::Stop)),
+        "restart" => wants(0..=0).map(|()| Command::Send(Request::Restart)),
+        "rollback" => wants(0..=0).map(|()| Command::Send(Request::Rollback)),
+        "prune" => wants(0..=0).map(|()| Command::Send(Request::Prune)),
+        "status" => wants(0..=0).map(|()| Command::Send(Request::Status)),
+        "history" => wants(0..=0).map(|()| Command::Send(Request::History)),
+        "log" => wants(0..=0).map(|()| {
+            Command::Send(Request::Log {
+                limit: count,
+                follow,
+            })
+        }),
+        "stage" => wants(1..=1).map(|()| {
+            Command::Send(Request::Stage {
+                git_ref: positional[0].clone(),
+            })
+        }),
+        "test" => wants(1..=1).map(|()| {
+            Command::Send(Request::Test {
+                generation: positional[0].clone(),
+            })
+        }),
+        "switch" => wants(1..=1).map(|()| {
+            Command::Send(Request::Switch {
+                generation: positional[0].clone(),
+                deadline,
+            })
+        }),
+        "confirm" => wants(0..=1).map(|()| {
+            Command::Send(Request::Confirm {
+                generation: positional.first().cloned(),
+            })
+        }),
+        other => Err(format!("unknown command `{other}`")),
+    }?;
+    if deadline.is_some() && name != "switch" {
         return Err("--deadline belongs to `switch`".into());
     }
-    if (cli.count.is_some() || cli.follow) && cli.command != "log" {
+    if (count.is_some() || follow) && name != "log" {
         return Err("-n and --follow belong to `log`".into());
     }
-    Ok(cli)
+    Ok(Cli {
+        json,
+        manifest,
+        socket,
+        command,
+    })
 }
 
 fn main() -> ExitCode {
@@ -121,7 +155,7 @@ fn main() -> ExitCode {
         }
     };
     let manifest_path = cli.manifest.clone().unwrap_or_else(|| "fawkes.toml".into());
-    if cli.command == "daemon" {
+    if matches!(cli.command, Command::Daemon) {
         return match daemon::Daemon::run(manifest_path, cli.socket) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -130,7 +164,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    if cli.command == "tui"
+    if matches!(cli.command, Command::Tui)
         && cli.socket.is_none()
         && cli.manifest.is_none()
         && std::env::var_os("FAWKES_SOCKET").is_none()
@@ -151,10 +185,11 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    if cli.command == "tui" {
+    // `daemon` returned above, so what is left but a request is `tui`.
+    let Command::Send(request) = &cli.command else {
         return ExitCode::from(tui::run(tui::Target::One(socket)));
-    }
-    ExitCode::from(client(&cli, &socket, &manifest_path))
+    };
+    ExitCode::from(client(&cli, request, &socket, &manifest_path))
 }
 
 /// `--socket`, else `FAWKES_SOCKET`, else the manifest's `<state_dir>/fawkes.sock`.
@@ -170,21 +205,8 @@ fn socket_path(cli: &Cli, manifest_path: &Path) -> Result<PathBuf, String> {
     Ok(manifest.state_dir().join("fawkes.sock"))
 }
 
-fn request_for(cli: &Cli) -> Value {
-    let arg = |i: usize| cli.positional[i].clone();
-    let args = match cli.command.as_str() {
-        "stage" => json!({ "ref": arg(0) }),
-        "test" => json!({ "generation": arg(0) }),
-        "switch" => json!({ "generation": arg(0), "deadline": cli.deadline }),
-        "confirm" => json!({ "generation": cli.positional.first() }),
-        "log" => json!({ "limit": cli.count, "follow": cli.follow }),
-        _ => json!({}),
-    };
-    json!({ "command": cli.command, "args": args })
-}
-
 /// Send one request, show progress, render the answer. Returns the exit code.
-fn client(cli: &Cli, socket: &Path, manifest_path: &Path) -> u8 {
+fn client(cli: &Cli, request: &Request, socket: &Path, manifest_path: &Path) -> u8 {
     let Ok(mut stream) = UnixStream::connect(socket) else {
         let message = format!(
             "no daemon answers on {}; start one with `fawkes daemon --manifest {}`",
@@ -194,56 +216,61 @@ fn client(cli: &Cli, socket: &Path, manifest_path: &Path) -> u8 {
         if cli.json {
             println!(
                 "{}",
-                json!({ "code": "daemon_unreachable", "message": message })
+                serde_json::to_string(&err(ErrorCode::DaemonUnreachable, message))
+                    .unwrap_or_default()
             );
         } else {
             eprintln!("error: {message}");
         }
         return EXIT_UNREACHABLE;
     };
-    if writeln!(stream, "{}", request_for(cli)).is_err() {
+    let sent = serde_json::to_string(request).map_err(std::io::Error::from);
+    if sent.and_then(|line| writeln!(stream, "{line}")).is_err() {
         eprintln!(
             "error: the daemon on {} closed the connection",
             socket.display()
         );
         return EXIT_UNREACHABLE;
     }
-    let follow = cli.command == "log" && cli.follow;
+    let follow = matches!(request, Request::Log { follow: true, .. });
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+        // `--json` shows what the daemon sent, not what this client understood of it.
+        let Ok(raw) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if let Some(event) = message.get("event") {
-            match (follow, cli.json) {
-                (true, true) => println!("{event}"),
-                (true, false) => println!("{}", render_event(event)),
-                (false, true) => eprintln!("{event}"),
-                (false, false) => eprintln!("{}", render_progress(event)),
+        let Ok(message) = Line::<Value>::deserialize(&raw) else {
+            continue;
+        };
+        match message {
+            Line::Event { event } => match (follow, cli.json) {
+                (true, true) => println!("{}", raw["event"]),
+                (true, false) => println!("{}", render_event(&event)),
+                (false, true) => eprintln!("{}", raw["event"]),
+                (false, false) => eprintln!("{}", render_progress(&event)),
+            },
+            // Only `subscribe` sends these.
+            Line::Status { .. } | Line::History { .. } => {}
+            Line::Done { result, .. } => {
+                if cli.json {
+                    println!("{result}");
+                } else {
+                    println!("{}", render_result(request, &result));
+                }
+                return 0;
             }
-        } else if message["ok"] == json!(true) {
-            let result = &message["result"];
-            if cli.json {
-                println!("{result}");
-            } else {
-                println!("{}", render_result(&cli.command, result));
+            Line::Failed { error, .. } => {
+                if cli.json {
+                    println!("{}", raw["error"]);
+                } else {
+                    eprintln!("error: {}", error.message);
+                }
+                // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
+                return if error.code == ErrorCode::Usage {
+                    EXIT_USAGE
+                } else {
+                    EXIT_FAILED
+                };
             }
-            return 0;
-        } else {
-            let error = &message["error"];
-            if cli.json {
-                println!("{error}");
-            } else {
-                eprintln!(
-                    "error: {}",
-                    error["message"].as_str().unwrap_or("unknown error")
-                );
-            }
-            // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
-            return if error["code"] == "usage" {
-                EXIT_USAGE
-            } else {
-                EXIT_FAILED
-            };
         }
     }
     if follow {
@@ -258,135 +285,142 @@ fn client(cli: &Cli, socket: &Path, manifest_path: &Path) -> u8 {
 
 // ----------------------------------------------------------- rendering
 
-/// A field as text: strings and numbers as they are, `-` for null.
-fn text(value: &Value) -> String {
-    match value {
-        Value::Null => "-".into(),
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
+/// An optional field as text: `-` for null.
+fn or_dash(value: Option<impl std::fmt::Display>) -> String {
+    value.map_or_else(|| "-".into(), |v| v.to_string())
 }
 
-fn short(commit: &Value) -> String {
-    commit.as_str().unwrap_or("").chars().take(8).collect()
-}
-
-fn render_progress(event: &Value) -> String {
+fn render_progress(event: &Event) -> String {
     format!(
         "{}: {}",
-        text(&event["generation"]),
-        text(&event["message"])
+        or_dash(event.generation.as_deref()),
+        event.message
     )
 }
 
-fn render_event(event: &Value) -> String {
+fn render_event(event: &Event) -> String {
     format!(
         "{}  {:<11} {:<4} {}",
-        text(&event["at"]),
-        text(&event["kind"]),
-        text(&event["generation"]),
-        text(&event["message"])
+        event.at,
+        event.kind.as_str(),
+        or_dash(event.generation.as_deref()),
+        event.message
     )
 }
 
-fn render_generation(g: &Value) -> String {
+fn render_generation(g: &Generation) -> String {
     format!(
         "{:<4} {:<12} {} @ {}",
-        text(&g["id"]),
-        text(&g["state"]),
-        text(&g["ref"]),
-        short(&g["commit"])
+        g.id,
+        g.state.as_str(),
+        g.git_ref,
+        g.short_commit()
     )
 }
 
-fn render_process(p: &Value) -> String {
-    let mut line = format!("{}  {}", text(&p["state"]), text(&p["generation"]));
-    if p["state"] == "running" {
+fn render_process(p: &Process) -> String {
+    let mut line = format!("{}  {}", p.state.as_str(), or_dash(p.generation.as_deref()));
+    if p.state == ProcessState::Running {
         line += &format!(
             "  pid {}  port {}  up {}s",
-            text(&p["pid"]),
-            text(&p["port"]),
-            text(&p["uptime"])
+            or_dash(p.pid),
+            p.port,
+            or_dash(p.uptime.map(|seconds| format!("{seconds:?}")))
         );
     }
-    line += &format!("  restarts {}", text(&p["restarts"]));
-    let exit = &p["last_exit"];
-    if !exit.is_null() {
-        let how = match (exit["code"].as_i64(), exit["signal"].as_i64()) {
+    line += &format!("  restarts {}", p.restarts);
+    if let Some(exit) = &p.last_exit {
+        let how = match (exit.code, exit.signal) {
             (Some(code), _) => format!("exit {code}"),
             (_, Some(signal)) => format!("signal {signal}"),
             _ => "unknown".into(),
         };
-        let who = if exit["requested"] == json!(true) {
+        let who = if exit.requested {
             "requested"
         } else {
             "unrequested"
         };
-        line += &format!("\nlast exit: {how} ({who}) at {}", text(&exit["at"]));
+        line += &format!("\nlast exit: {how} ({who}) at {}", exit.at);
     }
     line
 }
 
-fn render_result(command: &str, r: &Value) -> String {
-    match command {
-        "stage" => format!(
-            "staged {} ({} @ {})",
-            text(&r["id"]),
-            text(&r["ref"]),
-            short(&r["commit"])
-        ),
-        "test" => format!(
-            "{} passed its test on port {} in {}s; `fawkes switch {}` goes live",
-            text(&r["id"]),
-            text(&r["test"]["port"]),
-            text(&r["test"]["seconds"]),
-            text(&r["id"])
-        ),
-        "switch" => format!(
-            "switched to {} (previous: {}); confirm before {} or it rolls back",
-            text(&r["generation"]),
-            text(&r["previous"]),
-            text(&r["deadline"])
-        ),
-        "confirm" => format!("{} is now permanent", text(&r["id"])),
-        "rollback" => format!(
-            "rolled back {}; now running {} ({})",
-            text(&r["from"]),
-            text(&r["to"]),
-            text(&r["reason"])
-        ),
-        "prune" => match r["removed"].as_array() {
-            Some(removed) if !removed.is_empty() => format!(
-                "removed {}; kept {}",
-                removed.iter().map(text).collect::<Vec<_>>().join(", "),
-                r["kept"].as_array().map_or(String::new(), |kept| {
-                    kept.iter().map(text).collect::<Vec<_>>().join(", ")
-                })
-            ),
-            _ => "nothing to remove".into(),
-        },
-        "start" | "stop" | "restart" => render_process(r),
-        "status" => {
-            let pending = match &r["pending"] {
-                Value::Null => String::new(),
-                p => format!("  (waiting for confirm until {})", text(&p["deadline"])),
-            };
+/// The answer to `request` as text. A result this client cannot read (a newer daemon's) is shown as the JSON it is.
+fn render_result(request: &Request, result: &Value) -> String {
+    fn typed<T: serde::de::DeserializeOwned>(
+        result: &Value,
+        render: impl FnOnce(T) -> String,
+    ) -> String {
+        T::deserialize(result).map_or_else(|_| result.to_string(), render)
+    }
+    match request {
+        Request::Stage { .. } => typed(result, |g: Generation| {
+            format!("staged {} ({} @ {})", g.id, g.git_ref, g.short_commit())
+        }),
+        Request::Test { .. } => typed(result, |g: Generation| {
+            format!(
+                "{} passed its test on port {} in {}s; `fawkes switch {}` goes live",
+                g.id,
+                or_dash(g.test.as_ref().map(|t| t.port)),
+                or_dash(g.test.as_ref().map(|t| format!("{:?}", t.seconds))),
+                g.id
+            )
+        }),
+        Request::Switch { .. } => typed(result, |r: SwitchResult| {
+            format!(
+                "switched to {} (previous: {}); confirm before {} or it rolls back",
+                r.generation,
+                or_dash(r.previous),
+                r.deadline
+            )
+        }),
+        Request::Confirm { .. } => {
+            typed(result, |g: Generation| format!("{} is now permanent", g.id))
+        }
+        Request::Rollback => typed(result, |r: RollbackResult| {
+            format!(
+                "rolled back {}; now running {} ({})",
+                r.from,
+                or_dash(r.to),
+                r.reason
+            )
+        }),
+        Request::Prune => typed(result, |r: PruneResult| {
+            if r.removed.is_empty() {
+                "nothing to remove".into()
+            } else {
+                format!(
+                    "removed {}; kept {}",
+                    r.removed.join(", "),
+                    r.kept.join(", ")
+                )
+            }
+        }),
+        Request::Start | Request::Stop | Request::Restart => {
+            typed(result, |p: Process| render_process(&p))
+        }
+        Request::Status => typed(result, |s: Status| {
+            let pending = s.pending.map_or_else(String::new, |p| {
+                format!("  (waiting for confirm until {})", p.deadline)
+            });
             format!(
                 "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nprocess {}",
-                text(&r["name"]),
-                text(&r["daemon_pid"]),
-                text(&r["busy"]),
-                text(&r["permanent"]),
-                text(&r["current"]),
+                s.name,
+                s.daemon_pid,
+                or_dash(s.busy),
+                or_dash(s.permanent),
+                or_dash(s.current),
                 pending,
-                render_process(&r["process"])
+                render_process(&s.process)
             )
-        }
-        "history" => r["generations"].as_array().map_or_else(String::new, |gs| {
-            gs.iter()
+        }),
+        Request::History => typed(result, |h: History| {
+            h.generations
+                .iter()
                 .map(|g| {
-                    let reason = g["rollback_reason"]
-                        .as_str()
+                    let reason = g
+                        .rollback_reason
+                        .as_ref()
                         .map(|s| format!("  ({s})"))
                         .unwrap_or_default();
                     format!("{}{reason}", render_generation(g))
@@ -394,9 +428,13 @@ fn render_result(command: &str, r: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }),
-        "log" => r["events"].as_array().map_or_else(String::new, |es| {
-            es.iter().map(render_event).collect::<Vec<_>>().join("\n")
+        Request::Log { .. } => typed(result, |e: Events| {
+            e.events
+                .iter()
+                .map(render_event)
+                .collect::<Vec<_>>()
+                .join("\n")
         }),
-        _ => r.to_string(),
+        Request::Subscribe { .. } => result.to_string(),
     }
 }

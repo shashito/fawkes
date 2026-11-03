@@ -4,14 +4,14 @@
 //! detail, its generations and its events, and a one-line footer. Dialogs and the help overlay are the only boxes.
 
 use super::{App, AppView, Focus, Link, Mode};
+use crate::or_dash;
+use crate::protocol::{Event, EventKind, GenState, Generation, LastExit, ProcessState};
 use crate::state::parse_time;
-use crate::{short, text};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, HighlightSpacing, Paragraph, Row, Table, TableState};
-use serde_json::{Value, json};
 
 /// A countdown under this many seconds is red.
 const URGENT_SECS: u64 = 15;
@@ -86,13 +86,12 @@ fn bold() -> Style {
     Style::new().add_modifier(Modifier::BOLD)
 }
 
-fn state_color(state: &str) -> Color {
+fn state_color(state: GenState) -> Color {
     match state {
-        "current" | "running" | "tested" => Color::Green,
-        "permanent" => Color::Cyan,
-        "rolled_back" | "test_failed" | "failed" => Color::Red,
-        "stopped" => Color::Gray,
-        _ => Color::Reset,
+        GenState::Current | GenState::Tested => Color::Green,
+        GenState::Permanent => Color::Cyan,
+        GenState::RolledBack | GenState::TestFailed => Color::Red,
+        GenState::Staging | GenState::Staged | GenState::Retired => Color::Reset,
     }
 }
 
@@ -104,16 +103,9 @@ fn countdown_style(left: u64) -> Style {
     }
 }
 
-/// `ref@commit8`
-fn label(g: &Value) -> String {
-    format!("{}@{}", text(&g["ref"]), short(&g["commit"]))
-}
-
 /// `HH:MM:SS` of an RFC 3339 time, in the local time zone: people read the screen, not the log files.
-fn clock(at: &Value) -> String {
-    at.as_str()
-        .and_then(parse_time)
-        .map_or_else(|| "--:--:--".to_string(), local_clock)
+fn clock(at: &str) -> String {
+    parse_time(at).map_or_else(|| "--:--:--".to_string(), local_clock)
 }
 
 pub fn local_clock(secs: u64) -> String {
@@ -152,7 +144,7 @@ fn age(secs: u64) -> String {
     }
 }
 
-fn signal_name(signal: i64) -> String {
+fn signal_name(signal: i32) -> String {
     match signal {
         1 => "SIGHUP".into(),
         2 => "SIGINT".into(),
@@ -166,17 +158,13 @@ fn signal_name(signal: i64) -> String {
     }
 }
 
-fn last_exit(exit: &Value) -> String {
-    let how = match (exit["code"].as_i64(), exit["signal"].as_i64()) {
+fn last_exit(exit: &LastExit) -> String {
+    let how = match (exit.code, exit.signal) {
         (Some(code), _) => format!("exit {code}"),
         (_, Some(signal)) => signal_name(signal),
         _ => "unknown".into(),
     };
-    let requested = if exit["requested"] == json!(true) {
-        " (requested)"
-    } else {
-        ""
-    };
+    let requested = if exit.requested { " (requested)" } else { "" };
     format!("{how}{requested}")
 }
 
@@ -382,23 +370,22 @@ fn app_state(view: &AppView) -> (String, Color) {
     if matches!(view.link, Link::Down(_)) {
         return ("◌ disconnected".into(), Color::Red);
     }
-    if let Some(step) = status["busy"].as_str() {
+    if let Some(step) = &status.busy {
         return (format!("⟳ {step}"), Color::Yellow);
     }
-    match status["process"]["state"].as_str().unwrap_or("") {
-        "running" => ("● running".into(), Color::Green),
-        "stopped" => ("○ stopped".into(), Color::Gray),
-        "failed" => ("✘ failed".into(), Color::Red),
-        other => (format!("? {other}"), Color::Reset),
+    match status.process.state {
+        ProcessState::Running => ("● running".into(), Color::Green),
+        ProcessState::Stopped => ("○ stopped".into(), Color::Gray),
+        ProcessState::Failed => ("✘ failed".into(), Color::Red),
     }
 }
 
 /// The newest generation that waits to be switched to.
-fn staged(view: &AppView) -> Option<&Value> {
+fn staged(view: &AppView) -> Option<&Generation> {
     view.history.iter().rev().find(|g| {
         matches!(
-            g["state"].as_str(),
-            Some("staged" | "tested" | "test_failed")
+            g.state,
+            GenState::Staged | GenState::Tested | GenState::TestFailed
         )
     })
 }
@@ -416,20 +403,16 @@ fn draw_apps(frame: &mut Frame, app: &App, now: u64, area: Rect) {
         .map(|view| {
             let (state, state_color) = app_state(view);
             let status = view.status.as_ref();
-            let process = status.map(|s| &s["process"]);
-            let field = |f: &dyn Fn(&Value) -> String| status.map_or("-".to_string(), f);
-            let id = |key: &str| field(&|s| text(&s[key]));
-            let running = process.is_some_and(|p| p["state"] == "running");
+            let process = status.map(|s| &s.process);
+            let running = process.is_some_and(|p| p.state == ProcessState::Running);
             let fact = |value: String| if running { value } else { "-".to_string() };
-            let uptime = process
-                .and_then(|p| p["uptime"].as_f64())
-                .map_or("-".to_string(), |u| {
-                    duration(u + view.status_at.elapsed().as_secs_f64())
-                });
+            let uptime = process.and_then(|p| p.uptime).map_or("-".to_string(), |u| {
+                duration(u + view.status_at.elapsed().as_secs_f64())
+            });
             let confirm = view.countdown(now);
             let style = if matches!(view.link, Link::Down(_)) {
                 dim()
-            } else if process.is_some_and(|p| p["state"] == "failed") {
+            } else if process.is_some_and(|p| p.state == ProcessState::Failed) {
                 Style::new().fg(Color::Red)
             } else {
                 Style::new()
@@ -438,14 +421,14 @@ fn draw_apps(frame: &mut Frame, app: &App, now: u64, area: Rect) {
                 cells: [
                     state,
                     view.name(),
-                    id("current"),
-                    id("permanent"),
-                    staged(view).map_or("-".into(), |g| text(&g["id"])),
+                    or_dash(status.and_then(|s| s.current.as_ref())),
+                    or_dash(status.and_then(|s| s.permanent.as_ref())),
+                    or_dash(staged(view).map(|g| &g.id)),
                     confirm.map_or("-".into(), |left| format!("⏱ {}", mmss(left))),
-                    fact(process.map_or("-".into(), |p| text(&p["pid"]))),
-                    fact(process.map_or("-".into(), |p| text(&p["port"]))),
+                    fact(or_dash(process.and_then(|p| p.pid))),
+                    fact(or_dash(process.map(|p| p.port))),
                     fact(uptime),
-                    process.map_or("-".into(), |p| text(&p["restarts"])),
+                    or_dash(process.map(|p| p.restarts)),
                 ],
                 confirm,
                 state_color,
@@ -537,67 +520,64 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
             dim(),
         ))];
     };
-    let process = &status["process"];
+    let process = &status.process;
     let (state, color) = app_state(view);
     let mut first = vec![Span::styled(
         format!(" {state}"),
         Style::new().fg(color).bold(),
     )];
-    if let Some(g) = view.generation(&process["generation"]) {
-        first.push(Span::raw(format!("  {} {}", text(&g["id"]), label(g))));
+    if let Some(g) = process
+        .generation
+        .as_deref()
+        .and_then(|id| view.generation(id))
+    {
+        first.push(Span::raw(format!("  {} {}", g.id, g.label())));
     }
-    if process["state"] == "running" {
-        let uptime = process["uptime"].as_f64().map_or("-".to_string(), |u| {
+    if process.state == ProcessState::Running {
+        let uptime = process.uptime.map_or("-".to_string(), |u| {
             duration(u + view.status_at.elapsed().as_secs_f64())
         });
         first.push(Span::raw(format!(
             "  pid {}  :{}  up {uptime}  restarts {}",
-            text(&process["pid"]),
-            text(&process["port"]),
-            text(&process["restarts"])
+            or_dash(process.pid),
+            process.port,
+            process.restarts
         )));
     } else {
-        first.push(Span::raw(format!(
-            "  restarts {}",
-            text(&process["restarts"])
-        )));
+        first.push(Span::raw(format!("  restarts {}", process.restarts)));
     }
     let mut second = vec![Span::styled("   last exit ", dim())];
-    let exit = &process["last_exit"];
     second.push(Span::styled(
-        if exit.is_null() {
-            "-".into()
-        } else {
-            last_exit(exit)
-        },
+        process.last_exit.as_ref().map_or("-".into(), last_exit),
         dim(),
     ));
     let health = view.events.iter().rev().find(|e| {
-        matches!(e["kind"].as_str(), Some("healthy" | "unhealthy"))
-            && e["generation"] == process["generation"]
+        matches!(e.kind, EventKind::Healthy | EventKind::Unhealthy)
+            && e.generation == process.generation
     });
     if let Some(event) = health {
-        let (symbol, color) = if event["kind"] == "healthy" {
+        let (symbol, color) = if event.kind == EventKind::Healthy {
             ("✔", Color::Green)
         } else {
             ("✖", Color::Red)
         };
         second.push(Span::styled(" · health ", dim()));
         second.push(Span::styled(
-            format!("{symbol} {}", clock(&event["at"])),
+            format!("{symbol} {}", clock(&event.at)),
             Style::new().fg(color),
         ));
     }
     let mut lines = vec![Line::from(first), Line::from(second)];
-    if let Some(left) = view.countdown(now) {
-        let pending = &status["pending"];
-        let rollback = match pending["previous"].as_str() {
+    if let Some(left) = view.countdown(now)
+        && let Some(pending) = &status.pending
+    {
+        let rollback = match &pending.previous {
             Some(previous) => format!("rolls back to {previous} (code + storage)"),
             None => "is rolled back".to_string(),
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" ⏱ confirm {} within ", text(&pending["generation"])),
+                format!(" ⏱ confirm {} within ", pending.generation),
                 countdown_style(left),
             ),
             Span::styled(mmss(left), countdown_style(left).bold()),
@@ -608,51 +588,59 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
 }
 
 /// Seconds since the generation last changed state, from the newest time it recorded.
-fn generation_age(g: &Value, now: u64) -> String {
-    ["rolled_back_at", "confirmed_at", "switched_at", "staged_at"]
-        .iter()
-        .find_map(|key| g[*key].as_str().and_then(parse_time))
-        .map_or("-".into(), |at| age(now.saturating_sub(at)))
+fn generation_age(g: &Generation, now: u64) -> String {
+    [
+        g.rolled_back_at.as_deref(),
+        g.confirmed_at.as_deref(),
+        g.switched_at.as_deref(),
+        Some(g.staged_at.as_str()),
+    ]
+    .into_iter()
+    .find_map(|at| at.and_then(parse_time))
+    .map_or("-".into(), |at| age(now.saturating_sub(at)))
 }
 
 /// The INFO column and the colour it takes, for one generation.
-fn generation_info(view: &AppView, g: &Value) -> (String, Color) {
+fn generation_info(view: &AppView, g: &Generation) -> (String, Color) {
     let status = view.status.as_ref();
-    let pending = status.map(|s| &s["pending"]).filter(|p| !p.is_null());
-    let test = &g["test"];
-    match g["state"].as_str().unwrap_or("") {
-        "tested" => (
+    let pending = status.and_then(|s| s.pending.as_ref());
+    let test = g.test.as_ref();
+    match g.state {
+        GenState::Tested => (
             format!(
                 "✔ test {:.1}s on :{}",
-                test["seconds"].as_f64().unwrap_or(0.0),
-                text(&test["port"])
+                test.map_or(0.0, |t| t.seconds),
+                or_dash(test.map(|t| t.port))
             ),
             Color::Green,
         ),
-        "test_failed" => (
-            format!("✖ test failed: {}", text(&test["message"])),
-            Color::Red,
-        ),
-        "staging" => ("checking out and installing".into(), Color::Yellow),
-        "staged" => ("not tested".into(), Color::Reset),
-        "current" if pending.is_some_and(|p| p["generation"] == g["id"]) => {
-            ("live · awaiting confirm".into(), Color::Yellow)
-        }
-        "current" => ("live".into(), Color::Green),
-        "permanent" if pending.is_some_and(|p| p["previous"] == g["id"]) => {
-            ("rollback target".into(), Color::Cyan)
-        }
-        "permanent" if status.is_some_and(|s| s["current"] == g["id"]) => {
-            ("live".into(), Color::Green)
-        }
-        "rolled_back" => (
+        GenState::TestFailed => (
             format!(
-                "✖ {}",
-                g["rollback_reason"].as_str().unwrap_or("rolled back")
+                "✖ test failed: {}",
+                or_dash(test.map(|t| t.message.as_str()))
             ),
             Color::Red,
         ),
-        _ => (String::new(), Color::Reset),
+        GenState::Staging => ("checking out and installing".into(), Color::Yellow),
+        GenState::Staged => ("not tested".into(), Color::Reset),
+        GenState::Current if pending.is_some_and(|p| p.generation == g.id) => {
+            ("live · awaiting confirm".into(), Color::Yellow)
+        }
+        GenState::Current => ("live".into(), Color::Green),
+        GenState::Permanent if pending.is_some_and(|p| p.previous.as_ref() == Some(&g.id)) => {
+            ("rollback target".into(), Color::Cyan)
+        }
+        GenState::Permanent if status.is_some_and(|s| s.current.as_ref() == Some(&g.id)) => {
+            ("live".into(), Color::Green)
+        }
+        GenState::RolledBack => (
+            format!(
+                "✖ {}",
+                g.rollback_reason.as_deref().unwrap_or("rolled back")
+            ),
+            Color::Red,
+        ),
+        GenState::Permanent | GenState::Retired => (String::new(), Color::Reset),
     }
 }
 
@@ -662,9 +650,9 @@ fn draw_generations(frame: &mut Frame, app: &App, view: &AppView, now: u64, area
         .into_iter()
         .map(|g| {
             [
-                text(&g["id"]),
-                label(g),
-                text(&g["state"]),
+                g.id.clone(),
+                g.label(),
+                g.state.as_str().to_string(),
                 generation_age(g, now),
                 generation_info(view, g).0,
             ]
@@ -691,13 +679,12 @@ fn draw_generations(frame: &mut Frame, app: &App, view: &AppView, now: u64, area
         .into_iter()
         .zip(rows)
         .map(|(g, cells)| {
-            let state = text(&g["state"]);
             let info_color = generation_info(view, g).1;
-            let red = matches!(state.as_str(), "rolled_back" | "test_failed");
+            let red = matches!(g.state, GenState::RolledBack | GenState::TestFailed);
             let cells = cells.into_iter().enumerate().map(|(i, text)| {
                 let cell = Cell::new(text);
                 match i {
-                    2 => cell.style(Style::new().fg(state_color(&state))),
+                    2 => cell.style(Style::new().fg(state_color(g.state))),
                     3 => cell.style(dim()),
                     4 => cell.style(Style::new().fg(info_color)),
                     _ => cell,
@@ -726,14 +713,18 @@ fn draw_generations(frame: &mut Frame, app: &App, view: &AppView, now: u64, area
 
 // ------------------------------------------------------------ events
 
-fn event_color(kind: &str, message: &str) -> Color {
+fn event_color(kind: EventKind, message: &str) -> Color {
     match kind {
-        "switched" => Color::Yellow,
-        "rolled_back" | "failed" | "error" | "test_failed" | "unhealthy" => Color::Red,
+        EventKind::Switched => Color::Yellow,
+        EventKind::RolledBack
+        | EventKind::Failed
+        | EventKind::Error
+        | EventKind::TestFailed
+        | EventKind::Unhealthy => Color::Red,
         // A crash; an exit Fawkes asked for is routine.
-        "exited" if !message.contains("(requested)") => Color::Red,
-        "healthy" | "confirmed" | "tested" => Color::Green,
-        "progress" => Color::DarkGray,
+        EventKind::Exited if !message.contains("(requested)") => Color::Red,
+        EventKind::Healthy | EventKind::Confirmed | EventKind::Tested => Color::Green,
+        EventKind::Progress => Color::DarkGray,
         _ => Color::Reset,
     }
 }
@@ -770,7 +761,7 @@ fn draw_events(frame: &mut Frame, app: &App, view: &AppView, area: Rect) {
         view.frozen.unwrap_or(view.events.len())
     };
     let needle = app.filter.to_lowercase();
-    let events: Vec<&Value> = view
+    let events: Vec<&Event> = view
         .events
         .iter()
         .take(shown)
@@ -780,20 +771,19 @@ fn draw_events(frame: &mut Frame, app: &App, view: &AppView, area: Rect) {
     let events = &events[skip..];
     let kind_width = events
         .iter()
-        .map(|e| width_of(&text(&e["kind"])))
+        .map(|e| width_of(e.kind.as_str()))
         .max()
         .unwrap_or(0);
     let lines: Vec<Line> = events
         .iter()
         .map(|e| {
-            let kind = text(&e["kind"]);
-            let message = text(&e["message"]);
-            let color = event_color(&kind, &message);
-            let generation = e["generation"].as_str().unwrap_or("");
+            let message = e.message.clone();
+            let color = event_color(e.kind, &message);
+            let generation = e.generation.as_deref().unwrap_or("");
             Line::from(vec![
-                Span::styled(format!(" {} ", clock(&e["at"])), dim()),
+                Span::styled(format!(" {} ", clock(&e.at)), dim()),
                 Span::styled(
-                    format!("{} ", pad_to(&kind, kind_width)),
+                    format!("{} ", pad_to(e.kind.as_str(), kind_width)),
                     Style::new().fg(color),
                 ),
                 Span::styled(format!("{generation:<3} "), dim()),
@@ -812,13 +802,13 @@ fn draw_events(frame: &mut Frame, app: &App, view: &AppView, area: Rect) {
 }
 
 /// What `/` searches in one event.
-fn event_text(e: &Value) -> String {
+fn event_text(e: &Event) -> String {
     format!(
         "{} {} {} {}",
-        clock(&e["at"]),
-        text(&e["kind"]),
-        e["generation"].as_str().unwrap_or(""),
-        text(&e["message"])
+        clock(&e.at),
+        e.kind.as_str(),
+        e.generation.as_deref().unwrap_or(""),
+        e.message
     )
 }
 
@@ -868,7 +858,7 @@ fn keys_line(app: &App, width: u16) -> Line<'static> {
     let pending = app
         .current()
         .and_then(|a| a.status.as_ref())
-        .is_some_and(|s| !s["pending"].is_null());
+        .is_some_and(|s| s.pending.is_some());
     let mut items = vec![
         ("?", "help"),
         ("c", "confirm"),
