@@ -485,6 +485,7 @@ impl App {
 
 // ------------------------------------------------------------ the loop
 
+// SAFETY: `tzset` is declared as POSIX has it: no arguments and no result, so the signature cannot be mistaken.
 unsafe extern "C" {
     /// Not in the `libc` crate; POSIX, and in the C library on every platform Fawkes runs on.
     fn tzset();
@@ -886,8 +887,9 @@ mod tests {
         app.apply(press(KeyCode::Esc));
         assert!(app.filter.is_empty());
         assert_eq!(app.apply(key('q')), Some(Cmd::Quit));
-        // Found in review: the selection followed the sort order, so an app appearing (or leaving) moved it, and an
-        // unasked `c` went to another daemon. It stays on what is shown; a selected app that leaves selects nothing.
+        // The selection stays on what is shown instead of following the sort order, so an app appearing (or
+        // leaving) cannot move it and send an unasked `c` to another daemon; a selected app that leaves selects
+        // nothing.
         app.current = None;
         assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
         app.apply(Msg::Up("aaa".into(), "/tmp/fk/run/aaa.sock".into(), false));

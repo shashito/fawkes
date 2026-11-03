@@ -244,8 +244,8 @@ fn a_switch_records_its_intent_before_the_new_generation_starts() {
     assert_eq!(h.status()["permanent"], "g1");
 }
 
-/// Found in review: a crash only reaped the group leader, so processes the app had started lived on, unsupervised,
-/// while the rollback restored the storage under them.
+/// A crash ends the app's whole process group, not only its leader: processes the app started must not live on,
+/// unsupervised, while the rollback restores the storage under them.
 #[test]
 fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
     let mut h = Harness::new(4810, "");
@@ -420,6 +420,7 @@ install_timeout = 1"#,
         .parse()
         .unwrap();
     assert_ne!(
+        // SAFETY: signal 0 only asks whether the process group exists.
         unsafe { libc::kill(-pid, 0) },
         0,
         "the hanging install's process group outlived its timeout"
@@ -550,9 +551,9 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
     assert_eq!(h.status()["permanent"], "g1");
 }
 
-/// Found while bounding request reads: on macOS an accepted socket inherits the listener's non-blocking mode, so a
-/// request that arrived in two pieces was refused as "no request received" (and a reply larger than the socket buffer
-/// failed at once instead of waiting for the client).
+/// An accepted socket must block even where it inherits the listener's non-blocking mode (macOS): a request that
+/// arrives in two pieces is answered rather than refused as "no request received", and a reply larger than the
+/// socket buffer waits for the client instead of failing at once.
 #[test]
 fn a_request_that_arrives_in_pieces_is_answered() {
     use std::io::{BufRead, Write};

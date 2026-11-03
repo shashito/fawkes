@@ -236,6 +236,7 @@ APP_HOME = "{{home}}"
 impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
+            // SAFETY: the pid is our own child's, which is not reaped yet, so it cannot name another process.
             unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
             let give_up = Instant::now() + Duration::from_secs(10);
             while daemon.try_wait().ok().flatten().is_none() && Instant::now() < give_up {
@@ -249,6 +250,7 @@ impl Drop for Harness {
             && let Ok(pid) = text.trim().parse::<i32>()
             && pid > 1
         {
+            // SAFETY: `pid > 1` is neither our own group nor init's; the group is the app's, which must not outlive the test.
             unsafe { libc::killpg(pid, libc::SIGKILL) };
         }
         let _ = std::fs::remove_dir_all(&self.dir);
