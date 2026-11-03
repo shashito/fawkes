@@ -54,7 +54,8 @@ const listen = () => server.listen(Number(process.env.APP_PORT), '127.0.0.1', ()
     spawnSync(process.env.FAWKES_BIN, ['confirm', process.env.FAWKES_GENERATION], { stdio: 'inherit' });
   }
 });
-setTimeout(listen, mode === 'slow-test' && phase === 'test' ? 6000 : 0);
+if (mode === 'slow-test' && phase === 'test') setTimeout(listen, 6000);
+else listen();
 
 process.on('SIGTERM', () => {
   setTimeout(() => {

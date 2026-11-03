@@ -163,9 +163,9 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
     );
 
     h.ok(&["switch", "g2"]);
-    h.wait("v2's row in the storage", 5, || {
-        h.versions().contains(&"v2".to_string())
-    });
+    // v2 writes its row before it listens, so serving means both.
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+    assert!(h.versions().contains(&"v2".to_string()));
     h.kill_daemon();
     assert_eq!(
         h.get().as_deref(),
