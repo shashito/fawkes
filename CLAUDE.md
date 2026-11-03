@@ -50,8 +50,9 @@ not built yet. Don't start one unless asked.
   (`process::kill_group`, rustix's `kill_process_group`), never just the child pid.
 - **Storage snapshots** use the SQLite online backup API (`storage.rs`), never a file copy, because a copy can miss
   WAL contents.
-- **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (a `&'static str`) and a
-  readable `message`. Agents depend on the codes, so add codes instead of renaming them.
+- **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (the `ErrorCode` enum) and a
+  readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon, CLI and
+  TUI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
 - **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command supports `--json`.
 
 ## Dependencies
@@ -68,7 +69,7 @@ too. Update a single dependency with `cargo update --precise`, never everything 
   `// ------------------------------------------------ name` dividers.
 - Comments explain *why*, invariants and locking, not what the next line does. Write them for a future reader:
   never mention the conversation, a review or a previous version ("now", "no longer", "fixed").
-- Errors: use `protocol::err("code", "message")` and `R<T>` in the daemon and `Result<_, String>` in the CLI. Write
+- Errors: use `protocol::err(ErrorCode::Busy, "message")` and `R<T>` in the daemon and `Result<_, String>` in the CLI. Write
   messages for an agent: say what is wrong and what to do next (e.g. point at `rollback`).
 - Don't drop a fallible result with `let _ =` unless failure really doesn't matter (best-effort cleanup). If it's
   not obvious, say why in a short comment.

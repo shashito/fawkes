@@ -6,11 +6,10 @@
 
 mod draw;
 
+use crate::protocol::{self, Generation, Line, Request, Status};
 use crate::state::now_secs;
-use crate::text;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -23,7 +22,7 @@ const TICK: Duration = Duration::from_millis(250);
 const RETRY: Duration = Duration::from_secs(1);
 const RESCAN: Duration = Duration::from_secs(3);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const BACKLOG: usize = 100;
+const BACKLOG: u64 = 100;
 const MAX_EVENTS: usize = 500;
 
 /// Which daemons the screen talks to.
@@ -40,7 +39,7 @@ enum Msg {
     /// A daemon answered: the app exists from now on.
     Up(String, PathBuf),
     /// A line of the `subscribe` stream: `status`, `history` or `event`.
-    Line(String, Value),
+    Line(String, Line),
     /// The connection dropped; it will be retried.
     Down(String, String),
     /// A discovered app stopped answering; it leaves the list until it answers again.
@@ -81,7 +80,7 @@ enum Focus {
 struct Action {
     label: String,
     socket: PathBuf,
-    request: Value,
+    request: Request,
 }
 
 /// What a key asks the event loop to do.
@@ -97,11 +96,11 @@ struct AppView {
     key: String,
     socket: PathBuf,
     link: Link,
-    status: Option<Value>,
+    status: Option<Status>,
     status_at: Instant,
     /// Oldest first, as the daemon sends it.
-    history: Vec<Value>,
-    events: VecDeque<Value>,
+    history: Vec<Generation>,
+    events: VecDeque<protocol::Event>,
     /// While the events pane is paused: how many events it shows.
     frozen: Option<usize>,
     /// The chosen generation; the newest while nothing was chosen.
@@ -126,12 +125,11 @@ impl AppView {
     fn name(&self) -> String {
         self.status
             .as_ref()
-            .and_then(|s| s["name"].as_str())
-            .unwrap_or(&self.key)
+            .map_or(self.key.as_str(), |s| s.name.as_str())
             .to_string()
     }
 
-    fn push_event(&mut self, event: Value) {
+    fn push_event(&mut self, event: protocol::Event) {
         self.events.push_back(event);
         if self.events.len() > MAX_EVENTS {
             self.events.pop_front();
@@ -139,19 +137,20 @@ impl AppView {
         }
     }
 
-    fn line(&mut self, line: &Value) {
-        if let Some(status) = line.get("status") {
-            self.status = Some(status.clone());
-            self.status_at = Instant::now();
-        } else if let Some(history) = line["history"]["generations"].as_array() {
-            self.history = history.clone();
-        } else if let Some(event) = line.get("event") {
-            self.push_event(event.clone());
+    fn line(&mut self, line: Line) {
+        match line {
+            Line::Status { status } => {
+                self.status = Some(*status);
+                self.status_at = Instant::now();
+            }
+            Line::History { history } => self.history = history.generations,
+            Line::Event { event } => self.push_event(event),
+            Line::Done { .. } | Line::Failed { .. } => {}
         }
     }
 
     /// The history, newest first: the order of the list.
-    fn rows(&self) -> Vec<&Value> {
+    fn rows(&self) -> Vec<&Generation> {
         self.history.iter().rev().collect()
     }
 
@@ -159,33 +158,29 @@ impl AppView {
         let rows = self.rows();
         self.selected
             .as_ref()
-            .and_then(|id| rows.iter().position(|g| g["id"] == json!(id)))
+            .and_then(|id| rows.iter().position(|g| g.id == *id))
             .unwrap_or(0)
     }
 
     fn selected_id(&self) -> Option<String> {
-        self.rows()
-            .get(self.selected_index())
-            .and_then(|g| g["id"].as_str().map(String::from))
+        self.rows().get(self.selected_index()).map(|g| g.id.clone())
     }
 
     fn select(&mut self, delta: isize) {
         let rows = self.rows();
         let last = rows.len().saturating_sub(1);
         let index = self.selected_index().saturating_add_signed(delta).min(last);
-        self.selected = rows
-            .get(index)
-            .and_then(|g| g["id"].as_str().map(String::from));
+        self.selected = rows.get(index).map(|g| g.id.clone());
     }
 
-    fn generation(&self, id: &Value) -> Option<&Value> {
-        self.history.iter().find(|g| g["id"] == *id)
+    fn generation(&self, id: &str) -> Option<&Generation> {
+        self.history.iter().find(|g| g.id == id)
     }
 
     /// Seconds until the pending switch is rolled back, if one awaits confirm.
     fn countdown(&self, now: u64) -> Option<u64> {
-        let deadline = self.status.as_ref()?["pending"]["deadline"].as_str()?;
-        let deadline = crate::state::parse_time(deadline).unwrap_or(0);
+        let pending = self.status.as_ref()?.pending.as_ref()?;
+        let deadline = crate::state::parse_time(&pending.deadline).unwrap_or(0);
         Some(deadline.saturating_sub(now))
     }
 }
@@ -292,7 +287,7 @@ impl App {
             }
             Msg::Line(key, line) => {
                 if let Some(view) = self.view_mut(&key) {
-                    view.line(&line);
+                    view.line(line);
                 }
             }
             Msg::Done(label, Ok(())) => self.notice = Some((format!("✓ {label}"), false)),
@@ -315,7 +310,9 @@ impl App {
                 match key.code {
                     KeyCode::Enter if !git_ref.trim().is_empty() => {
                         let git_ref = git_ref.trim().to_string();
-                        let request = json!({ "command": "stage", "args": { "ref": git_ref } });
+                        let request = Request::Stage {
+                            git_ref: git_ref.clone(),
+                        };
                         return self.send(format!("stage {git_ref}"), request, None);
                     }
                     KeyCode::Esc => {}
@@ -363,7 +360,6 @@ impl App {
     }
 
     fn normal_key(&mut self, code: KeyCode) -> Option<Cmd> {
-        let plain = |name: &str| json!({ "command": name, "args": {} });
         match code {
             KeyCode::Char('q') => return Some(Cmd::Quit),
             KeyCode::Esc => self.filter.clear(),
@@ -386,33 +382,36 @@ impl App {
                     self.notice = Some(("no app to stage for".into(), true));
                 }
             }
-            KeyCode::Char('t') => return self.send_selected("test"),
-            KeyCode::Char('w') => return self.send_selected("switch"),
+            KeyCode::Char('t') => return self.send_selected(false),
+            KeyCode::Char('w') => return self.send_selected(true),
             KeyCode::Char('c') => {
-                let pending = self.current().and_then(|a| {
-                    a.status.as_ref()?["pending"]["generation"]
-                        .as_str()
-                        .map(String::from)
+                let generation = self.current().and_then(|a| {
+                    let pending = a.status.as_ref()?.pending.as_ref()?;
+                    Some(pending.generation.clone())
                 });
-                let args = pending.map_or(json!({}), |g| json!({ "generation": g }));
-                let request = json!({ "command": "confirm", "args": args });
-                return self.send("confirm".into(), request, None);
+                return self.send("confirm".into(), Request::Confirm { generation }, None);
             }
             KeyCode::Char('b') => {
                 let question = match self.current() {
-                    Some(app) => match app.status.as_ref().map(|s| &s["pending"]["previous"]) {
-                        Some(Value::String(to)) => format!("Roll back {} to {to}?", app.name()),
-                        _ => format!("Roll back {}?", app.name()),
-                    },
+                    Some(app) => {
+                        let previous = app
+                            .status
+                            .as_ref()
+                            .and_then(|s| s.pending.as_ref()?.previous.as_ref());
+                        match previous {
+                            Some(to) => format!("Roll back {} to {to}?", app.name()),
+                            None => format!("Roll back {}?", app.name()),
+                        }
+                    }
                     None => String::new(),
                 };
-                return self.send("rollback".into(), plain("rollback"), Some(question));
+                return self.send("rollback".into(), Request::Rollback, Some(question));
             }
-            KeyCode::Char('s') => return self.send("start".into(), plain("start"), None),
-            KeyCode::Char('x') => return self.ask_app("stop", "Stop", plain("stop")),
-            KeyCode::Char('r') => return self.ask_app("restart", "Restart", plain("restart")),
+            KeyCode::Char('s') => return self.send("start".into(), Request::Start, None),
+            KeyCode::Char('x') => return self.ask_app("stop", "Stop", Request::Stop),
+            KeyCode::Char('r') => return self.ask_app("restart", "Restart", Request::Restart),
             KeyCode::Char('p') => {
-                return self.ask_app("prune", "Prune old generations of", plain("prune"));
+                return self.ask_app("prune", "Prune old generations of", Request::Prune);
             }
             _ => {}
         }
@@ -420,7 +419,7 @@ impl App {
     }
 
     /// `stop` or `restart` of the current app, after a dialog.
-    fn ask_app(&mut self, label: &str, verb: &str, request: Value) -> Option<Cmd> {
+    fn ask_app(&mut self, label: &str, verb: &str, request: Request) -> Option<Cmd> {
         let question = self
             .current()
             .map(|a| format!("{verb} {}?", a.name()))
@@ -443,21 +442,29 @@ impl App {
     }
 
     /// `test` or `switch` on the selected generation of the current app; a switch asks first.
-    fn send_selected(&mut self, name: &str) -> Option<Cmd> {
+    fn send_selected(&mut self, switch: bool) -> Option<Cmd> {
         let Some(id) = self.current().and_then(AppView::selected_id) else {
             self.notice = Some(("no generation selected".into(), true));
             return None;
         };
-        let request = json!({ "command": name, "args": { "generation": id } });
-        let question = (name == "switch").then(|| {
+        let (request, question) = if switch {
             let app = self.current().map(AppView::name).unwrap_or_default();
-            format!("Switch {app} to {id}?")
-        });
-        self.send(format!("{name} {id}"), request, question)
+            let request = Request::Switch {
+                generation: id.clone(),
+                deadline: None,
+            };
+            (request, Some(format!("Switch {app} to {id}?")))
+        } else {
+            let request = Request::Test {
+                generation: id.clone(),
+            };
+            (request, None)
+        };
+        self.send(format!("{} {id}", request.command()), request, question)
     }
 
     /// Aim a request at the current app: send now, or ask `y/N` first.
-    fn send(&mut self, label: String, request: Value, ask: Option<String>) -> Option<Cmd> {
+    fn send(&mut self, label: String, request: Request, ask: Option<String>) -> Option<Cmd> {
         let Some(app) = self.current() else {
             self.notice = Some(("no app selected".into(), true));
             return None;
@@ -515,7 +522,9 @@ fn reader(key: &str, socket: &Path, active: Option<&Active>, tx: &Sender<Msg>) {
 
 /// Fetch the recent events, then follow `subscribe`. The error says whether the app had answered.
 fn follow(key: &str, socket: &Path, tx: &Sender<Msg>) -> (bool, String) {
-    let request = json!({ "command": "subscribe", "args": { "limit": BACKLOG } });
+    let request = Request::Subscribe {
+        limit: Some(BACKLOG),
+    };
     let stream = match open(socket, &request) {
         Ok(stream) => stream,
         Err(e) => return (false, e),
@@ -528,8 +537,8 @@ fn follow(key: &str, socket: &Path, tx: &Sender<Msg>) -> (bool, String) {
                 return (true, "the screen is gone".into());
             }
         }
-        if let Ok(value) = serde_json::from_str(&line)
-            && tx.send(Msg::Line(key.into(), value)).is_err()
+        if let Ok(line) = serde_json::from_str(&line)
+            && tx.send(Msg::Line(key.into(), line)).is_err()
         {
             return (true, "the screen is gone".into());
         }
@@ -571,19 +580,20 @@ fn scan(dir: &Path, active: &Active, tx: &Sender<Msg>) {
     }
 }
 
-fn open(socket: &Path, request: &Value) -> Result<UnixStream, String> {
+fn open(socket: &Path, request: &Request) -> Result<UnixStream, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
-    writeln!(stream, "{request}").map_err(|e| e.to_string())?;
+    let line = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    writeln!(stream, "{line}").map_err(|e| e.to_string())?;
     Ok(stream)
 }
 
-/// One request: progress lines are skipped (they reach the screen through `subscribe`), the answer is the result.
-fn request(socket: &Path, request: &Value) -> Result<Value, String> {
+/// One request: progress lines are skipped (they reach the screen through `subscribe`), the answer is the outcome.
+fn request(socket: &Path, request: &Request) -> Result<(), String> {
     let stream = open(socket, request)?;
     // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever. Only
     // quick actions get the limit: a stage, test, switch, stop or prune can stay silent for as long as an install,
     // a health check, a stop timeout or a removal takes, and the daemon bounds those by the manifest's timeouts.
-    if matches!(request["command"].as_str(), Some("start" | "confirm")) {
+    if matches!(request, Request::Start | Request::Confirm { .. }) {
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
             .map_err(|e| e.to_string())?;
@@ -595,13 +605,10 @@ fn request(socket: &Path, request: &Value) -> Result<Value, String> {
             }
             _ => e.to_string(),
         })?;
-        let Ok(message) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if message["ok"] == json!(true) {
-            return Ok(message["result"].clone());
-        } else if message.get("ok").is_some() {
-            return Err(text(&message["error"]["message"]));
+        match serde_json::from_str::<Line>(&line) {
+            Ok(Line::Done { .. }) => return Ok(()),
+            Ok(Line::Failed { error, .. }) => return Err(error.message),
+            _ => {}
         }
     }
     Err("the daemon closed the connection without an answer".into())
@@ -683,7 +690,7 @@ fn event_loop(
                     app.notice = Some((format!("{}…", action.label), false));
                     let tx = tx.clone();
                     std::thread::spawn(move || {
-                        let result = request(&action.socket, &action.request).map(|_| ());
+                        let result = request(&action.socket, &action.request);
                         let _ = tx.send(Msg::Done(action.label, result));
                     });
                 }
@@ -696,21 +703,29 @@ fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::History;
     use crate::state::format_time;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use serde_json::{Value, json};
 
+    /// A full record as the daemon sends it, which also checks that `Generation` reads that shape.
     fn gen_record(id: &str, git_ref: &str, commit: &str, state: &str) -> Value {
         json!({ "id": id, "ref": git_ref, "commit": format!("{commit}0000000000"), "state": state,
-                "test": null, "rollback_reason": null,
-                "staged_at": format_time(1_000_000 - 180) })
+                "dir": format!("/tmp/fk/generations/{id}/code"), "staged_at": format_time(1_000_000 - 180),
+                "test": null, "switched_at": null, "confirmed_at": null, "rolled_back_at": null,
+                "rollback_reason": null, "failed_starts": 0 })
+    }
+
+    fn typed<T: serde::de::DeserializeOwned>(value: Value) -> T {
+        serde_json::from_value(value).unwrap()
     }
 
     /// Two apps: `sample` with a switch awaiting confirm until `deadline`, and a quiet `blog`.
     fn fixture(deadline: u64) -> App {
         let mut app = App::new(&Target::Discover("/tmp/fk/run".into()));
         let mut g8 = gen_record("g8", "feat", "91aa2c01", "tested");
-        g8["test"] = json!({ "port": 4791, "passed": true, "seconds": 2.1, "message": "healthy" });
+        g8["test"] = json!({ "port": 4791, "passed": true, "at": "x", "seconds": 2.1, "message": "healthy" });
         let mut g5 = gen_record("g5", "main", "0c1d2e3f", "rolled_back");
         g5["rollback_reason"] = json!("missed confirm deadline");
         let history = [
@@ -723,14 +738,14 @@ mod tests {
             "name": "sample", "daemon_pid": 812, "permanent": "g6", "current": "g7", "busy": null,
             "pending": { "generation": "g7", "previous": "g6", "deadline": format_time(deadline) },
             "process": { "state": "running", "generation": "g7", "pid": 9001, "port": 4747,
-                         "uptime": 65.2, "restarts": 1,
+                         "started_at": "x", "uptime": 65.2, "restarts": 1,
                          "last_exit": { "at": "x", "code": null, "signal": 9, "requested": true } }
         });
         let quiet = json!({
             "name": "blog", "daemon_pid": 813, "permanent": "g1", "current": "g1", "busy": null,
             "pending": null,
-            "process": { "state": "stopped", "generation": "g1", "pid": null, "port": null,
-                         "uptime": null, "restarts": 0, "last_exit": null }
+            "process": { "state": "stopped", "generation": "g1", "pid": null, "port": 3000,
+                         "started_at": null, "uptime": null, "restarts": 0, "last_exit": null }
         });
         for (key, status, history) in [
             (
@@ -744,10 +759,19 @@ mod tests {
                 key.into(),
                 format!("/tmp/fk/run/{key}.sock").into(),
             ));
-            app.apply(Msg::Line(key.into(), json!({ "status": status })));
             app.apply(Msg::Line(
                 key.into(),
-                json!({ "history": { "generations": history } }),
+                Line::Status {
+                    status: Box::new(typed(status)),
+                },
+            ));
+            app.apply(Msg::Line(
+                key.into(),
+                Line::History {
+                    history: History {
+                        generations: typed(Value::Array(history)),
+                    },
+                },
             ));
         }
         for (at, kind, g, message) in [
@@ -771,7 +795,12 @@ mod tests {
             ),
         ] {
             let event = json!({ "at": at, "kind": kind, "generation": g, "message": message });
-            app.apply(Msg::Line("sample".into(), json!({ "event": event })));
+            app.apply(Msg::Line(
+                "sample".into(),
+                Line::Event {
+                    event: typed(event),
+                },
+            ));
         }
         app
     }
@@ -919,7 +948,13 @@ mod tests {
             panic!("y should send the switch");
         };
         assert_eq!(action.label, "switch g7");
-        assert_eq!(action.request["args"]["generation"], "g7");
+        assert_eq!(
+            action.request,
+            Request::Switch {
+                generation: "g7".into(),
+                deadline: None
+            }
+        );
         assert_eq!(action.socket, PathBuf::from("/tmp/fk/run/sample.sock"));
         // `b`, `x` and `r` ask too; Esc closes the dialog.
         for (k, question) in [
@@ -942,18 +977,25 @@ mod tests {
         };
         assert_eq!(
             action.request,
-            json!({ "command": "stage", "args": { "ref": "main" } })
+            Request::Stage {
+                git_ref: "main".into()
+            }
         );
         // `t`, `s` and `c` need no question; `c` names the pending generation.
         assert!(matches!(app.apply(key('t')), Some(Cmd::Send(_))));
         let Some(Cmd::Send(action)) = app.apply(key('s')) else {
             panic!("s should start");
         };
-        assert_eq!(action.request["command"], "start");
+        assert_eq!(action.request, Request::Start);
         let Some(Cmd::Send(action)) = app.apply(key('c')) else {
             panic!("c should confirm");
         };
-        assert_eq!(action.request["args"]["generation"], "g7");
+        assert_eq!(
+            action.request,
+            Request::Confirm {
+                generation: Some("g7".into())
+            }
+        );
         // The old S/X/R and digit bindings are gone; `q` quits.
         for k in ['S', 'X', 'R', '2'] {
             assert_eq!(app.apply(key(k)), None);

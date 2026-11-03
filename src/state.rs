@@ -1,12 +1,11 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
+use crate::protocol::{Event, GenState, Generation, Pending};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------- time
@@ -120,68 +119,6 @@ impl Paths {
 }
 
 // --------------------------------------------------------------- state
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GenState {
-    /// The worktree and install are in progress.
-    Staging,
-    Staged,
-    TestFailed,
-    Tested,
-    Current,
-    Permanent,
-    Retired,
-    RolledBack,
-}
-
-impl GenState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            GenState::Staging => "staging",
-            GenState::Staged => "staged",
-            GenState::TestFailed => "test_failed",
-            GenState::Tested => "tested",
-            GenState::Current => "current",
-            GenState::Permanent => "permanent",
-            GenState::Retired => "retired",
-            GenState::RolledBack => "rolled_back",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestInfo {
-    pub port: u16,
-    pub passed: bool,
-    pub at: String,
-    pub seconds: f64,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Generation {
-    pub id: String,
-    #[serde(rename = "ref")]
-    pub git_ref: String,
-    pub commit: String,
-    pub state: GenState,
-    pub dir: PathBuf,
-    pub staged_at: String,
-    pub test: Option<TestInfo>,
-    pub switched_at: Option<String>,
-    pub confirmed_at: Option<String>,
-    pub rolled_back_at: Option<String>,
-    pub rollback_reason: Option<String>,
-    pub failed_starts: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pending {
-    pub generation: String,
-    pub previous: Option<String>,
-    pub deadline: String,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
@@ -298,14 +235,6 @@ impl State {
 
 // -------------------------------------------------------------- events
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    pub at: String,
-    pub kind: String,
-    pub generation: Option<String>,
-    pub message: String,
-}
-
 /// How large `events.jsonl` grows before it becomes `events.1.jsonl` (replacing the one before).
 const EVENT_LOG_BYTES: u64 = 10 << 20;
 
@@ -402,39 +331,10 @@ impl EventLog {
     }
 }
 
-// ----------------------------------------------------------- last exit
-
-/// How the app's most recent process ended, and whether Fawkes asked for it.
-#[derive(Debug, Clone, Serialize)]
-pub struct LastExit {
-    pub at: String,
-    pub code: Option<i32>,
-    pub signal: Option<i32>,
-    pub requested: bool,
-}
-
-impl LastExit {
-    pub fn new(status: Option<ExitStatus>, requested: bool) -> LastExit {
-        LastExit {
-            at: now(),
-            code: status.and_then(|s| s.code()),
-            signal: status.and_then(|s| s.signal()),
-            requested,
-        }
-    }
-
-    pub fn describe(&self) -> String {
-        match (self.code, self.signal) {
-            (Some(code), _) => format!("exit status {code}"),
-            (_, Some(signal)) => format!("signal {signal}"),
-            _ => "unknown exit".into(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::EventKind;
 
     #[test]
     fn time_round_trips() {
@@ -494,7 +394,7 @@ mod tests {
         let path = root.join("events.jsonl");
         let event = |n: usize| Event {
             at: now(),
-            kind: "progress".into(),
+            kind: EventKind::Progress,
             generation: None,
             message: format!("event {n}"),
         };

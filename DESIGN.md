@@ -337,7 +337,7 @@ dropped, so its stream simply ends. Live clients reconnect.
 ```
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` is produced by the client only.)
+`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` is produced by the client only.) A client treats a code it does not know as a failed command.
 
 Results per command:
 
