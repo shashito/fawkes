@@ -81,6 +81,10 @@ impl Paths {
     pub fn lock(&self) -> PathBuf {
         self.root.join("lock")
     }
+    /// Written by the live app's start wrapper (`process::spawn`), so a later daemon can find a leftover app.
+    pub fn app_pid(&self) -> PathBuf {
+        self.root.join("app.pid")
+    }
     pub fn state_json(&self) -> PathBuf {
         self.root.join("state.json")
     }
@@ -187,8 +191,6 @@ pub struct State {
     pub permanent: Option<String>,
     pub pending: Option<Pending>,
     pub daemon_pid: Option<u32>,
-    /// Pid (= process group) of the live app, so a restarted daemon can kill a leftover one.
-    pub app_pid: Option<u32>,
 }
 
 /// `state.json.bak` next to `state.json`.

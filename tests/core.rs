@@ -191,16 +191,17 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
     );
 }
 
-/// The new generation's first process starts only once state.json says the switch is pending, so a daemon that dies
-/// right after spawning it still rolls the switch back at its next start.
+/// The new generation's first process starts only once state.json says the switch is pending, and it is on record
+/// before it runs, so a daemon that dies right after spawning it still stops it and rolls the switch back at its next
+/// start.
 #[test]
 fn a_switch_records_its_intent_before_the_new_generation_starts() {
     let mut h = Harness::new(4830, "");
-    // v2, started live, keeps a copy of the state.json it finds and kills the daemon, its parent, on the spot.
+    // v2, started live, keeps a copy of the state.json it finds, kills the daemon, its parent, on the spot, and runs on.
     let manifest = h.dir.join("fawkes.toml");
     let text = std::fs::read_to_string(&manifest).unwrap().replace(
         r#"start = "node app.js""#,
-        r#"start = 'if [ "$(cat VERSION)" = v2 ] && [ "$FAWKES_PHASE" = live ]; then cp {state}/state.json {home}/at-start.json; kill -9 $PPID; exit 1; fi; exec node app.js'"#,
+        r#"start = 'if [ "$(cat VERSION)" = v2 ] && [ "$FAWKES_PHASE" = live ]; then cp {state}/state.json {home}/at-start.json; kill -9 $PPID; fi; exec node app.js'"#,
     );
     std::fs::write(&manifest, text).unwrap();
     h.commit("v1", "confirm");

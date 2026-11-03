@@ -154,8 +154,26 @@ pub struct Daemon {
     hub: Hub,
     /// Process groups of running tests and installs, killed on shutdown.
     step_pgids: Mutex<Vec<u32>>,
-    /// `<fawkes_home>/run/<name>.sock`, removed on shutdown.
-    run_link: PathBuf,
+}
+
+/// The daemon's socket and its `<fawkes_home>/run/<name>.sock` link, removed when `run` returns however it returns,
+/// so a failed startup leaves neither behind. Both are only ever ours: `bind` refuses a socket another daemon answers
+/// on, and the link goes only while it still points at our socket.
+struct Published {
+    socket: PathBuf,
+    run_link: Option<PathBuf>,
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        // Best effort: a leftover socket file is replaced by the next daemon, a dead link skipped by the TUI.
+        let _ = std::fs::remove_file(&self.socket);
+        if let Some(link) = &self.run_link
+            && std::fs::read_link(link).is_ok_and(|target| target == self.socket)
+        {
+            let _ = std::fs::remove_file(link);
+        }
+    }
 }
 
 // ------------------------------------------------------------- errors
@@ -245,18 +263,19 @@ impl Daemon {
         let paths = Paths {
             root: manifest.state_dir().to_path_buf(),
         };
-        std::fs::create_dir_all(&paths.root)
-            .map_err(|e| format!("cannot create {}: {e}", paths.root.display()))?;
+        create_private_dir(&paths.root)?;
         let _lock = lock_state_dir(&paths)?;
         log_panics(paths.events());
         let socket = std::path::absolute(socket.unwrap_or_else(|| paths.socket()))
             .map_err(|e| e.to_string())?;
         let listener = bind(&socket)?;
-        let run_link = register(&manifest.name, &socket).inspect_err(|_| {
-            let _ = std::fs::remove_file(&socket);
-        })?;
+        // From here on every way out of `run`, a failed startup included, removes the socket and the run link.
+        let mut published = Published {
+            socket: socket.clone(),
+            run_link: None,
+        };
+        published.run_link = Some(register(&manifest.name, &socket)?);
         let (mut state, recovered) = State::load(&paths.state_json())?;
-        let stale_app = state.app_pid.take();
         state.daemon_pid = Some(std::process::id());
         let log = EventLog::open(paths.events())
             .map_err(|e| format!("cannot open the event log: {e}"))?;
@@ -285,7 +304,6 @@ impl Daemon {
             log: Mutex::new(log),
             hub: Hub(Mutex::new(Vec::new())),
             step_pgids: Mutex::new(Vec::new()),
-            run_link,
         });
         daemon.event(
             "daemon",
@@ -300,11 +318,9 @@ impl Daemon {
             daemon.event("error", None, warning);
         }
 
-        // A crashed daemon leaves its app running (pid reuse is accepted as a prototype risk). The state lock
-        // proves that daemon is gone, so the app it recorded has no other supervisor.
-        if let Some(pid) = stale_app
-            && process::group_alive(pid)
-        {
+        // A crashed daemon leaves its app running. The state lock proves that daemon is gone, so the app it started
+        // has no other supervisor; `leftover` makes sure the pid still names that app.
+        if let Some(pid) = process::leftover(&daemon.paths.app_pid()) {
             process::stop_group(pid, daemon.manifest().stop_timeout, None);
             daemon.event(
                 "daemon",
@@ -420,11 +436,19 @@ impl Daemon {
         self.save(&inner);
         drop(inner);
         self.event("daemon", None, "stopped");
-        let _ = std::fs::remove_file(&self.socket);
-        if std::fs::read_link(&self.run_link).is_ok_and(|target| target == self.socket) {
-            let _ = std::fs::remove_file(&self.run_link);
-        }
     }
+}
+
+/// Create the state directory (and missing parents) readable by its owner only, and tighten one that exists: it holds
+/// the app's logs and copies of its storage.
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
 }
 
 /// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes tui` finds every daemon.
@@ -670,6 +694,7 @@ impl Daemon {
             &env,
             &self.paths.app_log(id),
             &format!("start {id} live port {}", m.port),
+            Some(&self.paths.app_pid()),
         )
         .map_err(|e| err("start_failed", format!("cannot start {id}: {e}")))?;
         let pid = child.id();
@@ -693,7 +718,6 @@ impl Daemon {
             started: Instant::now(),
             started_at: now(),
         });
-        inner.state.app_pid = Some(pid);
         inner.app_failed = false;
         inner.restart_at = None;
         self.save(inner);
@@ -755,11 +779,14 @@ impl Daemon {
     fn stop_app(&self, mut app: App) {
         let m = self.manifest();
         let status = process::stop_group(app.child.id(), m.stop_timeout, Some(&mut app.child));
-        let exit = LastExit::new(status, true);
-        let mut inner = self.inner();
-        inner.state.app_pid = None;
-        inner.last_exit = Some(exit);
-        self.save(&inner);
+        self.forget_pid_file();
+        self.inner().last_exit = Some(LastExit::new(status, true));
+    }
+
+    /// The app's group is gone: its pid file names nothing a later daemon must stop. Best effort, since `leftover`
+    /// never mistakes a stale file for a live app.
+    fn forget_pid_file(&self) {
+        let _ = std::fs::remove_file(self.paths.app_pid());
     }
 
     fn process_value(&self, inner: &Inner) -> Value {
@@ -933,6 +960,7 @@ impl Daemon {
         // storage open while a rollback restores it.
         if let Some(pgid) = stragglers {
             process::stop_group(pgid, 1.0, None);
+            self.forget_pid_file();
         }
         if let Some(reason) = rollback {
             if let Err(e) = self.rollback_pending(&mut Out::none(), &reason) {
@@ -1014,7 +1042,6 @@ impl Daemon {
         let m = self.manifest();
         let pgid = app.child.id();
         let exit = LastExit::new(Some(status), false);
-        inner.state.app_pid = None;
         let pending = inner
             .state
             .pending
@@ -1294,8 +1321,15 @@ impl Daemon {
         code: &Path,
         log: &Path,
     ) -> Result<(), String> {
-        let mut child = process::spawn(command, code, &[], log, &format!("install: {command}"))
-            .map_err(|e| e.to_string())?;
+        let mut child = process::spawn(
+            command,
+            code,
+            &[],
+            log,
+            &format!("install: {command}"),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
         let pgid = child.id();
         lock(&self.step_pgids).push(pgid);
         let give_up = Instant::now() + Duration::from_secs_f64(m.install_timeout);
@@ -1391,6 +1425,7 @@ impl Daemon {
             &env,
             &log,
             &format!("start {id} test port {port}"),
+            None,
         )
         .map_err(|e| {
             err(
