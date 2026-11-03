@@ -453,7 +453,8 @@ impl Daemon {
             let mut inner = daemon.inner();
             daemon.update(&mut inner.store, |state| state.txn = None);
             let Some(previous) = &previous else { return };
-            if had_app {
+            // A daemon on its way out does not start what it is about to stop; its next start does.
+            if had_app && !daemon.shutting_down() {
                 if let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh) {
                     inner.live = Live::Failed;
                     daemon.event(EventKind::Failed, Some(previous), e.message);
@@ -488,6 +489,18 @@ impl Daemon {
         // The intent goes to disk before the side effect: once a process of the new generation exists, state.json
         // already says the switch is pending, so a daemon that dies from here on rolls it back at its next start.
         let mut inner = self.inner();
+        // `shutdown` waits for this switch and `start_live` refuses from then on: the target would be rolled back
+        // for good without ever running. Up to here it is still a switch that did not happen.
+        if self.shutting_down() {
+            drop(inner);
+            resume(self);
+            return Err(err(
+                ErrorCode::Busy,
+                format!(
+                    "the daemon is shutting down; {id} stays tested and nothing changed, switch again once it has started"
+                ),
+            ));
+        }
         let switched = self.modify(&mut inner.store, |state| {
             state.transition(id, GenState::Current)?;
             state.txn = Some(Txn::Pending(Pending {

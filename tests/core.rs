@@ -904,3 +904,52 @@ fn subscribe_since_replays_the_events_after_a_sequence_number() {
     let next: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
     assert!(next.get("history").is_some(), "{next}");
 }
+
+/// SIGTERM reaches the daemon while a switch is stopping the old app: the target never ran, so the switch is given up
+/// (the target stays tested and the answer says why), and the next daemon start runs the permanent generation.
+#[test]
+fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
+    let mut h = Harness::new(4950, "");
+    h.commit("v1", "slow-stop");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+
+    let daemon_pid = h.status()["daemon_pid"].as_i64().unwrap() as i32;
+    let (code, answer) = std::thread::scope(|scope| {
+        let switch = scope.spawn(|| h.fk(&["switch", "g2"]));
+        // g1 takes 1.5 s to leave after SIGTERM: the window for the daemon's own SIGTERM.
+        h.wait("the switch to stop g1", 10, || {
+            messages(&h, "progress").contains(&"stopping g1".to_string())
+        });
+        // SAFETY: the pid is the daemon this test started.
+        unsafe { libc::kill(daemon_pid, libc::SIGTERM) };
+        switch.join().unwrap()
+    });
+    assert_ne!(code, 0, "{answer}");
+    if let Some(message) = answer["message"].as_str() {
+        assert!(message.contains("shutting down"), "{answer}");
+        assert!(message.contains("g2 stays tested"), "{answer}");
+    }
+    h.wait("the daemon to end", 15, || h.fk(&["status"]).0 == 3);
+    h.kill_daemon();
+
+    h.start_daemon();
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    let status = h.status();
+    assert_eq!(
+        (status["permanent"].as_str(), status["pending"].clone()),
+        (Some("g1"), Value::Null),
+        "{status}"
+    );
+    assert_eq!(status["process"]["state"], "running", "{status}");
+    assert_eq!(h.generation("g2")["state"], "tested");
+    assert!(!h.versions().contains(&"v2".to_string()));
+}
