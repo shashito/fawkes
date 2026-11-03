@@ -6,6 +6,7 @@ mod process;
 mod protocol;
 mod state;
 mod storage;
+mod tui;
 
 use manifest::Manifest;
 use serde_json::{Value, json};
@@ -24,7 +25,8 @@ const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <c
   confirm [<gen>]                make the pending generation permanent
   rollback                       undo the pending switch now
   status | history               show the app and the generations
-  log [-n N] [--follow]          show the event log";
+  log [-n N] [--follow]          show the event log
+  tui                            full-screen live view and controls";
 
 /// Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 daemon unreachable.
 const EXIT_FAILED: u8 = 1;
@@ -89,9 +91,8 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
         }
     };
     match cli.command.as_str() {
-        "daemon" | "start" | "stop" | "restart" | "rollback" | "status" | "history" | "log" => {
-            wants(0..=0)?
-        }
+        "daemon" | "start" | "stop" | "restart" | "rollback" | "status" | "history" | "log"
+        | "tui" => wants(0..=0)?,
         "stage" | "test" | "switch" => wants(1..=1)?,
         "confirm" => wants(0..=1)?,
         other => return Err(format!("unknown command `{other}`")),
@@ -128,6 +129,13 @@ fn main() -> ExitCode {
             }
         };
     }
+    if cli.command == "tui"
+        && cli.socket.is_none()
+        && cli.manifest.is_none()
+        && std::env::var_os("FAWKES_SOCKET").is_none()
+    {
+        return ExitCode::from(tui::run(tui::Target::Discover(tui::run_dir())));
+    }
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
         Err(message) => {
@@ -135,6 +143,9 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    if cli.command == "tui" {
+        return ExitCode::from(tui::run(tui::Target::One(socket)));
+    }
     ExitCode::from(client(&cli, &socket, &manifest_path))
 }
 
