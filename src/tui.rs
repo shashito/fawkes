@@ -577,11 +577,14 @@ fn open(socket: &Path, request: &Value) -> Result<UnixStream, String> {
 /// One request: progress lines are skipped (they reach the screen through `subscribe`), the answer is the result.
 fn request(socket: &Path, request: &Value) -> Result<Value, String> {
     let stream = open(socket, request)?;
-    // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever. The
-    // limit applies to each read, so a long action that keeps sending progress lines is not cut off.
-    stream
-        .set_read_timeout(Some(REQUEST_TIMEOUT))
-        .map_err(|e| e.to_string())?;
+    // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever. Only
+    // quick actions get the limit: a stage, test, switch, stop or prune can stay silent for as long as an install,
+    // a health check, a stop timeout or a removal takes, and the daemon bounds those by the manifest's timeouts.
+    if matches!(request["command"].as_str(), Some("start" | "confirm")) {
+        stream
+            .set_read_timeout(Some(REQUEST_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+    }
     for line in BufReader::new(stream).lines() {
         let line = line.map_err(|e| match e.kind() {
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
