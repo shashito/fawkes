@@ -174,6 +174,7 @@ fawkes rollback
 fawkes status
 fawkes log      [-n N] [--follow]
 fawkes history
+fawkes tui
 ```
 
 Global options, before or after the command: `--json`, `--manifest FILE` (default `./fawkes.toml`), `--socket PATH`.
@@ -224,6 +225,13 @@ Results per command:
 | `status` | — | see below |
 | `log` | `limit?`, `follow?` | `events`; with `follow` the daemon instead streams every new event as an `event` line until the client closes |
 | `history` | — | `generations`, oldest first |
+| `subscribe` | — | never ends; see below |
+
+`subscribe` is the stream for live clients such as the TUI. The daemon first sends one `{"status": …}` line (the
+`status` result) and one `{"history": …}` line (the `history` result), then, until the client closes, every event as
+an `{"event": …}` line, followed by fresh `status` and `history` lines whenever a generation or the live app changed
+state. Clients never poll; a countdown to the confirm deadline is computed client-side from `pending.deadline`.
+Every event, including progress lines of a step another client started, reaches every subscriber.
 
 A generation record:
 
@@ -241,6 +249,36 @@ A generation record:
 ```
 
 `app` is `running`, `stopped` or `failed`; `busy` names the transaction step in progress.
+
+## TUI
+
+`fawkes tui` is a full-screen terminal client of the same socket: one `subscribe` connection for everything it
+shows, and ordinary one-shot requests for the actions. It holds no state of its own and works against a daemon
+started elsewhere; quitting it never affects the app.
+
+```
+┌ fawkes · ultimate ───────────────────────────────────────────────────────────┐
+│ live    g7  main@238c447f  current   confirm in 01:42   pid 9001  :4747      │
+│ perm.   g6  main@bf0ad442  permanent                                         │
+│ staged  g8  feat@91aa2c01  tested ✓ 2.1s on :4791                            │
+├ generations ─────────────────────────┬ log ──────────────────────────────────┤
+│ g8  tested       feat@91aa2c01       │ 14:02:01 switch g7 (deadline 120s)    │
+│ g7  current      main@238c447f       │ 14:02:03 g7 healthy                   │
+│ g6  permanent    main@bf0ad442       │ 14:02:40 g8 test passed on :4791      │
+│ g5  rolled_back  main@0c1d2e3f       │                                       │
+├──────────────────────────────────────┴───────────────────────────────────────┤
+│ s stage  t test  w switch  c confirm  r rollback  ↑↓ select  q quit          │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+- The header shows the live, permanent and newest staged generation, the deadline countdown (red under 15 s) and the
+  app's pid and port; `failed` and `busy` show there too.
+- The generations list is the history; the selected row is the target of `t`, `w` and `c`. `s` asks for a ref.
+- `w` and `r` ask for a `y` confirmation; a failed action shows its error message in the footer.
+- The log pane tails the event stream, progress lines included.
+
+Crate: **ratatui** (with its re-exported `crossterm` backend, so one dependency), the standard Rust TUI library;
+hand-written ANSI would need its own diffing, resize and raw-mode handling.
 
 ## On-disk layout
 
@@ -264,7 +302,7 @@ A generation record:
 
 ## Crates
 
-Five, each replacing something not worth hand-writing:
+Five for the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
