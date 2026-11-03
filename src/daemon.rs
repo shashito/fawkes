@@ -751,8 +751,9 @@ impl Daemon {
                 }
             }
         };
+        // An automatic rollback only needs the live process: a stage or test in progress must not delay it.
         if let Some(reason) = rollback_reason
-            && let Ok(_busy) = self.begin("rollback", Slot::Both)
+            && let Ok(_busy) = self.begin("rollback", Slot::Live)
         {
             match self.rollback_pending(&mut Out::none(), &reason) {
                 Ok(_) => {}
