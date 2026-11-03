@@ -95,12 +95,58 @@ pub struct Vars {
 }
 
 impl Vars {
+    /// Substitute the templates as they are, for `[env]` values and `health.url`.
     pub fn expand(&self, text: &str) -> String {
-        text.replace("{port}", &self.port.to_string())
-            .replace("{home}", &self.home.to_string_lossy())
-            .replace("{code}", &self.code.to_string_lossy())
-            .replace("{generation}", &self.generation)
-            .replace("{state}", &self.state.to_string_lossy())
+        self.substitute(text, |value| value)
+    }
+
+    /// Substitute the templates with each value shell-quoted, for text that goes to `/bin/sh -c`.
+    pub fn expand_command(&self, text: &str) -> String {
+        self.substitute(text, shell_quote)
+    }
+
+    /// One pass over `text`: substituted values are never scanned again, so a path that contains `{port}` stays
+    /// as it is. An unknown `{...}` stays as written.
+    fn substitute(&self, text: &str, finish: impl Fn(String) -> String) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            let value = rest.find('}').and_then(|close| {
+                let value = match &rest[1..close] {
+                    "port" => self.port.to_string(),
+                    "home" => self.home.to_string_lossy().into_owned(),
+                    "code" => self.code.to_string_lossy().into_owned(),
+                    "generation" => self.generation.clone(),
+                    "state" => self.state.to_string_lossy().into_owned(),
+                    _ => return None,
+                };
+                Some((close, value))
+            });
+            match value {
+                Some((close, value)) => {
+                    out.push_str(&finish(value));
+                    rest = &rest[close + 1..];
+                }
+                None => {
+                    out.push('{');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
+/// `value` as one shell word: bare when it only has shell-safe characters, else in single quotes.
+fn shell_quote(value: String) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "_-./:,+=@%".contains(c);
+    if !value.is_empty() && value.chars().all(safe) {
+        value
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
@@ -287,7 +333,7 @@ impl Manifest {
     pub fn health_check(&self, vars: &Vars) -> Check {
         match (&self.health.url, &self.health.command) {
             (Some(url), _) => Check::Url(vars.expand(url)),
-            (_, Some(command)) => Check::Command(vars.expand(command)),
+            (_, Some(command)) => Check::Command(vars.expand_command(command)),
             _ => unreachable!("load requires exactly one health check"),
         }
     }
@@ -296,6 +342,40 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vars(home: &str) -> Vars {
+        Vars {
+            port: 4790,
+            home: PathBuf::from(home),
+            code: PathBuf::from("/srv/code"),
+            generation: "g3".to_string(),
+            state: PathBuf::from("/srv/state"),
+        }
+    }
+
+    #[test]
+    fn templates_expand_in_one_pass() {
+        let v = vars("/tmp/{port}");
+        assert_eq!(
+            v.expand("{home}:{port}:{nope}:{"),
+            "/tmp/{port}:4790:{nope}:{"
+        );
+        assert_eq!(v.expand_command("{home} {port}"), "'/tmp/{port}' 4790");
+    }
+
+    #[test]
+    fn commands_quote_values_and_env_does_not() {
+        let tricky = "/tmp/it's a dir";
+        let v = vars(tricky);
+        assert_eq!(v.expand("{home}"), tricky);
+        assert_eq!(v.expand_command("{code} {generation}"), "/srv/code g3");
+        assert_eq!(vars("").expand_command("{home}"), "''");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &v.expand_command("printf %s {home}")])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), tricky);
+    }
 
     const VALID: &str = r#"
 name = "app"

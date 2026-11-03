@@ -158,6 +158,13 @@ TOML, one file per app. Relative paths resolve against the manifest's directory.
 | `{generation}` | the generation id, `g3` |
 | `{state}` | Fawkes's state directory |
 
+Expansion is one pass: a substituted value is never scanned again, and an unknown `{...}` stays as written. In
+`install`, `start` and `health.command` each value is shell-quoted (bare when it only has `A-Z a-z 0-9 _ - . / : , + = @ %`,
+otherwise in single quotes with `'\''` for a single quote), so a path with a space or a `'` stays one word. In `[env]`
+values and `health.url` values are substituted as is. A manifest that quotes a template itself (`'{home}'`) only keeps
+working for paths without special characters, so commands use the bare template, or the `[env]` variable
+(`"$APP_HOME"`).
+
 ```toml
 name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
