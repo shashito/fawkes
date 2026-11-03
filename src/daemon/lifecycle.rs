@@ -53,7 +53,7 @@ impl Daemon {
         let app = {
             let mut inner = self.inner();
             let id = self.current_generation(&inner)?;
-            inner.take_running().ok_or_else(|| {
+            inner.take_running_alive()?.ok_or_else(|| {
                 invalid_state(format!("{id} is not running; `fawkes start` starts it"))
             })?
         };
@@ -69,7 +69,7 @@ impl Daemon {
         let (id, app) = {
             let mut inner = self.inner();
             let id = self.current_generation(&inner)?;
-            (id, inner.take_running())
+            (id, inner.take_running_alive()?)
         };
         if let Some(app) = app {
             self.say(out, &id, format!("stopping {id}"));
