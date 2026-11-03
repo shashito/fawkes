@@ -2,6 +2,7 @@
 
 use crate::manifest::Check;
 use crate::state;
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -37,20 +38,36 @@ pub fn spawn(
         .spawn()
 }
 
+/// `pgid` as a process group the kernel can signal. 0 would mean our own group and 1 is init, so a value that cannot
+/// be an app's group (a corrupt `state.json`) names no group at all.
+fn group(pgid: u32) -> Option<Pid> {
+    i32::try_from(pgid)
+        .ok()
+        .filter(|&pid| pid > 1)
+        .and_then(Pid::from_raw)
+}
+
+fn signal_group(pgid: u32, signal: Signal) {
+    if let Some(group) = group(pgid) {
+        // Fails only when the group is already gone (or never was ours), which leaves nothing to stop.
+        let _ = kill_process_group(group, signal);
+    }
+}
+
 /// Does any process of group `pgid` still exist?
 pub fn group_alive(pgid: u32) -> bool {
-    unsafe { libc::killpg(pgid as i32, 0) == 0 }
+    group(pgid).is_some_and(|group| test_kill_process_group(group).is_ok())
 }
 
 pub fn kill_group(pgid: u32) {
-    unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+    signal_group(pgid, Signal::KILL);
 }
 
 /// SIGTERM the group `pgid`, wait up to `timeout` seconds for all of it to end, then SIGKILL it.
 /// With the group leader as `leader` (our child) its exit status is returned; a leftover group of an earlier
 /// daemon has no leader to reap and gives `None`.
 pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Option<ExitStatus> {
-    unsafe { libc::killpg(pgid as i32, libc::SIGTERM) };
+    signal_group(pgid, Signal::TERM);
     let give_up = Instant::now() + Duration::from_secs_f64(timeout);
     let mut status = None;
     loop {

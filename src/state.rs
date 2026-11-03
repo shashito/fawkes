@@ -67,6 +67,9 @@ impl Paths {
     pub fn socket(&self) -> PathBuf {
         self.root.join("fawkes.sock")
     }
+    pub fn lock(&self) -> PathBuf {
+        self.root.join("lock")
+    }
     pub fn state_json(&self) -> PathBuf {
         self.root.join("state.json")
     }
@@ -157,7 +160,7 @@ pub struct Pending {
     pub deadline: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub generations: Vec<Generation>,
@@ -170,22 +173,64 @@ pub struct State {
     pub app_pid: Option<u32>,
 }
 
+/// `state.json.bak` next to `state.json`.
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".bak");
+    name.into()
+}
+
+/// Write `bytes` to `path` so that any crash, a power loss included, leaves the old or the new file whole: a temp
+/// file, synced, renamed into place, then the directory synced so the rename is on disk too.
+pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(dir)?.sync_all()
+}
+
 impl State {
-    pub fn load(path: &Path) -> Result<State, String> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                serde_json::from_str(&text).map_err(|e| format!("corrupt {}: {e}", path.display()))
+    /// Read `state.json`, or its copy `state.json.bak` when `state.json` is unreadable. With the copy, the second
+    /// value says what was wrong with `state.json`, for the daemon to report.
+    pub fn load(path: &Path) -> Result<(State, Option<String>), String> {
+        let backup = backup_path(path);
+        let problem = match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(state) => return Ok((state, None)),
+                Err(e) => format!("{} is corrupt ({e})", path.display()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !backup.exists() => {
+                return Ok((State::default(), None));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
-        }
+            Err(e) => format!("cannot read {} ({e})", path.display()),
+        };
+        let unusable = |e: String| {
+            format!(
+                "{problem} and its copy {} is unusable ({e}); repair one of them, or delete both to start over without any generation",
+                backup.display()
+            )
+        };
+        let bytes = std::fs::read(&backup).map_err(|e| unusable(e.to_string()))?;
+        let state = serde_json::from_slice(&bytes).map_err(|e| unusable(e.to_string()))?;
+        Ok((
+            state,
+            Some(format!("{problem}; recovered from {}", backup.display())),
+        ))
     }
 
-    /// Atomic write: temp file, then rename.
+    /// Write `state.json` durably, then the same content to `state.json.bak`. A crash leaves at least one of them
+    /// whole, and `load` takes `state.json` whenever it can.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(tmp, path)
+        let bytes = serde_json::to_vec_pretty(self)?;
+        write_durably(path, &bytes)?;
+        write_durably(&backup_path(path), &bytes)
     }
 
     pub fn find(&self, id: &str) -> Option<&Generation> {
@@ -196,13 +241,13 @@ impl State {
         self.generations.iter_mut().find(|g| g.id == id)
     }
 
-    /// The generation `start`, `stop` and `restart` act on: the pending one, else the permanent one.
     /// The pending generation is already rolled back: only its storage restore failed and awaits a retry.
     pub fn restore_failed(&self, pending: &Pending) -> bool {
         self.find(&pending.generation)
             .is_some_and(|g| g.state == GenState::RolledBack)
     }
 
+    /// The generation `start`, `stop` and `restart` act on: the pending one, else the permanent one.
     pub fn current(&self) -> Option<&str> {
         self.pending
             .as_ref()
@@ -298,5 +343,41 @@ mod tests {
             assert_eq!(parse_time(&format_time(secs)), Some(secs));
         }
         assert_eq!(format_time(1_793_714_521), "2026-11-03T14:02:01Z");
+    }
+
+    #[test]
+    fn load_falls_back_to_the_copy_when_state_json_is_unreadable() {
+        let root = std::env::temp_dir().join(format!("fk-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        assert!(State::load(&path).unwrap().0.permanent.is_none());
+
+        let state = State {
+            permanent: Some("g2".into()),
+            next_id: 2,
+            ..State::default()
+        };
+        state.save(&path).unwrap();
+        let (loaded, warning) = State::load(&path).unwrap();
+        assert_eq!((loaded.permanent.as_deref(), warning), (Some("g2"), None));
+
+        // What a power loss before the rename reached the disk could leave: an empty state.json.
+        std::fs::write(&path, "").unwrap();
+        let (loaded, warning) = State::load(&path).unwrap();
+        assert_eq!(loaded.permanent.as_deref(), Some("g2"));
+        assert!(warning.unwrap().contains("recovered from"));
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            State::load(&path).unwrap().0.permanent.as_deref(),
+            Some("g2"),
+            "a missing state.json next to its copy is not a fresh start"
+        );
+
+        std::fs::write(&path, "{").unwrap();
+        std::fs::write(backup_path(&path), "").unwrap();
+        assert!(State::load(&path).unwrap_err().contains("delete both"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -237,7 +237,12 @@ fn client(cli: &Cli, socket: &Path, manifest_path: &Path) -> u8 {
                     error["message"].as_str().unwrap_or("unknown error")
                 );
             }
-            return EXIT_FAILED;
+            // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
+            return if error["code"] == "usage" {
+                EXIT_USAGE
+            } else {
+                EXIT_FAILED
+            };
         }
     }
     if follow {
