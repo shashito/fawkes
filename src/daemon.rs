@@ -72,8 +72,10 @@ struct Inner {
     busy: Option<String>,
     /// A step that moves the live process (switch, rollback, start, stop, restart): one at a time.
     moving: Option<String>,
-    /// A rollback has taken the pending generation apart; it can no longer be confirmed.
-    rolling_back: bool,
+    /// A rollback of the pending generation is decided or under way, with its reason: it can no longer be confirmed.
+    /// Set in the same critical section that learns why (a crash, the deadline, a failed health check), so no
+    /// confirm fits between the decision and the rollback.
+    rollback: Option<String>,
 }
 
 /// Which slots a step occupies.
@@ -253,7 +255,7 @@ impl Daemon {
                 restarts: 0,
                 busy: None,
                 moving: None,
-                rolling_back: false,
+                rollback: None,
             }),
             log: Mutex::new(log),
             hub: Mutex::new(Vec::new()),
@@ -672,7 +674,8 @@ impl Daemon {
         self.point_current_link(&g.dir);
         self.event("started", Some(id), format!("pid {pid} on port {}", m.port));
 
-        // Health is reported, never acted on: only `confirm` makes a generation permanent.
+        // Health never confirms: only `confirm` makes a generation permanent. With `rollback_on_unhealthy` a pending
+        // generation that gives up is rolled back by the supervisor without waiting for its deadline.
         let daemon = self.clone();
         let id = id.to_string();
         thread::spawn(move || {
@@ -687,11 +690,30 @@ impl Daemon {
             );
             match result {
                 Ok(()) => daemon.event("healthy", Some(&id), "health check passed"),
-                Err(e) if daemon.is_running(pid) => daemon.event("unhealthy", Some(&id), e),
+                Err(e) if daemon.is_running(pid) => {
+                    let event = daemon.event("unhealthy", Some(&id), e);
+                    if m.rollback_on_unhealthy {
+                        daemon.roll_back_unhealthy(&id, pid);
+                    }
+                    event
+                }
                 Err(_) => return,
             };
         });
         Ok(())
+    }
+
+    /// Record the rollback of the pending generation `id` whose process `pid` never became healthy, unless it has
+    /// changed since (confirmed, restarted, already rolling back); the next supervision pass carries it out.
+    fn roll_back_unhealthy(&self, id: &str, pid: u32) {
+        let mut inner = self.inner();
+        let pending = inner.state.pending.as_ref().is_some_and(|pending| {
+            pending.generation == id && !inner.state.restore_failed(pending)
+        });
+        let running = inner.app.as_ref().is_some_and(|app| app.child.id() == pid);
+        if pending && running && inner.rollback.is_none() {
+            inner.rollback = Some("health check failed".into());
+        }
     }
 
     /// `<state_dir>/current` -> the live worktree, replaced atomically.
@@ -855,78 +877,107 @@ impl Daemon {
 // ------------------------------------------------------ the supervisor
 
 impl Daemon {
-    /// One supervision pass: reap the app, roll back a pending switch that is dead or overdue, restart a crash.
+    /// One supervision pass: reap the app, roll back a pending switch that is dead, overdue or unhealthy, restart a
+    /// crash. Each of them moves the live process, so the pass holds the live slot like `stop` or `restart` do: no
+    /// start, stop, switch or rollback runs while it cleans up after a crash. A stage or test never delays it.
     fn tick(self: &Arc<Self>) {
-        let rollback_reason = {
+        let Some(step) = self.due() else { return };
+        // Busy: the step holding the slot deals with the live process itself, or the next pass does.
+        let Ok(_busy) = self.begin(step, Slot::Live) else {
+            return;
+        };
+        let (stragglers, rollback) = {
             let mut inner = self.inner();
             if self.shutting_down() {
                 return;
             }
-            self.reap(&mut inner);
-            match &inner.state.pending {
-                // Rolled back, but its storage restore failed: retried by `rollback` or the next daemon start.
-                Some(pending) if inner.state.restore_failed(pending) => None,
-                Some(pending) if now_secs() >= self.deadline_secs(pending) => {
-                    Some("missed confirm deadline".to_string())
-                }
-                Some(_) if inner.app.is_none() => inner
-                    .last_exit
-                    .as_ref()
-                    .filter(|x| !x.requested)
-                    .map(|x| format!("exited before confirm ({})", x.describe())),
-                Some(_) => None,
-                None => {
-                    let due = inner.restart_at.is_some_and(|at| Instant::now() >= at);
-                    if due
-                        && inner.app.is_none()
-                        && !inner.app_failed
-                        && inner.moving.is_none()
-                        && let Some(id) = inner.state.permanent.clone()
-                        && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
-                    {
-                        inner.app_failed = true;
-                        self.event("failed", Some(&id), e.message);
-                    }
-                    None
-                }
-            }
+            let stragglers = self.reap(&mut inner);
+            (stragglers, self.decide_rollback(&mut inner))
         };
-        // An automatic rollback only needs the live process: a stage or test in progress must not delay it.
-        if let Some(reason) = rollback_reason
-            && let Ok(_busy) = self.begin("rollback", Slot::Live)
-        {
-            match self.rollback_pending(&mut Out::none(), &reason) {
-                Ok(_) => {}
-                Err(e) if e.code == "invalid_state" => {}
-                Err(e) => {
-                    self.event("error", None, e.message);
-                }
+        // The leader is gone; end the rest of its group too, so nothing of it lives on unsupervised or keeps the
+        // storage open while a rollback restores it.
+        if let Some(pgid) = stragglers {
+            process::stop_group(pgid, 1.0, None);
+        }
+        if let Some(reason) = rollback {
+            if let Err(e) = self.rollback_pending(&mut Out::none(), &reason) {
+                self.event("error", None, e.message);
             }
+            return;
+        }
+        let mut inner = self.inner();
+        if self.restart_due(&inner)
+            && let Some(id) = inner.state.permanent.clone()
+            && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
+        {
+            inner.app_failed = true;
+            self.event("failed", Some(&id), e.message);
         }
     }
 
-    /// If the app exited without being asked to, count it and schedule its restart.
-    fn reap(&self, inner: &mut Inner) {
-        let Some(status) = inner
+    /// What a supervision pass has to do, named for `busy`; None in the usual case, so an idle pass takes no slot.
+    fn due(&self) -> Option<&'static str> {
+        let mut inner = self.inner();
+        if self.shutting_down() {
+            return None;
+        }
+        let exited = inner
             .app
             .as_mut()
-            .and_then(|a| a.child.try_wait().ok().flatten())
-        else {
-            return;
-        };
-        let app = inner.app.take().expect("checked above");
+            .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_))));
+        let pending = inner
+            .state
+            .pending
+            .as_ref()
+            .filter(|pending| !inner.state.restore_failed(pending));
+        let overdue = pending.is_some_and(|pending| {
+            parse_time(&pending.deadline).is_none_or(|deadline| now_secs() >= deadline)
+        });
+        if pending.is_some() && (exited || overdue || inner.rollback.is_some()) {
+            Some("rollback")
+        } else if exited {
+            Some("reap")
+        } else if self.restart_due(&inner) {
+            Some("restart")
+        } else {
+            None
+        }
+    }
+
+    fn restart_due(&self, inner: &Inner) -> bool {
+        inner.state.pending.is_none()
+            && inner.app.is_none()
+            && !inner.app_failed
+            && inner.restart_at.is_some_and(|at| Instant::now() >= at)
+    }
+
+    /// Whether the pending switch must roll back, and why. A reason is recorded in `inner.rollback` before the lock
+    /// is released, so from here on a confirm is refused.
+    fn decide_rollback(&self, inner: &mut Inner) -> Option<String> {
+        let pending = inner.state.pending.as_ref()?;
+        // Rolled back, but its storage restore failed: retried by `rollback` or the next daemon start.
+        if inner.state.restore_failed(pending) {
+            return None;
+        }
+        if inner.rollback.is_none() && now_secs() >= self.deadline_secs(pending) {
+            inner.rollback = Some("missed confirm deadline".into());
+        }
+        inner.rollback.clone()
+    }
+
+    /// If the app exited without being asked to, take it out and decide what follows where the facts are: the pending
+    /// generation gets no retries and is rolled back (recorded in `inner.rollback`, so no confirm slips in), any
+    /// other is restarted after a backoff or, after too many failed starts, given up. Returns the process group, which
+    /// the caller ends once it has released `inner`.
+    fn reap(&self, inner: &mut Inner) -> Option<u32> {
+        let status = inner
+            .app
+            .as_mut()
+            .and_then(|a| a.child.try_wait().ok().flatten())?;
+        let app = inner.app.take()?;
         let ran = app.started.elapsed().as_secs_f64();
         let m = self.manifest();
-        // The leader is gone; end the rest of its group too, so nothing of it lives on unsupervised or keeps the
-        // storage open while a rollback restores it.
         let pgid = app.child.id();
-        if process::group_alive(pgid) {
-            process::stop_group(pgid, 1.0, None);
-            let give_up = Instant::now() + Duration::from_secs(2);
-            while process::group_alive(pgid) && Instant::now() < give_up {
-                sleep(Duration::from_millis(10));
-            }
-        }
         let exit = LastExit::new(Some(status), false);
         inner.state.app_pid = None;
         let pending = inner
@@ -942,33 +993,31 @@ impl Daemon {
             };
             g.failed_starts
         });
-        let message = format!("{} after {ran:.1}s", exit.describe());
-        inner.last_exit = Some(exit);
+        let mut message = format!("{} after {ran:.1}s", exit.describe());
+        let gave_up = !pending && failed_starts >= m.max_failed_starts;
         if pending {
-            // A pending generation gets no retries; tick rolls it back.
-        } else if failed_starts >= m.max_failed_starts {
+            // A reason decided earlier (a failed health check) stays the reason.
+            inner
+                .rollback
+                .get_or_insert_with(|| format!("exited before confirm ({})", exit.describe()));
+        } else if gave_up {
             inner.app_failed = true;
-            self.event("exited", Some(&app.generation), message);
+        } else {
+            let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
+            inner.restart_at = Some(Instant::now() + Duration::from_secs(backoff));
+            message += &format!("; restarting in {backoff}s");
+        }
+        inner.last_exit = Some(exit);
+        self.event("exited", Some(&app.generation), message);
+        if gave_up {
             self.event(
                 "failed",
                 Some(&app.generation),
                 format!("{failed_starts} failed starts in a row; not restarting"),
             );
-            self.save(inner);
-            return;
-        } else {
-            let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
-            inner.restart_at = Some(Instant::now() + Duration::from_secs(backoff));
-            self.event(
-                "exited",
-                Some(&app.generation),
-                format!("{message}; restarting in {backoff}s"),
-            );
-            self.save(inner);
-            return;
         }
-        self.event("exited", Some(&app.generation), message);
         self.save(inner);
+        Some(pgid)
     }
 }
 
@@ -980,6 +1029,15 @@ impl Daemon {
             && inner.state.restore_failed(pending)
         {
             return Err(restore_failed(&pending.generation));
+        }
+        if let (Some(pending), Some(reason)) = (&inner.state.pending, &inner.rollback) {
+            return Err(err(
+                "busy",
+                format!(
+                    "{} is being rolled back ({reason}); try again when the rollback has finished",
+                    pending.generation
+                ),
+            ));
         }
         inner.state.current().map(String::from).ok_or_else(|| {
             invalid_state(
@@ -1393,15 +1451,16 @@ impl Daemon {
 
     fn confirm(&self, id: Option<&str>) -> R<Value> {
         let mut inner = self.inner();
-        if inner.rolling_back {
-            return Err(invalid_state(
-                "the pending switch is being rolled back and can no longer be confirmed",
-            ));
-        }
         if let Some(pending) = &inner.state.pending
             && inner.state.restore_failed(pending)
         {
             return Err(restore_failed(&pending.generation));
+        }
+        if let (Some(pending), Some(reason)) = (&inner.state.pending, &inner.rollback) {
+            return Err(invalid_state(format!(
+                "{} is being rolled back ({reason}) and can no longer be confirmed",
+                pending.generation
+            )));
         }
         if let Some(pending) = &inner.state.pending
             && now_secs() >= self.deadline_secs(pending)
@@ -1432,6 +1491,25 @@ impl Daemon {
                 )),
                 None => not_found(id),
             });
+        }
+        // Only a generation that runs can vouch for itself. One whose process just exited is about to be rolled back
+        // by the supervisor; making it permanent would keep crashed code.
+        match inner.app.as_mut() {
+            Some(app) if app.generation == pending.generation => {
+                if let Ok(Some(status)) = app.child.try_wait() {
+                    return Err(invalid_state(format!(
+                        "{} exited ({}) before it was confirmed and is being rolled back",
+                        pending.generation,
+                        LastExit::new(Some(status), false).describe()
+                    )));
+                }
+            }
+            _ => {
+                return Err(invalid_state(format!(
+                    "{} is not running, so it cannot be confirmed; `fawkes start` it and confirm again, or `fawkes rollback`",
+                    pending.generation
+                )));
+            }
         }
         // Applied to a copy and kept only once it is on disk: a confirm the daemon could not write is not one, and
         // the switch stays pending (a daemon restart would roll it back).
@@ -1475,7 +1553,7 @@ impl Daemon {
             let pending = inner.state.pending.clone().ok_or_else(|| {
                 invalid_state("no switch is pending, so there is nothing to roll back; to go back past a confirm, `test` and `switch` to a retired generation")
             })?;
-            inner.rolling_back = true;
+            inner.rollback.get_or_insert_with(|| reason.into());
             inner.restart_at = None;
             (pending, inner.app.take())
         };
@@ -1495,7 +1573,7 @@ impl Daemon {
             g.rolled_back_at = Some(now());
             g.rollback_reason = Some(reason.into());
         }
-        inner.rolling_back = false;
+        inner.rollback = None;
         let permanent = inner.state.permanent.clone();
         if let Err(e) = restored {
             // Starting the permanent generation on storage in an unknown state could do more harm. `pending` stays

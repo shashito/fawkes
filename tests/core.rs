@@ -291,3 +291,74 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
         "g1 runs again, with its own background process"
     );
 }
+
+/// A confirm that arrives just after the pending generation crashed must not make the crashed code permanent: the
+/// crash decides, and the confirm is refused.
+#[test]
+fn a_confirm_racing_a_crash_of_the_pending_generation_is_refused() {
+    let mut h = Harness::new(4840, "");
+    h.commit("v1", "confirm");
+    h.commit("v2", "crash-confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2"]);
+
+    let answer = h.dir.join("home/confirm.json");
+    let mut confirm = Value::Null;
+    h.wait("the late confirm to be answered", 15, || {
+        confirm = std::fs::read_to_string(&answer)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null);
+        !confirm.is_null()
+    });
+    assert_eq!(confirm["code"], "invalid_state", "{confirm}");
+    h.wait("g2's crash to roll it back", 15, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert!(
+        h.generation("g2")["rollback_reason"]
+            .as_str()
+            .unwrap()
+            .contains("exited before confirm"),
+        "{}",
+        h.generation("g2")
+    );
+    assert_eq!(h.status()["permanent"], "g1");
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+}
+
+/// With `rollback_on_unhealthy`, a pending generation whose health check gives up rolls back at once, long before
+/// its confirm deadline.
+#[test]
+fn rollback_on_unhealthy_rolls_back_without_waiting_for_the_deadline() {
+    let mut h = Harness::new(4850, "rollback_on_unhealthy = true");
+    h.edit_manifest("timeout = 20", "timeout = 3");
+    h.commit("v1", "confirm");
+    h.commit("v2", "unhealthy-live");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    let switched = std::time::Instant::now();
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("g2's failed health check to roll it back", 20, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert!(switched.elapsed().as_secs() < 20);
+    assert_eq!(h.generation("g2")["rollback_reason"], "health check failed");
+    assert_eq!(h.status()["permanent"], "g1");
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+}

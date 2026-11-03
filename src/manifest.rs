@@ -36,6 +36,9 @@ pub struct Manifest {
     pub min_uptime: f64,
     #[serde(default = "default_max_failed_starts")]
     pub max_failed_starts: u32,
+    /// Roll a pending generation back as soon as its health check gives up, instead of at the deadline.
+    #[serde(default)]
+    pub rollback_on_unhealthy: bool,
     pub health: Health,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -313,6 +316,10 @@ impl Manifest {
             (
                 "max_failed_starts",
                 self.max_failed_starts != new.max_failed_starts,
+            ),
+            (
+                "rollback_on_unhealthy",
+                self.rollback_on_unhealthy != new.rollback_on_unhealthy,
             ),
             ("health", self.health != new.health),
             ("env", self.env != new.env),
