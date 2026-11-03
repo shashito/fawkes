@@ -120,15 +120,106 @@ impl Paths {
 
 // --------------------------------------------------------------- state
 
+/// The transaction step in flight, saved to state.json before each of its side effects, so a daemon that dies
+/// anywhere inside a switch or a rollback finds out at its next start what it was doing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "snake_case")]
+pub enum Txn {
+    /// The live app is being stopped and the storage snapshotted for a switch to `generation`; no process of it has
+    /// run yet. Written before the old app is stopped.
+    Switching {
+        generation: String,
+        previous: Option<String>,
+    },
+    /// The switch is live and awaits confirm by `deadline`. Written before the target is started.
+    Pending(Pending),
+    /// The pending switch is being rolled back for `reason`. Written, together with the generation's `rolled_back`
+    /// state, before the target is stopped. `restore_failed`: the restore (or the save that ends the switch)
+    /// failed; the app stays stopped until `rollback` or the next daemon start retries.
+    RollingBack {
+        pending: Pending,
+        reason: String,
+        restore_failed: bool,
+    },
+}
+
+impl Txn {
+    /// The generation the step switches to or rolls back.
+    pub fn generation(&self) -> &str {
+        match self {
+            Txn::Switching { generation, .. } => generation,
+            Txn::Pending(pending) | Txn::RollingBack { pending, .. } => &pending.generation,
+        }
+    }
+
+    /// The generation the step returns to.
+    fn previous(&self) -> Option<&str> {
+        match self {
+            Txn::Switching { previous, .. } => previous.as_deref(),
+            Txn::Pending(pending) | Txn::RollingBack { pending, .. } => pending.previous.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "StateFile")]
 pub struct State {
-    #[serde(default)]
     pub generations: Vec<Generation>,
-    #[serde(default)]
     pub next_id: u32,
     pub permanent: Option<String>,
-    pub pending: Option<Pending>,
+    pub txn: Option<Txn>,
     pub daemon_pid: Option<u32>,
+}
+
+/// What `state.json` may hold: the current shape and the one before `txn`, which kept a `pending` switch and
+/// derived a failed restore from its generation being `rolled_back`.
+#[derive(Deserialize)]
+struct StateFile {
+    #[serde(default)]
+    generations: Vec<Generation>,
+    #[serde(default)]
+    next_id: u32,
+    permanent: Option<String>,
+    txn: Option<Txn>,
+    pending: Option<Pending>,
+    daemon_pid: Option<u32>,
+}
+
+impl From<StateFile> for State {
+    fn from(file: StateFile) -> State {
+        let StateFile {
+            generations,
+            next_id,
+            permanent,
+            txn,
+            pending,
+            daemon_pid,
+        } = file;
+        let txn = txn.or_else(|| {
+            let pending = pending?;
+            let rolled_back = generations
+                .iter()
+                .find(|g| g.id == pending.generation && g.state == GenState::RolledBack);
+            Some(match rolled_back {
+                Some(g) => Txn::RollingBack {
+                    reason: g
+                        .rollback_reason
+                        .clone()
+                        .unwrap_or_else(|| "no reason recorded".into()),
+                    pending,
+                    restore_failed: true,
+                },
+                None => Txn::Pending(pending),
+            })
+        });
+        State {
+            generations,
+            next_id,
+            permanent,
+            txn,
+            daemon_pid,
+        }
+    }
 }
 
 /// `state.json.bak` next to `state.json`.
@@ -199,22 +290,66 @@ impl State {
         self.generations.iter_mut().find(|g| g.id == id)
     }
 
-    /// The pending generation is already rolled back: only its storage restore failed and awaits a retry.
-    pub fn restore_failed(&self, pending: &Pending) -> bool {
-        self.find(&pending.generation)
-            .is_some_and(|g| g.state == GenState::RolledBack)
+    /// The switch that is live and not yet confirmed, also while it is being rolled back or its restore failed.
+    pub fn pending(&self) -> Option<&Pending> {
+        match &self.txn {
+            Some(Txn::Pending(pending) | Txn::RollingBack { pending, .. }) => Some(pending),
+            _ => None,
+        }
     }
 
-    /// The generations `prune` removes so that `keep` remain: the oldest first, never the permanent one, the pending
-    /// one or the one it rolls back to (a rollback needs its code and the pending one's snapshot), nor one still
-    /// staging. More than `keep` remain when those alone are more.
+    /// The reason of a rollback that is decided and not yet done, which can no longer be confirmed.
+    pub fn rolling_back(&self) -> Option<&str> {
+        match &self.txn {
+            Some(Txn::RollingBack {
+                reason,
+                restore_failed: false,
+                ..
+            }) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Decide to roll back the pending switch for `reason`: the generation becomes `rolled_back` and the step
+    /// `RollingBack`. Does nothing when no switch is pending, so the first reason sticks and a generation rolls back
+    /// at most once. Says whether it decided.
+    pub fn decide_rollback(&mut self, reason: &str) -> bool {
+        let Some(Txn::Pending(pending)) = self.txn.clone() else {
+            return false;
+        };
+        if let Some(g) = self.find_mut(&pending.generation)
+            && g.state != GenState::RolledBack
+        {
+            g.state = GenState::RolledBack;
+            g.rolled_back_at = Some(now());
+            g.rollback_reason = Some(reason.into());
+        }
+        self.txn = Some(Txn::RollingBack {
+            pending,
+            reason: reason.into(),
+            restore_failed: false,
+        });
+        true
+    }
+
+    /// The restore of the rollback in flight (or the save that ends it) failed: it awaits a retry.
+    pub fn fail_restore(&mut self) {
+        if let Some(Txn::RollingBack { restore_failed, .. }) = &mut self.txn {
+            *restore_failed = true;
+        }
+    }
+
+    /// The generations `prune` removes so that `keep` remain: the oldest first, never the permanent one, those of a
+    /// transaction step (the one it switches to and the one it returns to: a rollback needs the code of the one
+    /// and the snapshot of the other), nor one still staging. More than `keep` remain when those alone are more.
     pub fn prunable(&self, keep: usize) -> Vec<String> {
         let protected = |g: &Generation| {
             g.state == GenState::Staging
                 || self.permanent.as_deref() == Some(g.id.as_str())
-                || self.pending.as_ref().is_some_and(|p| {
-                    p.generation == g.id || p.previous.as_deref() == Some(g.id.as_str())
-                })
+                || self
+                    .txn
+                    .as_ref()
+                    .is_some_and(|t| t.generation() == g.id || t.previous() == Some(g.id.as_str()))
         };
         self.generations
             .iter()
@@ -226,8 +361,7 @@ impl State {
 
     /// The generation `start`, `stop` and `restart` act on: the pending one, else the permanent one.
     pub fn current(&self) -> Option<&str> {
-        self.pending
-            .as_ref()
+        self.pending()
             .map(|p| p.generation.as_str())
             .or(self.permanent.as_deref())
     }
@@ -374,11 +508,11 @@ mod tests {
                 generation("g5", GenState::Staging),
             ],
             permanent: Some("g1".into()),
-            pending: Some(Pending {
+            txn: Some(Txn::Pending(Pending {
                 generation: "g3".into(),
                 previous: Some("g1".into()),
                 deadline: String::new(),
-            }),
+            })),
             ..State::default()
         };
         assert_eq!(state.prunable(4), ["g2"]);
@@ -433,6 +567,135 @@ mod tests {
         ] {
             assert_eq!(parse_time(text), None, "{text}");
         }
+    }
+
+    /// A `state.json` as phase 2 wrote it (`State::save` before `txn`): three generations and the `pending` field
+    /// in place of `txn`. `pending` and the state of `g3` vary.
+    fn phase_two_state(pending: &str, g3_state: &str, g3_reason: &str) -> String {
+        let generation = |id: &str, state: &str, reason: &str| {
+            format!(
+                r#"    {{
+      "id": "{id}",
+      "ref": "main",
+      "commit": "0123456789abcdef",
+      "state": "{state}",
+      "dir": "/tmp/fk/generations/{id}/code",
+      "staged_at": "2026-11-03T14:00:00Z",
+      "test": null,
+      "switched_at": null,
+      "confirmed_at": null,
+      "rolled_back_at": null,
+      "rollback_reason": {reason},
+      "failed_starts": 0
+    }}"#
+            )
+        };
+        format!(
+            r#"{{
+  "generations": [
+{},
+{},
+{}
+  ],
+  "next_id": 3,
+  "permanent": "g2",
+  "pending": {pending},
+  "daemon_pid": 812
+}}"#,
+            generation("g1", "retired", "null"),
+            generation("g2", "permanent", "null"),
+            generation("g3", g3_state, g3_reason),
+        )
+    }
+
+    #[test]
+    fn a_phase_two_state_json_loads_with_its_pending_switch_as_a_txn() {
+        let root = std::env::temp_dir().join(format!("fk-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("state.json");
+        let pending = pending_json();
+        let load = |text: String| {
+            std::fs::write(&path, text).unwrap();
+            let (state, warning) = State::load(&path).unwrap();
+            assert_eq!(warning, None);
+            state
+        };
+
+        let state = load(phase_two_state(pending, "current", "null"));
+        assert_eq!(state.generations.len(), 3);
+        assert!(["g1", "g2", "g3"].iter().all(|id| state.find(id).is_some()));
+        assert_eq!(
+            (state.next_id, state.permanent.as_deref(), state.daemon_pid),
+            (3, Some("g2"), Some(812))
+        );
+        let Some(Txn::Pending(p)) = &state.txn else {
+            panic!("{:?}", state.txn);
+        };
+        assert_eq!(
+            (p.generation.as_str(), p.previous.as_deref()),
+            ("g3", Some("g2"))
+        );
+        assert_eq!(state.current(), Some("g3"));
+
+        // Its generation is rolled back: the switch ended and only the storage restore awaits a retry.
+        let state = load(phase_two_state(
+            pending,
+            "rolled_back",
+            r#""missed confirm deadline""#,
+        ));
+        let Some(Txn::RollingBack {
+            pending,
+            reason,
+            restore_failed,
+        }) = &state.txn
+        else {
+            panic!("{:?}", state.txn);
+        };
+        assert_eq!(pending.generation, "g3");
+        assert_eq!(reason, "missed confirm deadline");
+        assert!(restore_failed);
+
+        let state = load(phase_two_state("null", "tested", "null"));
+        assert!(state.txn.is_none());
+        assert_eq!(state.current(), Some("g2"));
+
+        // Saved, it keeps `txn` only and reads back the same.
+        let state = load(phase_two_state(pending_json(), "current", "null"));
+        state.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""step": "pending""#) && !text.contains(r#""pending":"#));
+        let (again, _) = State::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&state).unwrap()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn pending_json() -> &'static str {
+        r#"{"generation": "g3", "previous": "g2", "deadline": "2026-11-03T14:05:00Z"}"#
+    }
+
+    #[test]
+    fn the_first_reason_of_a_rollback_sticks() {
+        let mut state: State =
+            serde_json::from_str(&phase_two_state(pending_json(), "current", "null")).unwrap();
+        assert!(state.decide_rollback("health check failed"));
+        assert_eq!(state.rolling_back(), Some("health check failed"));
+        let g = state.find("g3").unwrap();
+        assert_eq!(g.state, GenState::RolledBack);
+        assert_eq!(g.rollback_reason.as_deref(), Some("health check failed"));
+        let at = g.rolled_back_at.clone();
+
+        assert!(!state.decide_rollback("rollback requested"));
+        assert_eq!(state.rolling_back(), Some("health check failed"));
+        assert_eq!(state.find("g3").unwrap().rolled_back_at, at);
+        assert_eq!(state.pending().map(|p| p.generation.as_str()), Some("g3"));
+
+        state.fail_restore();
+        assert_eq!(state.rolling_back(), None);
+        assert!(state.pending().is_some());
     }
 
     #[test]

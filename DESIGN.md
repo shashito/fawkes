@@ -69,10 +69,11 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
 ### Switch
 
 1. Refuse unless the target is `tested` and no other switch is pending.
-2. Stop the running generation (SIGTERM to its process group, SIGKILL after `stop_timeout`).
+2. Save the step `switching` to `state.json`, then stop the running generation (SIGTERM to its process group,
+   SIGKILL after `stop_timeout`).
 3. Snapshot every storage file into the target's `snapshot/` (SQLite online backup API). Stopping first means no
    write of the old generation lands after the snapshot, so a rollback loses nothing the old generation wrote.
-4. Mark the target `current` and write the pending switch with its deadline (absolute time) to `state.json`, then
+4. Mark the target `current` and write the step `pending` with its deadline (absolute time) to `state.json`, then
    start the target on the live port. The intent is on disk before any process of the target exists, so a daemon
    that dies from here on rolls the switch back at its next start. If the target cannot be started, the switch is
    rolled back at once (below).
@@ -81,8 +82,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    manifest the switch then rolls back at once (reason `health check failed`) instead of at its deadline. It is off
    by default, for apps that are slow to warm up.
 
-A switch whose `state.json` cannot be written fails before step 4 and starts the previous generation again; a
-confirm that cannot be written fails and stays pending.
+A switch whose `state.json` cannot be written, or whose snapshot fails, ends with no step in flight and starts the
+previous generation again; a confirm that cannot be written fails and stays pending.
 
 ### Confirm
 
@@ -103,14 +104,17 @@ in `state.json` (Fawkes itself died mid-switch). A deadline in `state.json` that
 and is reported as an `error` event.
 Code and storage roll back together:
 
-1. Stop the pending generation.
-2. Restore every storage file from the pending generation's `snapshot/` (backup API into the live path; a file that
+1. Mark the pending generation `rolled_back` with the reason and save the step `rolling_back` with it. Deciding is
+   one step under the daemon's lock, so no confirm fits in between, and the first reason stays. The save is best
+   effort: rolling back is the safe direction, and a `state.json` that still says `pending` rolls back at the next
+   start anyway.
+2. Stop the pending generation.
+3. Restore every storage file from the pending generation's `snapshot/` (backup API into the live path; a file that
    did not exist at snapshot time is deleted together with its `-wal`, `-shm` and `-journal`).
-3. Mark the pending generation `rolled_back` with the reason, then start the permanent generation again (none on a
-   first-ever switch).
+4. Clear the step, then start the permanent generation again (none on a first-ever switch).
 
-If the restore fails, the generation is still `rolled_back` (its code never runs again), but the pending switch
-stays in `state.json` and nothing is started on storage in an unknown state: `status` shows `failed`, and
+If the restore fails, the generation is still `rolled_back` (its code never runs again), but the step stays in
+`state.json` as `rolling_back` with `restore_failed` set, and nothing is started on storage in an unknown state: `status` shows `failed`, and
 `fawkes rollback` or the next daemon start retries the restore. The same holds when the restore worked but the end
 of the switch could not be written to `state.json`. A confirm after the deadline is refused, even if the rollback has
 not begun yet.
@@ -175,8 +179,13 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    file was written counts: a pid reused since, after a reboot too, belongs to a later process and is left alone.
 6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
    owns, and the worktrees git still lists for them (`git worktree prune`).
-7. If a switch is pending, roll it back (reason `daemon_restart`).
-8. Start the permanent generation, if there is one.
+7. Act on the step `state.json` says was in flight (`txn`):
+   - none: start the permanent generation, if there is one;
+   - `switching`: the target never ran. Log that the switch to it was cut short (it stays `tested`), clear the step
+     and start the permanent generation;
+   - `pending`: roll the switch back (reason `daemon_restart`); a pending switch is never resumed;
+   - `rolling_back`: retry the rollback with its recorded reason (restoring the same snapshot twice is harmless),
+     then start the permanent generation.
 
 ## Manifest
 
@@ -477,8 +486,10 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 <state_dir>/
   lock                   flock'ed by the running daemon; empty
   fawkes.sock            the daemon's socket
-  state.json             generations, permanent, current, pending switch; durable writes (temp file, fsync,
-                         rename, fsync of the directory)
+  state.json             generations, permanent, `txn` (the transaction step in flight: `switching`, `pending`
+                         with its deadline, or `rolling_back` with its reason; null between switches); durable
+                         writes (temp file, fsync, rename, fsync of the directory). A file with the older
+                         `pending` field instead of `txn` still loads
   app.pid                pid (= process group) of the live app, written by its start wrapper
   state.json.bak         the same content, written after state.json; read when state.json is unreadable
   events.jsonl           append-only event log, one JSON object per line; at 10 MiB it becomes events.1.jsonl
