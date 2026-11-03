@@ -53,7 +53,9 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   generation again (record, directory, worktree); one that a daemon's end cut short is removed at the next daemon
   start. Ids are never reused.
 - **staged:** worktree created and install succeeded. **test_failed:** the last test failed; `test` may run again.
-- **tested:** started on a spare port with a copy of the storage and passed the health check. Only a tested
+- **tested:** started on a spare port with a copy of the storage and passed the health check. The spare port is
+  the first in `spare_ports` that is free on both `127.0.0.1` and `0.0.0.0`; a test that fails while another
+  process holds its port afterwards is `port_in_use` and leaves the generation as it was. Only a tested
   generation can be switched to.
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
 - **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
@@ -334,7 +336,7 @@ dropped, so its stream simply ends. Live clients reconnect.
 ```
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `internal`. (`daemon_unreachable` is produced by the client only.)
+`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` is produced by the client only.)
 
 Results per command:
 
