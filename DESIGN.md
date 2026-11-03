@@ -53,9 +53,10 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    └──fails──▶ removed
 ```
 
-- **staging:** recorded before the worktree is created and the install runs. A stage that fails removes the
-  generation again (record, directory, worktree); one that a daemon's end cut short is removed at the next daemon
-  start. Ids are never reused.
+- **staging:** recorded before the worktree is created and the install runs, and the record (with the id it spends)
+  must be on disk first: a stage whose `state.json` cannot be written fails with `internal` before any worktree
+  exists. A stage that fails later removes the generation again (record, directory, worktree); one that a daemon's end
+  cut short is removed at the next daemon start. Ids are never reused.
 - **staged:** worktree created and install succeeded. **test_failed:** the last test failed; `test` may run again.
 - **tested:** started on a spare port with a copy of the storage and passed the health check. The spare port is
   the first in `spare_ports` that is free on both `127.0.0.1` and `0.0.0.0`; a test that fails while another
