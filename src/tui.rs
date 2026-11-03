@@ -38,8 +38,6 @@ enum Msg {
     Key(KeyEvent),
     /// A daemon answered: the app exists from now on.
     Up(String, PathBuf),
-    /// The events before we subscribed.
-    Backlog(String, Vec<Value>),
     /// A line of the `subscribe` stream: `status`, `history` or `event`.
     Line(String, Value),
     /// The connection dropped; it will be retried.
@@ -231,15 +229,17 @@ impl App {
         self.apps.iter_mut().find(|a| a.key == key)
     }
 
-    fn current_index(&self) -> usize {
-        self.current
-            .as_ref()
-            .and_then(|key| self.apps.iter().position(|a| a.key == *key))
-            .unwrap_or(0)
+    /// The selected app's row. An app that left the list stays selected (nothing is), so an action never falls
+    /// through to another app.
+    fn current_index(&self) -> Option<usize> {
+        match &self.current {
+            Some(key) => self.apps.iter().position(|a| a.key == *key),
+            None => (!self.apps.is_empty()).then_some(0),
+        }
     }
 
     fn current(&self) -> Option<&AppView> {
-        self.apps.get(self.current_index())
+        self.current_index().and_then(|i| self.apps.get(i))
     }
 
     fn choose(&mut self, index: usize) {
@@ -248,7 +248,8 @@ impl App {
 
     fn step_app(&mut self, delta: isize) {
         let last = self.apps.len().saturating_sub(1);
-        self.choose(self.current_index().saturating_add_signed(delta).min(last));
+        let index = self.current_index().unwrap_or(0);
+        self.choose(index.saturating_add_signed(delta).min(last));
     }
 
     fn toggle_follow(&mut self) {
@@ -262,14 +263,22 @@ impl App {
         match msg {
             Msg::Key(key) => return self.key(key),
             Msg::Up(key, socket) => {
+                // Pin what is on screen, so an app that sorts before it does not take the selection.
+                self.current = self
+                    .current
+                    .take()
+                    .or_else(|| self.apps.first().map(|a| a.key.clone()))
+                    .or_else(|| Some(key.clone()));
                 if self.view_mut(&key).is_none() {
                     self.apps.push(AppView::new(key.clone(), socket));
                     self.apps.sort_by(|a, b| a.key.cmp(&b.key));
                 }
+                let follow = self.follow;
                 if let Some(view) = self.view_mut(&key) {
                     view.link = Link::Up;
                     view.events.clear();
-                    view.frozen = None;
+                    // A paused pane stays paused: the replayed events arrive after this.
+                    view.frozen = (!follow).then_some(0);
                 }
             }
             Msg::Down(key, why) => {
@@ -278,14 +287,7 @@ impl App {
                 }
             }
             Msg::Gone(key) => {
-                let keep = self.current().map(|a| a.key.clone());
                 self.apps.retain(|a| a.key != key);
-                self.current = keep.filter(|k| *k != key);
-            }
-            Msg::Backlog(key, events) => {
-                if let Some(view) = self.view_mut(&key) {
-                    events.into_iter().for_each(|e| view.push_event(e));
-                }
             }
             Msg::Line(key, line) => {
                 if let Some(view) = self.view_mut(&key) {
@@ -431,8 +433,7 @@ impl App {
     }
 
     fn select(&mut self, delta: isize) {
-        let index = self.current_index();
-        if let Some(view) = self.apps.get_mut(index) {
+        if let Some(view) = self.current_index().and_then(|i| self.apps.get_mut(i)) {
             view.select(delta);
         }
     }
@@ -477,21 +478,31 @@ impl App {
 /// The keys of the apps that have a reader thread.
 type Active = Arc<Mutex<HashSet<String>>>;
 
-/// Follow one daemon. A single target is retried for as long as the screen lives; a discovered one is dropped from
-/// the list when it stops answering, and the scanner starts a fresh reader if it comes back.
+/// Follow one daemon. A single target is retried for as long as the screen lives. A discovered one is retried, shown
+/// as disconnected, while its link still leads to a socket file (a crashed daemon); it leaves the list once the link
+/// is gone (a daemon that stopped), and the scanner starts a fresh reader if it comes back. A link that never
+/// answered is not listed at all.
 fn reader(key: &str, socket: &Path, active: Option<&Active>, tx: &Sender<Msg>) {
+    let mut seen = false;
     loop {
         let (up, why) = follow(key, socket, tx);
-        let sent = match active {
-            None => tx.send(Msg::Down(key.into(), why)),
-            Some(_) if up => tx.send(Msg::Gone(key.into())),
-            Some(_) => Ok(()),
+        seen |= up;
+        let msg = match active {
+            None => Some(Msg::Down(key.into(), why)),
+            Some(_) if !seen => None,
+            Some(_) if socket.exists() => Some(Msg::Down(key.into(), why)),
+            Some(_) => Some(Msg::Gone(key.into())),
         };
-        if sent.is_err() {
+        let retry = matches!(msg, Some(Msg::Down(..)));
+        if let Some(msg) = msg
+            && tx.send(msg).is_err()
+        {
             return;
         }
-        if let Some(active) = active {
-            active.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+        if !retry {
+            if let Some(active) = active {
+                active.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+            }
             return;
         }
         std::thread::sleep(RETRY);
@@ -500,31 +511,33 @@ fn reader(key: &str, socket: &Path, active: Option<&Active>, tx: &Sender<Msg>) {
 
 /// Fetch the recent events, then follow `subscribe`. The error says whether the app had answered.
 fn follow(key: &str, socket: &Path, tx: &Sender<Msg>) -> (bool, String) {
-    let backlog = match request(
-        socket,
-        &json!({ "command": "log", "args": { "limit": BACKLOG } }),
-    ) {
-        Ok(backlog) => backlog,
+    let request = json!({ "command": "subscribe", "args": { "limit": BACKLOG } });
+    let stream = match open(socket, &request) {
+        Ok(stream) => stream,
         Err(e) => return (false, e),
     };
-    let events = backlog["events"].as_array().cloned().unwrap_or_default();
-    let sent = tx.send(Msg::Up(key.into(), socket.into())).is_ok()
-        && tx.send(Msg::Backlog(key.into(), events)).is_ok();
-    if !sent {
-        return (true, "the screen is gone".into());
-    }
-    let stream = match open(socket, &json!({ "command": "subscribe" })) {
-        Ok(stream) => stream,
-        Err(e) => return (true, e),
-    };
+    let mut up = false;
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        if !up {
+            up = true;
+            if tx.send(Msg::Up(key.into(), socket.into())).is_err() {
+                return (true, "the screen is gone".into());
+            }
+        }
         if let Ok(value) = serde_json::from_str(&line)
             && tx.send(Msg::Line(key.into(), value)).is_err()
         {
             return (true, "the screen is gone".into());
         }
     }
-    (true, "connection lost".into())
+    if up {
+        (true, "connection lost".into())
+    } else {
+        (
+            false,
+            "the daemon closed the connection without an answer".into(),
+        )
+    }
 }
 
 /// Every few seconds, start a reader for each `<name>.sock` link in `dir` that has none.
@@ -935,8 +948,19 @@ mod tests {
         app.apply(press(KeyCode::Esc));
         assert!(app.filter.is_empty());
         assert_eq!(app.apply(key('q')), Some(Cmd::Quit));
-        // A lost discovered app leaves the list.
-        app.apply(Msg::Gone("sample".into()));
-        assert_eq!(app.apps.len(), 1);
+        // Found in review: the selection followed the sort order, so an app appearing (or leaving) moved it, and an
+        // unasked `c` went to another daemon. It stays on what is shown; a selected app that leaves selects nothing.
+        app.current = None;
+        assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
+        app.apply(Msg::Up("aaa".into(), "/tmp/fk/run/aaa.sock".into()));
+        assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
+        app.apply(Msg::Gone("blog".into()));
+        assert_eq!(app.apps.len(), 2);
+        assert!(app.current().is_none());
+        assert_eq!(
+            app.apply(key('c')),
+            None,
+            "no action without a selected app"
+        );
     }
 }

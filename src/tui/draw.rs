@@ -487,7 +487,7 @@ fn draw_apps(frame: &mut Frame, app: &App, now: u64, area: Rect) {
             }
         })
         .collect();
-    let selected = (!bodies.is_empty()).then(|| app.current_index());
+    let selected = app.current_index();
     draw_table(
         frame,
         area,

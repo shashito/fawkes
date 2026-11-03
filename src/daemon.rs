@@ -138,6 +138,12 @@ pub struct Daemon {
 
 // ------------------------------------------------------------- errors
 
+fn restore_failed(id: &str) -> Error {
+    invalid_state(format!(
+        "{id} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore"
+    ))
+}
+
 fn invalid_state(message: impl Into<String>) -> Error {
     err("invalid_state", message)
 }
@@ -211,7 +217,9 @@ impl Daemon {
         let socket = std::path::absolute(socket.unwrap_or_else(|| paths.socket()))
             .map_err(|e| e.to_string())?;
         let listener = bind(&socket)?;
-        let run_link = register(&manifest.name, &socket)?;
+        let run_link = register(&manifest.name, &socket).inspect_err(|_| {
+            let _ = std::fs::remove_file(&socket);
+        })?;
         let mut state = State::load(&paths.state_json())?;
         let stale_app = state.app_pid.take();
         state.daemon_pid = Some(std::process::id());
@@ -707,7 +715,11 @@ impl Daemon {
                 )
             }
             "subscribe" => {
-                self.stream(out, None, true);
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                self.stream(out, limit, true);
                 Ok(Value::Null)
             }
             other => Err(err("usage", format!("unknown command `{other}`"))),
@@ -877,10 +889,7 @@ impl Daemon {
         if let Some(pending) = &inner.state.pending
             && inner.state.restore_failed(pending)
         {
-            return Err(invalid_state(format!(
-                "{} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore",
-                pending.generation
-            )));
+            return Err(restore_failed(&pending.generation));
         }
         inner.state.current().map(String::from).ok_or_else(|| {
             invalid_state(
@@ -1188,6 +1197,9 @@ impl Daemon {
         let previous = {
             let inner = self.inner();
             if let Some(pending) = &inner.state.pending {
+                if inner.state.restore_failed(pending) {
+                    return Err(restore_failed(&pending.generation));
+                }
                 return Err(invalid_state(format!(
                     "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
                     pending.generation
@@ -1274,8 +1286,12 @@ impl Daemon {
             ));
         }
         if let Some(pending) = &inner.state.pending
-            && (inner.state.restore_failed(pending)
-                || now_secs() >= parse_time(&pending.deadline).unwrap_or(0))
+            && inner.state.restore_failed(pending)
+        {
+            return Err(restore_failed(&pending.generation));
+        }
+        if let Some(pending) = &inner.state.pending
+            && now_secs() >= parse_time(&pending.deadline).unwrap_or(0)
         {
             return Err(invalid_state(format!(
                 "{} missed its confirm deadline ({}) and is being rolled back",

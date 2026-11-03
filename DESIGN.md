@@ -258,9 +258,10 @@ Results per command:
 | `status` | — | see below |
 | `log` | `limit?`, `follow?` | `events`; with `follow` the daemon instead streams every new event as an `event` line until the client closes |
 | `history` | — | `generations`, oldest first |
-| `subscribe` | — | never ends; see below |
+| `subscribe` | `limit?` | never ends; see below |
 
-`subscribe` is the stream for live clients such as the TUI. The daemon first sends one `{"status": …}` line (the
+`subscribe` is the stream for live clients such as the TUI. With `limit` it first replays that many recent events as
+`{"event": …}` lines (joined to the stream before the replay, so none falls in a gap). Then one `{"status": …}` line (the
 `status` result) and one `{"history": …}` line (the `history` result), then, until the client closes, every event as
 an `{"event": …}` line, followed by fresh `status` and `history` lines whenever a generation or the live app changed
 state. Clients never poll; a countdown to the confirm deadline is computed client-side from `pending.deadline`.
