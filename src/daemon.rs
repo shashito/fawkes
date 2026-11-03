@@ -1429,7 +1429,7 @@ impl Daemon {
             g.clone()
         };
         let port = (m.spare_ports[0]..=m.spare_ports[1])
-            .find(|&p| p != m.port && TcpListener::bind(("127.0.0.1", p)).is_ok())
+            .find(|&p| p != m.port && port_free(p))
             .ok_or_else(|| {
                 err(
                     "start_failed",
@@ -1482,6 +1482,15 @@ impl Daemon {
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
         lock(&self.step_pgids).retain(|p| *p != pgid);
         let _ = std::fs::remove_dir_all(&test_home);
+        // Our test process is gone, so a port that is still taken was taken by someone else, most likely between
+        // the probe and the app's bind: not the generation's fault, so its state and last result stay as they were.
+        if result.is_err() && !port_free(port) {
+            let message = format!(
+                "spare port {port} was taken by another process during the test of {id}; {id} is unchanged, run `fawkes test {id}` again"
+            );
+            self.event("error", Some(id), &message);
+            return Err(err("port_in_use", message));
+        }
 
         let passed = result.is_ok();
         let info = TestInfo {
@@ -1941,6 +1950,11 @@ impl Daemon {
 }
 
 // ------------------------------------------------------ small helpers
+
+/// Whether nothing listens on `port`, on the loopback address or on all addresses: an app may bind either.
+fn port_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
 
 /// Copy-on-write clone of a directory (APFS `clonefile` on macOS, reflinks elsewhere).
 fn clone_directory(from: &Path, to: &Path) -> Result<(), String> {
