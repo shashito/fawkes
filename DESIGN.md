@@ -190,6 +190,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    app running). The live app's start wrapper writes its pid there before it runs the `start` command, so even an
    app spawned an instant before its daemon died is found. Only a process that started at most a minute before the
    file was written counts: a pid reused since, after a reboot too, belongs to a later process and is left alone.
+   When that leader is gone but its group still has members (`start = "npm start"`), the group counts if the file
+   was written after the machine booted.
    The install or test that daemon was running is found and stopped the same way, through `step.pid`, before the
    next step removes the directory it runs in.
 6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
