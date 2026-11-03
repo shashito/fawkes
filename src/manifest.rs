@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links the TUI discovers.
 pub fn fawkes_home() -> Result<PathBuf, String> {
@@ -13,7 +13,7 @@ pub fn fawkes_home() -> Result<PathBuf, String> {
     Ok(Path::new(&home).join(".fawkes"))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub name: String,
@@ -41,7 +41,7 @@ pub struct Manifest {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
     pub url: Option<String>,
@@ -51,6 +51,14 @@ pub struct Health {
     #[serde(default = "default_health_timeout")]
     pub timeout: f64,
 }
+
+/// The longest confirm window, in seconds. A `deadline` in the manifest and `switch --deadline` are both held to it,
+/// so a typo cannot leave a generation unconfirmed (and its predecessor not rolled back to) for weeks.
+pub const MAX_DEADLINE: u64 = 7 * 86_400;
+
+/// The longest any manifest duration may be, in seconds. `Duration::from_secs_f64` and `Instant + Duration` panic on
+/// huge values, so the bound is what keeps those calls safe.
+const MAX_SECONDS: f64 = 86_400.0;
 
 fn default_deadline() -> u64 {
     120
@@ -96,6 +104,33 @@ impl Vars {
     }
 }
 
+/// Whether a `storage` or `reuse` entry stays inside the directory it is joined onto.
+fn is_inside(entry: &str) -> bool {
+    !entry.is_empty()
+        && Path::new(entry)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+        && Path::new(entry)
+            .components()
+            .any(|part| matches!(part, Component::Normal(_)))
+}
+
+/// Whether a raw `health.url` template is `http://` with an explicit port (digits or `{port}`) after the host.
+fn has_port(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            !host.is_empty()
+                && (port == "{port}"
+                    || (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())))
+        }
+        None => false,
+    }
+}
+
 impl Manifest {
     /// Read and validate a manifest; relative paths resolve against its directory.
     pub fn load(path: &Path) -> Result<Manifest, String> {
@@ -103,16 +138,12 @@ impl Manifest {
             .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
         let mut m: Manifest = toml::from_str(&text)
             .map_err(|e| format!("invalid manifest {}: {e}", path.display()))?;
-        if m.health.url.is_some() == m.health.command.is_some() {
+        let problems = m.problems();
+        if !problems.is_empty() {
             return Err(format!(
-                "invalid manifest {}: [health] needs exactly one of url or command",
-                path.display()
-            ));
-        }
-        if m.spare_ports[0] > m.spare_ports[1] {
-            return Err(format!(
-                "invalid manifest {}: spare_ports must be [low, high]",
-                path.display()
+                "invalid manifest {}: {}",
+                path.display(),
+                problems.join("; ")
             ));
         }
         let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
@@ -124,6 +155,131 @@ impl Manifest {
             None => fawkes_home()?.join(&m.name),
         });
         Ok(m)
+    }
+
+    /// Everything wrong with the manifest as written, each saying what is allowed. Empty when valid.
+    fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.name.is_empty()
+            || !self
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            problems.push(format!(
+                "name {:?} must be non-empty and use only letters, digits, '_' and '-' (it becomes a file name)",
+                self.name
+            ));
+        }
+        if self.health.url.is_some() == self.health.command.is_some() {
+            problems.push("[health] needs exactly one of url or command".into());
+        }
+        if self.spare_ports[0] > self.spare_ports[1] {
+            problems.push("spare_ports must be [low, high]".into());
+        } else if (self.spare_ports[0]..=self.spare_ports[1]).contains(&self.port) {
+            problems.push(format!(
+                "port {} must lie outside spare_ports {:?}: the spare range is for staged generations",
+                self.port, self.spare_ports
+            ));
+        }
+        if !(1..=MAX_DEADLINE).contains(&self.deadline) {
+            problems.push(format!(
+                "deadline {} must be between 1 and {MAX_DEADLINE} seconds",
+                self.deadline
+            ));
+        }
+        if self.max_failed_starts < 1 {
+            problems.push("max_failed_starts must be at least 1".into());
+        }
+        for (field, seconds) in [
+            ("stop_timeout", self.stop_timeout),
+            ("min_uptime", self.min_uptime),
+            ("health.interval", self.health.interval),
+            ("health.timeout", self.health.timeout),
+        ] {
+            if !(seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS) {
+                problems.push(format!(
+                    "{field} {seconds} must be a number of seconds above 0 and at most {MAX_SECONDS}"
+                ));
+            }
+        }
+        for (field, entries) in [("storage", &self.storage), ("reuse", &self.reuse)] {
+            for entry in entries {
+                if !is_inside(entry) {
+                    problems.push(format!(
+                        "{field} entry {entry:?} must be a non-empty relative path without '..' (it is joined onto a directory that a restore may delete from)"
+                    ));
+                }
+            }
+        }
+        if let Some(url) = &self.health.url
+            && !has_port(url)
+        {
+            problems.push(format!(
+                "health.url {url:?} must start with http:// and end its host with :<port> or :{{port}}, for example http://127.0.0.1:{{port}}/"
+            ));
+        }
+        problems
+    }
+
+    /// Decide whether `new` may replace `self` while the daemon runs. Ok: the TOML names of the changed fields,
+    /// possibly none. Err: a message naming every refused field and what to do instead. Both manifests are the loaded
+    /// ones, so paths are compared after resolution.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "wired into the daemon's SIGHUP handling")
+    )]
+    pub fn reload(&self, new: &Manifest, app_running: bool) -> Result<Vec<&'static str>, String> {
+        // The daemon's identity, its state and the files a restore overwrites are fixed for its lifetime: a changed
+        // `home` would restore a snapshot into a different directory than the one it was taken from.
+        let fixed = [
+            ("name", self.name != new.name),
+            ("repo", self.repo != new.repo),
+            ("state_dir", self.state_dir != new.state_dir),
+            ("home", self.home != new.home),
+            ("storage", self.storage != new.storage),
+        ];
+        let refused: Vec<&str> = fixed
+            .iter()
+            .filter(|(_, differs)| *differs)
+            .map(|(field, _)| *field)
+            .collect();
+        let mut problems = Vec::new();
+        if !refused.is_empty() {
+            problems.push(format!(
+                "{} can only change with a daemon restart: stop the daemon and start it again with the new manifest",
+                refused.join(", ")
+            ));
+        }
+        if app_running && self.port != new.port {
+            problems.push(
+                "port cannot change while the app is running: `fawkes stop` the app first, then reload again".into(),
+            );
+        }
+        if !problems.is_empty() {
+            return Err(problems.join("; "));
+        }
+        let reloadable = [
+            ("port", self.port != new.port),
+            ("spare_ports", self.spare_ports != new.spare_ports),
+            ("install", self.install != new.install),
+            ("reuse", self.reuse != new.reuse),
+            ("start", self.start != new.start),
+            ("deadline", self.deadline != new.deadline),
+            ("stop_timeout", self.stop_timeout != new.stop_timeout),
+            ("min_uptime", self.min_uptime != new.min_uptime),
+            (
+                "max_failed_starts",
+                self.max_failed_starts != new.max_failed_starts,
+            ),
+            ("health", self.health != new.health),
+            ("env", self.env != new.env),
+        ];
+        Ok(reloadable
+            .into_iter()
+            .filter(|(_, differs)| *differs)
+            .map(|(field, _)| field)
+            .collect())
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -138,5 +294,183 @@ impl Manifest {
             (_, Some(command)) => Check::Command(vars.expand(command)),
             _ => unreachable!("load requires exactly one health check"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID: &str = r#"
+name = "app"
+repo = "repo"
+state_dir = "state"
+home = "home"
+storage = ["data/app.db"]
+port = 4790
+spare_ports = [4791, 4795]
+reuse = ["node_modules"]
+start = "node app.js"
+[health]
+url = "http://127.0.0.1:{port}/"
+"#;
+
+    /// A temporary directory for manifests, removed on drop. Manifests loaded from one scratch resolve their paths
+    /// against the same directory, so they can be compared by `reload`.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Scratch {
+            let dir =
+                std::env::temp_dir().join(format!("fk-manifest-{}-{label}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        fn load(&self, text: &str) -> Result<Manifest, String> {
+            let path = self.0.join("fawkes.toml");
+            std::fs::write(&path, text).unwrap();
+            Manifest::load(&path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    /// `VALID` with one line replaced: `from` must occur in it.
+    fn with(from: &str, to: &str) -> String {
+        assert!(VALID.contains(from), "{from:?} is not in VALID");
+        VALID.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn a_valid_manifest_loads() {
+        let m = Scratch::new("valid").load(VALID).unwrap();
+        assert_eq!(m.name, "app");
+        assert!(m.home.is_absolute());
+    }
+
+    #[test]
+    fn invalid_manifests_are_refused_naming_the_field() {
+        let scratch = Scratch::new("invalid_manifests_ar");
+        let cases = [
+            (
+                "stop_timeout",
+                with("start =", "stop_timeout = -1.0\nstart ="),
+            ),
+            (
+                "stop_timeout",
+                with("start =", "stop_timeout = 0.0\nstart ="),
+            ),
+            (
+                "stop_timeout",
+                with("start =", "stop_timeout = 1e300\nstart ="),
+            ),
+            (
+                "stop_timeout",
+                with("start =", "stop_timeout = nan\nstart ="),
+            ),
+            (
+                "min_uptime",
+                with("start =", "min_uptime = 86401.0\nstart ="),
+            ),
+            (
+                "health.interval",
+                with("[health]", "[health]\ninterval = 0.0"),
+            ),
+            (
+                "health.timeout",
+                with("[health]", "[health]\ntimeout = inf"),
+            ),
+            ("deadline", with("start =", "deadline = 0\nstart =")),
+            ("deadline", with("start =", "deadline = 604801\nstart =")),
+            (
+                "max_failed_starts",
+                with("start =", "max_failed_starts = 0\nstart ="),
+            ),
+            ("name", with("\"app\"", "\"../x\"")),
+            ("name", with("\"app\"", "\"\"")),
+            ("name", with("\"app\"", "\"a b\"")),
+            ("storage", with("data/app.db", "/abs")),
+            ("storage", with("data/app.db", "../escape")),
+            ("storage", with("data/app.db", "a/../../b")),
+            ("storage", with("[\"data/app.db\"]", "[\"\"]")),
+            ("reuse", with("node_modules", "/abs")),
+            ("reuse", with("node_modules", "..")),
+            ("port", with("port = 4790", "port = 4793")),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "https://127.0.0.1:{port}/"),
+            ),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "http://localhost/"),
+            ),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "http://[::1]/health"),
+            ),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "http://host:80x/"),
+            ),
+        ];
+        for (field, text) in cases {
+            let err = scratch.load(&text).expect_err(&text);
+            assert!(err.starts_with("invalid manifest "), "{err}");
+            assert!(err.contains(field), "{field} not named in {err}");
+        }
+    }
+
+    #[test]
+    fn health_urls_with_a_port_are_accepted() {
+        let scratch = Scratch::new("health_urls_with_a_p");
+        for url in [
+            "http://127.0.0.1:{port}/",
+            "http://[::1]:4790/health",
+            "http://localhost:8080",
+        ] {
+            scratch
+                .load(&with("http://127.0.0.1:{port}/", url))
+                .expect(url);
+        }
+    }
+
+    #[test]
+    fn reload_reports_changed_fields() {
+        let scratch = Scratch::new("reload_reports_chang");
+        let old = scratch.load(VALID).unwrap();
+        assert_eq!(old.reload(&old, true), Ok(vec![]));
+
+        let changed = with(
+            "start = \"node app.js\"",
+            "start = \"node b.js\"\n[env]\nA = \"1\"",
+        );
+        let new = scratch.load(&changed).unwrap();
+        assert_eq!(old.reload(&new, true), Ok(vec!["start", "env"]));
+    }
+
+    #[test]
+    fn reload_refuses_fields_fixed_for_the_daemons_lifetime() {
+        let scratch = Scratch::new("reload_refuses_field");
+        let old = scratch.load(VALID).unwrap();
+        let new = scratch
+            .load(&with("home = \"home\"", "home = \"elsewhere\""))
+            .unwrap();
+        let err = old.reload(&new, false).unwrap_err();
+        assert!(err.contains("home") && err.contains("restart"), "{err}");
+    }
+
+    #[test]
+    fn reload_refuses_a_new_port_only_while_the_app_runs() {
+        let scratch = Scratch::new("reload_refuses_a_new");
+        let old = scratch.load(VALID).unwrap();
+        let new = scratch.load(&with("port = 4790", "port = 4780")).unwrap();
+        let err = old.reload(&new, true).unwrap_err();
+        assert!(err.contains("port") && err.contains("fawkes stop"), "{err}");
+        assert_eq!(old.reload(&new, false), Ok(vec!["port"]));
     }
 }
