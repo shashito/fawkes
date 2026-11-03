@@ -108,6 +108,10 @@ impl Paths {
     pub fn app_log(&self, id: &str) -> PathBuf {
         self.generation(id).join("logs").join("app.log")
     }
+    /// The install log of the latest stage that failed; its generation is gone.
+    pub fn failed_install_log(&self) -> PathBuf {
+        self.root.join("install-failed.log")
+    }
 }
 
 // --------------------------------------------------------------- state
@@ -115,6 +119,8 @@ impl Paths {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenState {
+    /// The worktree and install are in progress.
+    Staging,
     Staged,
     TestFailed,
     Tested,
@@ -127,6 +133,7 @@ pub enum GenState {
 impl GenState {
     pub fn as_str(self) -> &'static str {
         match self {
+            GenState::Staging => "staging",
             GenState::Staged => "staged",
             GenState::TestFailed => "test_failed",
             GenState::Tested => "tested",
@@ -258,6 +265,25 @@ impl State {
             .is_some_and(|g| g.state == GenState::RolledBack)
     }
 
+    /// The generations `prune` removes so that `keep` remain: the oldest first, never the permanent one, the pending
+    /// one or the one it rolls back to (a rollback needs its code and the pending one's snapshot), nor one still
+    /// staging. More than `keep` remain when those alone are more.
+    pub fn prunable(&self, keep: usize) -> Vec<String> {
+        let protected = |g: &Generation| {
+            g.state == GenState::Staging
+                || self.permanent.as_deref() == Some(g.id.as_str())
+                || self.pending.as_ref().is_some_and(|p| {
+                    p.generation == g.id || p.previous.as_deref() == Some(g.id.as_str())
+                })
+        };
+        self.generations
+            .iter()
+            .filter(|g| !protected(g))
+            .take(self.generations.len().saturating_sub(keep))
+            .map(|g| g.id.clone())
+            .collect()
+    }
+
     /// The generation `start`, `stop` and `restart` act on: the pending one, else the permanent one.
     pub fn current(&self) -> Option<&str> {
         self.pending
@@ -354,6 +380,43 @@ mod tests {
             assert_eq!(parse_time(&format_time(secs)), Some(secs));
         }
         assert_eq!(format_time(1_793_714_521), "2026-11-03T14:02:01Z");
+    }
+
+    #[test]
+    fn prune_takes_the_oldest_and_spares_what_a_rollback_needs() {
+        let generation = |id: &str, state| Generation {
+            id: id.into(),
+            git_ref: "main".into(),
+            commit: "0".into(),
+            state,
+            dir: PathBuf::new(),
+            staged_at: String::new(),
+            test: None,
+            switched_at: None,
+            confirmed_at: None,
+            rolled_back_at: None,
+            rollback_reason: None,
+            failed_starts: 0,
+        };
+        let state = State {
+            generations: vec![
+                generation("g1", GenState::Permanent),
+                generation("g2", GenState::RolledBack),
+                generation("g3", GenState::Current),
+                generation("g4", GenState::Tested),
+                generation("g5", GenState::Staging),
+            ],
+            permanent: Some("g1".into()),
+            pending: Some(Pending {
+                generation: "g3".into(),
+                previous: Some("g1".into()),
+                deadline: String::new(),
+            }),
+            ..State::default()
+        };
+        assert_eq!(state.prunable(4), ["g2"]);
+        assert_eq!(state.prunable(1), ["g2", "g4"]);
+        assert_eq!(state.prunable(5), Vec::<String>::new());
     }
 
     #[test]

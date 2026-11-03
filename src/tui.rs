@@ -411,6 +411,9 @@ impl App {
             KeyCode::Char('s') => return self.send("start".into(), plain("start"), None),
             KeyCode::Char('x') => return self.ask_app("stop", "Stop", plain("stop")),
             KeyCode::Char('r') => return self.ask_app("restart", "Restart", plain("restart")),
+            KeyCode::Char('p') => {
+                return self.ask_app("prune", "Prune old generations of", plain("prune"));
+            }
             _ => {}
         }
         None

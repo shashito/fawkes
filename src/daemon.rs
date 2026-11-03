@@ -24,7 +24,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -152,8 +152,8 @@ pub struct Daemon {
     inner: Mutex<Inner>,
     log: Mutex<EventLog>,
     hub: Hub,
-    /// Process groups of running tests, killed on shutdown.
-    test_pgids: Mutex<Vec<u32>>,
+    /// Process groups of running tests and installs, killed on shutdown.
+    step_pgids: Mutex<Vec<u32>>,
     /// `<fawkes_home>/run/<name>.sock`, removed on shutdown.
     run_link: PathBuf,
 }
@@ -187,6 +187,9 @@ fn refusal(g: &Generation, action: &str) -> Error {
             g.rolled_back_at.as_deref().unwrap_or("?"),
             g.rollback_reason.as_deref().unwrap_or("no reason recorded")
         ),
+        GenState::Staging => {
+            format!("{id} is still being staged; try again when its stage has finished")
+        }
         GenState::Staged if action == "switch" => {
             format!("{id} is staged, not tested; run `fawkes test {id}` first")
         }
@@ -281,7 +284,7 @@ impl Daemon {
             }),
             log: Mutex::new(log),
             hub: Hub(Mutex::new(Vec::new())),
-            test_pgids: Mutex::new(Vec::new()),
+            step_pgids: Mutex::new(Vec::new()),
             run_link,
         });
         daemon.event(
@@ -310,6 +313,7 @@ impl Daemon {
             );
         }
         daemon.save(&daemon.inner());
+        daemon.sweep_generations();
 
         if daemon.inner().state.pending.is_some() {
             let _busy = daemon
@@ -408,7 +412,7 @@ impl Daemon {
         if let Some(app) = app {
             self.stop_app(app);
         }
-        for pgid in lock(&self.test_pgids).drain(..) {
+        for pgid in lock(&self.step_pgids).drain(..) {
             process::kill_group(pgid);
         }
         let mut inner = self.inner();
@@ -838,7 +842,12 @@ impl Daemon {
             "stage" => self.stage(out, arg(args, "ref")?),
             "test" => self.test(out, arg(args, "generation")?),
             "switch" => self.switch(out, arg(args, "generation")?, protocol::deadline_arg(args)?),
-            "confirm" => self.confirm(args.get("generation").and_then(Value::as_str)),
+            "confirm" => {
+                let record = self.confirm(args.get("generation").and_then(Value::as_str))?;
+                self.prune_soon();
+                Ok(record)
+            }
+            "prune" => self.prune(out),
             "rollback" => {
                 let _busy = self.begin("rollback", Slot::Both)?;
                 self.rollback_pending(out, "rollback requested")
@@ -1151,6 +1160,8 @@ impl Daemon {
                 ),
             )
         })?;
+        // Recorded before the slow work, so a stage cut short by a daemon restart shows in history and the next
+        // daemon start cleans it up.
         let (id, reuse_from) = {
             let mut inner = self.inner();
             inner.state.next_id += 1;
@@ -1160,15 +1171,63 @@ impl Daemon {
                 .permanent
                 .as_ref()
                 .map_or(m.repo.clone(), |p| self.paths.code(p));
+            inner.state.generations.push(Generation {
+                id: id.clone(),
+                git_ref: git_ref.into(),
+                commit: commit.clone(),
+                state: GenState::Staging,
+                dir: self.paths.code(&id),
+                staged_at: now(),
+                test: None,
+                switched_at: None,
+                confirmed_at: None,
+                rolled_back_at: None,
+                rollback_reason: None,
+                failed_starts: 0,
+            });
             self.save(&inner);
             (id, reuse_from)
         };
-        let code = self.paths.code(&id);
-        std::fs::create_dir_all(self.paths.generation(&id))?;
+        if let Err(e) = self.build(out, &m, &id, git_ref, &commit, &reuse_from) {
+            // A failed install's log outlives the generation, for the agent to read.
+            let _ = std::fs::rename(self.paths.install_log(&id), self.paths.failed_install_log());
+            let removed = self.remove_generation(&m, &id);
+            self.event(
+                "error",
+                Some(&id),
+                format!(
+                    "stage of {git_ref} failed: {}{}",
+                    e.message,
+                    removed.err().map_or(String::new(), |e| format!("; {e}"))
+                ),
+            );
+            return Err(e);
+        }
+        let mut inner = self.inner();
+        let g = inner.state.find_mut(&id).ok_or_else(|| not_found(&id))?;
+        g.state = GenState::Staged;
+        g.staged_at = now();
+        let record = json!(g);
+        self.save(&inner);
+        self.event("staged", Some(&id), format!("{git_ref} staged as {id}"));
+        Ok(record)
+    }
 
+    /// The slow part of `stage`: the worktree, the reused directories and the install.
+    fn build(
+        &self,
+        out: &mut Out,
+        m: &Manifest,
+        id: &str,
+        git_ref: &str,
+        commit: &str,
+        reuse_from: &Path,
+    ) -> R<()> {
+        let code = self.paths.code(id);
+        std::fs::create_dir_all(self.paths.generation(id))?;
         self.say(
             out,
-            &id,
+            id,
             format!(
                 "checking out {} at {}",
                 git_ref,
@@ -1176,11 +1235,7 @@ impl Daemon {
             ),
         );
         let code_arg = code.to_string_lossy().into_owned();
-        git(
-            &m.repo,
-            &["worktree", "add", "--detach", &code_arg, &commit],
-        )
-        .map_err(|e| {
+        git(&m.repo, &["worktree", "add", "--detach", &code_arg, commit]).map_err(|e| {
             err(
                 "git_failed",
                 format!("cannot create the worktree for {id}: {e}"),
@@ -1192,13 +1247,13 @@ impl Daemon {
             if from.exists() && !to.exists() {
                 self.say(
                     out,
-                    &id,
+                    id,
                     format!("cloning {dir} from {}", reuse_from.display()),
                 );
                 if let Err(e) = clone_directory(&from, &to) {
                     self.say(
                         out,
-                        &id,
+                        id,
                         format!("cloning {dir} failed ({e}); install starts without it"),
                     );
                     let _ = std::fs::remove_dir_all(&to);
@@ -1206,50 +1261,89 @@ impl Daemon {
             }
         }
 
-        if let Some(install) = &m.install {
-            let vars = Vars {
-                port: m.port,
-                home: m.home.clone(),
-                code: code.clone(),
-                generation: id.clone(),
-                state: self.paths.root.clone(),
-            };
-            let log = self.paths.install_log(&id);
-            self.say(
-                out,
-                &id,
-                format!("installing: {}", vars.expand_command(install)),
-            );
-            let result = run_install(&vars.expand_command(install), &code, &log);
-            if let Err(e) = result {
-                let _ = git(&m.repo, &["worktree", "remove", "--force", &code_arg]);
-                return Err(err(
+        let Some(install) = &m.install else {
+            return Ok(());
+        };
+        let vars = Vars {
+            port: m.port,
+            home: m.home.clone(),
+            code: code.clone(),
+            generation: id.into(),
+            state: self.paths.root.clone(),
+        };
+        let command = vars.expand_command(install);
+        self.say(out, id, format!("installing: {command}"));
+        self.run_install(m, &command, &code, &self.paths.install_log(id))
+            .map_err(|e| {
+                err(
                     "install_failed",
-                    format!("install for {id} failed ({e}); see {}", log.display()),
+                    format!(
+                        "install for {id} failed ({e}); see {}",
+                        self.paths.failed_install_log().display()
+                    ),
+                )
+            })
+    }
+
+    /// Run the install command in the worktree, in its own process group and with Fawkes's own environment (so
+    /// package managers find their real caches), for at most `install_timeout` seconds.
+    fn run_install(
+        &self,
+        m: &Manifest,
+        command: &str,
+        code: &Path,
+        log: &Path,
+    ) -> Result<(), String> {
+        let mut child = process::spawn(command, code, &[], log, &format!("install: {command}"))
+            .map_err(|e| e.to_string())?;
+        let pgid = child.id();
+        lock(&self.step_pgids).push(pgid);
+        let give_up = Instant::now() + Duration::from_secs_f64(m.install_timeout);
+        let result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break Ok(()),
+                Ok(Some(status)) => break Err(status.to_string()),
+                Err(e) => break Err(e.to_string()),
+                Ok(None) if Instant::now() >= give_up => {
+                    break Err(format!("timed out after {}s", m.install_timeout));
+                }
+                Ok(None) => sleep(Duration::from_millis(100)),
+            }
+        };
+        // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
+        // outlives the stage.
+        process::stop_group(pgid, m.stop_timeout, Some(&mut child));
+        lock(&self.step_pgids).retain(|p| *p != pgid);
+        result
+    }
+
+    /// Remove generation `id` for good: its worktree, its directory (snapshot and logs included) and its record.
+    /// The caller makes sure nothing uses it.
+    fn remove_generation(&self, m: &Manifest, id: &str) -> Result<(), String> {
+        let code = self.paths.code(id);
+        if code.exists() {
+            // Best effort: the directory goes below either way, and `worktree prune` forgets a worktree whose
+            // directory is gone.
+            let _ = git(
+                &m.repo,
+                &["worktree", "remove", "--force", &code.to_string_lossy()],
+            );
+        }
+        match std::fs::remove_dir_all(self.paths.generation(id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot remove {}: {e}",
+                    self.paths.generation(id).display()
                 ));
             }
         }
-
-        let generation = Generation {
-            id: id.clone(),
-            git_ref: git_ref.into(),
-            commit,
-            state: GenState::Staged,
-            dir: code,
-            staged_at: now(),
-            test: None,
-            switched_at: None,
-            confirmed_at: None,
-            rolled_back_at: None,
-            rollback_reason: None,
-            failed_starts: 0,
-        };
-        let record = json!(generation);
+        let _ = git(&m.repo, &["worktree", "prune"]);
         let mut inner = self.inner();
-        inner.state.generations.push(generation);
+        inner.state.generations.retain(|g| g.id != id);
         self.save(&inner);
-        self.event("staged", Some(&id), format!("{git_ref} staged as {id}"));
-        Ok(record)
+        Ok(())
     }
 
     fn test(self: &Arc<Self>, out: &mut Out, id: &str) -> R<Value> {
@@ -1305,7 +1399,7 @@ impl Daemon {
             )
         })?;
         let pgid = child.id();
-        lock(&self.test_pgids).push(pgid);
+        lock(&self.step_pgids).push(pgid);
 
         let check = m.health_check(&vars);
         let result = process::wait_healthy(
@@ -1317,7 +1411,7 @@ impl Daemon {
             || matches!(child.try_wait(), Ok(None)),
         );
         process::stop_group(pgid, m.stop_timeout, Some(&mut child));
-        lock(&self.test_pgids).retain(|p| *p != pgid);
+        lock(&self.step_pgids).retain(|p| *p != pgid);
         let _ = std::fs::remove_dir_all(&test_home);
 
         let passed = result.is_ok();
@@ -1657,6 +1751,126 @@ impl Daemon {
     }
 }
 
+// ------------------------------------------------------------ pruning
+
+impl Daemon {
+    /// Remove the oldest generations so that the manifest's `keep` remain (`State::prunable` says which). It takes
+    /// the step slot, so no stage, test or switch uses a generation while it goes.
+    fn prune(&self, out: &mut Out) -> R<Value> {
+        let _busy = self.begin("prune", Slot::Step)?;
+        let m = self.manifest();
+        let keep = m.keep.ok_or_else(|| {
+            invalid_state(
+                "pruning needs `keep = N` in the manifest; without it every generation is kept",
+            )
+        })?;
+        let doomed = self
+            .inner()
+            .state
+            .prunable(usize::try_from(keep).unwrap_or(usize::MAX));
+        let mut removed = Vec::new();
+        for id in doomed {
+            self.say(out, &id, format!("removing {id}"));
+            if let Err(e) = self.remove_generation(&m, &id) {
+                self.event("error", Some(&id), format!("prune: {e}"));
+                return Err(err(
+                    "internal",
+                    format!(
+                        "{e}; removed before it: {}; `fawkes prune` tries again",
+                        if removed.is_empty() {
+                            "none".into()
+                        } else {
+                            removed.join(", ")
+                        }
+                    ),
+                ));
+            }
+            removed.push(id);
+        }
+        if !removed.is_empty() {
+            self.event(
+                "pruned",
+                None,
+                format!("removed {} (keep = {keep})", removed.join(", ")),
+            );
+        }
+        let kept: Vec<String> = self
+            .inner()
+            .state
+            .generations
+            .iter()
+            .map(|g| g.id.clone())
+            .collect();
+        Ok(json!({ "removed": removed, "kept": kept }))
+    }
+
+    /// After a confirm, prune in the background once no stage or test holds the step slot; the confirm itself never
+    /// waits for it.
+    fn prune_soon(self: &Arc<Self>) {
+        if self.manifest().keep.is_none() {
+            return;
+        }
+        let daemon = self.clone();
+        thread::spawn(move || {
+            while !daemon.shutting_down() {
+                match daemon.prune(&mut Out::none()) {
+                    Err(e) if e.code == "busy" => sleep(Duration::from_secs(1)),
+                    // Reported as an event already, and the next confirm or `fawkes prune` tries again.
+                    _ => return,
+                }
+            }
+        });
+    }
+
+    /// At startup: remove what a daemon that died mid-stage left behind, a `staging` record with its directory or a
+    /// generation directory without a record, and the worktrees git still lists for them.
+    fn sweep_generations(&self) {
+        let m = self.manifest();
+        let staging: Vec<String> = {
+            let inner = self.inner();
+            inner
+                .state
+                .generations
+                .iter()
+                .filter(|g| g.state == GenState::Staging)
+                .map(|g| g.id.clone())
+                .collect()
+        };
+        for id in staging {
+            match self.remove_generation(&m, &id) {
+                Ok(()) => self.event(
+                    "daemon",
+                    Some(&id),
+                    format!("removed {id}, whose stage the end of the last daemon cut short"),
+                ),
+                Err(e) => self.event("error", Some(&id), format!("cannot remove {id}: {e}")),
+            };
+        }
+        let dirs = std::fs::read_dir(self.paths.root.join("generations"))
+            .into_iter()
+            .flatten();
+        for dir in dirs.flatten() {
+            let name = dir.file_name().to_string_lossy().into_owned();
+            if self.inner().state.find(&name).is_none() {
+                match std::fs::remove_dir_all(dir.path()) {
+                    Ok(()) => self.event(
+                        "daemon",
+                        None,
+                        format!("removed {}, which no generation owns", dir.path().display()),
+                    ),
+                    Err(e) => self.event(
+                        "error",
+                        None,
+                        format!("cannot remove {}: {e}", dir.path().display()),
+                    ),
+                };
+            }
+        }
+        // Best effort: a worktree git still lists only costs a line in `git worktree list`.
+        let _ = git(&m.repo, &["worktree", "prune"]);
+    }
+}
+
 // ------------------------------------------------------ small helpers
 
 /// Copy-on-write clone of a directory (APFS `clonefile` on macOS, reflinks elsewhere).
@@ -1676,33 +1890,6 @@ fn clone_directory(from: &Path, to: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("cp {status}"))
-    }
-}
-
-/// Run the install command in the worktree with Fawkes's own environment.
-fn run_install(command: &str, code: &Path, log: &Path) -> Result<(), String> {
-    use std::io::Write;
-    if let Some(parent) = log.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .map_err(|e| e.to_string())?;
-    let _ = writeln!(file, "=== {} install: {command} ===", now());
-    let status = Command::new("/bin/sh")
-        .args(["-c", command])
-        .current_dir(code)
-        .stdin(Stdio::null())
-        .stdout(file.try_clone().map_err(|e| e.to_string())?)
-        .stderr(file)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(status.to_string())
     }
 }
 
