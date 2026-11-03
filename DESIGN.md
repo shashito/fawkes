@@ -136,7 +136,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 
 1. Take an exclusive `flock` on `<state_dir>/lock`, held for the daemon's life; refuse to start when another daemon
    holds it. The kernel releases it when the process ends, however it ends, so it is never stale.
-2. Bind the socket (a socket file left there belongs to a dead daemon and is replaced).
+2. Bind the socket: refuse when a daemon of another state directory answers on it (a `--socket` shared by two
+   manifests); a socket file nobody answers on belongs to a dead daemon and is replaced.
 3. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event). Refuse to
    start when neither can be read.
 4. If `state.json` records a live pid from an earlier daemon that is still running, kill its process group (a crashed

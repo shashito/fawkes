@@ -33,10 +33,14 @@ the `pending` save (1:§5.2); manifest validation unit tests; a huge `--deadline
 | 2.3 | Back-pressure: a write timeout on every client socket, a bounded `sync_channel` per subscriber that drops a subscriber when it falls behind, `take(64 KiB)` on request reads, and a read timeout in the TUI's `request`. | 1:M3, 2:§2, 2:1.9 |
 | 2.4 | `install` gets a process group, a timeout, tracking like `test_pgids`, and a kill on shutdown. | 1:M4 |
 | 2.5 | A startup guard (RAII) that removes the socket and run link on any failed startup. | 1:M5 |
-| 2.6 | Stale app kill: store the process start time (and boot id) with `app_pid`; kill only on a match and never after a reboot. | 1:M6 |
+| 2.6 | Stale app kill: store the process start time (and boot id) with `app_pid`; kill only on a match and never after a reboot. Also close the gap between spawning the app and saving its pid: a daemon that dies in between leaves an app the next daemon cannot find (e.g. record the pgid through a pidfile the start wrapper writes, or find the group by its environment). | 1:M6, phase 1 |
 | 2.7 | Event log: an in-memory ring for `tail`, rotation of `events.jsonl` by size, and a cap or rotation for each generation's `logs/app.log`. | 1:M7, 2:1.9 |
 | 2.8 | Stage cleanup: record the generation as `staging` before the slow work, remove its directory on failure, and run `git worktree prune` at startup. | 1:L2, 2:1.9 |
 | 2.9 | Create `state_dir` with mode 0700, so logs and storage snapshots are not world-readable. | 2:§2 |
+| 2.10 | Spare-port probe also binds `0.0.0.0`, and a test reports "port in use" apart from a health failure. | 1:L3 |
+| 2.11 | Single-pass template expansion; shell-quote values in commands or document the `FAWKES_*`/`[env]` route (a behaviour change for manifests that quote templates themselves: decide first). | 1:M9, 2:1.9 |
+| 2.12 | `parse_time` rejects out-of-range fields (`2026-13-45T99:99:99Z` parses today). | 1:§5.8 |
+| 2.13 | TUI: `tzset` once in `tui::run`; widths by terminal columns (`unicode-width`), not chars. | 2:1.9 |
 
 Tests: the `confirm`/crash race; a subscriber that never reads does not grow memory; a failing install leaves nothing
 behind; busy semantics (`stage` during `test`, `stop` during `switch`, rollback during a running `test`).
@@ -74,11 +78,9 @@ These touch the same code, so they go together after phases 1–2 have their tes
 
 ## Low-severity items (picked up in whichever phase touches the file)
 
-`--end-of-options` before the ref in `git rev-parse` (1:L1); also probe `0.0.0.0` and report "port in use" apart from
-a health failure (1:L3); a misplaced doc comment in `state.rs` (1:L5); daemon usage errors exit 2 (1:L6);
-`sigaction` with `SA_RESTART`, handlers installed before setup (1:L8, 2:§3); a comment that `umask` must stay before
-any thread (1:L9, 2:§2); single-pass, shell-quoted template expansion (1:M9, 2:1.9); `tzset` in the TUI; width by
-columns, not chars (`unicode-width`); log an `error` event when a corrupt deadline parses as 0 (2:1.9).
+Done in phase 1: `--end-of-options` (1:L1), the doc comment in `state.rs` (1:L5), daemon usage errors exit 2 (1:L6),
+checked pgids (1:L7), signal-hook handlers installed before setup (1:L8), the `umask` comment (1:L9), an `error`
+event for an unreadable deadline (2:1.9). The rest moved to phase 2 rows 2.10–2.13.
 
 ## Decisions before building
 

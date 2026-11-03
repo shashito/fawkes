@@ -457,11 +457,19 @@ fn log_panics(events: PathBuf) {
     }));
 }
 
-/// Bind the socket. The caller holds the state lock, so a socket file left there belongs to a dead daemon.
+/// Bind the socket. The caller holds the state lock, so a socket file nobody answers on belongs to a dead daemon.
 fn bind(socket: &Path) -> Result<UnixListener, String> {
     if socket.as_os_str().len() >= 100 {
         return Err(format!(
             "socket path {} is too long (limit about 100 bytes); use a shorter state_dir",
+            socket.display()
+        ));
+    }
+    // Only a daemon of another state directory can answer here (a `--socket` shared by two manifests): never take
+    // its socket over.
+    if UnixStream::connect(socket).is_ok() {
+        return Err(format!(
+            "another daemon already answers on {}; give this app another --socket",
             socket.display()
         ));
     }
