@@ -41,11 +41,22 @@ pub fn format_time(secs: u64) -> String {
     )
 }
 
-/// The inverse of `format_time`.
+/// The inverse of `format_time`: only the exact text it produces, so out-of-range fields and other spellings of
+/// a time (`2026-02-30`, `T24:00:00`, `11-3`) are refused.
 pub fn parse_time(text: &str) -> Option<u64> {
+    let secs = parse_fields(text)?;
+    (format_time(secs) == text).then_some(secs)
+}
+
+/// The arithmetic behind `parse_time`, which accepts any field values.
+fn parse_fields(text: &str) -> Option<u64> {
     let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
     let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
     let (year, month, day) = (d.next()??, d.next()??, d.next()??);
+    // Keeps the arithmetic below far from overflow; `format_time` writes four-digit years.
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
     let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
     let (h, m, s) = (t.next()??, t.next()??, t.next()??);
     let y = year - i64::from(month <= 2);
@@ -343,6 +354,21 @@ mod tests {
             assert_eq!(parse_time(&format_time(secs)), Some(secs));
         }
         assert_eq!(format_time(1_793_714_521), "2026-11-03T14:02:01Z");
+    }
+
+    #[test]
+    fn parse_time_refuses_anything_but_the_canonical_form() {
+        for text in [
+            "2026-13-45T99:99:99Z",
+            "2026-02-30T00:00:00Z",
+            "2026-11-03T24:00:00Z",
+            "2026-11-3T14:00:01Z",
+            "1969-12-31T23:59:59Z",
+            "99999999999999999-01-01T00:00:00Z",
+            "",
+        ] {
+            assert_eq!(parse_time(text), None, "{text}");
+        }
     }
 
     #[test]
