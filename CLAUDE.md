@@ -25,8 +25,9 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   They need `git` and `node` on `PATH`, and the sample app is `examples/sample/app.js`.
 - Each test claims a block of ten ports from `Harness::new(port, ..)` and a directory `/tmp/fk<port>`, which is kept
   short because socket paths have a length limit. Tests run in parallel, so **give a new test an unused block**
-  (4800 to 4830 are taken; use 4840, 4850, …).
-- Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `tui.rs`).
+  (4800 to 4890 are taken; use 4900, 4910, …).
+- Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
+  `process.rs`, `protocol.rs`, `daemon.rs`, `tui.rs`).
 - To fix a bug, first write a test that reproduces it.
 - Never point a test or a manual run at a live app or a real `~/.fawkes`. Use a temp directory and a manifest in it.
 
