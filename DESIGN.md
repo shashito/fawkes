@@ -84,7 +84,10 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
 
 A switch that fails before step 4 (its snapshot or its `state.json` cannot be written) ends with no step in flight
 and starts the previous generation again, or, when that one was waiting out a crash backoff, leaves its restart
-scheduled as it was; a confirm that cannot be written fails and stays pending.
+scheduled as it was; a confirm that cannot be written fails and stays pending. A `SIGTERM` that arrives while the old
+generation is stopping ends the switch the same way, just before step 4: the answer is `busy` (the daemon is shutting
+down), the target stays `tested`, and the old generation is not started again by a daemon that is leaving; the next
+daemon start runs the permanent generation.
 
 ### Confirm
 
@@ -188,8 +191,9 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    owns, and the worktrees git still lists for them (`git worktree prune`).
 7. Act on the step `state.json` says was in flight (`txn`):
    - none: start the permanent generation, if there is one;
-   - `switching`: the target never ran. Log that the switch to it was cut short (it stays `tested`), clear the step
-     and start the permanent generation;
+   - `switching`: the target never ran (the last daemon was killed, or stopped by `SIGTERM` while the switch stopped
+     the old generation). Log that the switch to it was cut short (it stays `tested`), clear the step and start the
+     permanent generation;
    - `pending`: roll the switch back (reason `daemon_restart`); a pending switch is never resumed;
    - `rolling_back`: retry the rollback with its recorded reason (restoring the same snapshot twice is harmless),
      then start the permanent generation.
