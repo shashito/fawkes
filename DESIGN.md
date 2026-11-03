@@ -350,7 +350,7 @@ Results per command:
 | `rollback` | — | `from`, `to`, `reason` |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
-| `log` | `limit?`, `follow?` | `events`; with `follow` the daemon instead streams every new event as an `event` line until the client closes |
+| `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead streams every new event as an `event` line until the client closes |
 | `history` | — | `generations`, oldest first |
 | `subscribe` | `limit?` | never ends; see below |
 
@@ -478,7 +478,9 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
                          rename, fsync of the directory)
   app.pid                pid (= process group) of the live app, written by its start wrapper
   state.json.bak         the same content, written after state.json; read when state.json is unreadable
-  events.jsonl           append-only event log, one JSON object per line (what `log` reads)
+  events.jsonl           append-only event log, one JSON object per line; at 10 MiB it becomes events.1.jsonl
+                         (replacing the one before). `log` and `subscribe` answer from the newest 1000 kept in
+                         memory
   current -> generations/g3/code    symlink to the live worktree, for people (replaced atomically)
   generations/<id>/
     code/                git worktree at the ref (`git worktree add --detach`)
@@ -488,7 +490,9 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
     test-home/           storage copy the test run used (removed after the test)
     logs/install.log     install output
   install-failed.log     install output of the latest stage that failed (its generation is removed)
-    logs/app.log         stdout and stderr of every run, live and test, with a header line per start
+    logs/app.log         stdout and stderr of every run, live and test, with a header line per start; past
+                         10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines
+                         written during the copy are lost)
 ```
 
 `state.json` is the source of truth; the deadline is an absolute time so it survives a daemon restart.

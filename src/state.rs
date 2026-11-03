@@ -1,6 +1,7 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
@@ -305,35 +306,99 @@ pub struct Event {
     pub message: String,
 }
 
-/// events.jsonl, append-only.
+/// How large `events.jsonl` grows before it becomes `events.1.jsonl` (replacing the one before).
+const EVENT_LOG_BYTES: u64 = 10 << 20;
+
+/// How many of the newest events stay in memory, which is as far back as `tail` reaches.
+pub const RECENT_EVENTS: usize = 1000;
+
+/// events.jsonl, append-only and rotated by size. The newest events are also kept in memory, so `log` and every
+/// `subscribe` answer without reading the file.
 pub struct EventLog {
     path: PathBuf,
     file: File,
+    bytes: u64,
+    limit: u64,
+    recent: VecDeque<Event>,
+}
+
+/// `events.1.jsonl` next to `events.jsonl`.
+fn rotated_path(path: &Path) -> PathBuf {
+    path.with_extension("1.jsonl")
+}
+
+fn open_append(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 impl EventLog {
     pub fn open(path: PathBuf) -> std::io::Result<EventLog> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(EventLog { path, file })
+        EventLog::with_limit(path, EVENT_LOG_BYTES)
+    }
+
+    fn with_limit(path: PathBuf, limit: u64) -> std::io::Result<EventLog> {
+        let file = open_append(&path)?;
+        let bytes = file.metadata()?.len();
+        let mut recent = VecDeque::with_capacity(RECENT_EVENTS);
+        for file in [rotated_path(&path), path.clone()] {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            for event in text.lines().filter_map(|l| serde_json::from_str(l).ok()) {
+                if recent.len() == RECENT_EVENTS {
+                    recent.pop_front();
+                }
+                recent.push_back(event);
+            }
+        }
+        Ok(EventLog {
+            path,
+            file,
+            bytes,
+            limit,
+            recent,
+        })
+    }
+
+    /// Append one event to the file at `path` without keeping it open: for the panic hook, which must not wait for
+    /// the daemon's log, and must not read it either.
+    pub fn append_once(path: &Path, event: &Event) {
+        if let Ok(mut file) = open_append(path) {
+            // Best effort: the process is about to abort.
+            let _ = writeln!(file, "{}", serde_json::to_string(event).unwrap_or_default());
+        }
     }
 
     pub fn append(&mut self, event: &Event) {
+        let line = format!("{}\n", serde_json::to_string(event).unwrap_or_default());
         // A full disk must not take the supervisor down; the event still reaches live clients.
-        let _ = writeln!(
-            self.file,
-            "{}",
-            serde_json::to_string(event).unwrap_or_default()
-        );
+        if self.file.write_all(line.as_bytes()).is_ok() {
+            self.bytes += line.len() as u64;
+        }
+        if self.recent.len() == RECENT_EVENTS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(event.clone());
+        if self.bytes >= self.limit {
+            self.rotate();
+        }
     }
 
-    /// The last `n` events, oldest first.
+    /// Move the full file aside and start a new one. On failure the log keeps growing and the next event tries again.
+    fn rotate(&mut self) {
+        if std::fs::rename(&self.path, rotated_path(&self.path)).is_ok()
+            && let Ok(file) = open_append(&self.path)
+        {
+            self.file = file;
+            self.bytes = 0;
+        }
+    }
+
+    /// The last `n` events (at most `RECENT_EVENTS`), oldest first.
     pub fn tail(&self, n: usize) -> Vec<Event> {
-        let text = std::fs::read_to_string(&self.path).unwrap_or_default();
-        let events: Vec<Event> = text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        events[events.len().saturating_sub(n)..].to_vec()
+        self.recent
+            .iter()
+            .skip(self.recent.len().saturating_sub(n))
+            .cloned()
+            .collect()
     }
 }
 
@@ -419,6 +484,40 @@ mod tests {
         assert_eq!(state.prunable(4), ["g2"]);
         assert_eq!(state.prunable(1), ["g2", "g4"]);
         assert_eq!(state.prunable(5), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_event_log_rotates_by_size_and_tails_from_memory() {
+        let root = std::env::temp_dir().join(format!("fk-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.jsonl");
+        let event = |n: usize| Event {
+            at: now(),
+            kind: "progress".into(),
+            generation: None,
+            message: format!("event {n}"),
+        };
+        let mut log = EventLog::with_limit(path.clone(), 4096).unwrap();
+        for n in 0..RECENT_EVENTS + 10 {
+            log.append(&event(n));
+        }
+        assert!(std::fs::metadata(&path).unwrap().len() < 4096);
+        assert!(std::fs::metadata(rotated_path(&path)).unwrap().len() >= 4096);
+        let tail = log.tail(usize::MAX);
+        assert_eq!(tail.len(), RECENT_EVENTS);
+        assert_eq!(
+            tail.last().unwrap().message,
+            format!("event {}", RECENT_EVENTS + 9)
+        );
+
+        // A new daemon's log starts from what both files still hold.
+        drop(log);
+        let reopened = EventLog::with_limit(path, 4096).unwrap();
+        let tail = reopened.tail(3);
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[2].message, format!("event {}", RECENT_EVENTS + 9));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -117,6 +117,9 @@ enum Msg {
     Changed,
 }
 
+/// How large a generation's `logs/app.log` grows before the watcher moves it to `app.log.1`.
+const APP_LOG_BYTES: u64 = 10 << 20;
+
 /// The longest request line a client may send, in bytes.
 const MAX_REQUEST: u64 = 64 * 1024;
 
@@ -344,9 +347,15 @@ impl Daemon {
 
         let watcher = daemon.clone();
         thread::spawn(move || {
-            while !watcher.shutting_down() {
+            for pass in 0u64.. {
+                if watcher.shutting_down() {
+                    break;
+                }
                 sleep(Duration::from_millis(100));
                 watcher.tick();
+                if pass % 100 == 0 {
+                    watcher.cap_app_log();
+                }
             }
         });
 
@@ -496,15 +505,16 @@ fn lock_state_dir(paths: &Paths) -> Result<File, String> {
 fn log_panics(events: PathBuf) {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // A file of its own: the panicking thread may hold the daemon's event log.
-        if let Ok(mut log) = EventLog::open(events.clone()) {
-            log.append(&Event {
+        // A file handle of its own: the panicking thread may hold the daemon's event log.
+        EventLog::append_once(
+            &events,
+            &Event {
                 at: now(),
                 kind: "error".into(),
                 generation: None,
                 message: format!("panic: {info}; the daemon aborts, and its next start recovers"),
-            });
-        }
+            },
+        );
         report(info);
     }));
 }
@@ -1004,6 +1014,30 @@ impl Daemon {
             Some("restart")
         } else {
             None
+        }
+    }
+
+    /// Keep the live generation's `logs/app.log` under `APP_LOG_BYTES`: copy it to `app.log.1` and truncate it. The
+    /// app's descriptor appends, so its next write lands at the new end; what it writes during the copy is lost, the
+    /// price of capping a log the daemon does not sit between.
+    fn cap_app_log(&self) {
+        let Some(id) = self.inner().app.as_ref().map(|app| app.generation.clone()) else {
+            return;
+        };
+        let log = self.paths.app_log(&id);
+        if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > APP_LOG_BYTES) {
+            let mut old = log.clone().into_os_string();
+            old.push(".1");
+            let capped = std::fs::copy(&log, &old)
+                .and_then(|_| OpenOptions::new().write(true).open(&log))
+                .and_then(|file| file.set_len(0));
+            if let Err(e) = capped {
+                self.event(
+                    "error",
+                    Some(&id),
+                    format!("cannot cap {}: {e}", log.display()),
+                );
+            }
         }
     }
 
