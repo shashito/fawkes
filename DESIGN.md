@@ -82,8 +82,9 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    rolled back at once (below).
 5. Health-check it in the background and log `healthy` when it passes. Health never confirms: only `confirm` does.
    A check that gives up after `health.timeout` logs `unhealthy`; with `rollback_on_unhealthy = true` in the
-   manifest the switch then rolls back at once (reason `health check failed`) instead of at its deadline. It is off
-   by default, for apps that are slow to warm up.
+   manifest the switch then rolls back at once (reason `health check failed`) instead of at its deadline; that
+   rollback is decided before the `unhealthy` event is logged. It is off by default, for apps that are slow to warm
+   up.
 
 A switch that fails before step 4 (its snapshot or its `state.json` cannot be written) ends with no step in flight
 and starts the previous generation again, or, when that one was waiting out a crash backoff, leaves its restart
