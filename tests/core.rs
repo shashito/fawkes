@@ -362,3 +362,182 @@ fn rollback_on_unhealthy_rolls_back_without_waiting_for_the_deadline() {
     assert_eq!(h.status()["permanent"], "g1");
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
 }
+
+/// The worktrees git knows of in the harness's repository, the repository itself included.
+fn worktrees(h: &Harness) -> usize {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(h.dir.join("repo"))
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count()
+}
+
+/// A stage whose install fails, or hangs past `install_timeout`, leaves nothing behind: no generation record, no
+/// directory, no worktree, no process.
+#[test]
+fn a_failing_or_hanging_install_leaves_nothing_behind() {
+    let mut h = Harness::new(
+        4860,
+        r#"install = '''case "$(cat MODE)" in fails) exit 1;; hangs) echo $$ > {state}/install.pid; exec sleep 600;; esac'''
+install_timeout = 1"#,
+    );
+    h.commit("v1", "fails");
+    h.commit("v2", "hangs");
+    h.commit("v3", "confirm");
+    h.start_daemon();
+
+    let (code, error) = h.fk(&["stage", "v1"]);
+    assert_eq!(
+        (code, error["code"].as_str()),
+        (1, Some("install_failed")),
+        "{error}"
+    );
+    let (code, error) = h.fk(&["stage", "v2"]);
+    assert_eq!(
+        (code, error["code"].as_str()),
+        (1, Some("install_failed")),
+        "{error}"
+    );
+    assert!(
+        error["message"].as_str().unwrap().contains("timed out"),
+        "{error}"
+    );
+    let pid: i32 = std::fs::read_to_string(h.dir.join("s/install.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(
+        unsafe { libc::kill(-pid, 0) },
+        0,
+        "the hanging install's process group outlived its timeout"
+    );
+    for id in ["g1", "g2"] {
+        assert!(
+            !h.dir.join("s/generations").join(id).exists(),
+            "{id}'s directory survived its failed stage"
+        );
+    }
+    assert_eq!(h.ok(&["history"])["generations"], serde_json::json!([]));
+    assert_eq!(worktrees(&h), 1);
+
+    assert_eq!(h.ok(&["stage", "v3"])["id"], "g3", "ids are never reused");
+    assert_eq!(worktrees(&h), 2);
+}
+
+/// `keep = 2`: `prune` removes the oldest generations beyond two, never the permanent one, the pending one or the
+/// one it rolls back to, and a confirm prunes by itself.
+#[test]
+fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
+    let mut h = Harness::new(4870, "keep = 2");
+    h.commit("v1", "confirm");
+    h.commit("v2", "confirm");
+    h.commit("v3", "never");
+    h.start_daemon();
+    let ids = |h: &Harness| -> Vec<String> {
+        h.ok(&["history"])["generations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for (version, id) in [("v1", "g1"), ("v2", "g2")] {
+        h.ok(&["stage", version]);
+        h.ok(&["test", id]);
+        h.ok(&["switch", id]);
+        h.wait("the new generation to confirm itself", 15, || {
+            h.status()["permanent"] == id
+        });
+    }
+    h.ok(&["stage", "v3"]);
+    h.ok(&["test", "g3"]);
+    h.ok(&["switch", "g3", "--deadline", "120"]);
+    h.ok(&["stage", "v1"]);
+    assert_eq!(ids(&h), ["g1", "g2", "g3", "g4"]);
+
+    let pruned = h.ok(&["prune"]);
+    assert_eq!(
+        pruned["removed"],
+        serde_json::json!(["g1", "g4"]),
+        "{pruned}"
+    );
+    assert_eq!(ids(&h), ["g2", "g3"]);
+    for id in ["g1", "g4"] {
+        assert!(
+            !h.dir.join("s/generations").join(id).exists(),
+            "{id} survived"
+        );
+    }
+    assert!(h.dir.join("s/generations/g3/snapshot/index.json").exists());
+    assert_eq!(worktrees(&h), 3);
+
+    // The rollback still has everything it needs.
+    h.ok(&["rollback"]);
+    h.wait("v2 to serve again", 10, || h.get().as_deref() == Some("v2"));
+
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g5"]);
+    h.ok(&["switch", "g5"]);
+    h.wait("the confirm of g5 to prune g2", 15, || {
+        ids(&h) == ["g3", "g5"]
+    });
+    assert_eq!(worktrees(&h), 3);
+}
+
+/// One transaction step at a time, but an automatic rollback never waits for a stage or test: `stop` during a
+/// switch and `stage` during a test are `busy`, and a deadline that passes during a test still rolls back.
+#[test]
+fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
+    let mut h = Harness::new(4880, "");
+    h.commit("v1", "slow-stop");
+    h.commit("v2", "never");
+    h.commit("v3", "slow-test");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+
+    std::thread::scope(|scope| {
+        let switch = scope.spawn(|| h.fk(&["switch", "g2", "--deadline", "4"]));
+        h.wait("the switch to stop g1", 5, || {
+            h.status()["busy"] == "switch g2"
+        });
+        let (code, error) = h.fk(&["stop"]);
+        assert_eq!((code, error["code"].as_str()), (1, Some("busy")), "{error}");
+        assert_eq!(switch.join().unwrap().0, 0);
+    });
+
+    h.ok(&["stage", "v3"]);
+    std::thread::scope(|scope| {
+        let test = scope.spawn(|| h.fk(&["test", "g3"]));
+        h.wait("the test of g3 to start", 5, || {
+            h.status()["busy"] == "test g3"
+        });
+        let (code, error) = h.fk(&["stage", "v1"]);
+        assert_eq!((code, error["code"].as_str()), (1, Some("busy")), "{error}");
+        h.wait("g2's deadline to roll it back", 10, || {
+            h.generation("g2")["state"] == "rolled_back"
+        });
+        assert_eq!(
+            h.status()["busy"],
+            "test g3",
+            "the rollback ran while the test went on"
+        );
+        assert_eq!(test.join().unwrap().0, 0);
+    });
+    assert_eq!(
+        h.generation("g2")["rollback_reason"],
+        "missed confirm deadline"
+    );
+    assert_eq!(h.status()["permanent"], "g1");
+}

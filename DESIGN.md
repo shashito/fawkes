@@ -13,7 +13,7 @@ implements all of it except where a section says **later**.
 
 `fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive). It is the parent of the
 app's live process and the only writer of the state directory. Every other command (`start`, `stop`, `restart`,
-`stage`, `test`, `switch`, `confirm`, `rollback`, `status`, `log`, `history`, `tui`) is a thin client that sends
+`stage`, `test`, `switch`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `tui`) is a thin client that sends
 requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
 manifest.
 
@@ -29,7 +29,7 @@ state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload i
 - `name`, `repo`, `state_dir`, `home` and `storage` never change by reload; they need a daemon restart. (A changed
   `home` would restore a snapshot into another directory than the one it was taken from.)
 - `port` does not change while the app runs; `stop` it first.
-- Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `spare_ports`, `deadline`,
+- Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`, `spare_ports`, `deadline`,
   the timeouts and the restart policy) applies from the next stage, test, switch or start on. An invalid manifest is not reloaded.
 
 Change `home` or `storage` only while no switch is pending: a daemon start rolls a pending switch back into the
@@ -43,19 +43,23 @@ it, and the daemon start below recovers whatever was in flight; no thread carrie
 A generation is a git worktree at a ref with its dependencies installed, numbered `g1`, `g2`, … in staging order.
 
 ```
-staged ──test──▶ tested ──switch──▶ current ──confirm──▶ permanent ──(next confirm)──▶ retired
-   ▲  ◀─fails─┘ (test_failed,                  │
-   │            retestable)                      └──missed deadline / exit / rollback──▶ rolled_back
+staging ──▶ staged ──test──▶ tested ──switch──▶ current ──confirm──▶ permanent ──(next confirm)──▶ retired
+   │           ▲  ◀─fails─┘ (test_failed,                  │
+   │           │            retestable)                      └──missed deadline / exit / rollback──▶ rolled_back
+   └──fails──▶ removed
 ```
 
+- **staging:** recorded before the worktree is created and the install runs. A stage that fails removes the
+  generation again (record, directory, worktree); one that a daemon's end cut short is removed at the next daemon
+  start. Ids are never reused.
 - **staged:** worktree created and install succeeded. **test_failed:** the last test failed; `test` may run again.
 - **tested:** started on a spare port with a copy of the storage and passed the health check. Only a tested
   generation can be switched to.
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
 - **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
   start of the daemon always runs the permanent generation (Erlang/OTP release handler).
-- **retired:** was permanent, superseded by a newer confirm. Its worktree stays; `switch` to it again is allowed
-  (after a new `test`), which is how an agent goes back to an older version on purpose.
+- **retired:** was permanent, superseded by a newer confirm. Its worktree stays until `prune` removes it; `switch` to it
+  again is allowed (after a new `test`), which is how an agent goes back to an older version on purpose.
 - **rolled_back:** final. A rolled-back generation is never started again, so a broken rollback cannot loop; stage
   the same ref again to get a fresh generation.
 
@@ -114,6 +118,15 @@ too, Fawkes does not roll further back; the restart policy below applies and the
 `fawkes rollback` with no pending switch is `invalid_state`; to go back past a confirm, `test` and `switch` to a
 retired generation.
 
+### Prune
+
+`fawkes prune`, and in the background after every confirm (once no stage or test runs), when the manifest sets
+`keep = N`: removes the oldest generations so that `N` remain. It never removes the permanent generation, the pending
+one or the one it would roll back to, so more than `N` remain when those alone are more. A removed generation loses
+its worktree (`git worktree remove`), its directory with its snapshot and logs, and its record in `state.json`;
+`history` no longer lists it and its id is not reused. `prune` takes the transaction step slot, so it waits for no
+stage or test and gets `busy` while one runs. Without `keep` it is `invalid_state` and nothing is ever pruned.
+
 ### Lifecycle: start, stop, restart
 
 The usual supervisor actions, the same in the CLI, the socket and the TUI. They act on the *current* generation:
@@ -152,8 +165,10 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    start when neither can be read.
 4. If `state.json` records a live pid from an earlier daemon that is still running, kill its process group (a crashed
    daemon leaves its app running; pid reuse is accepted as a prototype risk).
-5. If a switch is pending, roll it back (reason `daemon_restart`).
-6. Start the permanent generation, if there is one.
+5. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
+   owns, and the worktrees git still lists for them (`git worktree prune`).
+6. If a switch is pending, roll it back (reason `daemon_restart`).
+7. Start the permanent generation, if there is one.
 
 ## Manifest
 
@@ -184,7 +199,9 @@ storage = ["app.sqlite"]       # SQLite files relative to home, snapshotted at s
 port = 4790                    # live port
 spare_ports = [4791, 4799]     # inclusive range for `test`
 install = "npm ci"             # run in the worktree after checkout; optional
+install_timeout = 1800         # seconds before a hanging install is stopped and the stage fails
 reuse = ["node_modules"]       # cloned (copy-on-write) from the permanent generation before install; optional
+keep = 5                       # generations `prune` keeps (it runs after every confirm); optional, default all
 start = "node app.js"          # run in the worktree via /bin/sh -c
 deadline = 120                 # seconds to confirm after switch; `switch --deadline` overrides
 stop_timeout = 10              # seconds between SIGTERM and SIGKILL
@@ -210,15 +227,18 @@ APP_HOME = "{home}"
   and a restore deletes files at those paths);
 - `port` lies inside `spare_ports`, or `spare_ports` is not `[low, high]`;
 - `deadline` is not between 1 and 604800 seconds (a week);
-- `stop_timeout`, `min_uptime`, `health.interval` or `health.timeout` is not a number of seconds above 0 and at
-  most 86400;
-- `max_failed_starts` is 0;
+- `install_timeout`, `stop_timeout`, `min_uptime`, `health.interval` or `health.timeout` is not a number of seconds
+  above 0 and at most 86400;
+- `max_failed_starts` or `keep` is 0;
 - `[health]` does not have exactly one of `url` and `command`, or `url` is not `http://` with an explicit port
   after the host (`:4790` or `:{port}`).
 
 The error names every problem at once.
 
-`install` runs with Fawkes's own environment so package managers find their real caches. `start` and
+`install` runs with Fawkes's own environment so package managers find their real caches, in its own process group.
+After `install_timeout` seconds it is stopped like the app (SIGTERM, SIGKILL after `stop_timeout`) and the stage
+fails; whatever it left running in its group is ended when it finishes; a stopping daemon kills it. A failed
+install's output is kept in `<state_dir>/install-failed.log` (the latest one only). `start` and
 `health.command` get the inherited environment plus `[env]` plus `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION`
 and `FAWKES_PHASE` (`test` or `live`).
 
@@ -261,6 +281,7 @@ fawkes test     <gen>
 fawkes switch   <gen> [--deadline SECS]
 fawkes confirm  [<gen>]
 fawkes rollback
+fawkes prune
 fawkes status
 fawkes log      [-n N] [--follow]
 fawkes history
@@ -322,6 +343,7 @@ Results per command:
 | `switch` | `generation`, `deadline?` (seconds, `1..=604800`, else `usage`) | `generation`, `previous`, `deadline` |
 | `confirm` | `generation?` | the generation record, now permanent |
 | `rollback` | — | `from`, `to`, `reason` |
+| `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
 | `log` | `limit?`, `follow?` | `events`; with `follow` the daemon instead streams every new event as an `event` line until the client closes |
 | `history` | — | `generations`, oldest first |
@@ -429,12 +451,13 @@ Keys:
 | `w` | switch to the selected generation |
 | `c` | confirm the pending generation |
 | `b` | roll back the pending generation |
+| `p` | prune old generations beyond the manifest's `keep` |
 | `f` `z` `/` | pause/follow, zoom, filter the events |
 | `?` | help overlay listing every key |
 | `q`, Ctrl-C | quit |
 | Esc | close the prompt, dialog, help or filter |
 
-`w`, `b`, `x` and `r` ask first in a small centered dialog naming the target (`Switch demo to g4? y/N`); only `y`
+`w`, `b`, `p`, `x` and `r` ask first in a small centered dialog naming the target (`Switch demo to g4? y/N`); only `y`
 confirms. A failed action shows the daemon's error message in the footer.
 
 Crate: **ratatui** (with its re-exported `crossterm` backend, so one dependency), the standard Rust TUI library;
@@ -458,6 +481,7 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
       0.sqlite
     test-home/           storage copy the test run used (removed after the test)
     logs/install.log     install output
+  install-failed.log     install output of the latest stage that failed (its generation is removed)
     logs/app.log         stdout and stderr of every run, live and test, with a header line per start
 ```
 
@@ -480,12 +504,12 @@ Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replaci
   `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
 - **libc:** `localtime_r` for the TUI's local clock (neither std nor rustix has it).
 
-Hand-written instead of a crate: argument parsing (nine commands, three flags), the HTTP health check (one GET over
+Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
 `std::net::TcpStream` to localhost), UTC timestamps (days-to-civil conversion), threads instead of an async runtime.
 
 ## Later
 
 - `confirm = "health"` for apps that cannot call `confirm` themselves.
-- Pruning old generations and snapshots; storage that is not SQLite.
+- Storage that is not SQLite.
 - The Ultimate extension in `~/.ultimate/extensions/` that drives Fawkes for self-upgrades.
 - Falling back past the permanent generation when it crash-loops.

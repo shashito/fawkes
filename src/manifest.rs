@@ -25,8 +25,12 @@ pub struct Manifest {
     pub port: u16,
     pub spare_ports: [u16; 2],
     pub install: Option<String>,
+    #[serde(default = "default_install_timeout")]
+    pub install_timeout: f64,
     #[serde(default)]
     pub reuse: Vec<String>,
+    /// How many generations `prune` keeps; without it nothing is pruned.
+    pub keep: Option<u32>,
     pub start: String,
     #[serde(default = "default_deadline")]
     pub deadline: u64,
@@ -65,6 +69,9 @@ const MAX_SECONDS: f64 = 86_400.0;
 
 fn default_deadline() -> u64 {
     120
+}
+fn default_install_timeout() -> f64 {
+    1800.0
 }
 fn default_stop_timeout() -> f64 {
     10.0
@@ -240,7 +247,11 @@ impl Manifest {
         if self.max_failed_starts < 1 {
             problems.push("max_failed_starts must be at least 1".into());
         }
+        if self.keep == Some(0) {
+            problems.push("keep must be at least 1 (leave it out to keep every generation)".into());
+        }
         for (field, seconds) in [
+            ("install_timeout", self.install_timeout),
             ("stop_timeout", self.stop_timeout),
             ("min_uptime", self.min_uptime),
             ("health.interval", self.health.interval),
@@ -308,6 +319,11 @@ impl Manifest {
             ("port", self.port != new.port),
             ("spare_ports", self.spare_ports != new.spare_ports),
             ("install", self.install != new.install),
+            (
+                "install_timeout",
+                self.install_timeout != new.install_timeout,
+            ),
+            ("keep", self.keep != new.keep),
             ("reuse", self.reuse != new.reuse),
             ("start", self.start != new.start),
             ("deadline", self.deadline != new.deadline),
@@ -469,6 +485,11 @@ url = "http://127.0.0.1:{port}/"
                 with("[health]", "[health]\ntimeout = inf"),
             ),
             ("deadline", with("start =", "deadline = 0\nstart =")),
+            ("keep", with("start =", "keep = 0\nstart =")),
+            (
+                "install_timeout",
+                with("start =", "install_timeout = 0.0\nstart ="),
+            ),
             ("deadline", with("start =", "deadline = 604801\nstart =")),
             (
                 "max_failed_starts",

@@ -633,6 +633,7 @@ fn generation_info(view: &AppView, g: &Value) -> (String, Color) {
             format!("✖ test failed: {}", text(&test["message"])),
             Color::Red,
         ),
+        "staging" => ("checking out and installing".into(), Color::Yellow),
         "staged" => ("not tested".into(), Color::Reset),
         "current" if pending.is_some_and(|p| p["generation"] == g["id"]) => {
             ("live · awaiting confirm".into(), Color::Yellow)
@@ -945,6 +946,7 @@ fn draw_help(frame: &mut Frame) {
         ("w", "switch to the selected generation (asks)"),
         ("c", "confirm the pending generation"),
         ("b", "roll back the pending generation (asks)"),
+        ("p", "prune old generations beyond `keep` (asks)"),
         ("f", "pause / follow the events pane"),
         ("z", "zoom the events pane"),
         ("/", "filter events (Esc clears)"),

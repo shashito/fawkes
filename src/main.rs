@@ -24,6 +24,7 @@ const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <c
   switch <gen> [--deadline SECS] go live; roll back unless confirmed in time
   confirm [<gen>]                make the pending generation permanent
   rollback                       undo the pending switch now
+  prune                          remove old generations beyond the manifest's `keep`
   status | history               show the app and the generations
   log [-n N] [--follow]          show the event log
   tui                            full-screen live view and controls";
@@ -91,8 +92,8 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
         }
     };
     match cli.command.as_str() {
-        "daemon" | "start" | "stop" | "restart" | "rollback" | "status" | "history" | "log"
-        | "tui" => wants(0..=0)?,
+        "daemon" | "start" | "stop" | "restart" | "rollback" | "prune" | "status" | "history"
+        | "log" | "tui" => wants(0..=0)?,
         "stage" | "test" | "switch" => wants(1..=1)?,
         "confirm" => wants(0..=1)?,
         other => return Err(format!("unknown command `{other}`")),
@@ -354,6 +355,16 @@ fn render_result(command: &str, r: &Value) -> String {
             text(&r["to"]),
             text(&r["reason"])
         ),
+        "prune" => match r["removed"].as_array() {
+            Some(removed) if !removed.is_empty() => format!(
+                "removed {}; kept {}",
+                removed.iter().map(text).collect::<Vec<_>>().join(", "),
+                r["kept"].as_array().map_or(String::new(), |kept| {
+                    kept.iter().map(text).collect::<Vec<_>>().join(", ")
+                })
+            ),
+            _ => "nothing to remove".into(),
+        },
         "start" | "stop" | "restart" => render_process(r),
         "status" => {
             let pending = match &r["pending"] {
