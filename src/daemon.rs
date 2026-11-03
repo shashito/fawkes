@@ -848,6 +848,12 @@ impl Daemon {
 
 impl Daemon {
     fn handle(self: Arc<Self>, stream: UnixStream) {
+        // Blocking, with timeouts: on macOS an accepted socket inherits the listener's non-blocking mode, which would
+        // fail a request that arrives in pieces and every write that finds the socket buffer full.
+        if let Err(e) = stream.set_nonblocking(false) {
+            self.event("error", None, format!("cannot serve a client: {e}"));
+            return;
+        }
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut line = String::new();
         // Bounded, so a client cannot make the daemon allocate without limit.

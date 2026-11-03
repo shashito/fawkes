@@ -542,3 +542,23 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
     );
     assert_eq!(h.status()["permanent"], "g1");
 }
+
+/// Found while bounding request reads: on macOS an accepted socket inherits the listener's non-blocking mode, so a
+/// request that arrived in two pieces was refused as "no request received" (and a reply larger than the socket buffer
+/// failed at once instead of waiting for the client).
+#[test]
+fn a_request_that_arrives_in_pieces_is_answered() {
+    use std::io::{BufRead, Write};
+    let mut h = Harness::new(4890, "");
+    h.start_daemon();
+    let mut stream = std::os::unix::net::UnixStream::connect(h.dir.join("s/fawkes.sock")).unwrap();
+    stream.write_all(br#"{"command": "log", "#).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    stream.write_all(b"\"args\": {\"limit\": 1000}}\n").unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(&stream)
+        .read_line(&mut line)
+        .unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
+}
