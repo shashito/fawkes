@@ -1,0 +1,5 @@
+# Tracks stable rather than a fixed release, so no extra toolchain has to be installed; Cargo.toml's `rust-version`
+# is the floor. A `rustup update` can bring new lints, which `cargo clippy -- -D warnings` then reports.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
