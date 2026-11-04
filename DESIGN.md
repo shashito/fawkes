@@ -580,16 +580,16 @@ Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replaci
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
 - **rusqlite** (features `bundled`, `backup`): the SQLite online backup API for consistent snapshots of live
   databases, including WAL contents. `bundled` builds a known SQLite instead of depending on the system one.
-- **rustix** (features `fs`, `net`, `process`): safe wrappers for the system calls std lacks: `flock` for the state
-  lock, signalling a process group (std only sends SIGKILL to one pid), `umask` around binding the socket and a
-  peeking `recv` to notice a closed client. Its typed `Pid` refuses 0, so a corrupt pid never signals our own
-  group. Already in the tree through ratatui's crossterm.
+- **rustix** (features `fs`, `net`, `param`, `process`): safe wrappers for the system calls std lacks: `flock` for
+  the state lock, signalling a process group (std only sends SIGKILL to one pid), `umask` around binding the socket,
+  a peeking `recv` to notice a closed client and the clock tick on Linux. Its typed `Pid` refuses 0, so a corrupt
+  pid never signals our own group. The tests signal processes through it too, without `unsafe`. Already in the tree
+  through ratatui's crossterm.
 - **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags, installed with `sigaction` and
   `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
 - **libc:** what neither std nor rustix has: `localtime_r` (and `tzset`, declared by hand because the crate has no
   binding for it on macOS) for the TUI's local clock, and a process's start time for the leftover-app check
-  (`proc_pidinfo` on macOS, `sysconf` for the clock tick on Linux) and the boot time (`sysctlbyname("kern.boottime")`
-  on macOS).
+  (`proc_pidinfo` on macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
 
 Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
 `std::net::TcpStream` to localhost), UTC timestamps (days-to-civil conversion), threads instead of an async runtime.

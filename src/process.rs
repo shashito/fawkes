@@ -96,8 +96,7 @@ fn start_time(pid: u32) -> Option<f64> {
         .parse()
         .ok()?;
     let boot = boot_time()?;
-    // SAFETY: sysconf only reads a configuration value.
-    let per_second = u32::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    let per_second = u32::try_from(rustix::param::clock_ticks_per_second()).ok()?;
     (per_second > 0).then(|| boot + ticks / f64::from(per_second))
 }
 
