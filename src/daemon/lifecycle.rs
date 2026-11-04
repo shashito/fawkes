@@ -7,7 +7,7 @@ use crate::state::Txn;
 use std::sync::Arc;
 
 impl Daemon {
-    pub(super) fn current_generation(&self, inner: &Inner) -> R<String> {
+    pub(super) fn current_generation(inner: &Inner) -> R<String> {
         match &inner.store.state().txn {
             Some(Txn::RollingBack {
                 pending,
@@ -37,7 +37,7 @@ impl Daemon {
     pub(super) fn start_command(self: &Arc<Self>) -> R<Process> {
         let _busy = self.begin("start", Slot::Live)?;
         let mut inner = self.inner();
-        let id = self.current_generation(&inner)?;
+        let id = Self::current_generation(&inner)?;
         if let Some(app) = inner.running() {
             return Err(invalid_state(format!(
                 "{id} is already running (pid {})",
@@ -52,7 +52,7 @@ impl Daemon {
         let _busy = self.begin("stop", Slot::Live)?;
         let app = {
             let mut inner = self.inner();
-            let id = self.current_generation(&inner)?;
+            let id = Self::current_generation(&inner)?;
             let scheduled = matches!(inner.live, Live::Backoff { .. });
             let Some(app) = inner.take_running_alive()? else {
                 if !scheduled {
@@ -82,7 +82,7 @@ impl Daemon {
         let _busy = self.begin("restart", Slot::Live)?;
         let (id, app) = {
             let mut inner = self.inner();
-            let id = self.current_generation(&inner)?;
+            let id = Self::current_generation(&inner)?;
             (id, inner.take_running_alive()?)
         };
         if let Some(app) = app {

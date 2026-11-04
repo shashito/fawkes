@@ -1,6 +1,12 @@
 //! The happy path and the safety net, against the real binary and its socket:
 //! stage → test → switch → confirm, the lifecycle commands, then a switch that is never confirmed and rolls back.
 
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "a panic fails the test, which is what a helper that cannot proceed should do"
+)]
+
 mod common;
 use common::Harness;
 use serde_json::Value;
@@ -576,7 +582,7 @@ fn a_request_that_arrives_in_pieces_is_answered() {
 /// generation, so nothing of the stage outlives the daemon that started it. Tests are recorded the same way.
 #[test]
 fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
-    let mut h = Harness::new(r#"install = '''echo $$ > {state}/install.pid; exec sleep 600'''"#);
+    let mut h = Harness::new(r"install = '''echo $$ > {state}/install.pid; exec sleep 600'''");
     h.commit("v1", "confirm");
     h.start_daemon();
     let mut stage = std::process::Command::new(common::BIN)
@@ -924,7 +930,7 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
 
-    let daemon_pid = h.status()["daemon_pid"].as_i64().unwrap() as i32;
+    let daemon_pid = i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap();
     let (code, answer) = std::thread::scope(|scope| {
         let switch = scope.spawn(|| h.fk(&["switch", "g2"]));
         // g1 takes 1.5 s to leave after SIGTERM: the window for the daemon's own SIGTERM.
@@ -1229,7 +1235,10 @@ fn a_reload_cannot_change_the_port_while_a_switch_has_stopped_the_old_app() {
     });
     assert_eq!(h.status()["process"]["port"], h.port);
     assert!(messages(&h, "started").contains(&started));
-    assert!(messages_starting(&h, "daemon", "manifest reloaded").is_empty());
+    assert_eq!(
+        messages_starting(&h, "daemon", "manifest reloaded"),
+        Vec::<String>::new()
+    );
 }
 
 /// With `rollback_on_unhealthy`, the rollback is decided before `unhealthy` is logged, so a confirm sent the moment

@@ -332,7 +332,7 @@ impl Daemon {
         let _ = git(&m.repo, &["worktree", "prune"]);
         let mut inner = self.inner();
         self.update(&mut inner.store, |state| {
-            state.generations.retain(|g| g.id != id)
+            state.generations.retain(|g| g.id != id);
         });
         Ok(())
     }
@@ -422,7 +422,7 @@ impl Daemon {
             seconds: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
             message: result
                 .as_ref()
-                .map_or_else(Clone::clone, |_| "healthy".into()),
+                .map_or_else(Clone::clone, |()| "healthy".into()),
         };
         let mut inner = self.inner();
         let record = self.update(&mut inner.store, |state| {

@@ -23,6 +23,11 @@ const MAX_GEN_ROWS: usize = 6;
 /// The events pane keeps at least its rule and this many lines while the lists above it have room.
 const MIN_EVENT_ROWS: u16 = 3;
 
+/// A length as terminal rows or columns, which no terminal reaches the `u16` limit of.
+fn clamp_u16(len: usize) -> u16 {
+    u16::try_from(len).unwrap_or(u16::MAX)
+}
+
 pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     let area = frame.area();
     let mut left = area.height;
@@ -39,10 +44,10 @@ pub fn draw(frame: &mut Frame, app: &App, now: u64) {
     if app.zoom {
         events = take(u16::MAX);
     } else if let Some(view) = view {
-        table = take(app.apps.len().min(MAX_APP_ROWS) as u16 + 1);
-        detail = take(1 + lines.len() as u16);
+        table = take(clamp_u16(app.apps.len().min(MAX_APP_ROWS)) + 1);
+        detail = take(1 + clamp_u16(lines.len()));
         let reserve = take(MIN_EVENT_ROWS);
-        gens = take(view.history.len().min(MAX_GEN_ROWS) as u16 + 1);
+        gens = take(clamp_u16(view.history.len().min(MAX_GEN_ROWS)) + 1);
         events = reserve + take(u16::MAX);
     } else {
         table = take(u16::MAX);
@@ -109,12 +114,14 @@ fn clock(at: &str) -> String {
 }
 
 pub fn local_clock(secs: u64) -> String {
-    let t = secs as libc::time_t;
+    let Ok(t) = libc::time_t::try_from(secs) else {
+        return "--:--:--".into();
+    };
     // SAFETY: `tm` is plain integers (and a pointer) that zero is valid for.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers refer to live locals; `localtime_r` keeps no state of its own beyond the zone data that
     // `tzset` loaded in `tui::run` before any thread started.
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
         return "--:--:--".into();
     }
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
@@ -124,6 +131,11 @@ fn mmss(secs: u64) -> String {
     format!("{:02}:{:02}", secs / 60, secs % 60)
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a float-to-integer cast saturates, so a negative or absurd uptime shows as 0s or the largest count"
+)]
 fn duration(secs: f64) -> String {
     let secs = secs as u64;
     match secs {
@@ -171,7 +183,7 @@ fn last_exit(exit: &LastExit) -> String {
 /// Terminal columns `text` takes, the measure ratatui itself lays out with: `chars().count()` is wrong for wide and
 /// zero-width characters.
 fn width_of(text: &str) -> u16 {
-    Span::raw(text).width() as u16
+    clamp_u16(Span::raw(text).width())
 }
 
 /// `text` padded with spaces to `width` terminal columns.
@@ -346,7 +358,7 @@ fn draw_table(
     let mut state = TableState::default().with_selected(selected);
     frame.render_stateful_widget(table, area, &mut state);
     let Some(selected) = selected else { return };
-    let y = area.y + 1 + selected.saturating_sub(state.offset()) as u16;
+    let y = area.y + 1 + clamp_u16(selected.saturating_sub(state.offset()));
     if y < area.bottom() {
         let edge = Style::new().fg(Color::Cyan);
         let buffer = frame.buffer_mut();
@@ -547,11 +559,13 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
         first.push(Span::raw(format!("  restarts {}", process.restarts)));
     }
     if let Some(at) = process.restart_at.as_deref().and_then(parse_time) {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a countdown of seconds is far below 2^52"
+        )]
+        let remaining = at.saturating_sub(now) as f64;
         first.push(Span::styled(
-            format!(
-                "  restarting in {}",
-                duration(at.saturating_sub(now) as f64)
-            ),
+            format!("  restarting in {}", duration(remaining)),
             Style::new().fg(Color::Yellow),
         ));
     }
@@ -884,12 +898,12 @@ fn keys_line(app: &App, width: u16) -> Line<'static> {
     // Items are `key label`, two spaces apart when all of them fit that way, else one. The highlighted first item
     // has a space of padding on each side.
     let size = |(key, what): &(&str, &str)| width_of(key) + width_of(what) + 1;
-    let all: u16 = 1 + items.iter().map(size).sum::<u16>() + 2 * (items.len() as u16 - 1);
+    let all: u16 = 1 + items.iter().map(size).sum::<u16>() + 2 * (clamp_u16(items.len()) - 1);
     let gap = if all <= width { "  " } else { " " };
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
     for (i, item) in items.iter().enumerate() {
-        let need = size(item) + if i > 0 { gap.len() as u16 } else { 0 };
+        let need = size(item) + if i > 0 { clamp_u16(gap.len()) } else { 0 };
         if used + need > width {
             break;
         }
@@ -962,7 +976,7 @@ fn draw_help(frame: &mut Frame) {
             ])
         })
         .collect();
-    let area = centered(frame.area(), 62, keys.len() as u16 + 2);
+    let area = centered(frame.area(), 62, clamp_u16(keys.len()) + 2);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" keys ")),

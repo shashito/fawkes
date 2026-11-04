@@ -24,12 +24,13 @@ pub fn now() -> String {
 
 /// `2026-11-03T14:00:01Z`, via days-to-civil (Howard Hinnant's algorithm).
 pub fn format_time(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
+    // The quotient is at most 2.2e14, so the conversion cannot fail.
+    let days = i64::try_from(secs / 86400).unwrap_or_default();
     let rest = secs % 86400;
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
@@ -55,21 +56,29 @@ pub fn parse_time(text: &str) -> Option<u64> {
 fn parse_fields(text: &str) -> Option<u64> {
     let field = |text: &str| text.parse::<i64>().ok().filter(|_| text.len() <= 4);
     let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
-    let mut d = date.split('-').map(field);
-    let (year, month, day) = (d.next()??, d.next()??, d.next()??);
+    let mut date_fields = date.split('-').map(field);
+    let (year, month, day) = (
+        date_fields.next()??,
+        date_fields.next()??,
+        date_fields.next()??,
+    );
     // Keeps the arithmetic below far from overflow; `format_time` writes four-digit years.
     if !(0..=9999).contains(&year) {
         return None;
     }
-    let mut t = time.split(':').map(field);
-    let (h, m, s) = (t.next()??, t.next()??, t.next()??);
-    let y = year - i64::from(month <= 2);
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
+    let mut time_fields = time.split(':').map(field);
+    let (hours, minutes, seconds) = (
+        time_fields.next()??,
+        time_fields.next()??,
+        time_fields.next()??,
+    );
+    let march_year = year - i64::from(month <= 2);
+    let era = march_year.div_euclid(400);
+    let yoe = march_year - era * 400;
     let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    u64::try_from(days * 86400 + h * 3600 + m * 60 + s).ok()
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86400 + hours * 3600 + minutes * 60 + seconds).ok()
 }
 
 // --------------------------------------------------------------- paths
@@ -233,7 +242,7 @@ impl From<StateFile> for State {
 /// The edges of the generation diagram (DESIGN.md → Generations and states). A stage that fails and `prune` remove
 /// the record instead, which is not a transition; nothing leaves `rolled_back`, and nothing returns to `staging`.
 pub fn allowed(from: GenState, to: GenState) -> bool {
-    use GenState::*;
+    use GenState::{Current, Permanent, Retired, RolledBack, Staged, Staging, TestFailed, Tested};
     matches!(
         (from, to),
         (Staging, Staged)

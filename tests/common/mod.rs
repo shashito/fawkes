@@ -180,7 +180,7 @@ APP_HOME = "{{home}}"
     pub fn signal_daemon(&self, signal: i32) {
         let daemon = self.daemon.as_ref().expect("the daemon was started");
         // SAFETY: the pid is our own child's, which is not reaped while `self.daemon` holds it.
-        let sent = unsafe { libc::kill(daemon.id() as i32, signal) };
+        let sent = unsafe { libc::kill(i32::try_from(daemon.id()).unwrap(), signal) };
         assert_eq!(sent, 0, "signal {signal} could not be sent to the daemon");
     }
 
@@ -373,7 +373,7 @@ impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
             // SAFETY: the pid is our own child's, which is not reaped yet, so it cannot name another process.
-            unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) };
+            unsafe { libc::kill(i32::try_from(daemon.id()).unwrap(), libc::SIGTERM) };
             let give_up = Instant::now() + Duration::from_secs(10);
             while daemon.try_wait().ok().flatten().is_none() && Instant::now() < give_up {
                 std::thread::sleep(Duration::from_millis(50));

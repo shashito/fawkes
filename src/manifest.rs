@@ -169,15 +169,12 @@ impl Vars {
                 };
                 Some((close, value))
             });
-            match value {
-                Some((close, value)) => {
-                    out.push_str(&finish(value));
-                    rest = &rest[close + 1..];
-                }
-                None => {
-                    out.push('{');
-                    rest = &rest[1..];
-                }
+            if let Some((close, value)) = value {
+                out.push_str(&finish(value));
+                rest = &rest[close + 1..];
+            } else {
+                out.push('{');
+                rest = &rest[1..];
             }
         }
         out.push_str(rest);
@@ -279,6 +276,10 @@ impl Manifest {
     /// Decide whether `new` may replace `self` while the daemon runs. Ok: the TOML names of the changed fields,
     /// possibly none. Err: a message naming every refused field and what to do instead. Both manifests are the loaded
     /// ones, so paths are compared after resolution.
+    #[expect(
+        clippy::float_cmp,
+        reason = "the timeouts are copied from the manifest text, never computed: any difference is a change the user wrote"
+    )]
     pub fn reload(&self, new: &Manifest, app_running: bool) -> Result<Vec<&'static str>, String> {
         // The daemon's identity, its state and the files a restore overwrites are fixed for its lifetime: a changed
         // `home` would restore a snapshot into a different directory than the one it was taken from.

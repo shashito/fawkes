@@ -738,7 +738,7 @@ mod tests {
             );
         }
         for (args, limit, follow) in [
-            (r#"{}"#, None, false),
+            (r"{}", None, false),
             (r#"{"limit":null,"follow":false}"#, None, false),
             (r#"{"limit":5,"follow":true}"#, Some(5), true),
         ] {
