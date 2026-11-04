@@ -3,11 +3,13 @@
 use super::{Daemon, MAX_REQUEST, Msg, Slot, lock};
 use crate::protocol::{ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, err};
 use rustix::fs::Mode;
+use std::io::{ErrorKind, Read};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes tui` finds every daemon.
 pub(super) fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
@@ -60,8 +62,115 @@ pub(super) fn bind(socket: &Path) -> Result<UnixListener, String> {
     bound.map_err(|e| format!("cannot bind {}: {e}", socket.display()))
 }
 
+/// How long a client has to send its whole request line.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many connections may be open at once, streams (`subscribe`, `log --follow`) excepted: each holds a thread and
+/// a file descriptor, and a client that opens them without end must not starve `confirm` of both.
+const MAX_CONNECTIONS: usize = 64;
+
+/// A place among the open connections, given back when the connection ends or turns out to be a stream.
+pub(super) struct Admission(Option<Arc<AtomicUsize>>);
+
+impl Admission {
+    /// A place, or None when `MAX_CONNECTIONS` are open.
+    pub(super) fn take(open: &Arc<AtomicUsize>) -> Option<Admission> {
+        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            open.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Admission(Some(open.clone())))
+    }
+
+    fn release(&mut self) {
+        if let Some(open) = self.0.take() {
+            open.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Answer `busy` to a client the daemon has no place for, without reading what it sends.
+pub(super) fn refuse(stream: UnixStream) {
+    // Blocking, as in `handle`; the reply is one short line into an empty socket buffer.
+    if stream.set_nonblocking(false).is_ok() {
+        Out::new(stream).finish(Err(err(
+            ErrorCode::Busy,
+            format!("too many connections ({MAX_CONNECTIONS} open); retry shortly"),
+        )));
+    }
+}
+
+/// One request line (without its newline) from `stream`: all of it must arrive by `until`, in at most `limit` bytes.
+/// The read timeout is the time left before each `read`, because a timeout alone bounds only each `read`, which a
+/// client sending a byte at a time never exceeds.
+fn read_request(stream: &UnixStream, until: Instant, limit: u64) -> R<String> {
+    let too_slow = || {
+        err(
+            ErrorCode::Usage,
+            format!(
+                "the request did not arrive within {} s",
+                REQUEST_TIMEOUT.as_secs()
+            ),
+        )
+    };
+    let mut line = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut reader = stream;
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(too_slow());
+        }
+        // Refused with EINVAL on macOS once the client has closed its end, when the read below returns what it sent
+        // and then end-of-file at once, so there is nothing to bound.
+        let _ = stream.set_read_timeout(Some(left));
+        let n = match reader.read(&mut chunk) {
+            Ok(n) => n,
+            // A timeout, or a signal: the deadline above decides whether to go on.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => {
+                return Err(err(
+                    ErrorCode::Usage,
+                    format!("cannot read the request: {e}"),
+                ));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        let newline = chunk[..n].iter().position(|&byte| byte == b'\n');
+        line.extend_from_slice(&chunk[..newline.map_or(n, |at| at + 1)]);
+        if line.len() as u64 > limit || (newline.is_none() && line.len() as u64 >= limit) {
+            return Err(err(
+                ErrorCode::Usage,
+                format!("the request is longer than {limit} bytes"),
+            ));
+        }
+        if newline.is_some() {
+            break;
+        }
+    }
+    if line.is_empty() {
+        return Err(err(ErrorCode::Usage, "no request received"));
+    }
+    String::from_utf8(line).map_err(|_| err(ErrorCode::Usage, "the request is not UTF-8"))
+}
+
 impl Daemon {
-    pub(super) fn handle(self: Arc<Self>, stream: UnixStream) {
+    pub(super) fn handle(self: Arc<Self>, stream: UnixStream, mut admitted: Admission) {
         // Blocking, with timeouts: on macOS an accepted socket inherits the listener's non-blocking mode, which would
         // fail a request that arrives in pieces and every write that finds the socket buffer full.
         if let Err(e) = stream.set_nonblocking(false) {
@@ -72,24 +181,20 @@ impl Daemon {
             );
             return;
         }
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-        let mut line = String::new();
-        // Bounded, so a client cannot make the daemon allocate without limit.
-        let read = stream.try_clone().and_then(|s| {
-            use std::io::{BufRead, Read};
-            std::io::BufReader::new(s.take(MAX_REQUEST)).read_line(&mut line)
-        });
+        let read = read_request(&stream, Instant::now() + REQUEST_TIMEOUT, MAX_REQUEST);
         let mut out = Out::new(stream);
-        let result = match read {
-            Ok(n) if n as u64 >= MAX_REQUEST && !line.ends_with('\n') => Err(err(
-                ErrorCode::Usage,
-                format!("the request is longer than {MAX_REQUEST} bytes"),
-            )),
-            Ok(n) if n > 0 => {
-                Request::parse(&line).and_then(|request| self.dispatch(&mut out, request))
-            }
-            _ => Err(err(ErrorCode::Usage, "no request received")),
-        };
+        let result = read
+            .and_then(|line| Request::parse(&line))
+            .and_then(|request| {
+                // Streams last as long as their client listens, by design, so they do not count against the cap.
+                if matches!(
+                    request,
+                    Request::Subscribe { .. } | Request::Log { follow: true, .. }
+                ) {
+                    admitted.release();
+                }
+                self.dispatch(&mut out, request)
+            });
         out.finish(result);
     }
 
@@ -176,5 +281,74 @@ impl Daemon {
         }) && out.line(&Line::<Reply>::History {
             history: self.history(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn a_request_trickled_past_the_deadline_is_refused_not_waited_for() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        // One byte every 100 ms keeps every single `read` inside any per-read timeout, and never sends the newline.
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..30 {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let started = Instant::now();
+        let refused =
+            read_request(&server, started + Duration::from_millis(300), MAX_REQUEST).unwrap_err();
+        let waited = started.elapsed();
+
+        drop(server);
+        trickle.join().unwrap();
+        assert_eq!(refused.code, ErrorCode::Usage);
+        assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+    }
+
+    #[test]
+    fn a_request_line_is_read_whole_and_bounded() {
+        let ask = |bytes: &[u8], limit| {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client.write_all(bytes).unwrap();
+            drop(client);
+            read_request(&server, Instant::now() + Duration::from_secs(5), limit)
+        };
+        assert_eq!(ask(b"{\"a\":1}\nrest", 64).unwrap(), "{\"a\":1}\n");
+        assert_eq!(ask(b"", 64).unwrap_err().code, ErrorCode::Usage);
+        assert_eq!(ask(&[b'x'; 65], 64).unwrap_err().code, ErrorCode::Usage);
+        let mut longest = vec![b'x'; 63];
+        longest.push(b'\n');
+        assert!(ask(&longest, 64).is_ok());
+        longest.insert(0, b'x');
+        assert_eq!(ask(&longest, 64).unwrap_err().code, ErrorCode::Usage);
+    }
+
+    #[test]
+    fn the_65th_open_connection_gets_no_place_until_one_ends() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let mut places: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| Admission::take(&open).unwrap())
+            .collect();
+        assert!(Admission::take(&open).is_none());
+        assert_eq!(open.load(Ordering::SeqCst), MAX_CONNECTIONS);
+
+        // A stream gives its place back at once, and a second release (the drop) gives nothing more.
+        places[0].release();
+        assert_eq!(open.load(Ordering::SeqCst), MAX_CONNECTIONS - 1);
+        places.remove(0);
+        assert_eq!(open.load(Ordering::SeqCst), MAX_CONNECTIONS - 1);
+        let again = Admission::take(&open).unwrap();
+        assert!(Admission::take(&open).is_none());
+        drop(again);
+        drop(places);
+        assert_eq!(open.load(Ordering::SeqCst), 0);
     }
 }

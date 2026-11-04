@@ -326,6 +326,12 @@ The error names every problem at once.
 `install_timeout` seconds, the other git calls 60. Past it the group is killed and the step fails with "timed out".
 `git worktree add` skips the repository's hooks (`core.hooksPath=/dev/null`); the install is the place for setup.
 
+A health attempt is bounded too. A `url` attempt must connect, send and read the status line (at most 1 KiB of it)
+within 2 s in all, however slowly the app answers. A `command` attempt gets 10 s, and its process group is ended when
+it finishes, passed or not, so nothing it backgrounded outlives it; the wait for the group after SIGKILL is bounded
+(2 s). The pause between attempts is `interval` or the time left until `timeout`, whichever is shorter, so `unhealthy`
+comes at `timeout` and not up to an `interval` after it (one attempt may still run past it).
+
 `install` runs with Fawkes's own environment so package managers find their real caches, in its own process group.
 After `install_timeout` seconds it is stopped like the app (SIGTERM, SIGKILL after `stop_timeout`) and the stage
 fails; whatever it left running in its group is ended when it finishes; a stopping daemon kills it. A failed
@@ -425,7 +431,10 @@ Request:
 {"command": "switch", "args": {"generation": "g3", "deadline": 60}}
 ```
 
-A request line longer than 64 KiB, or one that has not arrived whole within 5 s, is refused with `usage`. Response: zero or more progress lines, then exactly one
+A request line longer than 64 KiB, or one that has not arrived whole within 5 s of the connection (one deadline for the
+whole line, however slowly it trickles in), is refused with `usage`. At most 64 connections are open at once, streams
+(`subscribe`, `log --follow`) not counted; a 65th is answered `busy` at once without reading its request, and the client
+retries. Response: zero or more progress lines, then exactly one
 final line, then the daemon closes the connection.
 
 The daemon never waits on a client that stops reading: a write that blocks for 2 s ends that connection (a step in

@@ -19,7 +19,7 @@ mod server;
 mod supervisor;
 mod transactions;
 
-use server::{bind, register};
+use server::{Admission, bind, refuse, register};
 
 use crate::manifest::{Manifest, Vars};
 use crate::process;
@@ -34,7 +34,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, sleep};
@@ -511,6 +511,7 @@ impl Daemon {
     ) -> Result<(), String> {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         signals.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let open = Arc::new(AtomicUsize::new(0));
         loop {
             // Drained before the flags are read: a signal that comes after the drain leaves a byte that ends the
             // next `poll` at once.
@@ -523,8 +524,14 @@ impl Daemon {
             }
             let failed = match listener.accept() {
                 Ok((stream, _)) => {
-                    let daemon = self.clone();
-                    thread::spawn(move || daemon.handle(stream));
+                    // Taken before anything is read, so a client that sends nothing still holds its place.
+                    match Admission::take(&open) {
+                        Some(admitted) => {
+                            let daemon = self.clone();
+                            thread::spawn(move || daemon.handle(stream, admitted));
+                        }
+                        None => refuse(stream),
+                    }
                     None
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

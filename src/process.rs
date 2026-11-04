@@ -8,7 +8,7 @@ use rustix::process::{
     Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
 };
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -297,8 +297,11 @@ pub fn wait_healthy(
                 return Err(format!("not healthy after {timeout}s: {e}"));
             }
             Err(_) => {
+                // Never past `give_up`: with `interval` longer than `timeout` the last try would come late.
+                let wait = Duration::from_secs_f64(interval)
+                    .min(give_up.saturating_duration_since(Instant::now()));
                 if !matches!(
-                    exited.recv_timeout(Duration::from_secs_f64(interval)),
+                    exited.recv_timeout(wait),
                     Err(mpsc::RecvTimeoutError::Timeout)
                 ) {
                     return gone();
@@ -322,15 +325,42 @@ fn run_check(command: &str, cwd: &Path, env: &Env) -> Result<(), String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot run health command: {e}"))?;
-    match wait_until(&mut child, Instant::now() + COMMAND_TIMEOUT).map_err(|e| e.to_string())? {
+    let waited = wait_until(&mut child, Instant::now() + COMMAND_TIMEOUT);
+    // Whatever the check left in its group ends with it, passed or not, and the wait for the group is bounded: a
+    // command stuck in the kernel outlives SIGKILL, and must not hold the thread that runs the check.
+    stop_group(child.id(), 0.0, Some(&mut child));
+    match waited.map_err(|e| e.to_string())? {
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(format!("health command failed ({status})")),
-        None => {
-            kill_group(child.id());
-            let _ = child.wait();
-            Err("health command timed out".into())
+        None => Err("health command timed out".into()),
+    }
+}
+
+/// What one health request may take in all: connecting, sending and reading the status line.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The longest status line read; the rest of a longer one is ignored.
+const STATUS_LINE_BYTES: u64 = 1024;
+
+/// The first line of the answer on `stream`, which must be complete by `until`. The read timeout is the time left
+/// before each `read`, because a timeout alone bounds only each `read`, which a peer sending a byte at a time never
+/// exceeds.
+fn read_status_line(stream: &TcpStream, until: Instant) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let mut reader = stream.take(STATUS_LINE_BYTES);
+    let mut byte = [0u8; 1];
+    while line.last() != Some(&b'\n') {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        stream.set_read_timeout(Some(left))?;
+        match reader.read(&mut byte)? {
+            0 => break,
+            _ => line.push(byte[0]),
         }
     }
+    Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// One `GET` over a plain TCP connection; healthy on a 2xx or 3xx status.
@@ -342,23 +372,20 @@ fn http_get(url: &str) -> Result<(), String> {
         Some((authority, path)) => (authority, format!("/{path}")),
         None => (rest, "/".to_string()),
     };
-    let timeout = Duration::from_secs(2);
     let mut last = format!("cannot resolve {authority}");
     for addr in authority
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve {authority}: {e}"))?
     {
         let attempt = (|| -> std::io::Result<String> {
-            let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
-            stream.set_read_timeout(Some(timeout))?;
-            stream.set_write_timeout(Some(timeout))?;
+            let until = Instant::now() + HTTP_TIMEOUT;
+            let mut stream = TcpStream::connect_timeout(&addr, HTTP_TIMEOUT)?;
+            stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
             write!(
                 stream,
                 "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
             )?;
-            let mut status_line = String::new();
-            BufReader::new(stream).read_line(&mut status_line)?;
-            Ok(status_line)
+            read_status_line(&stream, until)
         })();
         match attempt {
             Ok(line) => {
@@ -518,5 +545,67 @@ mod tests {
             );
             assert!(waited < Duration::from_secs(2), "{url} waited {waited:?}");
         }
+    }
+
+    #[test]
+    fn a_status_line_that_never_ends_is_given_up_on_within_the_attempts_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // A byte every 250 ms keeps every single read inside its own timeout, and the line never ends.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..24 {
+                if stream.write_all(b"H").is_err() {
+                    break;
+                }
+                sleep(Duration::from_millis(250));
+            }
+        });
+
+        let started = Instant::now();
+        let result = http_get(&url);
+        let waited = started.elapsed();
+
+        server.join().unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+    }
+
+    #[test]
+    fn the_wait_between_tries_never_runs_past_the_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_alive, exited) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let result = wait_healthy(
+            &Check::Command("exit 1".into()),
+            temp.path(),
+            &[],
+            30.0,
+            1.0,
+            || true,
+            &exited,
+        );
+        let waited = started.elapsed();
+
+        assert!(result.is_err(), "{result:?}");
+        assert!(waited < Duration::from_secs(3), "waited {waited:?}");
+    }
+
+    #[test]
+    fn a_health_command_that_passes_leaves_nothing_running_in_its_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("background.pid");
+        let command = format!("sleep 30 & echo $! > {}", pid_file.display());
+        assert_eq!(run_check(&command, temp.path(), &[]), Ok(()));
+
+        let background: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            start_time(background).is_none(),
+            "the backgrounded `sleep` outlived the check"
+        );
     }
 }
