@@ -67,15 +67,22 @@ fn follow(
         limit: Some(BACKLOG),
         since: *last_seq,
     };
-    let resumed = last_seq.is_some();
     let stream = match open(socket, &request) {
         Ok(stream) => stream,
         Err(e) => return (false, e),
     };
     let mut up = false;
     for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let line = serde_json::from_str::<Line>(&line).ok();
+        let seq = match &line {
+            Some(Line::Event { event }) => Some(event.seq),
+            _ => None,
+        };
         if !up {
             up = true;
+            // The screen keeps its events only when the replay continues them without a gap: more events than the
+            // replay holds, or a daemon whose log started over, start the pane afresh.
+            let resumed = last_seq.is_some_and(|last| seq.is_none_or(|seq| seq == last + 1));
             if tx
                 .send(Msg::Up(key.into(), socket.into(), resumed))
                 .is_err()
@@ -83,11 +90,7 @@ fn follow(
                 return (true, "the screen is gone".into());
             }
         }
-        if let Ok(line) = serde_json::from_str::<Line>(&line) {
-            let seq = match &line {
-                Line::Event { event } => Some(event.seq),
-                _ => None,
-            };
+        if let Some(line) = line {
             if tx.send(Msg::Line(key.into(), line)).is_err() {
                 return (true, "the screen is gone".into());
             }

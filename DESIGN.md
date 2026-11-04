@@ -177,7 +177,7 @@ its process group (SIGTERM, SIGKILL after 1 s), so nothing the app started lives
 
 Each generation counts `failed_starts`: unrequested exits within `min_uptime` seconds of a start. The pending
 generation gets no retries: its first crash rolls it back. The permanent generation is restarted after a crash with a
-backoff of 1, 1, 2, 4, … s for the first, second, third, … failed start in a row (at most 30 s; a crash after a run
+backoff of 1, 2, 4, … s for the first, second, third, … failed start in a row (at most 30 s; a crash after a run
 longer than `min_uptime` waits 1 s); a run longer than `min_uptime` resets its counter and the backoff; after
 `max_failed_starts` consecutive failed starts it is no longer restarted and `status` reports `"state": "failed"` until
 `start`, `restart`, the next `switch` or a daemon start. While a restart is scheduled, `status` shows
@@ -581,7 +581,8 @@ Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replaci
   `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
 - **libc:** what neither std nor rustix has: `localtime_r` (and `tzset`, declared by hand because the crate has no
   binding for it on macOS) for the TUI's local clock, and a process's start time for the leftover-app check
-  (`proc_pidinfo` on macOS, `sysconf` for the clock tick on Linux).
+  (`proc_pidinfo` on macOS, `sysconf` for the clock tick on Linux) and the boot time (`sysctlbyname("kern.boottime")`
+  on macOS).
 
 Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
 `std::net::TcpStream` to localhost), UTC timestamps (days-to-civil conversion), threads instead of an async runtime.
