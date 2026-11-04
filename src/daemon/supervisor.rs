@@ -12,6 +12,53 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+// ------------------------------------------------ restart policy
+
+/// What follows an exit the supervisor did not ask for.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Outcome {
+    /// The pending generation died before confirm: it is not restarted, its rollback is decided.
+    RollBack,
+    /// Start the same generation again after a backoff.
+    Restart { after: Duration },
+    /// Too many failed starts in a row: stay down until started by hand.
+    GiveUp,
+}
+
+/// The crash count after an exit and what to do about it. A run of at least `min_uptime` seconds resets the count, so
+/// a crash after a long run is a first failure again. Pure: the caller keeps the saving, the events and the clock.
+fn after_exit(
+    failed_starts: u32,
+    ran: Duration,
+    pending: bool,
+    min_uptime: f64,
+    max_failed_starts: u32,
+) -> (u32, Outcome) {
+    let failed_starts = if ran.as_secs_f64() < min_uptime {
+        failed_starts + 1
+    } else {
+        0
+    };
+    (
+        failed_starts,
+        outcome(failed_starts, pending, max_failed_starts),
+    )
+}
+
+fn outcome(failed_starts: u32, pending: bool, max_failed_starts: u32) -> Outcome {
+    if pending {
+        Outcome::RollBack
+    } else if failed_starts >= max_failed_starts {
+        Outcome::GiveUp
+    } else {
+        // 1, 2, 4, 8, 16, then 30 seconds; a count of 0 waits the first second.
+        let seconds = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
+        Outcome::Restart {
+            after: Duration::from_secs(seconds),
+        }
+    }
+}
+
 impl Daemon {
     /// One supervision pass: reap the app, roll back a pending switch that is dead, overdue or unhealthy, restart a
     /// crash. Each of them moves the live process, so the pass holds the live slot like `stop` or `restart` do: no
@@ -131,47 +178,51 @@ impl Daemon {
             .running_mut()
             .and_then(|a| a.child.try_wait().ok().flatten())?;
         let app = inner.take_running()?;
-        let ran = app.started.elapsed().as_secs_f64();
+        let ran = app.started.elapsed();
         let m = self.manifest();
         let pgid = app.child.id();
         let exit = LastExit::new(Some(status), false);
         // The crash count and the decision to roll back are one save. A reason decided earlier (a failed health
         // check) stays the reason.
-        let (pending, failed_starts) = self.update(&mut inner.store, |state| {
+        let (failed_starts, outcome) = self.update(&mut inner.store, |state| {
             let pending = state
                 .pending()
                 .is_some_and(|p| p.generation == app.generation);
-            let failed_starts = state.find_mut(&app.generation).map_or(0, |g| {
-                g.failed_starts = if ran < m.min_uptime {
-                    g.failed_starts + 1
-                } else {
-                    0
-                };
-                g.failed_starts
-            });
+            let decided = match state.find_mut(&app.generation) {
+                Some(g) => {
+                    let decided = after_exit(
+                        g.failed_starts,
+                        ran,
+                        pending,
+                        m.min_uptime,
+                        m.max_failed_starts,
+                    );
+                    g.failed_starts = decided.0;
+                    decided
+                }
+                None => (0, outcome(0, pending, m.max_failed_starts)),
+            };
             if pending {
                 state.decide_rollback(&format!("exited before confirm ({})", exit.describe()));
             }
-            (pending, failed_starts)
+            decided
         });
-        let mut message = format!("{} after {ran:.1}s", exit.describe());
-        let gave_up = !pending && failed_starts >= m.max_failed_starts;
-        // A pending generation is not restarted: the next supervision pass carries the rollback out.
-        if !pending {
-            if gave_up {
-                inner.live = Live::Failed;
-            } else {
-                let backoff = (1u64 << failed_starts.saturating_sub(1).min(5)).min(30);
+        let mut message = format!("{} after {:.1}s", exit.describe(), ran.as_secs_f64());
+        match outcome {
+            // The next supervision pass carries the rollback out.
+            Outcome::RollBack => {}
+            Outcome::GiveUp => inner.live = Live::Failed,
+            Outcome::Restart { after } => {
                 inner.live = Live::Backoff {
-                    until: Instant::now() + Duration::from_secs(backoff),
-                    at: format_time(now_secs() + backoff),
+                    until: Instant::now() + after,
+                    at: format_time(now_secs() + after.as_secs()),
                 };
-                message += &format!("; restarting in {backoff}s");
+                message += &format!("; restarting in {}s", after.as_secs());
             }
         }
         inner.last_exit = Some(exit);
         self.event(EventKind::Exited, Some(&app.generation), message);
-        if gave_up {
+        if outcome == Outcome::GiveUp {
             self.event(
                 EventKind::Failed,
                 Some(&app.generation),
@@ -374,6 +425,57 @@ impl Daemon {
     pub(super) fn history(&self) -> History {
         History {
             generations: self.inner().store.state().generations.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN_UPTIME: f64 = 10.0;
+    const SHORT: Duration = Duration::from_secs(1);
+
+    fn restart(seconds: u64) -> Outcome {
+        Outcome::Restart {
+            after: Duration::from_secs(seconds),
+        }
+    }
+
+    #[test]
+    fn crashes_back_off_by_doubling_up_to_the_cap() {
+        let mut failed_starts = 0;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let (count, decided) = after_exit(failed_starts, SHORT, false, MIN_UPTIME, 100);
+            failed_starts = count;
+            waits.push(decided);
+        }
+        let expected: Vec<Outcome> = [1, 2, 4, 8, 16, 30, 30, 30].map(restart).to_vec();
+        assert_eq!(waits, expected);
+        assert_eq!(failed_starts, 8);
+    }
+
+    #[test]
+    fn a_long_run_resets_the_count_and_waits_one_second() {
+        let ran = Duration::from_secs_f64(MIN_UPTIME);
+        assert_eq!(after_exit(4, ran, false, MIN_UPTIME, 5), (0, restart(1)));
+    }
+
+    #[test]
+    fn the_last_allowed_failed_start_gives_up() {
+        assert_eq!(after_exit(1, SHORT, false, MIN_UPTIME, 3), (2, restart(2)));
+        assert_eq!(
+            after_exit(2, SHORT, false, MIN_UPTIME, 3),
+            (3, Outcome::GiveUp)
+        );
+    }
+
+    #[test]
+    fn a_pending_generation_always_rolls_back() {
+        for (failed_starts, ran) in [(0, SHORT), (5, SHORT), (0, Duration::from_secs(60))] {
+            let (_, decided) = after_exit(failed_starts, ran, true, MIN_UPTIME, 3);
+            assert_eq!(decided, Outcome::RollBack);
         }
     }
 }
