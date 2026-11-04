@@ -1,4 +1,9 @@
 {
+  "modelFamilies": {
+    "families": {
+      "review": { "model": "anthropic/claude-opus-5-5", "thinking": "high", "color": "violet" }
+    }
+  },
   "isolates": {
     "worktree": {
       "setup": [
