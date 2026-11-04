@@ -84,17 +84,17 @@ pub fn exited(child: &Child) -> Receiver<()> {
 }
 
 /// `child`'s exit status once it has exited, reaped; None when `until` passes first.
-pub fn wait_until(child: &mut Child, until: Instant) -> Option<ExitStatus> {
-    if let Ok(Some(status)) = child.try_wait() {
-        return Some(status);
+pub fn wait_until(child: &mut Child, until: Instant) -> std::io::Result<Option<ExitStatus>> {
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
     }
     let left = until.saturating_duration_since(Instant::now());
     if left.is_zero() {
-        return None;
+        return Ok(None);
     }
     // A message or a timeout: `try_wait` tells which.
     let _ = exited(child).recv_timeout(left);
-    child.try_wait().ok().flatten()
+    child.try_wait()
 }
 
 /// `pgid` as a process group the kernel can signal. 0 would mean our own group and 1 is init, so a value that cannot
@@ -252,7 +252,7 @@ fn wait_group(
     until: Instant,
 ) -> bool {
     if let Some(child) = leader {
-        *status = status.or_else(|| wait_until(child, until));
+        *status = status.or_else(|| wait_until(child, until).ok().flatten());
         if status.is_none() {
             return false;
         }
@@ -322,7 +322,7 @@ fn run_check(command: &str, cwd: &Path, env: &Env) -> Result<(), String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot run health command: {e}"))?;
-    match wait_until(&mut child, Instant::now() + COMMAND_TIMEOUT) {
+    match wait_until(&mut child, Instant::now() + COMMAND_TIMEOUT).map_err(|e| e.to_string())? {
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(format!("health command failed ({status})")),
         None => {

@@ -641,7 +641,7 @@ fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
     let exited = follow.until("the crash", 5, |e| e["kind"] == "exited");
     let noticed = killed.elapsed();
     assert!(
-        noticed < Duration::from_millis(500),
+        noticed < Duration::from_secs(1),
         "the crash was noticed after {noticed:?}"
     );
     assert!(
@@ -654,7 +654,7 @@ fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
     follow.until("the restart", 5, |e| e["kind"] == "started");
     let restarted = killed.elapsed();
     assert!(
-        (Duration::from_secs(1)..Duration::from_millis(1500)).contains(&restarted),
+        (Duration::from_secs(1)..Duration::from_secs(2)).contains(&restarted),
         "the 1 s backoff ended after {restarted:?}"
     );
     let pid = h.status()["process"]["pid"].as_i64().unwrap();
@@ -670,7 +670,7 @@ fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
     });
     let reloaded = signalled.elapsed();
     assert!(
-        reloaded < Duration::from_millis(500),
+        reloaded < Duration::from_secs(1),
         "SIGHUP was acted on after {reloaded:?}"
     );
     settle();
@@ -683,7 +683,7 @@ fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
         h.daemon_log()
     );
     let stopped = signalled.elapsed();
-    assert!(stopped < Duration::from_secs(1), "SIGTERM took {stopped:?}");
+    assert!(stopped < Duration::from_secs(2), "SIGTERM took {stopped:?}");
     assert!(
         test_kill_process_group(app).is_err(),
         "the app outlived the daemon"

@@ -439,7 +439,12 @@ impl Daemon {
     /// decided. The next supervision pass carries the rollback out.
     fn judge_unhealthy(&self, id: &str, pid: u32, roll_back: bool) -> bool {
         let mut inner = self.inner();
-        if inner.running().is_none_or(|app| app.child.id() != pid) {
+        // A process that has exited is not news either, though the supervisor may not have reaped it yet: its exit
+        // ended the check, and `reap` judges it with its own reason. `try_wait` keeps the status for `reap`.
+        if inner
+            .running_mut()
+            .is_none_or(|app| app.child.id() != pid || !matches!(app.child.try_wait(), Ok(None)))
+        {
             return false;
         }
         if roll_back
@@ -721,5 +726,42 @@ mod tests {
         let mut app = daemon.inner().take_running().unwrap();
         app.child.kill().unwrap();
         app.child.wait().unwrap();
+    }
+
+    /// The app's exit ends its health check at once, possibly before the supervisor has reaped it: a crash is for
+    /// `reap` to judge, with its own reason, so the check that gave up is no news and decides no rollback.
+    #[test]
+    fn a_health_check_ended_by_a_crash_leaves_the_rollback_to_the_reap() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = scratch_daemon(temp.path());
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        // Exited, not reaped: as the live app is between its exit and the supervisor's pass.
+        process::exited(&child).recv().unwrap();
+        {
+            let mut inner = daemon.inner();
+            inner.live = Live::Running(App::new(child, "g2"));
+            inner
+                .store
+                .modify(|state| {
+                    state.txn = Some(Txn::Pending(Pending {
+                        generation: "g2".into(),
+                        previous: Some("g1".into()),
+                        deadline: format_time(now_secs() + 120),
+                    }));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert!(!daemon.judge_unhealthy("g2", pid, true));
+        assert_eq!(daemon.inner().store.state().rolling_back(), None);
+        assert!(
+            daemon
+                .inner()
+                .running_mut()
+                .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_)))),
+            "the exit is still there for `reap`"
+        );
     }
 }

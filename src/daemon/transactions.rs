@@ -84,7 +84,9 @@ fn run_bounded(
     let pgid = child.id();
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let Some(status) = process::wait_until(&mut child, Instant::now() + timeout) else {
+    let Some(status) = process::wait_until(&mut child, Instant::now() + timeout)
+        .map_err(|e| format!("{what}: {e}"))?
+    else {
         // The readers are left to finish on their own: a group stuck in the kernel keeps its pipes open.
         process::stop_group(pgid, 0.0, Some(&mut child));
         return Err(format!("{what} timed out after {}s", timeout.as_secs()));
@@ -278,9 +280,10 @@ impl Daemon {
             .map_err(|e| e.to_string())?;
         let until = Instant::now() + Duration::from_secs_f64(m.install_timeout);
         let result = match process::wait_until(&mut child, until) {
-            Some(status) if status.success() => Ok(()),
-            Some(status) => Err(status.to_string()),
-            None => Err(format!("timed out after {}s", m.install_timeout)),
+            Ok(Some(status)) if status.success() => Ok(()),
+            Ok(Some(status)) => Err(status.to_string()),
+            Err(e) => Err(e.to_string()),
+            Ok(None) => Err(format!("timed out after {}s", m.install_timeout)),
         };
         // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
         // outlives the stage.
