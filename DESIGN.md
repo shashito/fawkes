@@ -17,10 +17,15 @@ app's live process and the only writer of the state directory. Every other comma
 sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
 manifest.
 
-The daemon runs one transaction step (stage, test, switch, rollback) at a time; a second one gets `busy`. `start`,
-`stop` and `restart` get `busy` only while a switch or rollback moves the live process, or while the supervisor does
-(`reap` after a crash, `restart` after its backoff, an automatic `rollback`). `status`, `log`, `history` and
-`confirm` are always answered.
+A step takes one or both of two slots. The *step* slot belongs to the transaction steps: `stage`, `test` and `prune`
+take it alone, `switch` and `rollback` take it together with the live slot, and a second step gets `busy`. The *live*
+slot belongs to whatever moves the live process: `start`, `stop` and `restart`, a `switch` or `rollback`, and the
+supervisor's own work (reaping the app after a crash, restarting it after its backoff, an automatic rollback). So the
+lifecycle commands exclude each other and a switch or rollback, and get `busy` while the supervisor works, but a
+`stage`, `test` or `prune` never delays them, and an automatic rollback never waits for a stage or test (it runs
+beside them; a `switch` or `rollback` asked meanwhile gets `busy` from the stage or test). When both slots are
+taken, `busy` names the step in the step slot first, and the live slot's step otherwise. `status`, `log`, `history`
+and `confirm` are always answered.
 
 The daemon is a few threads and no async runtime: one accepts clients, one per client answers it, one supervises
 the app, one per running child waits for its exit, and short-lived ones run health checks and read a step's output.
@@ -269,7 +274,7 @@ working for paths without special characters, so commands use the bare template,
 ```toml
 name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
-state_dir = "/tmp/fawkes-sample"   # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes
+state_dir = "/tmp/fawkes-sample"   # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes (absolute)
 home = "/tmp/sample-home"      # the app's own state directory
 storage = ["app.sqlite"]       # SQLite files relative to home, snapshotted at switch
 port = 4790                    # live port
@@ -296,6 +301,10 @@ APP_PORT = "{port}"
 APP_HOME = "{home}"
 ```
 
+`$FAWKES_HOME` (or, without it, `$HOME`) must be an absolute path: a relative one would resolve against the current
+directory of whoever runs the command, so worktrees would appear inside the repository and the CLI would look for the
+socket somewhere else than the daemon. Fawkes refuses it with a message saying to use an absolute path.
+
 **Validation:** the daemon refuses to start with (and does not reload) a manifest where:
 
 - `name` is not made of letters, digits, `_` and `-` (it becomes a file name);
@@ -307,7 +316,9 @@ APP_HOME = "{home}"
   above 0 and at most 86400;
 - `max_failed_starts` or `keep` is 0;
 - `[health]` does not have exactly one of `url` and `command`, or `url` is not `http://` with an explicit port
-  after the host (`:4790` or `:{port}`).
+  after the host (`:{port}`, or a number from 1 to 65535);
+- `port` or the first of `spare_ports` is 0;
+- the file has a key the manifest does not know (a misspelt `stop_timeout` is an error, never silently ignored).
 
 The error names every problem at once.
 
@@ -324,7 +335,9 @@ and `FAWKES_PHASE` (`test` or `live`).
 
 **Copy-on-write reuse:** before `install`, every `reuse` directory is cloned from the permanent generation's worktree
 (or the repository's working tree when there is none): `cp -cR` on macOS (APFS `clonefile`, near-instant and no extra
-space), `cp -R --reflink=auto` elsewhere. The install then only reconciles the difference.
+space), `cp -R --reflink=auto` elsewhere. The install then only reconciles the difference. A copy that fails or
+times out (`install_timeout`) is skipped: its partial result is removed, a progress line says so, and the install
+starts without it. The stage does not fail for it.
 
 The Ultimate manifest (first user; see `examples/ultimate.toml`). Its `start` is the wrapper of the Ultimate extension
 in `ultimate/fawkes/`, which runs Ultimate for `<project>` from the generation and isolates a test run like an
@@ -459,6 +472,28 @@ Every event, including progress lines of a step another client started, reaches 
 `seq` order: the replay and the live stream are cut at one point, so none repeats and none falls in a gap. `seq` is the
 first field of an event, a number the daemon counts across all its events: it increases by one, continues after a
 daemon restart, and is `0` for lines written before events were numbered.
+
+**Events.** Every event has a `kind`, a `generation` (or `null`) and a `message`. The kinds, with what `generation`
+holds:
+
+| Kind | Logged when | `generation` |
+|---|---|---|
+| `daemon` | the daemon starts (`started, pid …`) or ends (`stopped`); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down | the generation concerned, else `null` |
+| `progress` | a step narrates itself to the client waiting for it (stage, test, switch, rollback, prune, stop, restart); it does not mark a change of state | the generation the line is about |
+| `started` | the live app's process has been spawned, with its pid and port (a `test` run does not log it) | the generation started |
+| `healthy` | the live app's health check passed | the generation checked |
+| `unhealthy` | the live app's health check gave up and its process is still the live one | the generation checked |
+| `exited` | the supervisor found the live app's process gone without a request from Fawkes; the message says when it restarts, if it does. A stop on request logs `stopped` instead | the generation that ran |
+| `failed` | Fawkes gives up the app: `max_failed_starts` starts in a row ended early, or a start of the permanent generation could not spawn the process; nothing restarts it until `start` or a switch | the generation given up |
+| `stopped` | `stop` ended the app, or cancelled the restart a crash had scheduled | the generation stopped |
+| `staged` | `stage` finished: worktree, reuse and install are done | the new generation |
+| `tested` | `test` passed | the generation tested |
+| `test_failed` | `test` ran and the health check failed (a spare port taken by another process is an `error`, not this) | the generation tested |
+| `switched` | `switch` started the target on the live port; the confirm deadline runs | the target |
+| `confirmed` | `confirm` made a generation permanent | the generation confirmed |
+| `rolled_back` | a rollback ended: normally, or with its restore failed, with `state.json` unwritable, or with the restore given up by `--keep-storage`; the message says which | the generation rolled back (not the one that runs now) |
+| `pruned` | `prune` removed at least one generation; the message lists them | `null` |
+| `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a panic | the generation concerned, else `null` |
 
 A generation record:
 

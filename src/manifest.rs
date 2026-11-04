@@ -3,15 +3,34 @@
 use crate::state::Paths;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links the TUI discovers.
 pub fn fawkes_home() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("FAWKES_HOME") {
-        return Ok(dir.into());
+    fawkes_home_from(std::env::var_os("FAWKES_HOME"), std::env::var_os("HOME"))
+}
+
+/// `fawkes_home` for given values of the two variables, so a test need not change the process's environment. A
+/// relative directory would resolve against whichever directory the daemon or client runs in: worktrees would be
+/// created inside the repository, and the CLI would look for the socket in another place than the daemon.
+fn fawkes_home_from(
+    fawkes_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, String> {
+    let (variable, dir) = match (fawkes_home, home) {
+        (Some(dir), _) => ("FAWKES_HOME", PathBuf::from(dir)),
+        (None, Some(home)) => ("HOME", Path::new(&home).join(".fawkes")),
+        (None, None) => return Err("neither FAWKES_HOME nor HOME is set".into()),
+    };
+    if dir.is_absolute() {
+        Ok(dir)
+    } else {
+        Err(format!(
+            "{variable} must be an absolute path, but it gives {}; set it to an absolute path",
+            dir.display()
+        ))
     }
-    let home = std::env::var_os("HOME").ok_or("neither FAWKES_HOME nor HOME is set")?;
-    Ok(Path::new(&home).join(".fawkes"))
 }
 
 /// `<fawkes_home>/run`, where every daemon links its socket as `<name>.sock` for `fawkes tui` to find.
@@ -209,7 +228,8 @@ fn is_inside(entry: &str) -> bool {
             .any(|part| matches!(part, Component::Normal(_)))
 }
 
-/// Whether a raw `health.url` template is `http://` with an explicit port (digits or `{port}`) after the host.
+/// Whether a raw `health.url` template is `http://` with an explicit port after the host: `{port}`, or a number
+/// from 1 to 65535.
 fn has_port(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else {
         return false;
@@ -218,8 +238,7 @@ fn has_port(url: &str) -> bool {
     match authority.rsplit_once(':') {
         Some((host, port)) => {
             !host.is_empty()
-                && (port == "{port}"
-                    || (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())))
+                && (port == "{port}" || port.parse::<u16>().is_ok_and(|port| port != 0))
         }
         None => false,
     }
@@ -382,6 +401,12 @@ impl Written {
         if self.health.url.is_some() == self.health.command.is_some() {
             problems.push("[health] needs exactly one of url or command".into());
         }
+        if self.port == 0 {
+            problems.push("port must be between 1 and 65535".into());
+        }
+        if self.spare_ports[0] == 0 {
+            problems.push("spare_ports must start at 1 or higher".into());
+        }
         if self.spare_ports[0] > self.spare_ports[1] {
             problems.push("spare_ports must be [low, high]".into());
         } else if (self.spare_ports[0]..=self.spare_ports[1]).contains(&self.port) {
@@ -428,7 +453,7 @@ impl Written {
             && !has_port(url)
         {
             problems.push(format!(
-                "health.url {url:?} must start with http:// and end its host with :<port> or :{{port}}, for example http://127.0.0.1:{{port}}/"
+                "health.url {url:?} must start with http:// and end its host with :<port> (1 to 65535) or :{{port}}, for example http://127.0.0.1:{{port}}/"
             ));
         }
         problems
@@ -585,12 +610,51 @@ url = "http://127.0.0.1:{port}/"
                 "health.url",
                 with("http://127.0.0.1:{port}/", "http://host:80x/"),
             ),
+            ("port", with("port = 4790", "port = 0")),
+            (
+                "spare_ports",
+                with("port = 4790", "port = 5000").replacen("[4791, 4795]", "[0, 4795]", 1),
+            ),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "http://127.0.0.1:0/"),
+            ),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "http://127.0.0.1:65536/"),
+            ),
+            (
+                "health.url",
+                with("http://127.0.0.1:{port}/", "http://127.0.0.1:99999999999/"),
+            ),
         ];
         for (field, text) in cases {
             let err = scratch.load(&text).expect_err(&text);
             assert!(err.starts_with("invalid manifest "), "{err}");
             assert!(err.contains(field), "{field} not named in {err}");
         }
+    }
+
+    #[test]
+    fn a_relative_fawkes_home_or_home_is_refused() {
+        let os = |s: &str| Some(OsString::from(s));
+        for (fawkes_home, home) in [
+            (os(".fawkes"), os("/home/me")),
+            (os(""), os("/home/me")),
+            (None, os("relative/home")),
+        ] {
+            let err = fawkes_home_from(fawkes_home, home).unwrap_err();
+            assert!(err.contains("absolute path"), "{err}");
+        }
+        assert_eq!(
+            fawkes_home_from(os("/srv/fawkes"), os("relative")),
+            Ok(PathBuf::from("/srv/fawkes"))
+        );
+        assert_eq!(
+            fawkes_home_from(None, os("/home/me")),
+            Ok(PathBuf::from("/home/me/.fawkes"))
+        );
+        assert!(fawkes_home_from(None, None).is_err());
     }
 
     #[test]
