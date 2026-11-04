@@ -346,13 +346,14 @@ impl Follow {
     pub fn until(&mut self, what: &str, seconds: u64, found: impl Fn(&Value) -> bool) -> Value {
         let give_up = Instant::now() + Duration::from_secs(seconds);
         let mut passed = Vec::new();
-        while let Some(left) = give_up.checked_duration_since(Instant::now()) {
-            if let Some(event) = self.next(left) {
-                if found(&event) {
-                    return event;
-                }
-                passed.push(event.to_string());
+        // None: the time is up, or the command ended and nothing more will come.
+        while let Some(left) = give_up.checked_duration_since(Instant::now())
+            && let Some(event) = self.next(left)
+        {
+            if found(&event) {
+                return event;
             }
+            passed.push(event.to_string());
         }
         panic!(
             "timed out waiting for {what} in the followed log; events passed over:\n{}",
