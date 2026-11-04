@@ -1,27 +1,71 @@
 //! A throwaway Fawkes world for integration tests: a git repo of the sample app, a manifest, a daemon.
 
 use rusqlite::{Connection, OpenFlags};
+use rustix::fs::{FlockOperation, flock};
 use serde_json::Value;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const APP_JS: &str = include_str!("../../examples/sample/app.js");
 pub const BIN: &str = env!("CARGO_BIN_EXE_fawkes");
+
+/// Where the port blocks' lock files live, shared by every suite on the machine whatever worktree it runs from.
+const PORT_LOCKS: &str = "/tmp/fawkes-test-ports";
+/// Blocks of ten ports from 20000 to 29999: below the ephemeral ranges of macOS (49152) and Linux (32768), so no
+/// outgoing connection takes one.
+const FIRST_PORT: u16 = 20000;
+const BLOCKS: u16 = 1000;
+
+/// Claim a block of ten free ports, `base..base + 10`, for as long as the returned lock file stays open. Suites that
+/// run at the same time, in this process or in another worktree, skip a block whose file is locked, and the probe
+/// skips ports something else listens on. A `flock` ends with its process, so a killed run leaves no stale claim.
+fn claim_ports() -> (u16, File) {
+    // Spread the starting points, so concurrent suites and the tests within one rarely try the same blocks.
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let offset = std::process::id() + NEXT.fetch_add(7, Ordering::Relaxed);
+    std::fs::create_dir_all(PORT_LOCKS).unwrap();
+    for i in 0..u32::from(BLOCKS) {
+        let block = u16::try_from(offset.wrapping_add(i) % u32::from(BLOCKS)).unwrap();
+        let base = FIRST_PORT + block * 10;
+        let lock = File::create(format!("{PORT_LOCKS}/{base}")).unwrap();
+        if flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok()
+            && (base..base + 10).all(port_free)
+        {
+            return (base, lock);
+        }
+    }
+    panic!(
+        "no free block of ten ports between {FIRST_PORT} and {}",
+        FIRST_PORT + BLOCKS * 10
+    );
+}
+
+/// The daemon's own probe: nothing listens on the port on either address.
+fn port_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
 
 pub struct Harness {
     pub dir: PathBuf,
     pub port: u16,
     manifest: PathBuf,
     daemon: Option<Child>,
+    /// The claim on `port..port + 10` and on `dir`, released when the harness drops (after `drop` cleaned up).
+    _ports: File,
 }
 
 impl Harness {
-    /// A world under `/tmp/fk<port>` (short: socket paths are limited) with live port `port` and spare
-    /// ports `port+1..=port+9`. `extra` is added to the manifest's top-level keys.
-    pub fn new(port: u16, extra: &str) -> Harness {
+    /// A world of its own: live port `port` and spare ports `port+1..=port+9` from a block claimed for this test
+    /// (`claim_ports`), under `/tmp/fk<port>`, kept short because socket paths are limited. `extra` is added to the
+    /// manifest's top-level keys.
+    pub fn new(extra: &str) -> Harness {
+        let (port, ports) = claim_ports();
+        // A run that was killed may have left the directory; the claim makes it ours now.
         let dir = PathBuf::from(format!("/tmp/fk{port}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("repo")).unwrap();
@@ -30,6 +74,7 @@ impl Harness {
             dir,
             port,
             daemon: None,
+            _ports: ports,
         };
         h.git(&["init", "-q"]);
         let d = h.dir.display();

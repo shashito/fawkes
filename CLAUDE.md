@@ -23,9 +23,11 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
 
 - Integration tests (`tests/core.rs`) run the real binary against a throwaway world built by `tests/common/mod.rs`.
   They need `git` and `node` on `PATH`, and the sample app is `examples/sample/app.js`.
-- Each test claims a block of ten ports from `Harness::new(port, ..)` and a directory `/tmp/fk<port>`, which is kept
-  short because socket paths have a length limit. Tests run in parallel, so **give a new test an unused block**
-  (4800 to 4970 are taken; use 4980, 4990, …).
+- `Harness::new(extra)` claims a free block of ten ports between 20000 and 29999 through a `flock` on
+  `/tmp/fawkes-test-ports/<port>`, and the directory `/tmp/fk<port>`, kept short because socket paths have a length
+  limit. Tests, and suites in other worktrees, run in parallel without colliding, so never hard-code a port or a
+  path: use `h.port` and `h.dir`, and never look for processes machine-wide (`pgrep`, `pkill`), since another
+  suite's look the same. Have the app record its pid in a file instead.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
   `process.rs`, `protocol.rs`, `daemon/mod.rs`, `tui.rs`).
 - To fix a bug, first write a test that reproduces it.

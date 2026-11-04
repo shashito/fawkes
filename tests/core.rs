@@ -7,7 +7,7 @@ use serde_json::Value;
 
 #[test]
 fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
-    let mut h = Harness::new(4800, "");
+    let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
@@ -129,7 +129,7 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
 /// before anything stops, and a second daemon for the same state directory is refused.
 #[test]
 fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
-    let mut h = Harness::new(4820, "");
+    let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
@@ -196,7 +196,7 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
 /// start.
 #[test]
 fn a_switch_records_its_intent_before_the_new_generation_starts() {
-    let mut h = Harness::new(4830, "");
+    let mut h = Harness::new("");
     // v2, started live, keeps a copy of the state.json it finds, kills the daemon, its parent, on the spot, and runs on.
     let manifest = h.dir.join("fawkes.toml");
     let text = std::fs::read_to_string(&manifest).unwrap().replace(
@@ -248,21 +248,24 @@ fn a_switch_records_its_intent_before_the_new_generation_starts() {
 /// unsupervised, while the rollback restores the storage under them.
 #[test]
 fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
-    let mut h = Harness::new(4810, "");
-    let manifest = h.dir.join("fawkes.toml");
-    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+    let mut h = Harness::new("");
+    // Each start leaves a background process in the app's group, and its pid in the generation's code directory.
+    h.edit_manifest(
         r#"start = "node app.js""#,
-        r#"start = "sleep 6$(cut -c2 VERSION)1 & node app.js""#,
+        r#"start = "sleep 600 & echo $! > background.pid; node app.js""#,
     );
-    std::fs::write(&manifest, text).unwrap();
     h.commit("v1", "confirm");
     h.commit("v2", "crash-live");
     h.start_daemon();
-    let alive = |pattern: &str| {
-        std::process::Command::new("pgrep")
-            .args(["-f", pattern])
-            .output()
-            .is_ok_and(|o| !o.stdout.is_empty())
+    let alive = |id: &str| {
+        let dir = h.generation(id)["dir"].as_str().unwrap().to_string();
+        let pid: i32 = std::fs::read_to_string(format!("{dir}/background.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only asks whether the process exists; nothing is sent.
+        unsafe { libc::kill(pid, 0) == 0 }
     };
 
     h.ok(&["stage", "v1"]);
@@ -283,13 +286,10 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
             .unwrap()
             .contains("exited before confirm")
     );
-    assert!(
-        !alive("sleep 621"),
-        "g2's background process outlived its crash"
-    );
+    assert!(!alive("g2"), "g2's background process outlived its crash");
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
     assert!(
-        alive("sleep 611"),
+        alive("g1"),
         "g1 runs again, with its own background process"
     );
 }
@@ -298,7 +298,7 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
 /// crash decides, and the confirm is refused.
 #[test]
 fn a_confirm_racing_a_crash_of_the_pending_generation_is_refused() {
-    let mut h = Harness::new(4840, "");
+    let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.commit("v2", "crash-confirm");
     h.start_daemon();
@@ -347,7 +347,7 @@ fn a_confirm_racing_a_crash_of_the_pending_generation_is_refused() {
 /// its confirm deadline.
 #[test]
 fn rollback_on_unhealthy_rolls_back_without_waiting_for_the_deadline() {
-    let mut h = Harness::new(4850, "rollback_on_unhealthy = true");
+    let mut h = Harness::new("rollback_on_unhealthy = true");
     h.edit_manifest("timeout = 20", "timeout = 3");
     h.commit("v1", "confirm");
     h.commit("v2", "unhealthy-live");
@@ -389,7 +389,6 @@ fn worktrees(h: &Harness) -> usize {
 #[test]
 fn a_failing_or_hanging_install_leaves_nothing_behind() {
     let mut h = Harness::new(
-        4860,
         r#"install = '''case "$(cat MODE)" in fails) exit 1;; hangs) echo $$ > {state}/install.pid; exec sleep 600;; esac'''
 install_timeout = 1"#,
     );
@@ -442,7 +441,7 @@ install_timeout = 1"#,
 /// one it rolls back to, and a confirm prunes by itself.
 #[test]
 fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
-    let mut h = Harness::new(4870, "keep = 2");
+    let mut h = Harness::new("keep = 2");
     h.commit("v1", "confirm");
     h.commit("v2", "confirm");
     h.commit("v3", "never");
@@ -502,7 +501,7 @@ fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
 /// switch and `stage` during a test are `busy`, and a deadline that passes during a test still rolls back.
 #[test]
 fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
-    let mut h = Harness::new(4880, "");
+    let mut h = Harness::new("");
     h.commit("v1", "slow-stop");
     h.commit("v2", "never");
     h.commit("v3", "slow-test");
@@ -557,7 +556,7 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
 #[test]
 fn a_request_that_arrives_in_pieces_is_answered() {
     use std::io::{BufRead, Write};
-    let mut h = Harness::new(4890, "");
+    let mut h = Harness::new("");
     h.start_daemon();
     let mut stream = std::os::unix::net::UnixStream::connect(h.dir.join("s/fawkes.sock")).unwrap();
     stream.write_all(br#"{"command": "log", "#).unwrap();
@@ -575,10 +574,7 @@ fn a_request_that_arrives_in_pieces_is_answered() {
 /// generation, so nothing of the stage outlives the daemon that started it. Tests are recorded the same way.
 #[test]
 fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
-    let mut h = Harness::new(
-        4900,
-        r#"install = '''echo $$ > {state}/install.pid; exec sleep 600'''"#,
-    );
+    let mut h = Harness::new(r#"install = '''echo $$ > {state}/install.pid; exec sleep 600'''"#);
     h.commit("v1", "confirm");
     h.start_daemon();
     let mut stage = std::process::Command::new(common::BIN)
@@ -616,7 +612,7 @@ fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
 /// comes back as it would have without the switch.
 #[test]
 fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
-    let mut h = Harness::new(4910, "max_failed_starts = 5");
+    let mut h = Harness::new("max_failed_starts = 5");
     h.edit_manifest("min_uptime = 1", "min_uptime = 60");
     h.edit_manifest(
         r#"storage = ["app.sqlite"]"#,
@@ -681,7 +677,7 @@ fn messages(h: &Harness, kind: &str) -> Vec<String> {
 /// backs off 1, 2 s, …, the third gives it up (`failed`, not restarted), and `start` clears that.
 #[test]
 fn a_crash_looping_permanent_generation_backs_off_then_fails_until_started() {
-    let mut h = Harness::new(4920, "");
+    let mut h = Harness::new("");
     // While `{home}/crash` exists, every live start exits at once.
     h.edit_manifest(
         r#"start = "node app.js""#,
@@ -759,7 +755,7 @@ fn a_crash_looping_permanent_generation_backs_off_then_fails_until_started() {
 /// time `fawkes rollback` retries, and once it gets through the permanent generation serves on its own storage.
 #[test]
 fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_through() {
-    let mut h = Harness::new(4930, "");
+    let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
@@ -867,7 +863,7 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
 #[test]
 fn subscribe_since_replays_the_events_after_a_sequence_number() {
     use std::io::{BufRead, Write};
-    let mut h = Harness::new(4940, "");
+    let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.start_daemon();
     h.ok(&["stage", "v1"]);
@@ -913,7 +909,7 @@ fn subscribe_since_replays_the_events_after_a_sequence_number() {
 /// (the target stays tested and the answer says why), and the next daemon start runs the permanent generation.
 #[test]
 fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
-    let mut h = Harness::new(4950, "");
+    let mut h = Harness::new("");
     h.commit("v1", "slow-stop");
     h.commit("v2", "confirm");
     h.start_daemon();
@@ -963,7 +959,7 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
 #[test]
 fn stop_during_a_crash_backoff_cancels_the_restart_and_answers_ok() {
     use std::io::Write;
-    let mut h = Harness::new(4960, "max_failed_starts = 5");
+    let mut h = Harness::new("max_failed_starts = 5");
     // Two failed starts in a row: the second restart waits 2 s, the window `stop` lands in.
     h.edit_manifest("min_uptime = 1", "min_uptime = 60");
     h.commit("v1", "confirm");
@@ -1024,7 +1020,7 @@ fn stop_during_a_crash_backoff_cancels_the_restart_and_answers_ok() {
 /// permanent generation on the storage as it is.
 #[test]
 fn rollback_keep_storage_gives_up_a_restore_that_failed() {
-    let mut h = Harness::new(4970, "");
+    let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
