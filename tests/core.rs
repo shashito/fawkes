@@ -685,6 +685,22 @@ fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
     assert_eq!(h.generation("g2")["state"], "tested");
 }
 
+/// A test works on a copy of the storage, which does not outlive the test: not when the test fails before the app
+/// starts either (here the copy itself fails).
+#[test]
+fn a_test_that_fails_before_its_app_starts_leaves_no_copy_of_the_storage() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    std::fs::create_dir_all(h.dir.join("home")).unwrap();
+    std::fs::write(h.dir.join("home/app.sqlite"), "not a database").unwrap();
+
+    refused(&h, &["test", "g1"], "storage_failed", "app.sqlite");
+    assert!(!h.dir.join("s/generations/g1/test-home").exists());
+    assert_eq!(h.generation("g1")["state"], "staged");
+}
+
 /// The messages of the events of `kind`, oldest first.
 fn messages(h: &Harness, kind: &str) -> Vec<String> {
     h.ok(&["log", "-n", "1000"])["events"]
@@ -898,17 +914,14 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     let snapshot = h.dir.join("s/generations/g2/snapshot");
     let moved = h.dir.join("s/snapshot-moved");
     std::fs::rename(&snapshot, &moved).unwrap();
-    refused(&h, &["rollback"], "storage_failed", "could not be restored");
+    // Both messages name the way out, and the permanent generation it starts.
+    let way_out = "`fawkes rollback` retries the restore, or `fawkes rollback --keep-storage` starts g1 on the storage as it is (it may already be migrated)";
+    refused(&h, &["rollback"], "storage_failed", way_out);
     let status = h.status();
     assert_eq!(status["process"]["state"], "failed", "{status}");
     assert_eq!(status["pending"]["generation"], "g2", "{status}");
     for args in [&["start"][..], &["confirm"], &["switch", "g1"]] {
-        refused(
-            &h,
-            args,
-            "invalid_state",
-            "`fawkes rollback` retries the restore",
-        );
+        refused(&h, args, "invalid_state", way_out);
     }
     assert_eq!(h.get(), None);
     std::fs::rename(&moved, &snapshot).unwrap();

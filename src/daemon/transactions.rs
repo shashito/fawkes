@@ -18,6 +18,17 @@ use std::sync::Arc;
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
+/// The two ways out of a failed restore, for the end of an error message: retry it, or give it up.
+fn restore_way_out(permanent: Option<&str>) -> String {
+    let start = permanent.map_or_else(
+        || "leaves the app stopped (there is no permanent generation)".into(),
+        |id| format!("starts {id}"),
+    );
+    format!(
+        "`fawkes rollback` retries the restore, or `fawkes rollback --keep-storage` {start} on the storage as it is (it may already be migrated)"
+    )
+}
+
 /// Refuse a command that acts on the live generation (start, stop, restart, switch, confirm) while a rollback's
 /// restore has failed and awaits `rollback`.
 pub(super) fn refuse_failed_restore(state: &State) -> R<()> {
@@ -27,10 +38,21 @@ pub(super) fn refuse_failed_restore(state: &State) -> R<()> {
             restore_failed: true,
             ..
         }) => Err(invalid_state(format!(
-            "{} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore",
-            pending.generation
+            "{} was rolled back but its storage could not be restored; {}",
+            pending.generation,
+            restore_way_out(state.permanent.as_deref())
         ))),
         _ => Ok(()),
+    }
+}
+
+/// Removes a directory when dropped, on every way out of the function that made it. Best effort: a directory that
+/// cannot be removed is no reason to change the answer.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0);
     }
 }
 
@@ -195,7 +217,16 @@ impl Daemon {
         reuse_from: &Path,
     ) -> R<()> {
         let code = self.paths.code(id);
-        std::fs::create_dir_all(self.paths.generation(id))?;
+        let generation_dir = self.paths.generation(id);
+        std::fs::create_dir_all(&generation_dir).map_err(|e| {
+            err(
+                ErrorCode::Internal,
+                format!(
+                    "cannot create {} to stage {id}: {e}",
+                    generation_dir.display()
+                ),
+            )
+        })?;
         self.say(
             out,
             id,
@@ -366,7 +397,16 @@ impl Daemon {
             })?;
         let test_home = self.paths.test_home(id);
         let _ = std::fs::remove_dir_all(&test_home);
-        std::fs::create_dir_all(&test_home)?;
+        let test_home_guard = RemoveOnDrop(&test_home);
+        std::fs::create_dir_all(&test_home).map_err(|e| {
+            err(
+                ErrorCode::StorageFailed,
+                format!(
+                    "cannot create {} for the test of {id}: {e}",
+                    test_home.display()
+                ),
+            )
+        })?;
         storage::copy(&m.home, &m.storage, &test_home)
             .map_err(|e| err(ErrorCode::StorageFailed, e))?;
 
@@ -406,7 +446,7 @@ impl Daemon {
             &exited,
         );
         self.end_step(&mut child, m.stop_timeout);
-        let _ = std::fs::remove_dir_all(&test_home);
+        drop(test_home_guard);
         // Our test process is gone, so a port that is still taken was taken by someone else, most likely between
         // the probe and the app's bind: not the generation's fault, so its state and last result stay as they were.
         if result.is_err() && !port_free(port) {
@@ -749,7 +789,8 @@ impl Daemon {
             return Err(err(
                 ErrorCode::StorageFailed,
                 format!(
-                    "{id} was rolled back but its storage could not be restored: {e}; the app stays stopped"
+                    "{id} was rolled back but its storage could not be restored: {e}; the app stays stopped; {}",
+                    restore_way_out(permanent.as_deref())
                 ),
             ));
         }

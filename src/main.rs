@@ -36,7 +36,8 @@ const EXIT_UNREACHABLE: u8 = 3;
     after_help = "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers."
 )]
 struct Cli {
-    /// Print the result as one JSON document, and progress as JSON lines on stderr
+    /// Print the result (or the error) as one JSON document, and progress as JSON lines on stderr; `log --follow` prints
+    /// one event document per line. Not for `daemon` and `tui`
     #[arg(long, global = true)]
     json: bool,
     /// The app's manifest [default: fawkes.toml]
@@ -176,6 +177,12 @@ fn main() -> ExitCode {
     };
     let manifest_path = cli.manifest.clone().unwrap_or_else(|| "fawkes.toml".into());
     if matches!(cli.command, Command::Daemon) {
+        // A manifest that cannot be loaded is a usage error here as for every other command; the rest of the
+        // daemon's startup failures are not.
+        if let Err(message) = Manifest::load(&manifest_path) {
+            warn(format!("error: {message}"));
+            return ExitCode::from(EXIT_USAGE);
+        }
         return match daemon::Daemon::run(manifest_path, cli.socket) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
@@ -198,11 +205,11 @@ fn main() -> ExitCode {
         };
         return ExitCode::from(tui::run(&tui::Target::Discover(run)));
     }
+    let mut stdout = std::io::stdout().lock();
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
         Err(message) => {
-            warn(format!("error: {message}"));
-            return ExitCode::from(EXIT_USAGE);
+            return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
         }
     };
     // `daemon` returned above, so what is left but a request is `tui`.
@@ -220,6 +227,7 @@ fn main() -> ExitCode {
         &socket,
         &manifest_path,
         REQUEST_TIMEOUT,
+        &mut stdout,
     ))
 }
 
@@ -236,10 +244,11 @@ fn socket_path(cli: &Cli, manifest_path: &Path) -> Result<PathBuf, String> {
     Ok(manifest.paths().socket())
 }
 
-/// Print a line on stdout; false when it could not be written. A reader that has gone (`fawkes log --follow | head`)
-/// ends a followed log, but changes nothing about how a command went: the daemon's answer decides its exit code.
-fn say(line: impl Display) -> bool {
-    writeln!(std::io::stdout().lock(), "{line}").is_ok()
+/// Print a line on `out`, the client's stdout; false when it could not be written. A reader that has gone
+/// (`fawkes log --follow | head`) ends a followed log, but changes nothing about how a command went: the daemon's
+/// answer decides its exit code.
+fn say(out: &mut dyn Write, line: impl Display) -> bool {
+    writeln!(out, "{line}").is_ok()
 }
 
 /// Print a line on stderr, best effort: a terminal that has gone is no reason to exit otherwise.
@@ -247,14 +256,39 @@ fn warn(line: impl Display) {
     let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
-/// Send one request, show progress, render the answer. Returns the exit code. A quick command waits `timeout` for
-/// each line of the answer.
+/// The exit code of a failed command, from its error code.
+fn exit_code(code: ErrorCode) -> u8 {
+    match code {
+        ErrorCode::Usage => EXIT_USAGE,
+        ErrorCode::DaemonUnreachable => EXIT_UNREACHABLE,
+        _ => EXIT_FAILED,
+    }
+}
+
+/// Report a failure of the client itself, the one way every such failure goes out: the `{"code", "message"}` error
+/// object on `out` under `--json` (the document an agent parses), `error: …` on stderr otherwise. Returns the exit
+/// code.
+fn fail(json: bool, out: &mut dyn Write, code: ErrorCode, message: String) -> u8 {
+    if json {
+        say(
+            out,
+            serde_json::to_string(&err(code, message)).unwrap_or_default(),
+        );
+    } else {
+        warn(format!("error: {message}"));
+    }
+    exit_code(code)
+}
+
+/// Send one request, show progress, render the answer on `out`. Returns the exit code. A quick command waits
+/// `timeout` for each line of the answer.
 fn client(
     cli: &Cli,
     request: &Request,
     socket: &Path,
     manifest_path: &Path,
     timeout: Duration,
+    out: &mut dyn Write,
 ) -> u8 {
     let Ok(mut stream) = UnixStream::connect(socket) else {
         let message = format!(
@@ -262,35 +296,32 @@ fn client(
             socket.display(),
             manifest_path.display()
         );
-        if cli.json {
-            say(
-                serde_json::to_string(&err(ErrorCode::DaemonUnreachable, message))
-                    .unwrap_or_default(),
-            );
-        } else {
-            warn(format!("error: {message}"));
-        }
-        return EXIT_UNREACHABLE;
+        return fail(cli.json, out, ErrorCode::DaemonUnreachable, message);
     };
     if request.write_to(&mut stream).is_err() {
-        warn(format!(
-            "error: the daemon on {} closed the connection",
+        let message = format!(
+            "the daemon on {} closed the connection before the request was sent; check that it is running with `fawkes status`",
             socket.display()
-        ));
-        return EXIT_UNREACHABLE;
+        );
+        return fail(cli.json, out, ErrorCode::DaemonUnreachable, message);
     }
     let follow = matches!(request, Request::Log { follow: true, .. });
     // A daemon that accepts and then never answers must not hang a quick command (`Request::is_quick`).
-    if request.is_quick() && stream.set_read_timeout(Some(timeout)).is_err() {
-        warn("error: cannot set a read timeout on the connection");
-        return EXIT_FAILED;
+    if request.is_quick()
+        && let Err(e) = stream.set_read_timeout(Some(timeout))
+    {
+        let message = format!("cannot set a read timeout on the connection: {e}");
+        return fail(cli.json, out, ErrorCode::Internal, message);
     }
     for line in BufReader::new(stream).lines() {
         let line = match line {
             Ok(line) => line,
             Err(e) if timed_out(&e) => {
-                warn("error: the daemon did not answer in time");
-                return EXIT_FAILED;
+                let message = format!(
+                    "the daemon on {} did not answer in time; check that it is healthy with `fawkes status`",
+                    socket.display()
+                );
+                return fail(cli.json, out, ErrorCode::NoAnswer, message);
             }
             Err(_) => break,
         };
@@ -305,7 +336,7 @@ fn client(
             && let Some(event) = raw.get("event")
         {
             if follow {
-                if !say(event) {
+                if !say(out, event) {
                     return 0;
                 }
             } else {
@@ -319,8 +350,8 @@ fn client(
         match message {
             Line::Event { event } => {
                 let shown = match (follow, cli.json) {
-                    (true, true) => say(&raw["event"]),
-                    (true, false) => say(render_event(&event)),
+                    (true, true) => say(out, &raw["event"]),
+                    (true, false) => say(out, render_event(&event)),
                     (false, true) => {
                         warn(&raw["event"]);
                         true
@@ -336,17 +367,19 @@ fn client(
             }
             // Only `subscribe` sends these.
             Line::Status { .. } | Line::History { .. } => {}
+            // A followed log ends with a null result when the daemon ends the stream; the events were the output.
+            Line::Done { .. } if follow => return 0,
             Line::Done { result, .. } => {
                 if cli.json {
-                    say(result);
+                    say(out, result);
                 } else {
-                    say(render_result(request, &result));
+                    say(out, render_result(request, &result));
                 }
                 return 0;
             }
             Line::Failed { error, .. } => {
                 if cli.json {
-                    say(&raw["error"]);
+                    say(out, &raw["error"]);
                 } else {
                     warn(format!("error: {}", error.message));
                 }
@@ -362,11 +395,11 @@ fn client(
     if follow {
         return 0;
     }
-    warn(format!(
-        "error: the daemon on {} closed the connection without an answer",
+    let message = format!(
+        "the daemon on {} closed the connection without an answer; `fawkes status` shows whether it is running",
         socket.display()
-    ));
-    EXIT_FAILED
+    );
+    fail(cli.json, out, ErrorCode::DaemonUnreachable, message)
 }
 
 // ----------------------------------------------------------- rendering
@@ -615,8 +648,9 @@ mod tests {
         assert_eq!(confirm("confirm", None), None);
     }
 
-    #[test]
-    fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
+    /// Run `status` against a daemon that accepts and then says nothing for 3 s; returns the exit code, what the
+    /// client printed on stdout, and how long it waited.
+    fn status_from_a_silent_daemon(json: bool) -> (u8, String, Duration) {
         // Under /tmp: a socket path over about 100 bytes does not bind, and `$TMPDIR` can be that long.
         let temp = tempfile::tempdir_in("/tmp").unwrap();
         let socket = temp.path().join("fawkes.sock");
@@ -628,12 +662,13 @@ mod tests {
             drop(stream);
         });
         let cli = Cli {
-            json: false,
+            json,
             manifest: None,
             socket: Some(socket.clone()),
             command: Command::Status,
         };
 
+        let mut out = Vec::new();
         let started = Instant::now();
         let code = client(
             &cli,
@@ -641,16 +676,42 @@ mod tests {
             &socket,
             Path::new("fawkes.toml"),
             Duration::from_millis(300),
+            &mut out,
         );
         let waited = started.elapsed();
+        silent.join().unwrap();
+        (code, String::from_utf8(out).unwrap(), waited)
+    }
+
+    #[test]
+    fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
+        let (code, out, waited) = status_from_a_silent_daemon(false);
 
         assert_eq!(code, EXIT_FAILED);
+        // The message goes to stderr, not stdout.
+        assert_eq!(out, "");
         // The read timed out; the daemon had not closed the connection yet.
         assert!(
             waited >= Duration::from_millis(300),
             "gave up after {waited:?}"
         );
         assert!(waited < Duration::from_secs(2), "hung for {waited:?}");
-        silent.join().unwrap();
+    }
+
+    #[test]
+    fn under_json_a_daemon_that_never_answers_gives_a_no_answer_error_object() {
+        let (code, out, _) = status_from_a_silent_daemon(true);
+
+        assert_eq!(code, EXIT_FAILED);
+        let error: Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(error["code"], "no_answer", "{out}");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("did not answer in time"),
+            "{out}"
+        );
+        assert_eq!(out.lines().count(), 1, "{out}");
     }
 }

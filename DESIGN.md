@@ -151,7 +151,9 @@ Code and storage roll back together:
 
 If the restore fails, the generation is still `rolled_back` (its code never runs again), but the step stays in
 `state.json` as `rolling_back` with `restore_failed` set, and nothing is started on storage in an unknown state: `status` shows `failed`, and
-`fawkes rollback` or the next daemon start retries the restore. The same holds when the restore worked but the end
+`fawkes rollback` or the next daemon start retries the restore, and the error says so, with the other way out:
+"`fawkes rollback` retries the restore, or `fawkes rollback --keep-storage` starts g1 on the storage as it is (it may
+already be migrated)". The same holds when the restore worked but the end
 of the switch could not be written to `state.json`. A confirm after the deadline is refused, even if the rollback has
 not begun yet.
 
@@ -405,12 +407,18 @@ generation then runs on storage that the failed generation may already have migr
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
-Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` the daemon is unreachable. A stdout or stderr that
+That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (a manifest that
+cannot be read is `usage`, no daemon on the socket, a connection that breaks or closes without an answer is
+`daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`). The one exception is
+`log --follow`, a stream: stdout carries one event document per line, as they happen, and nothing else when the
+daemon ends the stream (in text mode too). `--json` does not apply to `daemon` and `tui`, which print text only.
+Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
+for `daemon` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
 cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
 decides, and `log --follow` ends with `0`.
 
 `start`, `confirm`, `status`, `history` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
-fail with exit 1, "the daemon did not answer in time". The other commands wait as long as their step runs, which the
+fail with exit 1 and `no_answer`, "the daemon … did not answer in time". The other commands wait as long as their step runs, which the
 manifest's timeouts bound, and `log --follow` waits for ever.
 
 Errors read as a sentence that says what to do next, for example:
@@ -432,10 +440,11 @@ Request:
 ```
 
 A request line longer than 64 KiB, or one that has not arrived whole within 5 s of the connection (one deadline for the
-whole line, however slowly it trickles in), is refused with `usage`. At most 64 connections are open at once, streams
-(`subscribe`, `log --follow`) not counted; a 65th is answered `busy` at once without reading its request, and the client
-retries. Response: zero or more progress lines, then exactly one
-final line, then the daemon closes the connection.
+whole line, however slowly it trickles in), is refused with `usage`. So is an optional argument of the wrong JSON type
+(`{"generation": 7}`, `{"keep_storage": "true"}`, `{"limit": -1}`): it is never read as absent. `null` means absent,
+and keys a command does not use are ignored. At most 64 connections are open at once, streams (`subscribe`,
+`log --follow`) not counted; a 65th is answered `busy` at once without reading its request, and the client retries.
+Response: zero or more progress lines, then exactly one final line, then the daemon closes the connection.
 
 The daemon never waits on a client that stops reading: a write that blocks for 2 s ends that connection (a step in
 progress carries on without it), and a `subscribe` or `log --follow` client that falls 1024 messages behind is
@@ -448,7 +457,9 @@ dropped, so its stream simply ends. Live clients reconnect.
 ```
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` is produced by the client only.)
+`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` and `no_answer` are produced by the
+client only: no daemon answers, or it closed the connection without an answer, and the daemon accepted a quick request
+and did not answer in time.)
 A client treats a code it does not know as a failed command.
 
 Results per command:
@@ -465,7 +476,7 @@ Results per command:
 | `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason` |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
-| `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes |
+| `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
 | `history` | — | `generations`, oldest first |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
 
@@ -640,7 +651,8 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
     snapshot/            storage of the previous generation, taken when switching to <id>
       index.json         [{"path": "state.sqlite", "file": "0.sqlite", "present": true}], written last and durably
       0.sqlite
-    test-home/           storage copy the test run used (removed after the test)
+    test-home/           storage copy the test run used (removed after the test, whether it passed, failed or never
+                         got as far as starting the app)
     logs/install.log     install output
     logs/app.log         stdout and stderr of every run, live and test, with a header line per start; past
                          10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines

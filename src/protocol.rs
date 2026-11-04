@@ -47,8 +47,10 @@ pub enum ErrorCode {
     StartFailed,
     PortInUse,
     Internal,
-    /// Produced by the client only: no daemon answers on the socket.
+    /// Produced by the client only: no daemon answers on the socket, or it closed the connection without answering.
     DaemonUnreachable,
+    /// Produced by the client only: the daemon accepted a quick request and did not answer in time.
+    NoAnswer,
     /// A code a newer daemon sent that this client does not know; the command failed all the same.
     #[serde(other)]
     Unknown,
@@ -86,12 +88,6 @@ pub fn not_found(id: &str) -> Error {
         ErrorCode::NotFound,
         format!("there is no generation {id}; `fawkes history` lists them"),
     )
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Error {
-        err(ErrorCode::Internal, e.to_string())
-    }
 }
 
 // ----------------------------------------------------------- requests
@@ -167,21 +163,21 @@ impl Request {
                 deadline: deadline_arg(&args)?,
             },
             "confirm" => Request::Confirm {
-                generation: optional_text(&args, "generation"),
+                generation: optional_text(&args, "generation")?,
             },
             "prune" => Request::Prune,
             "rollback" => Request::Rollback {
-                keep_storage: args.get("keep_storage").and_then(Value::as_bool) == Some(true),
+                keep_storage: optional_bool(&args, "keep_storage")?,
             },
             "status" => Request::Status,
             "history" => Request::History,
             "log" => Request::Log {
-                limit: args.get("limit").and_then(Value::as_u64),
-                follow: args.get("follow").and_then(Value::as_bool) == Some(true),
+                limit: optional_count(&args, "limit")?,
+                follow: optional_bool(&args, "follow")?,
             },
             "subscribe" => Request::Subscribe {
-                limit: args.get("limit").and_then(Value::as_u64),
-                since: args.get("since").and_then(Value::as_u64),
+                limit: optional_count(&args, "limit")?,
+                since: optional_count(&args, "since")?,
             },
             other => {
                 return Err(err(ErrorCode::Usage, format!("unknown command `{other}`")));
@@ -258,12 +254,42 @@ impl Serialize for Request {
 }
 
 fn required(args: &Value, key: &str) -> R<String> {
-    optional_text(args, key)
+    optional_text(args, key)?
         .ok_or_else(|| err(ErrorCode::Usage, format!("missing argument `{key}`")))
 }
 
-fn optional_text(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(String::from)
+// A present argument of the wrong type is refused, not read as absent: `{"generation": 7}` must not confirm whatever
+// is pending. Null still means absent, and keys no command uses are ignored.
+
+/// The argument `key` through `read`, `None` when absent or null; `type_name` names what it must be in the error.
+fn optional_arg<T>(
+    args: &Value,
+    key: &str,
+    type_name: &str,
+    read: impl FnOnce(&Value) -> Option<T>,
+) -> R<Option<T>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => read(value).map(Some).ok_or_else(|| {
+            err(
+                ErrorCode::Usage,
+                format!("the argument `{key}` must be {type_name}, not {value}"),
+            )
+        }),
+    }
+}
+
+fn optional_text(args: &Value, key: &str) -> R<Option<String>> {
+    optional_arg(args, key, "a string", |v| v.as_str().map(String::from))
+}
+
+fn optional_count(args: &Value, key: &str) -> R<Option<u64>> {
+    optional_arg(args, key, "a non-negative whole number", Value::as_u64)
+}
+
+/// A flag: false when absent or null.
+fn optional_bool(args: &Value, key: &str) -> R<bool> {
+    optional_arg(args, key, "true or false", Value::as_bool).map(|flag| flag == Some(true))
 }
 
 /// The `deadline` argument of `switch`: absent, or whole seconds in `1..=MAX_DEADLINE`. Checked at the boundary, so
@@ -503,7 +529,7 @@ pub struct Status {
     pub permanent: Option<String>,
     pub current: Option<String>,
     pub pending: Option<Pending>,
-    /// The transaction step in progress.
+    /// The step in progress: a transaction step, else one that moves the live process (see DESIGN.md).
     pub busy: Option<String>,
     pub process: Process,
 }
@@ -841,6 +867,52 @@ mod tests {
                 )
             );
         }
+        // A present argument of the wrong type is refused instead of read as absent.
+        for (request, says) in [
+            (
+                r#"{"command":"confirm","args":{"generation":7}}"#,
+                "the argument `generation` must be a string, not 7",
+            ),
+            (
+                r#"{"command":"stage","args":{"ref":["main"]}}"#,
+                r#"the argument `ref` must be a string, not ["main"]"#,
+            ),
+            (
+                r#"{"command":"rollback","args":{"keep_storage":"true"}}"#,
+                r#"the argument `keep_storage` must be true or false, not "true""#,
+            ),
+            (
+                r#"{"command":"log","args":{"limit":-1}}"#,
+                "the argument `limit` must be a non-negative whole number, not -1",
+            ),
+            (
+                r#"{"command":"log","args":{"follow":1}}"#,
+                "the argument `follow` must be true or false, not 1",
+            ),
+            (
+                r#"{"command":"subscribe","args":{"limit":"5"}}"#,
+                r#"the argument `limit` must be a non-negative whole number, not "5""#,
+            ),
+            (
+                r#"{"command":"subscribe","args":{"since":1.5}}"#,
+                "the argument `since` must be a non-negative whole number, not 1.5",
+            ),
+        ] {
+            assert_eq!(refused(request), says, "{request}");
+        }
+        // Null still means absent, and keys no command uses are ignored.
+        assert_eq!(
+            Request::parse(r#"{"command":"confirm","args":{"generation":null,"other":[1]}}"#)
+                .unwrap(),
+            Request::Confirm { generation: None }
+        );
+        assert_eq!(
+            Request::parse(r#"{"command":"log","args":{"limit":null,"follow":null}}"#).unwrap(),
+            Request::Log {
+                limit: None,
+                follow: false
+            }
+        );
     }
 
     #[test]

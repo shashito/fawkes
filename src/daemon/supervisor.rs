@@ -353,7 +353,12 @@ impl Daemon {
             .ok_or_else(|| not_found(id))?;
         let vars = self.vars(m.port, &m.home, &g.dir, id);
         let env = self.app_env(&m, &vars, "live");
-        std::fs::create_dir_all(&m.home)?;
+        std::fs::create_dir_all(&m.home).map_err(|e| {
+            err(
+                ErrorCode::StartFailed,
+                format!("cannot create the home {} for {id}: {e}", m.home.display()),
+            )
+        })?;
         let child = process::spawn(
             &vars.expand_command(&m.start),
             &g.dir,
