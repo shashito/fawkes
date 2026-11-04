@@ -2,9 +2,12 @@
 //!
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
-//! Lock order is `inner` before `manifest` before `log` before `hub` (`step_pgids` is only ever taken alone), and
-//! nothing waits for another thread while holding one. Events go to the hub while `log` is held, so every subscriber
-//! sees them once and in `seq` order.
+//! Lock order is `inner` before `manifest` before `log` before `hub` (`step_pgids` is only ever taken alone, and
+//! `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding one. Events
+//! go to the hub while `log` is held, so every subscriber sees them once and in `seq` order.
+//!
+//! Nothing polls while the daemon is idle: the accept loop sleeps in `poll(2)` on the socket and a pipe the signal
+//! handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.
 //!
 //! Panics abort the process (`Cargo.toml`): the init system restarts the daemon and its startup recovers a pending
 //! switch, so no thread ever carries on past a broken invariant and no mutex is ever poisoned.
@@ -20,15 +23,18 @@ use crate::manifest::{Manifest, Vars};
 use crate::process;
 use crate::protocol::{ErrorCode, Event, EventKind, LastExit, Out, Pending, R, err};
 use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time};
+use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{FlockOperation, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
@@ -203,7 +209,7 @@ impl Drop for Busy<'_> {
             inner.moving = None;
         }
         drop(inner);
-        self.daemon.broadcast(&Msg::Changed);
+        self.daemon.changed();
     }
 }
 
@@ -240,6 +246,50 @@ impl Hub {
     }
 }
 
+/// What the supervisor sleeps on: a count of changes, and a condvar to wait for the next one. Every change
+/// subscribers hear of (`Daemon::changed`) moves it, since whatever changes the picture may be for the supervisor to
+/// act on, and so do an exit of the live app and the start of shutdown. A waiter reads the count before it looks at
+/// the state, so a change made after the look ends the wait, and none is lost in between.
+struct Wake {
+    count: Mutex<u64>,
+    moved: Condvar,
+}
+
+impl Wake {
+    fn new() -> Wake {
+        Wake {
+            count: Mutex::new(0),
+            moved: Condvar::new(),
+        }
+    }
+
+    fn seen(&self) -> u64 {
+        *lock(&self.count)
+    }
+
+    fn notify(&self) {
+        *lock(&self.count) += 1;
+        self.moved.notify_all();
+    }
+
+    /// Sleep until the count has moved past `seen`, or `timeout` has passed (without one, for as long as it takes).
+    fn wait(&self, seen: u64, timeout: Option<Duration>) {
+        let count = lock(&self.count);
+        let unmoved = |count: &mut u64| *count == seen;
+        // Under `panic = "abort"` the mutex is never poisoned.
+        let poisoned = match timeout {
+            Some(timeout) => self
+                .moved
+                .wait_timeout_while(count, timeout, unmoved)
+                .is_err(),
+            None => self.moved.wait_while(count, unmoved).is_err(),
+        };
+        if poisoned {
+            std::process::abort();
+        }
+    }
+}
+
 pub struct Daemon {
     /// Set by SIGTERM and SIGINT.
     shutdown: Arc<AtomicBool>,
@@ -253,6 +303,7 @@ pub struct Daemon {
     inner: Mutex<Inner>,
     log: Mutex<EventLog>,
     hub: Hub,
+    wake: Wake,
     /// Process groups of running tests and installs, killed on shutdown.
     step_pgids: Mutex<Vec<u32>>,
 }
@@ -283,11 +334,17 @@ impl Daemon {
     /// Run the daemon until SIGTERM or SIGINT.
     pub fn run(manifest_path: PathBuf, socket: Option<PathBuf>) -> Result<(), String> {
         // First of all, so a SIGTERM during startup still ends in `shutdown`'s cleanup. signal-hook installs them
-        // with sigaction and SA_RESTART; the handlers only set a flag.
+        // with sigaction and SA_RESTART; the handlers set a flag, then write a byte to `signals` to wake the accept
+        // loop. Actions run in the order they were registered, so a woken loop that has drained the pipe finds the
+        // flag set.
         let shutdown = Arc::new(AtomicBool::new(false));
         let reload = Arc::new(AtomicBool::new(false));
+        let (signals, signalled) =
+            UnixStream::pair().map_err(|e| format!("cannot create the signal pipe: {e}"))?;
         for (signal, flag) in [(SIGTERM, &shutdown), (SIGINT, &shutdown), (SIGHUP, &reload)] {
             signal_hook::flag::register(signal, flag.clone())
+                .and_then(|_| signalled.try_clone())
+                .and_then(|pipe| signal_hook::low_level::pipe::register(signal, pipe))
                 .map_err(|e| format!("cannot install the signal handlers: {e}"))?;
         }
         let manifest = Manifest::load(&manifest_path)?;
@@ -320,6 +377,7 @@ impl Daemon {
             inner: Mutex::new(Inner::new(store)),
             log: Mutex::new(log),
             hub: Hub(Mutex::new(Vec::new())),
+            wake: Wake::new(),
             step_pgids: Mutex::new(Vec::new()),
         });
         daemon.event(
@@ -378,39 +436,55 @@ impl Daemon {
         }
 
         let watcher = daemon.clone();
-        thread::spawn(move || {
-            for pass in 0u64.. {
-                if watcher.shutting_down() {
-                    break;
-                }
-                sleep(Duration::from_millis(100));
-                watcher.tick();
-                if pass % 100 == 0 {
-                    watcher.cap_app_log();
-                }
-            }
-        });
+        thread::spawn(move || watcher.watch());
 
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        while !daemon.shutting_down() {
-            if daemon.reload.swap(false, Ordering::SeqCst) {
-                daemon.reload_manifest();
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let daemon = daemon.clone();
-                    thread::spawn(move || daemon.handle(stream));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    sleep(Duration::from_millis(20));
-                }
-                Err(e) => {
-                    daemon.event(EventKind::Error, None, format!("accept failed: {e}"));
-                }
-            }
-        }
+        daemon.serve(&listener, signals)?;
         daemon.shutdown();
         Ok(())
+    }
+
+    /// Accept clients and act on SIGHUP until SIGTERM or SIGINT, asleep in `poll` in between.
+    fn serve(
+        self: &Arc<Self>,
+        listener: &UnixListener,
+        mut signals: UnixStream,
+    ) -> Result<(), String> {
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        signals.set_nonblocking(true).map_err(|e| e.to_string())?;
+        loop {
+            // Drained before the flags are read: a signal that comes after the drain leaves a byte that ends the
+            // next `poll` at once.
+            while signals.read(&mut [0; 64]).is_ok_and(|n| n > 0) {}
+            if self.shutting_down() {
+                return Ok(());
+            }
+            if self.reload.swap(false, Ordering::SeqCst) {
+                self.reload_manifest();
+            }
+            let failed = match listener.accept() {
+                Ok((stream, _)) => {
+                    let daemon = self.clone();
+                    thread::spawn(move || daemon.handle(stream));
+                    None
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut ready = [
+                        PollFd::new(listener, PollFlags::IN),
+                        PollFd::new(&signals, PollFlags::IN),
+                    ];
+                    match poll(&mut ready, None) {
+                        Ok(_) | Err(rustix::io::Errno::INTR) => None,
+                        Err(e) => Some(format!("cannot wait for clients: {e}")),
+                    }
+                }
+                Err(e) => Some(format!("accept failed: {e}")),
+            };
+            if let Some(e) = failed {
+                self.event(EventKind::Error, None, e);
+                // An error that persists (out of file descriptors) would otherwise repeat as fast as it fails.
+                sleep(Duration::from_millis(100));
+            }
+        }
     }
 
     /// Carry out the rollback that startup found pending or under way; `reason` applies when it was not decided yet.
@@ -492,12 +566,19 @@ impl Daemon {
 
     /// Stop the live app and any test and clean up; the generations keep their state.
     fn shutdown(&self) {
+        // The supervisor and every other waiter on `wake` see the flag now.
+        self.wake.notify();
         // A switch, rollback or restart in flight finishes first (start_live refuses from now on), so no app it
-        // starts outlives the daemon.
+        // starts outlives the daemon. Its end frees the live slot, which moves `wake`.
         let give_up =
             Instant::now() + Duration::from_secs_f64(2.0 * self.manifest().stop_timeout + 5.0);
-        while self.inner().moving.is_some() && Instant::now() < give_up {
-            sleep(Duration::from_millis(20));
+        loop {
+            let seen = self.wake.seen();
+            let left = give_up.saturating_duration_since(Instant::now());
+            if self.inner().moving.is_none() || left.is_zero() {
+                break;
+            }
+            self.wake.wait(seen, Some(left));
         }
         let app = self.inner().take_running();
         if let Some(app) = app {
@@ -628,6 +709,12 @@ impl Daemon {
         self.hub.send(msg);
     }
 
+    /// Generations, the live process or a slot changed: subscribers get fresh status, and the supervisor looks again.
+    fn changed(&self) {
+        self.broadcast(&Msg::Changed);
+        self.wake.notify();
+    }
+
     /// Record an event: stderr, events.jsonl, every subscriber. Anything but progress also changes the picture.
     fn event(
         &self,
@@ -659,7 +746,7 @@ impl Daemon {
             event
         };
         if kind != EventKind::Progress {
-            self.broadcast(&Msg::Changed);
+            self.changed();
         }
         event
     }
@@ -690,7 +777,7 @@ impl Daemon {
             inner.moving = Some(step.into());
         }
         drop(inner);
-        self.broadcast(&Msg::Changed);
+        self.changed();
         Ok(Busy { daemon: self, slot })
     }
 

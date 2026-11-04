@@ -22,6 +22,13 @@ The daemon runs one transaction step (stage, test, switch, rollback) at a time; 
 (`reap` after a crash, `restart` after its backoff, an automatic `rollback`). `status`, `log`, `history` and
 `confirm` are always answered.
 
+The daemon is a few threads and no async runtime: one accepts clients, one per client answers it, one supervises
+the app, one per running child waits for its exit, and short-lived ones run health checks and read a step's output.
+None of them polls while the daemon is idle. The accept thread sleeps in `poll(2)` on the socket and on a pipe the
+signal handlers write to; the supervisor sleeps until the app exits, a request changes something, or its next timer
+runs out (a crash restart's backoff, the confirm deadline, and every 10 s while an app runs the `app.log` size cap).
+An idle daemon without an app does not wake at all.
+
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
 `daemon` event naming the changed fields, or an `error` event saying why it was refused:
@@ -79,8 +86,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    write of the old generation lands after the snapshot, so a rollback loses nothing the old generation wrote.
 4. Mark the target `current` and write the step `pending` with its deadline (absolute time) to `state.json`, then
    start the target on the live port. The deadline is wall-clock time, so it survives a daemon restart, and it also
-   runs on while the machine sleeps: a switch whose deadline passes during a sleep rolls back on wake, however
-   healthy the new generation was. Confirm before closing the lid, or give a longer `--deadline`. The intent is on disk before any process of the target exists, so a daemon
+   runs on while the machine sleeps: a switch whose deadline passes during a sleep rolls back on wake (within a
+   second, as after a change of the system clock), however healthy the new generation was. Confirm before closing the lid, or give a longer `--deadline`. The intent is on disk before any process of the target exists, so a daemon
    that dies from here on rolls the switch back at its next start. If the target cannot be started, the switch is
    rolled back at once (below).
 5. Health-check it in the background and log `healthy` when it passes. Health never confirms: only `confirm` does.
@@ -586,13 +593,17 @@ For the daemon and CLI, plus ratatui for the TUI (see above), each replacing som
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
 - **rusqlite** (features `bundled`, `backup`): the SQLite online backup API for consistent snapshots of live
   databases, including WAL contents. `bundled` builds a known SQLite instead of depending on the system one.
-- **rustix** (features `fs`, `net`, `param`, `process`): safe wrappers for the system calls std lacks: `flock` for
-  the state lock, signalling a process group (std only sends SIGKILL to one pid), `umask` around binding the socket,
-  a peeking `recv` to notice a closed client and the clock tick on Linux. Its typed `Pid` refuses 0, so a corrupt
+- **rustix** (features `event`, `fs`, `net`, `param`, `process`): safe wrappers for the system calls std lacks:
+  `flock` for the state lock, signalling a process group (std only sends SIGKILL to one pid), `umask` around binding
+  the socket, a peeking `recv` to notice a closed client, the clock tick on Linux, `poll` for the accept loop, and
+  `waitid` with `WNOWAIT`, which waits for a child's exit without reaping it, so the `Child` that owns it still
+  reaps it. One waiting thread per child is the same code on macOS and Linux, where kqueue's `NOTE_EXIT` and a
+  pidfd would need one path each. Its typed `Pid` refuses 0, so a corrupt
   pid never signals our own group. The tests signal processes through it too, without `unsafe`. Already in the tree
   through ratatui's crossterm.
-- **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags, installed with `sigaction` and
-  `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
+- **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags and then write to the accept
+  loop's self-pipe, installed with `sigaction` and `SA_RESTART`; hand-written handlers would need `unsafe` for the
+  same thing. Also already in the tree.
 - **jiff** (no default features; `std`, `tz-system`, `tzdb-zoneinfo`): UTC timestamps in `state.json`, the event
   log and the protocol, and the TUI's local clock, read from the system's zone database. It replaces hand-written
   calendar arithmetic and the `localtime_r`/`tzset` calls, which needed `unsafe` and had to load the zone before

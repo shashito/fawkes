@@ -179,6 +179,20 @@ APP_HOME = "{{home}}"
             .unwrap_or_else(|e| panic!("{signal:?} could not be sent to the daemon: {e}"));
     }
 
+    /// Wait up to `within` for the daemon to exit by itself (after a SIGTERM); whether it did.
+    pub fn daemon_exits_within(&mut self, within: Duration) -> bool {
+        let daemon = self.daemon.as_mut().expect("the daemon was started");
+        let give_up = Instant::now() + within;
+        while daemon.try_wait().unwrap().is_none() {
+            if Instant::now() >= give_up {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.daemon = None;
+        true
+    }
+
     /// A connection to the daemon's socket, for a test that decides when its request goes out.
     pub fn connect(&self) -> UnixStream {
         let stream = UnixStream::connect(self.dir.join("s/fawkes.sock")).unwrap();

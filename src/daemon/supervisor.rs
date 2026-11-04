@@ -1,4 +1,8 @@
 //! The supervision loop: reaping and restarting the app, the health check, and the process and status reports.
+//!
+//! The loop sleeps on the daemon's `wake` between passes. An exit of the live app wakes it (`process::on_exit`), and
+//! so does every change subscribers hear of; the timers it keeps (a crash restart's backoff, the confirm deadline,
+//! the app-log cap) bound the sleep. An idle daemon without an app wakes for nothing.
 
 use super::{APP_LOG_BYTES, App, Daemon, Inner, Live, Slot, Why, tenths};
 use crate::process;
@@ -8,9 +12,9 @@ use crate::protocol::{
 use crate::state::{Txn, format_time, now_secs, parse_time, with_suffix};
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ------------------------------------------------ restart policy
 
@@ -59,20 +63,100 @@ fn outcome(failed_starts: u32, pending: bool, max_failed_starts: u32) -> Outcome
     }
 }
 
+// ------------------------------------------------ timers
+
+/// How often the live generation's `logs/app.log` is measured against `APP_LOG_BYTES`.
+const CAP_EVERY: Duration = Duration::from_secs(10);
+
+/// The pause after a pass that acted, before the next pass looks again. It bounds a step that keeps failing (a
+/// rollback that cannot write state.json) to ten tries a second instead of a spin.
+const AFTER_ACTING: Duration = Duration::from_millis(100);
+
+/// The longest the supervisor sleeps while a switch awaits its confirm deadline. The deadline is wall-clock time and
+/// the sleep is not: it runs on a monotonic clock, which neither a change of the system clock nor a machine asleep
+/// moves on. Looking at the wall clock again every second notices either within a second; an idle daemon has no
+/// deadline, so this costs it nothing.
+const WALL_CLOCK_LOOK: Duration = Duration::from_secs(1);
+
+/// How long the supervisor may sleep before one of its timers runs out: a crash restart's backoff, which ends at
+/// `backoff` on the monotonic clock, or a pending switch's `deadline`, in seconds since the epoch. None when no timer
+/// runs: it sleeps until something changes. Pure: the caller passes both clocks.
+fn sleep_for(
+    backoff: Option<Instant>,
+    deadline: Option<u64>,
+    now: Instant,
+    wall: SystemTime,
+) -> Option<Duration> {
+    let restart = backoff.map(|until| until.saturating_duration_since(now));
+    let confirm = deadline.map(|secs| {
+        (UNIX_EPOCH + Duration::from_secs(secs))
+            .duration_since(wall)
+            .unwrap_or(Duration::ZERO)
+            .min(WALL_CLOCK_LOOK)
+    });
+    [restart, confirm].into_iter().flatten().min()
+}
+
+/// What a supervision pass found to do now, or how long nothing is due.
+enum Due {
+    Now(&'static str),
+    /// Nothing until a timer runs out after this long (`sleep_for`), or something changes.
+    Later(Option<Duration>),
+}
+
+/// What a supervision pass did, which decides how long the supervisor sleeps after it.
+enum Pass {
+    Idle(Option<Duration>),
+    /// Something was due, but another step holds the live slot: freeing it moves `wake`.
+    Blocked,
+    Acted,
+}
+
 impl Daemon {
+    /// The supervision thread: a pass whenever `wake` moves or a timer runs out, until shutdown.
+    pub(super) fn watch(self: &Arc<Self>) {
+        let mut next_cap = Instant::now() + CAP_EVERY;
+        while !self.shutting_down() {
+            let seen = self.wake.seen();
+            let pass = self.tick();
+            let now = Instant::now();
+            if now >= next_cap {
+                self.cap_app_log();
+                next_cap = now + CAP_EVERY;
+            }
+            let (seen, sleep) = match pass {
+                Pass::Idle(sleep) => (seen, sleep),
+                Pass::Blocked => (seen, None),
+                // The pass's own steps moved the count: only a change after it ends the pause early.
+                Pass::Acted => (self.wake.seen(), Some(AFTER_ACTING)),
+            };
+            // Only while an app runs, so a daemon without one has no timer at all.
+            let cap = self
+                .inner()
+                .running()
+                .is_some()
+                .then(|| next_cap.saturating_duration_since(now));
+            self.wake
+                .wait(seen, [sleep, cap].into_iter().flatten().min());
+        }
+    }
+
     /// One supervision pass: reap the app, roll back a pending switch that is dead, overdue or unhealthy, restart a
     /// crash. Each of them moves the live process, so the pass holds the live slot like `stop` or `restart` do: no
     /// start, stop, switch or rollback runs while it cleans up after a crash. A stage or test never delays it.
-    pub(super) fn tick(self: &Arc<Self>) {
-        let Some(step) = self.due() else { return };
-        // Busy: the step holding the slot deals with the live process itself, or the next pass does.
+    fn tick(self: &Arc<Self>) -> Pass {
+        let step = match self.due() {
+            Due::Now(step) => step,
+            Due::Later(sleep) => return Pass::Idle(sleep),
+        };
+        // Busy: the step holding the slot deals with the live process itself, or the pass after it does.
         let Ok(_busy) = self.begin(step, Slot::Live) else {
-            return;
+            return Pass::Blocked;
         };
         let (stragglers, rollback) = {
             let mut inner = self.inner();
             if self.shutting_down() {
-                return;
+                return Pass::Acted;
             }
             let stragglers = self.reap(&mut inner);
             self.decide_overdue(&mut inner);
@@ -91,7 +175,7 @@ impl Daemon {
             if let Err(e) = self.rollback_pending(&mut Out::none(), &reason) {
                 self.event(EventKind::Error, None, e.message);
             }
-            return;
+            return Pass::Acted;
         }
         let mut inner = self.inner();
         if Self::restart_due(&inner)
@@ -99,13 +183,15 @@ impl Daemon {
         {
             self.start_or_give_up(&mut inner, &id, Why::Crash);
         }
+        Pass::Acted
     }
 
-    /// What a supervision pass has to do, named for `busy`; None in the usual case, so an idle pass takes no slot.
-    fn due(&self) -> Option<&'static str> {
+    /// What a supervision pass has to do, named for `busy`; in the usual case nothing, so an idle pass takes no slot,
+    /// and how long nothing will be due.
+    fn due(&self) -> Due {
         let mut inner = self.inner();
         if self.shutting_down() {
-            return None;
+            return Due::Later(None);
         }
         let exited = inner
             .running_mut()
@@ -119,13 +205,29 @@ impl Daemon {
             _ => false,
         };
         if rollback {
-            Some("rollback")
+            Due::Now("rollback")
         } else if exited {
-            Some("reap")
+            Due::Now("reap")
         } else if Self::restart_due(&inner) {
-            Some("restart")
+            Due::Now("restart")
         } else {
-            None
+            // The same conditions as above, so no timer that has run out is left to wake the next pass at once:
+            // a backoff counts only between switches, and a deadline only when it can be read.
+            let state = inner.store.state();
+            let backoff = match &inner.live {
+                Live::Backoff { until, .. } if state.txn.is_none() => Some(*until),
+                _ => None,
+            };
+            let deadline = match &state.txn {
+                Some(Txn::Pending(pending)) => parse_time(&pending.deadline),
+                _ => None,
+            };
+            Due::Later(sleep_for(
+                backoff,
+                deadline,
+                Instant::now(),
+                SystemTime::now(),
+            ))
         }
     }
 
@@ -258,6 +360,14 @@ impl Daemon {
         )
         .map_err(|e| err(ErrorCode::StartFailed, format!("cannot start {id}: {e}")))?;
         let pid = child.id();
+        // Its exit wakes the supervisor to reap it, and ends the health check's wait between two tries.
+        let (tell_health, exited) = mpsc::channel();
+        let daemon = self.clone();
+        process::on_exit(&child, move || {
+            daemon.wake.notify();
+            // The health check may be over already.
+            let _ = tell_health.send(());
+        });
 
         if why == Why::Fresh {
             if inner.last_started.as_deref() != Some(id) {
@@ -292,9 +402,15 @@ impl Daemon {
         let daemon = self.clone();
         let id = id.to_string();
         thread::spawn(move || {
-            let result = process::wait_healthy(&check, &code, &env, interval, timeout, || {
-                daemon.is_running(pid)
-            });
+            let result = process::wait_healthy(
+                &check,
+                &code,
+                &env,
+                interval,
+                timeout,
+                || daemon.is_running(pid),
+                &exited,
+            );
             match result {
                 Ok(()) => {
                     daemon.event(EventKind::Healthy, Some(&id), "health check passed");
@@ -430,7 +546,7 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Hub;
+    use super::super::{Hub, Wake};
     use super::*;
     use crate::manifest::Manifest;
     use crate::protocol::Pending;
@@ -485,6 +601,52 @@ mod tests {
         }
     }
 
+    /// The supervisor sleeps exactly until its next timer, with no polling interval to round it to; the wall-clock
+    /// deadline is looked at again at least every `WALL_CLOCK_LOOK`, so a clock that jumps is noticed within it.
+    #[test]
+    fn the_supervisor_sleeps_until_its_next_timer_and_looks_at_the_wall_clock_every_second() {
+        let now = Instant::now();
+        let wall = UNIX_EPOCH + Duration::from_millis(1_000_000_600);
+        let deadline_in = |seconds: u64| Some(1_000_000 + seconds);
+        let ms = Duration::from_millis;
+
+        assert_eq!(sleep_for(None, None, now, wall), None, "idle: no timer");
+        assert_eq!(
+            sleep_for(Some(now + ms(1500)), None, now, wall),
+            Some(ms(1500))
+        );
+        // The deadline is a whole second, 400 ms after `wall`: the sleep ends on it, not a poll after it.
+        assert_eq!(sleep_for(None, deadline_in(1), now, wall), Some(ms(400)));
+        assert_eq!(
+            sleep_for(Some(now + ms(300)), deadline_in(1), now, wall),
+            Some(ms(300)),
+            "the earlier timer"
+        );
+        assert_eq!(
+            sleep_for(None, deadline_in(120), now, wall),
+            Some(WALL_CLOCK_LOOK),
+            "a far deadline is looked at again within a second"
+        );
+        // The clock jumped past the deadline during a sleep, or a backoff ran out: no sleep at all.
+        assert_eq!(
+            sleep_for(None, deadline_in(0), now, wall),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            sleep_for(None, deadline_in(1), now, wall + Duration::from_secs(3600)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            sleep_for(Some(now), None, now + ms(5), wall),
+            Some(Duration::ZERO)
+        );
+        // A clock set back an hour puts the deadline an hour away, and it is still looked at every second.
+        assert_eq!(
+            sleep_for(None, deadline_in(1), now, wall - Duration::from_secs(3600)),
+            Some(WALL_CLOCK_LOOK)
+        );
+    }
+
     /// A daemon over a scratch state directory, with no socket and no supervision thread.
     fn scratch_daemon(dir: &Path) -> Daemon {
         let manifest_path = dir.join("fawkes.toml");
@@ -511,6 +673,7 @@ mod tests {
             log: Mutex::new(EventLog::open(paths.events()).unwrap()),
             paths,
             hub: Hub(Mutex::new(Vec::new())),
+            wake: Wake::new(),
             step_pgids: Mutex::new(Vec::new()),
         }
     }
