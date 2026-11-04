@@ -573,7 +573,7 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 
 ## Crates
 
-Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
+For the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
@@ -587,12 +587,15 @@ Seven for the daemon and CLI, plus ratatui for the TUI (see above), each replaci
   through ratatui's crossterm.
 - **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags, installed with `sigaction` and
   `SA_RESTART`; hand-written handlers would need `unsafe` for the same thing. Also already in the tree.
-- **libc:** what neither std nor rustix has: `localtime_r` (and `tzset`, declared by hand because the crate has no
-  binding for it on macOS) for the TUI's local clock, and a process's start time for the leftover-app check
-  (`proc_pidinfo` on macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
+- **jiff** (no default features; `std`, `tz-system`, `tzdb-zoneinfo`): UTC timestamps in `state.json`, the event
+  log and the protocol, and the TUI's local clock, read from the system's zone database. It replaces hand-written
+  calendar arithmetic and the `localtime_r`/`tzset` calls, which needed `unsafe` and had to load the zone before
+  any thread started.
+- **libc:** what neither std nor rustix has: a process's start time for the leftover-app check (`proc_pidinfo` on
+  macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
 
 Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
-`std::net::TcpStream` to localhost), UTC timestamps (days-to-civil conversion), threads instead of an async runtime.
+`std::net::TcpStream` to localhost), threads instead of an async runtime.
 
 ## Later
 

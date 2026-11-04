@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.99"
 
 [dependencies]
+jiff = { version = "0.2.39", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.191"
 ratatui = "0.30.2"
 rusqlite = { version = "0.41.1", features = ["bundled", "backup"] }

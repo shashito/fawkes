@@ -488,16 +488,7 @@ impl App {
 
 // ------------------------------------------------------------ the loop
 
-// SAFETY: `tzset` is declared as POSIX has it: no arguments and no result, so the signature cannot be mistaken.
-unsafe extern "C" {
-    /// Not in the `libc` crate; POSIX, and in the C library on every platform Fawkes runs on.
-    fn tzset();
-}
-
 pub fn run(target: &Target) -> u8 {
-    // SAFETY: this runs before the TUI starts its threads, so none can be inside `localtime_r`; `draw::local_clock` relies on
-    // the zone data this loads once, as `localtime_r` is not required to.
-    unsafe { tzset() };
     let (tx, rx) = mpsc::channel();
     match target {
         Target::One(socket) => {
