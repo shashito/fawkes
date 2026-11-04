@@ -784,8 +784,7 @@ impl Daemon {
             ),
         );
         if let Some(permanent) = &permanent
-            && !self.start_or_give_up(&mut inner, permanent, Why::Fresh)
-            && self.shutting_down()
+            && self.start_or_give_up(&mut inner, permanent, Why::Fresh)
         {
             return Err(left_to_next_start(&id, permanent));
         }
@@ -830,8 +829,7 @@ impl Daemon {
             ),
         );
         if let Some(permanent) = &permanent
-            && !self.start_or_give_up(&mut inner, permanent, Why::Fresh)
-            && self.shutting_down()
+            && self.start_or_give_up(&mut inner, permanent, Why::Fresh)
         {
             return Err(left_to_next_start(&id, permanent));
         }

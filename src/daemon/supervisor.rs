@@ -172,9 +172,10 @@ impl Daemon {
             self.forget_pid_file();
         }
         if let Some(reason) = rollback {
-            // A daemon that is shutting down has already logged what it did not start.
+            // `busy` is a rollback that ended while the daemon shuts down: `start_or_give_up` logged what it did
+            // not start.
             if let Err(e) = self.rollback_pending(&mut Out::none(), &reason)
-                && !self.shutting_down()
+                && e.code != ErrorCode::Busy
             {
                 self.event(EventKind::Error, None, e.message);
             }
@@ -429,7 +430,7 @@ impl Daemon {
 
     /// `start_live` of the permanent generation `id`, giving the app up when it cannot start: the failure is logged
     /// and nothing retries it. A daemon on its way out starts nothing, which is no failure of the generation: its
-    /// next start runs it. Says whether the app started.
+    /// next start runs it. Says whether the start was left to that next start.
     pub(super) fn start_or_give_up(
         self: &Arc<Self>,
         inner: &mut Inner,
@@ -437,7 +438,7 @@ impl Daemon {
         why: Why,
     ) -> bool {
         let Err(e) = self.start_live(inner, id, why) else {
-            return true;
+            return false;
         };
         if self.shutting_down() {
             self.event(
@@ -447,10 +448,10 @@ impl Daemon {
                     "{id} not started: the daemon is shutting down, and its next start runs {id}"
                 ),
             );
-        } else {
-            inner.live = Live::Failed;
-            self.event(EventKind::Failed, Some(id), e.message);
+            return true;
         }
+        inner.live = Live::Failed;
+        self.event(EventKind::Failed, Some(id), e.message);
         false
     }
 

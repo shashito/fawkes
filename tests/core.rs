@@ -1038,16 +1038,13 @@ fn a_daemon_stopped_during_a_rollback_leaves_the_permanent_generation_to_its_nex
     h.ok(&["switch", "g2", "--deadline", "120"]);
     h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
 
-    let daemon_pid =
-        Pid::from_raw(i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap()).unwrap();
     let (code, answer) = std::thread::scope(|scope| {
         let rollback = scope.spawn(|| h.fk(&["rollback"]));
         // g2 takes 1.5 s to leave after SIGTERM: the window for the daemon's own SIGTERM.
         h.wait("the rollback to stop g2", 10, || {
             !messages_starting(&h, "progress", "rolling back g2").is_empty()
         });
-        // The pid is the daemon this test started.
-        kill_process(daemon_pid, Signal::TERM).unwrap();
+        h.signal_daemon(Signal::TERM);
         rollback.join().unwrap()
     });
     assert_eq!(
@@ -1090,16 +1087,13 @@ fn a_daemon_killed_during_a_switch_recovers_to_the_permanent_generation() {
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
 
-    let daemon_pid =
-        Pid::from_raw(i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap()).unwrap();
     let (code, answer) = std::thread::scope(|scope| {
         let switch = scope.spawn(|| h.fk(&["switch", "g2"]));
         // g1 takes 1.5 s to leave after SIGTERM: the window for the kill.
         h.wait("the switch to stop g1", 10, || {
             messages(&h, "progress").contains(&"stopping g1".to_string())
         });
-        // The pid is the daemon this test started.
-        kill_process(daemon_pid, Signal::KILL).unwrap();
+        h.signal_daemon(Signal::KILL);
         switch.join().unwrap()
     });
     assert_ne!(code, 0, "{answer}");

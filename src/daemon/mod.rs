@@ -37,7 +37,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle, sleep};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 /// Lock a mutex. Under `panic = "abort"` no mutex is ever poisoned, so the error arm cannot run.
@@ -258,16 +258,19 @@ const ECHO_QUEUE: usize = 1024;
 struct Echo(SyncSender<String>);
 
 impl Echo {
-    /// Start the thread that writes to `to`. It ends once the `Echo` is gone and what was queued is written.
-    fn start(mut to: impl Write + Send + 'static) -> (Echo, JoinHandle<()>) {
+    /// Start the thread that writes to `to`. It ends once the `Echo` is gone and what was queued is written, which
+    /// disconnects the returned receiver.
+    fn start(mut to: impl Write + Send + 'static) -> (Echo, Receiver<()>) {
         let (lines, queued) = mpsc::sync_channel::<String>(ECHO_QUEUE);
-        let writer = thread::spawn(move || {
+        let (finished, ended) = mpsc::channel();
+        thread::spawn(move || {
+            let _finished = finished;
             for line in queued {
                 // A failed write is no reason to stop: a terminal on hold takes lines again once it is released.
                 let _ = writeln!(to, "{line}");
             }
         });
-        (Echo(lines), writer)
+        (Echo(lines), ended)
     }
 
     fn line(&self, line: String) {
@@ -336,8 +339,27 @@ pub struct Daemon {
     wake: Wake,
     /// Process groups of running tests and installs, killed on shutdown.
     step_pgids: Mutex<Vec<u32>>,
-    /// Taken at the end of `run`, so stderr's writer finishes what is queued and ends.
+    /// Taken at the end of `run` (`Flush`), so stderr's writer finishes what is queued and ends.
     echo: Mutex<Option<Echo>>,
+}
+
+/// How long a daemon on its way out waits for stderr to take its last lines.
+const FLUSH_FOR: Duration = Duration::from_secs(1);
+
+/// Lets stderr's writer finish the queued lines (the last of them `stopped`, or why startup failed) when `run`
+/// returns however it returns, for at most `FLUSH_FOR`: a stderr that does not read must not keep the state lock, and
+/// with it the next daemon, waiting.
+struct Flush {
+    daemon: Arc<Daemon>,
+    finished: Receiver<()>,
+}
+
+impl Drop for Flush {
+    fn drop(&mut self) {
+        lock(&self.daemon.echo).take();
+        // Disconnected once the writer has ended; a timeout leaves the rest unwritten, as events.jsonl has it.
+        let _ = self.finished.recv_timeout(FLUSH_FOR);
+    }
 }
 
 /// The daemon's socket and its `<fawkes_home>/run/<name>.sock` link, removed when `run` returns however it returns,
@@ -397,7 +419,7 @@ impl Daemon {
         published.run_link = Some(register(&manifest.name, &socket)?);
         let (store, recovered) = Store::load(paths.state_json())?;
         let bin = std::env::current_exe().map_err(|e| e.to_string())?;
-        let (echo, echo_writer) = Echo::start(std::io::stderr());
+        let (echo, echo_finished) = Echo::start(std::io::stderr());
 
         let daemon = Arc::new(Daemon {
             shutdown,
@@ -414,6 +436,10 @@ impl Daemon {
             step_pgids: Mutex::new(Vec::new()),
             echo: Mutex::new(Some(echo)),
         });
+        let _flush = Flush {
+            daemon: daemon.clone(),
+            finished: echo_finished,
+        };
         daemon.event(
             EventKind::Daemon,
             None,
@@ -474,10 +500,6 @@ impl Daemon {
 
         daemon.serve(&listener, signals)?;
         daemon.shutdown();
-        // The last lines (`stopped`) still reach the terminal. Waits only while stderr blocks, and by now the app is
-        // stopped and nothing is left to supervise.
-        lock(&daemon.echo).take();
-        let _ = echo_writer.join();
         Ok(())
     }
 
@@ -528,9 +550,9 @@ impl Daemon {
     /// Carry out the rollback that startup found pending or under way; `reason` applies when it was not decided yet.
     fn roll_back_at_start(self: &Arc<Self>, reason: &str) -> Result<(), String> {
         let _busy = self.begin("rollback", Slot::Both).map_err(|e| e.message)?;
-        // A daemon that is shutting down has already logged what it left undone, and what it did not start.
+        // `busy` is a rollback that ended while the daemon shuts down: `start_or_give_up` logged what it did not start.
         if let Err(e) = self.rollback_pending(&mut Out::none(), reason)
-            && !self.shutting_down()
+            && e.code != ErrorCode::Busy
         {
             self.event(EventKind::Error, None, e.message);
         }
@@ -706,7 +728,7 @@ impl Daemon {
             self.event(
                 EventKind::Error,
                 None,
-                format!("cannot write state.json: {e}"),
+                format!("saving state.json failed: {e}"),
             );
         }
         value

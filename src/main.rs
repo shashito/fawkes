@@ -206,7 +206,11 @@ fn main() -> ExitCode {
         }
     };
     // `daemon` returned above, so what is left but a request is `tui`.
-    let own_generation = std::env::var("FAWKES_GENERATION").ok();
+    // Only towards the daemon that started the caller: generation ids repeat across apps, so another daemon, picked
+    // with `--socket`, may have a pending generation of the same name.
+    let own_generation = std::env::var("FAWKES_GENERATION")
+        .ok()
+        .filter(|_| cli.socket.is_none());
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
         return ExitCode::from(tui::run(&tui::Target::One(socket)));
     };
