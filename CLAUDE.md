@@ -65,10 +65,11 @@ not built yet. Don't start one unless asked.
 
 The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, rusqlite, rustix, signal-hook, jiff,
 libc and ratatui, and tempfile for the tests. Argument parsing, the HTTP health check and the thread-based
-concurrency are hand-written on purpose. thiserror is agreed but not used yet; it goes into the Crates section when it
-is. Don't add any other crate
-(anyhow, clap, tokio, chrono, …) without asking. If one is agreed, add it to the Crates section
-too. Update a single dependency with `cargo update --precise`, never everything at once.
+concurrency are hand-written on purpose; errors stay `protocol::Error` and `String`, without anyhow or thiserror.
+
+A well-known crate is preferred over hand-written code when it removes a meaningful amount of code or `unsafe`, but
+ask before adding one (and never tokio: the threads are deliberate). Once one is agreed, add it to the Crates section
+with what it replaces. Update a single dependency with `cargo update --precise`, never everything at once.
 
 ## Code style
 
