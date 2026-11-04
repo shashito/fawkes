@@ -119,9 +119,8 @@ mod tests {
 
     #[test]
     fn snapshot_and_restore_wal_database() {
-        let root = std::env::temp_dir().join(format!("fk-storage-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (home, snap) = (root.join("home"), root.join("snap"));
+        let root = tempfile::tempdir().unwrap();
+        let (home, snap) = (root.path().join("home"), root.path().join("snap"));
         std::fs::create_dir_all(&home).unwrap();
         let storage = vec!["a.sqlite".to_string(), "later.sqlite".to_string()];
 
@@ -145,6 +144,5 @@ mod tests {
         }
 
         drop((live, later));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

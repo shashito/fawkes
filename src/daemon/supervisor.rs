@@ -520,9 +520,8 @@ mod tests {
     /// cannot see the difference: the decision would win the race against a client reading the event either way.
     #[test]
     fn an_unhealthy_pending_generation_has_its_rollback_decided_before_the_event_is_logged() {
-        let dir = std::env::temp_dir().join(format!("fk-unhealthy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let daemon = scratch_daemon(&dir);
         let child = std::process::Command::new("sleep")
             .arg("30")
@@ -559,6 +558,5 @@ mod tests {
         let mut app = daemon.inner().take_running().unwrap();
         app.child.kill().unwrap();
         app.child.wait().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

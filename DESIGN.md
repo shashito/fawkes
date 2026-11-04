@@ -594,6 +594,9 @@ For the daemon and CLI, plus ratatui for the TUI (see above), each replacing som
 - **libc:** what neither std nor rustix has: a process's start time for the leftover-app check (`proc_pidinfo` on
   macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
 
+For the tests only, **tempfile**: the unit tests' scratch directories, removed even when a test fails. The
+integration harness keeps `/tmp/fk<port>`, which belongs to its port claim and stays short for socket paths.
+
 Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
 `std::net::TcpStream` to localhost), threads instead of an async runtime.
 

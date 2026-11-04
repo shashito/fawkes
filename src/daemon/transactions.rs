@@ -995,10 +995,8 @@ mod tests {
 
     #[test]
     fn a_hanging_command_is_ended_with_everything_it_left_running() {
-        let dir = std::env::temp_dir().join(format!("fk-bounded-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let pid_file = dir.join("leader.pid");
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("leader.pid");
         // The shell starts a member in the background, then records its pid (its group's id) and waits: a written
         // file means the group has the member to end. A second leaves the shell ample time to get there under load.
         let mut command = Command::new("/bin/sh");
@@ -1024,6 +1022,5 @@ mod tests {
             !process::group_alive(pgid),
             "a member of the group survived"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -489,26 +489,17 @@ url = "http://127.0.0.1:{port}/"
 
     /// A temporary directory for manifests, removed on drop. Manifests loaded from one scratch resolve their paths
     /// against the same directory, so they can be compared by `reload`.
-    struct Scratch(PathBuf);
+    struct Scratch(tempfile::TempDir);
 
     impl Scratch {
-        fn new(label: &str) -> Scratch {
-            let dir =
-                std::env::temp_dir().join(format!("fk-manifest-{}-{label}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
+        fn new() -> Scratch {
+            Scratch(tempfile::tempdir().unwrap())
         }
 
         fn load(&self, text: &str) -> Result<Manifest, String> {
-            let path = self.0.join("fawkes.toml");
+            let path = self.0.path().join("fawkes.toml");
             std::fs::write(&path, text).unwrap();
             Manifest::load(&path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
 
@@ -520,14 +511,14 @@ url = "http://127.0.0.1:{port}/"
 
     #[test]
     fn a_valid_manifest_loads() {
-        let m = Scratch::new("valid").load(VALID).unwrap();
+        let m = Scratch::new().load(VALID).unwrap();
         assert_eq!(m.name, "app");
         assert!(m.home.is_absolute());
     }
 
     #[test]
     fn invalid_manifests_are_refused_naming_the_field() {
-        let scratch = Scratch::new("invalid_manifests_ar");
+        let scratch = Scratch::new();
         let cases = [
             (
                 "stop_timeout",
@@ -604,7 +595,7 @@ url = "http://127.0.0.1:{port}/"
 
     #[test]
     fn health_urls_with_a_port_are_accepted() {
-        let scratch = Scratch::new("health_urls_with_a_p");
+        let scratch = Scratch::new();
         for url in [
             "http://127.0.0.1:{port}/",
             "http://[::1]:4790/health",
@@ -618,7 +609,7 @@ url = "http://127.0.0.1:{port}/"
 
     #[test]
     fn reload_reports_changed_fields() {
-        let scratch = Scratch::new("reload_reports_chang");
+        let scratch = Scratch::new();
         let old = scratch.load(VALID).unwrap();
         assert_eq!(old.reload(&old, true), Ok(vec![]));
 
@@ -632,7 +623,7 @@ url = "http://127.0.0.1:{port}/"
 
     #[test]
     fn reload_refuses_fields_fixed_for_the_daemons_lifetime() {
-        let scratch = Scratch::new("reload_refuses_field");
+        let scratch = Scratch::new();
         let old = scratch.load(VALID).unwrap();
         let new = scratch
             .load(&with("home = \"home\"", "home = \"elsewhere\""))
@@ -643,7 +634,7 @@ url = "http://127.0.0.1:{port}/"
 
     #[test]
     fn reload_refuses_a_new_port_only_while_the_app_runs() {
-        let scratch = Scratch::new("reload_refuses_a_new");
+        let scratch = Scratch::new();
         let old = scratch.load(VALID).unwrap();
         let new = scratch.load(&with("port = 4790", "port = 4780")).unwrap();
         let err = old.reload(&new, true).unwrap_err();
