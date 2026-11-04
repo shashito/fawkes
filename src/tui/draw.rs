@@ -7,6 +7,8 @@ use super::{App, AppView, Focus, Link, Mode};
 use crate::or_dash;
 use crate::protocol::{Event, EventKind, GenState, Generation, LastExit, ProcessState};
 use crate::state::parse_time;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -114,17 +116,13 @@ fn clock(at: &str) -> String {
 }
 
 pub fn local_clock(secs: u64) -> String {
-    let Ok(t) = libc::time_t::try_from(secs) else {
-        return "--:--:--".into();
-    };
-    // SAFETY: `tm` is plain integers (and a pointer) that zero is valid for.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers refer to live locals; `localtime_r` keeps no state of its own beyond the zone data that
-    // `tzset` loaded in `tui::run` before any thread started.
-    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
-        return "--:--:--".into();
+    match i64::try_from(secs).map(Timestamp::from_second) {
+        Ok(Ok(t)) => t
+            .to_zoned(TimeZone::system())
+            .strftime("%H:%M:%S")
+            .to_string(),
+        _ => "--:--:--".into(),
     }
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
 
 fn mmss(secs: u64) -> String {

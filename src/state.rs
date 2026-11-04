@@ -1,6 +1,7 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
 use crate::protocol::{Error, Event, GenState, Generation, Pending, R, invalid_state, not_found};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -22,63 +23,20 @@ pub fn now() -> String {
     format_time(now_secs())
 }
 
-/// `2026-11-03T14:00:01Z`, via days-to-civil (Howard Hinnant's algorithm).
+/// `2026-11-03T14:00:01Z`: whole seconds, in UTC. A time past the end of the year 9999, which Fawkes never computes,
+/// is written as the latest one jiff represents.
 pub fn format_time(secs: u64) -> String {
-    // The quotient is at most 2.2e14, so the conversion cannot fail.
-    let days = i64::try_from(secs / 86400).unwrap_or_default();
-    let rest = secs % 86400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    )
+    let secs = i64::try_from(secs)
+        .unwrap_or(i64::MAX)
+        .min(Timestamp::MAX.as_second());
+    Timestamp::from_second(secs).unwrap_or_default().to_string()
 }
 
 /// The inverse of `format_time`: only the exact text it produces, so out-of-range fields and other spellings of
-/// a time (`2026-02-30`, `T24:00:00`, `11-3`) are refused.
+/// a time (`2026-02-30`, `T24:00:00`, `11-3`, an offset, a fraction) are refused.
 pub fn parse_time(text: &str) -> Option<u64> {
-    let secs = parse_fields(text)?;
+    let secs = u64::try_from(text.parse::<Timestamp>().ok()?.as_second()).ok()?;
     (format_time(secs) == text).then_some(secs)
-}
-
-/// The arithmetic behind `parse_time`, which accepts any field values of up to four digits: longer ones are
-/// refused before the arithmetic, which they could overflow.
-fn parse_fields(text: &str) -> Option<u64> {
-    let field = |text: &str| text.parse::<i64>().ok().filter(|_| text.len() <= 4);
-    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
-    let mut date_fields = date.split('-').map(field);
-    let (year, month, day) = (
-        date_fields.next()??,
-        date_fields.next()??,
-        date_fields.next()??,
-    );
-    // Keeps the arithmetic below far from overflow; `format_time` writes four-digit years.
-    if !(0..=9999).contains(&year) {
-        return None;
-    }
-    let mut time_fields = time.split(':').map(field);
-    let (hours, minutes, seconds) = (
-        time_fields.next()??,
-        time_fields.next()??,
-        time_fields.next()??,
-    );
-    let march_year = year - i64::from(month <= 2);
-    let era = march_year.div_euclid(400);
-    let yoe = march_year - era * 400;
-    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86400 + hours * 3600 + minutes * 60 + seconds).ok()
 }
 
 // --------------------------------------------------------------- paths
@@ -809,6 +767,9 @@ mod tests {
             "1969-12-31T23:59:59Z",
             "99999999999999999-01-01T00:00:00Z",
             "2026-11-03T1000000000000000000:00:00Z",
+            "2026-11-03T14:00:01+00:00",
+            "2026-11-03T14:00:01.5Z",
+            "2026-11-03t14:00:01z",
             "",
         ] {
             assert_eq!(parse_time(text), None, "{text}");
