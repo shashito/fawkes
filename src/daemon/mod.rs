@@ -2,8 +2,9 @@
 //!
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
-//! Lock order is `inner` before `manifest` before `log` before `hub`, and nothing waits for another thread while
-//! holding one.
+//! Lock order is `inner` before `manifest` before `log` before `hub` (`step_pgids` is only ever taken alone), and
+//! nothing waits for another thread while holding one. Events go to the hub while `log` is held, so every subscriber
+//! sees them once and in `seq` order.
 //!
 //! Panics abort the process (`Cargo.toml`): the init system restarts the daemon and its startup recovers a pending
 //! switch, so no thread ever carries on past a broken invariant and no mutex is ever poisoned.

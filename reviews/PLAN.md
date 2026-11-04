@@ -57,6 +57,19 @@ behind; busy semantics (`stage` during `test`, `stop` during `switch`, rollback 
 
 These touch the same code, so they go together after phases 1–2 have their tests.
 
+**Done:** every row below, 3.1 to 3.7, in that order, one commit each (3.2 and 3.3, 3.4 and 3.5 as two). Where the
+build differs from the row: 3.2's `Switching` has no `phase`, since every point before the target starts recovers the
+same way (the target stays `tested`, the permanent generation starts); its intent goes to disk before the old app is
+stopped, so an unwritable `state.json` now refuses a switch before anything is stopped. A phase 2 `state.json`
+(`pending` instead of `txn`) still loads. 3.5's `Store` has two methods, `modify` for intents (kept only once on disk)
+and `update` for bookkeeping (kept, the failed save reported), so 1.4 holds. 3.1 keeps the wire format; its structs
+write keys in DESIGN.md order instead of alphabetically. `thiserror` was not needed.
+
+Also folded into phase 3, from [03-review.md](03-review.md) (the user's decision): M1 and M2 landed on main first
+(9477d1e) and were carried into the split daemon; L1–L14 and D1–D15 are fixed or documented here. Two of them are
+protocol additions the user chose: `process.restart_at` shows a scheduled crash restart (L2, `state` stays
+`stopped`), and `fawkes rollback --keep-storage` gives up a restore that cannot succeed (L13).
+
 | # | Change | From |
 |---|---|---|
 | 3.1 | Typed protocol in `protocol.rs`, shared by daemon, CLI and TUI: `Request` and `EventKind` enums, an `ErrorCode` enum, and typed `Status`, `Process`, `Generation`, `Pending`, `Event` and `RollbackResult` structs. The wire format is unchanged; the roughly 150 `Value["key"]` lookups in clients become fields. | 1:A1, 2:§3, 2:5.6 |
