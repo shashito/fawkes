@@ -6,8 +6,9 @@
 //! `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding one. Events
 //! go to the hub while `log` is held, so every subscriber sees them once and in `seq` order.
 //!
-//! Nothing polls while the daemon is idle: the accept loop sleeps in `poll(2)` on the socket and a pipe the signal
-//! handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.
+//! Neither the accept loop nor the supervisor polls: the accept loop sleeps in `poll(2)` on the socket and a pipe the
+//! signal handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.
+//! A subscribed client's thread looks every 500 ms whether its client has gone.
 //!
 //! Panics abort the process (`Cargo.toml`): the init system restarts the daemon and its startup recovers a pending
 //! switch, so no thread ever carries on past a broken invariant and no mutex is ever poisoned.

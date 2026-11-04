@@ -24,10 +24,11 @@ The daemon runs one transaction step (stage, test, switch, rollback) at a time; 
 
 The daemon is a few threads and no async runtime: one accepts clients, one per client answers it, one supervises
 the app, one per running child waits for its exit, and short-lived ones run health checks and read a step's output.
-None of them polls while the daemon is idle. The accept thread sleeps in `poll(2)` on the socket and on a pipe the
-signal handlers write to; the supervisor sleeps until the app exits, a request changes something, or its next timer
-runs out (a crash restart's backoff, the confirm deadline, and every 10 s while an app runs the `app.log` size cap).
-An idle daemon without an app does not wake at all.
+The accept thread sleeps in `poll(2)` on the socket and on a pipe the signal handlers write to; the supervisor
+sleeps until the app exits, a request changes something, or its next timer runs out (a crash restart's backoff, the
+confirm deadline, and every 10 s while an app runs the `app.log` size cap). An idle daemon without an app or a
+client does not wake at all; a client that follows the log (`subscribe`, `log --follow`, the TUI) has its thread
+look every 500 ms whether the client has gone.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
