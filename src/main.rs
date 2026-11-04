@@ -617,9 +617,9 @@ mod tests {
 
     #[test]
     fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
-        let socket = dir.join("fawkes.sock");
+        // Under /tmp: a socket path over about 100 bytes does not bind, and `$TMPDIR` can be that long.
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("fawkes.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         // Accepts and keeps the connection open without a word.
         let silent = std::thread::spawn(move || {
