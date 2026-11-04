@@ -1,15 +1,20 @@
-//! Child processes: spawning in their own process group, stopping the group, and health checks.
+//! Child processes: spawning in their own process group, waiting for them to exit, stopping the group, and health
+//! checks.
 
 use crate::manifest::Check;
 use crate::state;
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::io::Errno;
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread::sleep;
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 pub type Env = [(String, String)];
@@ -47,6 +52,49 @@ pub fn spawn(
         .stderr(file)
         .process_group(0)
         .spawn()
+}
+
+/// Run `then` once `child` has exited. A thread blocks in `waitid` with `WNOWAIT`, which leaves the exit unreaped:
+/// the status stays for `Child::try_wait`, so whoever owns the `Child` reaps it as before. A thread per child keeps
+/// one code path for macOS and Linux, where kqueue's `NOTE_EXIT` and a pidfd would need one each.
+pub fn on_exit(child: &Child, then: impl FnOnce() + Send + 'static) {
+    let pid = Pid::from_child(child);
+    thread::spawn(move || {
+        // Any error but an interruption means `pid` is no longer an unreaped child of ours: it has exited and been
+        // reaped already.
+        while matches!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT
+            ),
+            Err(Errno::INTR)
+        ) {}
+        then();
+    });
+}
+
+/// A receiver that gets a message once `child` has exited (`on_exit`), and is disconnected after it.
+pub fn exited(child: &Child) -> Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    on_exit(child, move || {
+        // The receiver is gone when nobody waits any more.
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// `child`'s exit status once it has exited, reaped; None when `until` passes first.
+pub fn wait_until(child: &mut Child, until: Instant) -> Option<ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Some(status);
+    }
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return None;
+    }
+    // A message or a timeout: `try_wait` tells which.
+    let _ = exited(child).recv_timeout(left);
+    child.try_wait().ok().flatten()
 }
 
 /// `pgid` as a process group the kernel can signal. 0 would mean our own group and 1 is init, so a value that cannot
@@ -184,37 +232,46 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 /// daemon has no leader to reap and gives `None`.
 pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Option<ExitStatus> {
     signal_group(pgid, Signal::TERM);
-    let give_up = Instant::now() + Duration::from_secs_f64(timeout);
     let mut status = None;
+    let until = Instant::now() + Duration::from_secs_f64(timeout);
+    if wait_group(pgid, leader.as_deref_mut(), &mut status, until) {
+        return status;
+    }
+    kill_group(pgid);
+    // The leader is reaped inside the same bound: until it is, it stays a zombie, and a zombie still counts as alive.
+    wait_group(pgid, leader, &mut status, Instant::now() + KILL_WAIT);
+    status
+}
+
+/// Wait until `until` for group `pgid` to end: its leader, when it is our child, exited and reaped into `status`,
+/// and no other member left. True when it has ended.
+fn wait_group(
+    pgid: u32,
+    leader: Option<&mut Child>,
+    status: &mut Option<ExitStatus>,
+    until: Instant,
+) -> bool {
+    if let Some(child) = leader {
+        *status = status.or_else(|| wait_until(child, until));
+        if status.is_none() {
+            return false;
+        }
+    }
+    // The other members are not our children, so nothing reports their exit: they are polled, which takes one look
+    // when the leader took its group with it, and runs only as long as a member outlives its leader.
     loop {
-        if let Some(child) = leader.as_deref_mut() {
-            status = status.or(child.try_wait().ok().flatten());
+        if !group_alive(pgid) {
+            return true;
         }
-        let leader_gone = leader.is_none() || status.is_some();
-        if leader_gone && !group_alive(pgid) {
-            return status;
-        }
-        if Instant::now() >= give_up {
-            kill_group(pgid);
-            // The leader is reaped inside the same bound: until it is, it stays a zombie, and a zombie still
-            // counts as alive.
-            let give_up = Instant::now() + KILL_WAIT;
-            loop {
-                if let Some(child) = leader.as_deref_mut() {
-                    status = status.or(child.try_wait().ok().flatten());
-                }
-                let leader_gone = leader.is_none() || status.is_some();
-                if (leader_gone && !group_alive(pgid)) || Instant::now() >= give_up {
-                    return status;
-                }
-                sleep(Duration::from_millis(10));
-            }
+        if Instant::now() >= until {
+            return false;
         }
         sleep(Duration::from_millis(20));
     }
 }
 
-/// Poll the health check until it passes, the app stops being alive, or `timeout` seconds pass.
+/// Try the health check every `interval` seconds until it passes, the app stops being alive, or `timeout` seconds
+/// pass. The app's exit (`exited`, from `exited`) ends the wait between two tries at once.
 pub fn wait_healthy(
     check: &Check,
     cwd: &Path,
@@ -222,11 +279,13 @@ pub fn wait_healthy(
     interval: f64,
     timeout: f64,
     mut alive: impl FnMut() -> bool,
+    exited: &Receiver<()>,
 ) -> Result<(), String> {
     let give_up = Instant::now() + Duration::from_secs_f64(timeout);
+    let gone = || Err("the app exited before it became healthy".into());
     loop {
         if !alive() {
-            return Err("the app exited before it became healthy".into());
+            return gone();
         }
         let last = match check {
             Check::Url(url) => http_get(url),
@@ -237,7 +296,14 @@ pub fn wait_healthy(
             Err(e) if Instant::now() >= give_up => {
                 return Err(format!("not healthy after {timeout}s: {e}"));
             }
-            Err(_) => sleep(Duration::from_secs_f64(interval)),
+            Err(_) => {
+                if !matches!(
+                    exited.recv_timeout(Duration::from_secs_f64(interval)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return gone();
+                }
+            }
         }
     }
 }
@@ -256,17 +322,13 @@ fn run_check(command: &str, cwd: &Path, env: &Env) -> Result<(), String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot run health command: {e}"))?;
-    let give_up = Instant::now() + COMMAND_TIMEOUT;
-    loop {
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => return Err(format!("health command failed ({status})")),
-            None if Instant::now() >= give_up => {
-                kill_group(child.id());
-                let _ = child.wait();
-                return Err("health command timed out".into());
-            }
-            None => sleep(Duration::from_millis(20)),
+    match wait_until(&mut child, Instant::now() + COMMAND_TIMEOUT) {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(format!("health command failed ({status})")),
+        None => {
+            kill_group(child.id());
+            let _ = child.wait();
+            Err("health command timed out".into())
         }
     }
 }

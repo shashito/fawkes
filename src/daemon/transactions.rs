@@ -84,17 +84,10 @@ fn run_bounded(
     let pgid = child.id();
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let give_up = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait().map_err(|e| format!("{what}: {e}"))? {
-            Some(status) => break status,
-            None if Instant::now() >= give_up => {
-                // The readers are left to finish on their own: a group stuck in the kernel keeps its pipes open.
-                process::stop_group(pgid, 0.0, Some(&mut child));
-                return Err(format!("{what} timed out after {}s", timeout.as_secs()));
-            }
-            None => sleep(Duration::from_millis(20)),
-        }
+    let Some(status) = process::wait_until(&mut child, Instant::now() + timeout) else {
+        // The readers are left to finish on their own: a group stuck in the kernel keeps its pipes open.
+        process::stop_group(pgid, 0.0, Some(&mut child));
+        return Err(format!("{what} timed out after {}s", timeout.as_secs()));
     };
     // Whatever the child left running would keep the pipes open, and the readers waiting.
     process::stop_group(pgid, 0.0, Some(&mut child));
@@ -283,17 +276,11 @@ impl Daemon {
         let mut child = self
             .spawn_step(command, code, &[], log, &format!("install: {command}"))
             .map_err(|e| e.to_string())?;
-        let give_up = Instant::now() + Duration::from_secs_f64(m.install_timeout);
-        let result = loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => break Ok(()),
-                Ok(Some(status)) => break Err(status.to_string()),
-                Err(e) => break Err(e.to_string()),
-                Ok(None) if Instant::now() >= give_up => {
-                    break Err(format!("timed out after {}s", m.install_timeout));
-                }
-                Ok(None) => sleep(Duration::from_millis(100)),
-            }
+        let until = Instant::now() + Duration::from_secs_f64(m.install_timeout);
+        let result = match process::wait_until(&mut child, until) {
+            Some(status) if status.success() => Ok(()),
+            Some(status) => Err(status.to_string()),
+            None => Err(format!("timed out after {}s", m.install_timeout)),
         };
         // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
         // outlives the stage.
@@ -405,6 +392,7 @@ impl Daemon {
             })?;
 
         let check = m.health_check(&vars);
+        let exited = process::exited(&child);
         let result = process::wait_healthy(
             &check,
             &g.dir,
@@ -412,6 +400,7 @@ impl Daemon {
             m.health.interval,
             m.health.timeout,
             || matches!(child.try_wait(), Ok(None)),
+            &exited,
         );
         self.end_step(&mut child, m.stop_timeout);
         let _ = std::fs::remove_dir_all(&test_home);

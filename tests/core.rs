@@ -14,7 +14,7 @@ use rustix::process::{
 };
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
@@ -621,6 +621,73 @@ fn messages(h: &Harness, kind: &str) -> Vec<String> {
         .filter(|event| event["kind"] == kind)
         .map(|event| event["message"].as_str().unwrap().to_string())
         .collect()
+}
+
+/// An idle daemon sleeps until something happens, then acts at once: a crash of the app is reaped and restarted when
+/// its backoff ends, SIGHUP reloads, SIGTERM stops the app and the daemon. A lost wake-up would wait for the next
+/// timer, ten seconds away or none at all.
+#[test]
+fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    let mut follow = h.follow(&["-n", "0"]);
+    let settle = || std::thread::sleep(Duration::from_millis(500));
+    settle();
+
+    let killed = Instant::now();
+    kill_process_group(read_pid(h.dir.join("s/app.pid")), Signal::KILL).unwrap();
+    let exited = follow.until("the crash", 5, |e| e["kind"] == "exited");
+    let noticed = killed.elapsed();
+    assert!(
+        noticed < Duration::from_millis(500),
+        "the crash was noticed after {noticed:?}"
+    );
+    assert!(
+        exited["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("restarting in 1s"),
+        "{exited}"
+    );
+    follow.until("the restart", 5, |e| e["kind"] == "started");
+    let restarted = killed.elapsed();
+    assert!(
+        (Duration::from_secs(1)..Duration::from_millis(1500)).contains(&restarted),
+        "the 1 s backoff ended after {restarted:?}"
+    );
+    let pid = h.status()["process"]["pid"].as_i64().unwrap();
+    let app = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    settle();
+
+    let signalled = Instant::now();
+    h.signal_daemon(Signal::HUP);
+    follow.until("the reload", 5, |e| {
+        e["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("manifest reloaded"))
+    });
+    let reloaded = signalled.elapsed();
+    assert!(
+        reloaded < Duration::from_millis(500),
+        "SIGHUP was acted on after {reloaded:?}"
+    );
+    settle();
+
+    let signalled = Instant::now();
+    h.signal_daemon(Signal::TERM);
+    assert!(
+        h.daemon_exits_within(Duration::from_secs(5)),
+        "the daemon ignored SIGTERM; daemon log:\n{}",
+        h.daemon_log()
+    );
+    let stopped = signalled.elapsed();
+    assert!(stopped < Duration::from_secs(1), "SIGTERM took {stopped:?}");
+    assert!(
+        test_kill_process_group(app).is_err(),
+        "the app outlived the daemon"
+    );
 }
 
 /// The permanent generation crash-loops: a crash after a long run restarts it in 1 s, each failed start in a row then
