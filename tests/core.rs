@@ -1078,6 +1078,105 @@ fn a_daemon_stopped_during_a_rollback_leaves_the_permanent_generation_to_its_nex
     assert_eq!(h.status()["pending"], Value::Null);
 }
 
+/// A daemon that dies for good (SIGKILL, no cleanup) in the middle of a switch leaves `switching` in state.json. Its
+/// successor must say so, leave the target `tested` (it never ran) and serve the permanent generation again.
+#[test]
+fn a_daemon_killed_during_a_switch_recovers_to_the_permanent_generation() {
+    let mut h = Harness::new("");
+    h.commit("v1", "slow-stop");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+
+    let daemon_pid =
+        Pid::from_raw(i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap()).unwrap();
+    let (code, answer) = std::thread::scope(|scope| {
+        let switch = scope.spawn(|| h.fk(&["switch", "g2"]));
+        // g1 takes 1.5 s to leave after SIGTERM: the window for the kill.
+        h.wait("the switch to stop g1", 10, || {
+            messages(&h, "progress").contains(&"stopping g1".to_string())
+        });
+        // The pid is the daemon this test started.
+        kill_process(daemon_pid, Signal::KILL).unwrap();
+        switch.join().unwrap()
+    });
+    assert_ne!(code, 0, "{answer}");
+    h.kill_daemon();
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(h.dir.join("s/state.json")).unwrap()).unwrap();
+    assert_eq!(state["txn"]["step"], "switching", "{state}");
+    assert_eq!(state["txn"]["generation"], "g2", "{state}");
+
+    h.start_daemon();
+    h.wait("v1 to serve again", 15, || h.get().as_deref() == Some("v1"));
+    let cut_short = messages(&h, "daemon")
+        .into_iter()
+        .filter(|message| message.contains("cut short"))
+        .collect::<Vec<_>>();
+    assert_eq!(cut_short.len(), 1, "{cut_short:?}");
+    assert!(cut_short[0].contains("g2"), "{cut_short:?}");
+    let status = h.status();
+    assert_eq!(
+        (status["permanent"].as_str(), status["pending"].clone()),
+        (Some("g1"), Value::Null),
+        "{status}"
+    );
+    assert_eq!(status["process"]["state"], "running", "{status}");
+    assert_eq!(status["process"]["generation"], "g1", "{status}");
+    assert_eq!(h.generation("g2")["state"], "tested");
+    assert!(!h.versions().contains(&"v2".to_string()));
+}
+
+/// A daemon that dies after a restore failed leaves `rolling_back` in state.json with the app stopped. Its successor
+/// retries the restore, finishes the rollback with the reason it already had and serves the permanent generation.
+#[test]
+fn a_daemon_restart_retries_a_failed_restore_and_finishes_the_rollback() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+    assert_eq!(h.versions(), ["v1", "v2"]);
+
+    let snapshot = h.dir.join("s/generations/g2/snapshot");
+    let moved = h.dir.join("s/snapshot-moved");
+    std::fs::rename(&snapshot, &moved).unwrap();
+    refused(&h, &["rollback"], "storage_failed", "could not be restored");
+    let status = h.status();
+    assert_eq!(status["process"]["state"], "failed", "{status}");
+    assert_eq!(status["pending"]["generation"], "g2", "{status}");
+
+    h.kill_daemon();
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(h.dir.join("s/state.json")).unwrap()).unwrap();
+    assert_eq!(state["txn"]["step"], "rolling_back", "{state}");
+    assert_eq!(state["txn"]["restore_failed"], true, "{state}");
+    std::fs::rename(&moved, &snapshot).unwrap();
+
+    h.start_daemon();
+    h.wait("v1 to serve again", 15, || h.get().as_deref() == Some("v1"));
+    let status = h.status();
+    assert_eq!(
+        (status["permanent"].as_str(), status["pending"].clone()),
+        (Some("g1"), Value::Null),
+        "{status}"
+    );
+    assert_eq!(status["process"]["state"], "running", "{status}");
+    assert_eq!(status["process"]["generation"], "g1", "{status}");
+    let g2 = h.generation("g2");
+    assert_eq!(g2["state"], "rolled_back", "{g2}");
+    // The first rollback's reason stays; the restart only finished it.
+    assert_eq!(g2["rollback_reason"], "rollback requested", "{g2}");
+    // v2's row is gone and g1's start after the restart is the second.
+    assert_eq!(h.versions(), ["v1", "v1"]);
+}
+
 /// A crash backoff shows as `restart_at` while `state` stays `stopped`, and `stop` during it cancels the restart and
 /// answers ok: the app stays stopped once the backoff has passed.
 #[test]

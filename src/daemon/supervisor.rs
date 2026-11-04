@@ -576,7 +576,7 @@ mod tests {
     use super::super::{Hub, Wake};
     use super::*;
     use crate::manifest::Manifest;
-    use crate::protocol::Pending;
+    use crate::protocol::{GenState, Generation, Pending};
     use crate::state::{EventLog, Paths, Store};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -786,5 +786,100 @@ mod tests {
                 .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_)))),
             "the exit is still there for `reap`"
         );
+    }
+
+    /// `confirm` is the commit point, so each way it refuses must leave the switch as it was: a confirm that lands
+    /// between the deadline and the supervisor's rollback, one for a generation that is not the pending one, and
+    /// one for a pending generation that does not run.
+    #[test]
+    fn confirm_refuses_a_late_a_wrong_a_stopped_and_a_missing_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = scratch_daemon(temp.path());
+        let record = |id: &str, state: GenState| Generation {
+            id: id.into(),
+            git_ref: "main".into(),
+            commit: "0".into(),
+            state,
+            dir: PathBuf::new(),
+            staged_at: String::new(),
+            test: None,
+            switched_at: None,
+            confirmed_at: None,
+            rolled_back_at: None,
+            rollback_reason: None,
+            failed_starts: 0,
+            restore_abandoned_at: None,
+        };
+        // g1 is permanent and g2 is pending with its deadline `seconds_from_now` (negative: passed), or no switch.
+        let set_txn = |seconds_from_now: Option<i64>| {
+            daemon
+                .inner()
+                .store
+                .modify(|state| {
+                    state.generations = vec![
+                        record("g1", GenState::Permanent),
+                        record("g2", GenState::Current),
+                    ];
+                    state.permanent = Some("g1".into());
+                    state.txn = seconds_from_now.map(|seconds| {
+                        Txn::Pending(Pending {
+                            generation: "g2".into(),
+                            previous: Some("g1".into()),
+                            deadline: format_time(now_secs().saturating_add_signed(seconds)),
+                        })
+                    });
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let refusal = |id: Option<&str>| {
+            let error = daemon.confirm(id).unwrap_err();
+            (error.code, error.message)
+        };
+        let assert_pending = || {
+            let inner = daemon.inner();
+            assert_eq!(
+                inner.store.state().pending().map(|p| p.generation.as_str()),
+                Some("g2")
+            );
+            assert_eq!(
+                inner.store.state().find("g2").unwrap().state,
+                GenState::Current
+            );
+            assert_eq!(inner.store.state().permanent.as_deref(), Some("g1"));
+        };
+
+        set_txn(None);
+        let (code, message) = refusal(None);
+        assert_eq!(code, ErrorCode::InvalidState);
+        assert!(message.contains("no switch is pending"), "{message}");
+
+        // Past its deadline, even though the supervisor has not rolled it back yet.
+        set_txn(Some(-5));
+        let (code, message) = refusal(None);
+        assert_eq!(code, ErrorCode::InvalidState);
+        assert!(message.contains("missed its confirm deadline"), "{message}");
+        assert_pending();
+
+        set_txn(Some(120));
+        let (code, _) = refusal(Some("g9"));
+        assert_eq!(code, ErrorCode::NotFound);
+        let (code, message) = refusal(Some("g1"));
+        assert_eq!(code, ErrorCode::InvalidState);
+        assert!(
+            message.contains("g1 is permanent, not pending"),
+            "{message}"
+        );
+
+        // Nothing runs (`Live::Stopped`): only a generation that runs can vouch for itself.
+        for id in [None, Some("g2")] {
+            let (code, message) = refusal(id);
+            assert_eq!(code, ErrorCode::InvalidState);
+            assert!(
+                message.contains("g2 is not running, so it cannot be confirmed"),
+                "{message}"
+            );
+        }
+        assert_pending();
     }
 }
