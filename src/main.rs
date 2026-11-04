@@ -329,22 +329,7 @@ fn client(
         let Ok(raw) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let message = Line::<Value>::deserialize(&raw);
-        // An event this client cannot read (a kind from a newer daemon) still reaches `--json`.
-        if cli.json
-            && message.is_err()
-            && let Some(event) = raw.get("event")
-        {
-            if follow {
-                if !say(out, event) {
-                    return 0;
-                }
-            } else {
-                warn(event);
-            }
-            continue;
-        }
-        let Ok(message) = message else {
+        let Ok(message) = Line::<Value>::deserialize(&raw) else {
             continue;
         };
         match message {
@@ -483,6 +468,9 @@ fn render_status(s: &Status) -> String {
             (Some(Step::RestoreFailed), _) => format!(
                 "\n{generation}'s storage could not be restored and the app is stopped; `fawkes rollback` retries it, `fawkes rollback --keep-storage` gives it up"
             ),
+            (Some(step @ (Step::Switching | Step::Unknown)), _) => {
+                format!("  (step: {})", step.as_str())
+            }
             _ => String::new(),
         }
     };
@@ -785,5 +773,44 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.lines().count(), 1, "{out}");
+    }
+
+    /// An event of a kind a newer daemon logs reaches `--json` as the line the daemon sent.
+    #[test]
+    fn a_followed_log_under_json_prints_an_event_of_an_unknown_kind_as_sent() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("fawkes.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let sent = r#"{"seq":3,"at":"t","kind":"from_the_future","generation":null,"message":"m","extra":1}"#;
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&stream).read_line(&mut request).unwrap();
+            writeln!(stream, r#"{{"event":{sent}}}"#).unwrap();
+            writeln!(stream, r#"{{"ok":true,"result":null}}"#).unwrap();
+        });
+        let cli = Cli {
+            json: true,
+            manifest: None,
+            socket: Some(socket.clone()),
+            command: Command::Status,
+        };
+        let request = Request::Log {
+            limit: None,
+            follow: true,
+        };
+        let mut out = Vec::new();
+        let code = client(
+            &cli,
+            &request,
+            &socket,
+            Path::new("fawkes.toml"),
+            Duration::from_secs(5),
+            &mut out,
+        );
+        daemon.join().unwrap();
+        assert_eq!(code, 0);
+        let printed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, serde_json::from_str::<Value>(sent).unwrap());
     }
 }

@@ -99,6 +99,7 @@ fn state_color(state: GenState) -> Color {
         GenState::Permanent => Color::Cyan,
         GenState::RolledBack | GenState::TestFailed => Color::Red,
         GenState::Staging | GenState::Staged | GenState::Retired => Color::Reset,
+        GenState::Unknown => Color::Gray,
     }
 }
 
@@ -384,6 +385,7 @@ fn app_state(view: &AppView) -> (String, Color) {
         ProcessState::Running => ("● running".into(), Color::Green),
         ProcessState::Stopped => ("○ stopped".into(), Color::Gray),
         ProcessState::Failed => ("✘ failed".into(), Color::Red),
+        ProcessState::Unknown => ("? unknown".into(), Color::Gray),
     }
 }
 
@@ -613,7 +615,7 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
                 " ✘ restore failed, b retries",
                 Style::new().fg(Color::Red),
             ))),
-            Step::Switching | Step::Pending => {}
+            Step::Switching | Step::Pending | Step::Unknown => {}
         }
     }
     lines
@@ -673,6 +675,7 @@ fn generation_info(view: &AppView, g: &Generation) -> (String, Color) {
             Color::Red,
         ),
         GenState::Permanent | GenState::Retired => (String::new(), Color::Reset),
+        GenState::Unknown => ("a state this fawkes does not know".into(), Color::Gray),
     }
 }
 
@@ -755,6 +758,7 @@ fn event_color(kind: EventKind, message: &str) -> Color {
         EventKind::Exited if !message.contains("(requested)") => Color::Red,
         EventKind::Healthy | EventKind::Confirmed | EventKind::Tested => Color::Green,
         EventKind::Progress => Color::DarkGray,
+        EventKind::Unknown => Color::Gray,
         _ => Color::Reset,
     }
 }

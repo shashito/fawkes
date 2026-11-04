@@ -783,6 +783,45 @@ mod tests {
     }
 
     #[test]
+    fn values_from_a_newer_daemon_are_kept_and_shown_neutrally() {
+        let now = 1_000_000;
+        let mut app = fixture(now + 102);
+        app.choose(1);
+        let events = app.apps[1].events.len();
+        app.apply(Msg::Line(
+            "sample".into(),
+            Line::Event {
+                event: typed(
+                    json!({ "seq": 9, "at": "2026-11-03T14:03:00Z", "kind": "from_the_future",
+                                     "generation": "g7", "message": "something new" }),
+                ),
+            },
+        ));
+        assert_eq!(app.apps[1].events.len(), events + 1);
+        let AppView {
+            status: Some(status),
+            history,
+            ..
+        } = &mut app.apps[1]
+        else {
+            panic!("the fixture has a status");
+        };
+        status.process.state = typed(json!("paused"));
+        history[0].state = typed(json!("quarantined"));
+        let screen = render(&app, now);
+        for expected in [
+            "? unknown",
+            "a state this fawkes does not know",
+            "something new",
+        ] {
+            assert!(
+                screen.contains(expected),
+                "missing `{expected}` in\n{screen}"
+            );
+        }
+    }
+
+    #[test]
     fn a_narrow_terminal_drops_columns_and_footer_items_and_never_panics() {
         let now = 1_000_000;
         let mut app = fixture(now + 10);

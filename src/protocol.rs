@@ -327,6 +327,10 @@ pub enum GenState {
     Permanent,
     Retired,
     RolledBack,
+    /// A state a newer daemon wrote that this client does not know. Decode-only: this daemon never writes it, and
+    /// refuses a `state.json` that holds it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl GenState {
@@ -341,6 +345,7 @@ impl GenState {
             GenState::Permanent => "permanent",
             GenState::Retired => "retired",
             GenState::RolledBack => "rolled_back",
+            GenState::Unknown => "unknown",
         }
     }
 }
@@ -411,6 +416,22 @@ pub enum Step {
     /// The storage restore of a rollback failed: the app stays stopped until `rollback` retries it or
     /// `rollback --keep-storage` gives it up.
     RestoreFailed,
+    /// A step a newer daemon reports that this client does not know. Decode-only.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Step {
+    /// The name on the wire, for messages and screens.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Step::Switching => "switching",
+            Step::Pending => "pending",
+            Step::RollingBack => "rolling_back",
+            Step::RestoreFailed => "restore_failed",
+            Step::Unknown => "unknown",
+        }
+    }
 }
 
 /// What an entry of the event log is about.
@@ -433,6 +454,10 @@ pub enum EventKind {
     RolledBack,
     Pruned,
     Error,
+    /// A kind a newer daemon logs that this client does not know. Decode-only; a log written by a newer daemon
+    /// replays with it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl EventKind {
@@ -455,6 +480,7 @@ impl EventKind {
             EventKind::RolledBack => "rolled_back",
             EventKind::Pruned => "pruned",
             EventKind::Error => "error",
+            EventKind::Unknown => "unknown",
         }
     }
 }
@@ -509,6 +535,9 @@ pub enum ProcessState {
     Stopped,
     /// It crashed `max_failed_starts` times in a row and is no longer restarted.
     Failed,
+    /// A state a newer daemon reports that this client does not know. Decode-only.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ProcessState {
@@ -518,6 +547,7 @@ impl ProcessState {
             ProcessState::Running => "running",
             ProcessState::Stopped => "stopped",
             ProcessState::Failed => "failed",
+            ProcessState::Unknown => "unknown",
         }
     }
 }
@@ -1016,6 +1046,39 @@ mod tests {
             line,
             Line::Failed { error, .. } if error.code == ErrorCode::Unknown && error.message == "m"
         ));
+    }
+
+    /// A daemon outlives the binary that was upgraded under it, so a client meets values it does not know. The line
+    /// must still decode: a dropped status or history leaves a stale picture, and a dropped event a gap.
+    #[test]
+    fn lines_with_values_from_a_newer_daemon_still_decode() {
+        let status = r#"{"status":{"name":"s","daemon_pid":1,"permanent":null,"current":null,"pending":null,"step":"from_the_future","busy":null,"process":{"state":"paused","generation":null,"pid":null,"port":4790,"started_at":null,"uptime":null,"restarts":0,"last_exit":null,"restart_at":null}}}"#;
+        let Line::Status { status } = serde_json::from_str::<Line>(status).unwrap() else {
+            panic!("a status line reads as one");
+        };
+        assert_eq!(status.process.state, ProcessState::Unknown);
+        assert_eq!(status.step, Some(Step::Unknown));
+
+        let history = r#"{"history":{"generations":[{"id":"g1","ref":"main","commit":"0","state":"quarantined","dir":"/d","staged_at":"t","test":null,"switched_at":null,"confirmed_at":null,"rolled_back_at":null,"rollback_reason":null,"failed_starts":0}]}}"#;
+        let Line::History { history } = serde_json::from_str::<Line>(history).unwrap() else {
+            panic!("a history line reads as one");
+        };
+        assert_eq!(history.generations[0].state, GenState::Unknown);
+
+        let event = r#"{"event":{"seq":7,"at":"t","kind":"from_the_future","generation":null,"message":"m"}}"#;
+        let Line::Event { event } = serde_json::from_str::<Line>(event).unwrap() else {
+            panic!("an event line reads as one");
+        };
+        assert_eq!((event.seq, event.kind), (7, EventKind::Unknown));
+
+        for name in [
+            GenState::Unknown.as_str(),
+            EventKind::Unknown.as_str(),
+            ProcessState::Unknown.as_str(),
+            Step::Unknown.as_str(),
+        ] {
+            assert_eq!(name, "unknown");
+        }
     }
 
     #[test]

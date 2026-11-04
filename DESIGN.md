@@ -228,7 +228,9 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    manifests); a socket file nobody answers on belongs to a dead daemon and is replaced.
    Then link it into `<fawkes_home>/run/`. A startup that fails after this removes the socket and the link again.
 4. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event). Refuse to
-   start when neither can be read.
+   start when neither can be read, and when a generation is in a state this daemon does not know (a `state.json`
+   written by a newer fawkes): the error names the generation and says to run the newer fawkes again or upgrade this
+   binary, and the copy is not tried, since `state.json` was readable.
 5. If `app.pid` names an app an earlier daemon left running, stop its process group (a crashed daemon leaves its
    app running). The live app's start wrapper writes its pid there before it runs the `start` command, so even an
    app spawned an instant before its daemon died is found. Only a process that started at most a minute before the
@@ -461,6 +463,12 @@ Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `insta
 client only: no daemon answers, or it closed the connection without an answer, and the daemon accepted a quick request
 and did not answer in time.)
 A client treats a code it does not know as a failed command.
+
+The same goes for the other enumerations a newer daemon may extend: a client reads an event `kind`, a generation
+`state`, a `process.state` or a `step` it does not know as `unknown` and keeps the line, instead of dropping it and
+leaving a stale picture. `unknown` is never written: a daemon does not send it, and refuses a `state.json` with a
+generation in a state it does not know (see Daemon start). `--json` prints the event line as the daemon sent it, so an
+agent sees the real kind. The TUI draws an unknown value in grey.
 
 Results per command:
 

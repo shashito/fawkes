@@ -299,8 +299,8 @@ impl State {
     pub fn load(path: &Path) -> Result<(State, Option<String>), String> {
         let backup = backup_path(path);
         let problem = match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(state) => return Ok((state, None)),
+            Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
+                Ok(state) => return state.known().map(|state| (state, None)),
                 Err(e) => format!("{} is corrupt ({e})", path.display()),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !backup.exists() => {
@@ -315,11 +315,28 @@ impl State {
             )
         };
         let bytes = std::fs::read(&backup).map_err(|e| unusable(e.to_string()))?;
-        let state = serde_json::from_slice(&bytes).map_err(|e| unusable(e.to_string()))?;
+        let state = serde_json::from_slice::<State>(&bytes).map_err(|e| unusable(e.to_string()))?;
         Ok((
-            state,
+            state.known()?,
             Some(format!("{problem}; recovered from {}", backup.display())),
         ))
+    }
+
+    /// `self`, unless a generation is in a state this fawkes cannot read (`unknown`): state.json was written by a
+    /// newer fawkes. Rolling such a generation back, pruning it or leaving it running would be a guess, so the daemon
+    /// does not start. An older copy is no way around it.
+    fn known(self) -> Result<State, String> {
+        match self
+            .generations
+            .iter()
+            .find(|g| g.state == GenState::Unknown)
+        {
+            Some(g) => Err(format!(
+                "{} is in a state this fawkes does not know, so state.json was written by a newer fawkes; run the newer fawkes that wrote it, or upgrade this binary",
+                g.id
+            )),
+            None => Ok(self),
+        }
     }
 
     /// Write `state.json` durably, then the same content to `state.json.bak`. A crash leaves at least one of them
@@ -1104,5 +1121,37 @@ mod tests {
         std::fs::write(&path, "{").unwrap();
         std::fs::write(backup_path(&path), "").unwrap();
         assert!(State::load(&path).unwrap_err().contains("delete both"));
+    }
+
+    /// A state.json from a newer fawkes may hold a generation state this one cannot read as anything but `unknown`.
+    /// Acting on it (rolling it back, pruning it, starting it) would be a guess, so the daemon refuses to start, and
+    /// the copy of an older state.json is no way around that.
+    #[test]
+    fn a_state_json_with_a_generation_state_this_fawkes_does_not_know_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let state = State {
+            generations: vec![generation("g1", GenState::Permanent)],
+            permanent: Some("g1".into()),
+            next_id: 2,
+            ..State::default()
+        };
+        state.save(&path).unwrap();
+        assert!(State::load(&path).is_ok());
+
+        let newer = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"permanent\",", "\"quarantined\",");
+        assert!(newer.contains("quarantined"), "{newer}");
+        std::fs::write(&path, &newer).unwrap();
+        let message = State::load(&path).unwrap_err();
+        for expected in ["g1", "does not know", "newer fawkes"] {
+            assert!(message.contains(expected), "{message}");
+        }
+
+        // An older copy is no way around it: the refusal is not an unreadable file.
+        let copy = backup_path(&path);
+        std::fs::write(&copy, "{}").unwrap();
+        assert!(State::load(&path).is_err());
     }
 }
