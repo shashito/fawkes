@@ -75,7 +75,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   process holds its port afterwards is `port_in_use` and leaves the generation as it was. Only a tested
   generation can be switched to.
   The copy of each database is one read, so it is consistent (and, in WAL mode, does not hold up the app's
-  writes); one that stays locked for 10 s fails the test with `storage_failed`.
+  writes); one that stays locked for 10 s fails the test with `storage_failed`. The same bound holds for a switch's
+  snapshot (`storage_failed`, and the switch does not happen) and a rollback's restore (a failed restore, below).
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
 - **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
   start of the daemon always runs the permanent generation (Erlang/OTP release handler).
@@ -116,7 +117,7 @@ daemon start runs the permanent generation.
 `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE`). An app confirms only when `FAWKES_PHASE` is
 `live`, and names itself: `"$FAWKES_BIN" confirm "$FAWKES_GENERATION"`. Its test run gets the same variables, with
 `FAWKES_PHASE=test`, while another generation may be pending. Without `<gen>` the CLI sends `$FAWKES_GENERATION`
-when it is set, so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
+when it is set (and no `--socket` points it at another daemon), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
 an app, a bare `confirm` confirms whichever generation is pending. The `confirmed` event says whether the confirm
 named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
 deadline is cleared. Confirming a generation that is not pending is `invalid_state`,

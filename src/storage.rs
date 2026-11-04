@@ -53,7 +53,14 @@ fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
                 ));
             }
             StepResult::Busy | StepResult::Locked => std::thread::sleep(LOCKED_RETRY),
-            _ => {}
+            StepResult::More => {}
+            other => {
+                return Err(format!(
+                    "cannot copy {} to {}: unexpected backup step result {other:?}",
+                    src.display(),
+                    dst.display()
+                ));
+            }
         }
     }
 }

@@ -492,10 +492,10 @@ impl Store {
         change: impl FnOnce(&mut State) -> T,
     ) -> (T, Option<std::io::Error>) {
         let value = change(&mut self.state);
-        let failed = match self.state.save(&self.path) {
-            Ok(late) => late,
-            Err(e) => Some(e),
-        };
+        let failed = self
+            .state
+            .save(&self.path)
+            .unwrap_or_else(|e| Some(late_failure("write state.json", &e)));
         (value, failed)
     }
 }
