@@ -47,7 +47,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The toolchain is pinned in `rust-toolchain.toml`. The integration tests (`tests/core.rs`) run the real binary
+`rust-toolchain.toml` uses stable Rust with clippy and rustfmt, and `rust-version` in `Cargo.toml` is the oldest
+release that builds it. The integration tests (`tests/core.rs`) run the real binary
 against the sample app in `examples/sample/`, so they need `git` and Node.js 22.13 or later on `PATH` (the app uses
 `node:sqlite`, which 22.5 to 22.12 only have behind `--experimental-sqlite`). Each test builds its own world under
 `/tmp/fk<port>` with a block of ports it claims for itself, so the suite runs in parallel, and several checkouts can
