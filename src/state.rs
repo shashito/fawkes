@@ -658,6 +658,34 @@ mod tests {
     use super::*;
     use crate::protocol::{ErrorCode, EventKind};
 
+    fn generation(id: &str, state: GenState) -> Generation {
+        Generation {
+            id: id.into(),
+            git_ref: "main".into(),
+            commit: "0".into(),
+            state,
+            dir: PathBuf::new(),
+            staged_at: String::new(),
+            test: None,
+            switched_at: None,
+            confirmed_at: None,
+            rolled_back_at: None,
+            rollback_reason: None,
+            failed_starts: 0,
+            restore_abandoned_at: None,
+        }
+    }
+
+    fn event(n: usize) -> Event {
+        Event {
+            seq: 0,
+            at: now(),
+            kind: EventKind::Progress,
+            generation: None,
+            message: format!("event {n}"),
+        }
+    }
+
     #[test]
     fn time_round_trips() {
         for secs in [
@@ -673,21 +701,6 @@ mod tests {
 
     #[test]
     fn prune_takes_the_oldest_and_spares_what_a_rollback_needs() {
-        let generation = |id: &str, state| Generation {
-            id: id.into(),
-            git_ref: "main".into(),
-            commit: "0".into(),
-            state,
-            dir: PathBuf::new(),
-            staged_at: String::new(),
-            test: None,
-            switched_at: None,
-            confirmed_at: None,
-            rolled_back_at: None,
-            rollback_reason: None,
-            failed_starts: 0,
-            restore_abandoned_at: None,
-        };
         let state = State {
             generations: vec![
                 generation("g1", GenState::Permanent),
@@ -715,13 +728,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("events.jsonl");
-        let event = |n: usize| Event {
-            seq: 0,
-            at: now(),
-            kind: EventKind::Progress,
-            generation: None,
-            message: format!("event {n}"),
-        };
         let mut log = EventLog::with_limit(path.clone(), 4096).unwrap();
         for n in 0..RECENT_EVENTS + 10 {
             log.append(event(n));
@@ -750,13 +756,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("events.jsonl");
-        let event = |n: usize| Event {
-            seq: 0,
-            at: now(),
-            kind: EventKind::Progress,
-            generation: None,
-            message: format!("event {n}"),
-        };
         // A line from before events were numbered loads as 0, and the first numbered event is 1.
         std::fs::write(
             &path,
@@ -970,19 +969,8 @@ mod tests {
             for to in all {
                 let mut state = State {
                     generations: vec![Generation {
-                        id: "g1".into(),
-                        git_ref: "main".into(),
-                        commit: "0".into(),
-                        state: from,
-                        dir: PathBuf::new(),
                         staged_at: "then".into(),
-                        test: None,
-                        switched_at: None,
-                        confirmed_at: None,
-                        rolled_back_at: None,
-                        rollback_reason: None,
-                        failed_starts: 0,
-                        restore_abandoned_at: None,
+                        ..generation("g1", from)
                     }],
                     ..State::default()
                 };

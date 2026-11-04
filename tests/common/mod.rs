@@ -157,13 +157,7 @@ APP_HOME = "{{home}}"
             .append(true)
             .open(self.dir.join("daemon.log"))
             .unwrap();
-        let child = Command::new(BIN)
-            .args(["daemon", "--manifest"])
-            .arg(&self.manifest)
-            .env("FAWKES_HOME", self.manifest.parent().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+        let child = self.daemon_command().stderr(log).spawn().unwrap();
         self.daemon = Some(child);
         self.wait("the daemon to answer", 10, || self.fk(&["status"]).0 == 0);
     }
@@ -195,13 +189,10 @@ APP_HOME = "{{home}}"
 
     /// `fawkes --json log --follow <args>` running in the background, its output read line by line.
     pub fn follow(&self, args: &[&str]) -> Follow {
-        let mut child = Command::new(BIN)
-            .arg("--json")
-            .arg("--manifest")
-            .arg(&self.manifest)
+        let mut child = self
+            .cli()
             .args(["log", "--follow"])
             .args(args)
-            .env_remove("FAWKES_SOCKET")
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -219,28 +210,37 @@ APP_HOME = "{{home}}"
 
     /// Run `fawkes daemon` for this manifest in the foreground; its exit code and stderr.
     pub fn run_second_daemon(&self) -> (i32, String) {
-        let output = Command::new(BIN)
-            .args(["daemon", "--manifest"])
-            .arg(&self.manifest)
-            .env("FAWKES_HOME", self.manifest.parent().unwrap())
-            .output()
-            .unwrap();
+        let output = self.daemon_command().output().unwrap();
         (
             output.status.code().unwrap(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
     }
 
-    /// Run `fawkes --json <args>`; the exit code and the single JSON document it printed.
-    pub fn fk(&self, args: &[&str]) -> (i32, Value) {
-        let output = Command::new(BIN)
+    /// `fawkes daemon` for this manifest, with its `run/` links kept inside the test directory.
+    fn daemon_command(&self) -> Command {
+        let mut command = Command::new(BIN);
+        command
+            .args(["daemon", "--manifest"])
+            .arg(&self.manifest)
+            .env("FAWKES_HOME", self.manifest.parent().unwrap());
+        command
+    }
+
+    /// `fawkes --json --manifest <manifest>`, deaf to a `FAWKES_SOCKET` of the environment the tests run in.
+    fn cli(&self) -> Command {
+        let mut command = Command::new(BIN);
+        command
             .arg("--json")
             .arg("--manifest")
             .arg(&self.manifest)
-            .args(args)
-            .env_remove("FAWKES_SOCKET")
-            .output()
-            .unwrap();
+            .env_remove("FAWKES_SOCKET");
+        command
+    }
+
+    /// Run `fawkes --json <args>`; the exit code and the single JSON document it printed.
+    pub fn fk(&self, args: &[&str]) -> (i32, Value) {
+        let output = self.cli().args(args).output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json = if stdout.trim().is_empty() {
             Value::Null

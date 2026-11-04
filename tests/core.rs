@@ -62,7 +62,7 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     assert_eq!(stopped["last_exit"]["requested"], true);
     assert_eq!(h.get(), None);
     assert_eq!(h.fk(&["stop"]).1["code"], "invalid_state");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(
         h.status()["process"]["state"],
         "stopped",
@@ -141,12 +141,7 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
 
     let (code, stderr) = h.run_second_daemon();
     assert_eq!(code, 1, "a second daemon must refuse to start: {stderr}");
@@ -206,21 +201,14 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
 fn a_switch_records_its_intent_before_the_new_generation_starts() {
     let mut h = Harness::new("");
     // v2, started live, keeps a copy of the state.json it finds, kills the daemon, its parent, on the spot, and runs on.
-    let manifest = h.dir.join("fawkes.toml");
-    let text = std::fs::read_to_string(&manifest).unwrap().replace(
+    h.edit_manifest(
         r#"start = "node app.js""#,
         r#"start = 'if [ "$(cat VERSION)" = v2 ] && [ "$FAWKES_PHASE" = live ]; then cp {state}/state.json {home}/at-start.json; kill -9 $PPID; fi; exec node app.js'"#,
     );
-    std::fs::write(&manifest, text).unwrap();
     h.commit("v1", "confirm");
     h.commit("v2", "confirm");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
 
@@ -267,21 +255,12 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
     h.start_daemon();
     let alive = |id: &str| {
         let dir = h.generation(id)["dir"].as_str().unwrap().to_string();
-        let pid: i32 = std::fs::read_to_string(format!("{dir}/background.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = read_pid(format!("{dir}/background.pid"));
         // SAFETY: signal 0 only asks whether the process exists; nothing is sent.
         unsafe { libc::kill(pid, 0) == 0 }
     };
 
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
     h.ok(&["switch", "g2"]);
@@ -310,12 +289,7 @@ fn a_confirm_racing_a_crash_of_the_pending_generation_is_refused() {
     h.commit("v1", "confirm");
     h.commit("v2", "crash-confirm");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
     h.ok(&["switch", "g2"]);
@@ -360,12 +334,7 @@ fn rollback_on_unhealthy_rolls_back_without_waiting_for_the_deadline() {
     h.commit("v1", "confirm");
     h.commit("v2", "unhealthy-live");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
     let switched = std::time::Instant::now();
@@ -421,11 +390,7 @@ install_timeout = 1"#,
         error["message"].as_str().unwrap().contains("timed out"),
         "{error}"
     );
-    let pid: i32 = std::fs::read_to_string(h.dir.join("s/install.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = read_pid(h.dir.join("s/install.pid"));
     assert_ne!(
         // SAFETY: signal 0 only asks whether the process group exists.
         unsafe { libc::kill(-pid, 0) },
@@ -463,12 +428,7 @@ fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
             .collect()
     };
     for (version, id) in [("v1", "g1"), ("v2", "g2")] {
-        h.ok(&["stage", version]);
-        h.ok(&["test", id]);
-        h.ok(&["switch", id]);
-        h.wait("the new generation to confirm itself", 15, || {
-            h.status()["permanent"] == id
-        });
+        make_permanent(&h, version, id);
     }
     h.ok(&["stage", "v3"]);
     h.ok(&["test", "g3"]);
@@ -514,12 +474,7 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
     h.commit("v2", "never");
     h.commit("v3", "slow-test");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
 
@@ -563,17 +518,14 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
 /// socket buffer waits for the client instead of failing at once.
 #[test]
 fn a_request_that_arrives_in_pieces_is_answered() {
-    use std::io::{BufRead, Write};
     let mut h = Harness::new("");
     h.start_daemon();
-    let mut stream = std::os::unix::net::UnixStream::connect(h.dir.join("s/fawkes.sock")).unwrap();
+    let mut stream = h.connect();
     stream.write_all(br#"{"command": "log", "#).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(200));
     stream.write_all(b"\"args\": {\"limit\": 1000}}\n").unwrap();
     let mut line = String::new();
-    std::io::BufReader::new(&stream)
-        .read_line(&mut line)
-        .unwrap();
+    BufReader::new(&stream).read_line(&mut line).unwrap();
     let answer: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(answer["ok"], true, "{answer}");
 }
@@ -597,11 +549,7 @@ fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
     h.wait("the install to run", 10, || {
         std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n'))
     });
-    let pid: i32 = std::fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = read_pid(&pid_file);
     h.kill_daemon();
     stage.wait().unwrap();
 
@@ -629,12 +577,7 @@ fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
     h.commit("v1", "confirm");
     h.commit("v2", "confirm");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
     // A storage file that is not a database: the next switch cannot snapshot it.
@@ -693,12 +636,7 @@ fn a_crash_looping_permanent_generation_backs_off_then_fails_until_started() {
     );
     h.commit("v1", "confirm");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     // The first crash comes after a run longer than min_uptime, so it is not a failed start.
     h.wait("g1 to outlive min_uptime", 10, || {
         h.status()["process"]["uptime"]
@@ -767,29 +705,15 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
     let blocker = h.dir.join("s/state.json.tmp");
-    let refused = |args: &[&str], code: &str, says: &str| {
-        let (exit, error) = h.fk(args);
-        assert_eq!(
-            (exit, error["code"].as_str()),
-            (1, Some(code)),
-            "{args:?}: {error}"
-        );
-        let message = error["message"].as_str().unwrap();
-        assert!(message.contains(says), "{args:?}: {message}");
-    };
 
     // The switch: its first intent cannot be written, so g1 is never stopped and g2 is still only tested.
     std::fs::create_dir(&blocker).unwrap();
     refused(
+        &h,
         &["switch", "g2"],
         "internal",
         "g2 stays tested and nothing changed",
@@ -798,7 +722,7 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     assert_eq!(h.status()["pending"], Value::Null);
     assert_eq!(h.generation("g2")["state"], "tested");
     // A stage whose record cannot be written fails before its worktree exists.
-    refused(&["stage", "v1"], "internal", "nothing was staged");
+    refused(&h, &["stage", "v1"], "internal", "nothing was staged");
     assert!(!h.dir.join("s/generations/g3").exists());
     std::fs::remove_dir(&blocker).unwrap();
 
@@ -807,6 +731,7 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
     std::fs::create_dir(&blocker).unwrap();
     refused(
+        &h,
         &["confirm", "g2"],
         "internal",
         "g2 is still pending, confirm again",
@@ -817,6 +742,7 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
 
     // The end of the rollback: the storage is restored, but nothing starts while the switch is still on disk.
     refused(
+        &h,
         &["rollback"],
         "internal",
         "the app stays stopped and `fawkes rollback` retries",
@@ -833,12 +759,13 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     let snapshot = h.dir.join("s/generations/g2/snapshot");
     let moved = h.dir.join("s/snapshot-moved");
     std::fs::rename(&snapshot, &moved).unwrap();
-    refused(&["rollback"], "storage_failed", "could not be restored");
+    refused(&h, &["rollback"], "storage_failed", "could not be restored");
     let status = h.status();
     assert_eq!(status["process"]["state"], "failed", "{status}");
     assert_eq!(status["pending"]["generation"], "g2", "{status}");
     for args in [&["start"][..], &["confirm"], &["switch", "g1"]] {
         refused(
+            &h,
             args,
             "invalid_state",
             "`fawkes rollback` retries the restore",
@@ -870,7 +797,6 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
 /// `status` and `history` lines.
 #[test]
 fn subscribe_since_replays_the_events_after_a_sequence_number() {
-    use std::io::{BufRead, Write};
     let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.start_daemon();
@@ -888,16 +814,16 @@ fn subscribe_since_replays_the_events_after_a_sequence_number() {
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
     let middle = seqs[seqs.len() / 2];
 
-    let mut stream = std::os::unix::net::UnixStream::connect(h.dir.join("s/fawkes.sock")).unwrap();
+    let mut stream = h.connect();
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     writeln!(
         stream,
         r#"{{"command": "subscribe", "args": {{"since": {middle}}}}}"#
     )
     .unwrap();
-    let mut lines = std::io::BufReader::new(&stream).lines();
+    let mut lines = BufReader::new(&stream).lines();
     let mut replayed = Vec::new();
     let first_other = loop {
         let line: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
@@ -921,12 +847,7 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
     h.commit("v1", "slow-stop");
     h.commit("v2", "confirm");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
 
@@ -966,18 +887,12 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
 /// answers ok: the app stays stopped once the backoff has passed.
 #[test]
 fn stop_during_a_crash_backoff_cancels_the_restart_and_answers_ok() {
-    use std::io::Write;
     let mut h = Harness::new("max_failed_starts = 5");
     // Two failed starts in a row: the second restart waits 2 s, the window `stop` lands in.
     h.edit_manifest("min_uptime = 1", "min_uptime = 60");
     h.commit("v1", "confirm");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     assert_eq!(h.status()["process"]["restart_at"], Value::Null);
 
     let crash = |h: &Harness| {
@@ -1014,7 +929,7 @@ fn stop_during_a_crash_backoff_cancels_the_restart_and_answers_ok() {
             .is_some_and(|message| message.contains("scheduled restart")),
     );
     // Past the 2 s backoff: nothing restarted the app.
-    std::thread::sleep(std::time::Duration::from_millis(3000));
+    std::thread::sleep(Duration::from_millis(3000));
     let process = h.status()["process"].clone();
     assert_eq!(process["state"], "stopped", "{process}");
     assert_eq!(process["restart_at"], Value::Null, "{process}");
@@ -1032,27 +947,13 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();
-    h.ok(&["stage", "v1"]);
-    h.ok(&["test", "g1"]);
-    h.ok(&["switch", "g1"]);
-    h.wait("g1 to confirm itself", 15, || {
-        h.status()["permanent"] == "g1"
-    });
+    make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
-    let refused = |args: &[&str], code: &str, says: &str| {
-        let (exit, error) = h.fk(args);
-        assert_eq!(
-            (exit, error["code"].as_str()),
-            (1, Some(code)),
-            "{args:?}: {error}"
-        );
-        let message = error["message"].as_str().unwrap();
-        assert!(message.contains(says), "{args:?}: {message}");
-    };
 
     // Nothing has failed: neither with a switch pending nor without one.
     refused(
+        &h,
         &["rollback", "--keep-storage"],
         "invalid_state",
         "only gives up a restore that failed",
@@ -1060,6 +961,7 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     h.ok(&["switch", "g2", "--deadline", "120"]);
     h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
     refused(
+        &h,
         &["rollback", "--keep-storage"],
         "invalid_state",
         "only gives up a restore that failed",
@@ -1067,7 +969,7 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     assert_eq!(h.status()["pending"]["generation"], "g2");
 
     std::fs::remove_dir_all(h.dir.join("s/generations/g2/snapshot")).unwrap();
-    refused(&["rollback"], "storage_failed", "could not be restored");
+    refused(&h, &["rollback"], "storage_failed", "could not be restored");
     assert_eq!(h.status()["process"]["state"], "failed");
     assert_eq!(h.get(), None);
 
@@ -1096,7 +998,7 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
             .is_some_and(|message| message.contains("may already have migrated")),
     );
     // Nothing is pending any more.
-    refused(&["rollback"], "invalid_state", "nothing to roll back");
+    refused(&h, &["rollback"], "invalid_state", "nothing to roll back");
 }
 
 /// The messages of the events of `kind`, oldest first, that start with `prefix`.
@@ -1107,14 +1009,35 @@ fn messages_starting(h: &Harness, kind: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// Make a generation `id` of `version` permanent, in a daemon that has none yet.
+/// Stage `version` as generation `id`, test it, switch to it and wait for the app to confirm itself.
 fn make_permanent(h: &Harness, version: &str, id: &str) {
     h.ok(&["stage", version]);
     h.ok(&["test", id]);
     h.ok(&["switch", id]);
-    h.wait("the generation to confirm itself", 15, || {
+    h.wait(&format!("{id} to confirm itself"), 15, || {
         h.status()["permanent"] == id
     });
+}
+
+/// `fawkes <args>` fails with exit code 1, error `code`, and a message that says `says`.
+fn refused(h: &Harness, args: &[&str], code: &str, says: &str) {
+    let (exit, error) = h.fk(args);
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (1, Some(code)),
+        "{args:?}: {error}"
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains(says), "{args:?}: {message}");
+}
+
+/// The pid a process wrote to `path`.
+fn read_pid(path: impl AsRef<std::path::Path>) -> i32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 /// SIGHUP applies what may change while the daemon runs and the next start uses it. A manifest that changes a fixed
@@ -1317,9 +1240,8 @@ fn log_follow_replays_the_newest_events_then_streams_new_ones_once() {
     // Quiet: nothing is logged between the picture of the log and the follow.
     let log = || h.ok(&["log", "-n", "1000"])["events"].clone();
     let snapshot = log();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
     assert!(log() == snapshot, "the daemon was not quiet");
-    let all = snapshot.as_array().unwrap();
 
     let mut follow = h.follow(&[]);
     let replay: Vec<Value> = (0..20)
@@ -1329,7 +1251,7 @@ fn log_follow_replays_the_newest_events_then_streams_new_ones_once() {
                 .expect("a replayed event")
         })
         .collect();
-    assert_eq!(replay, all[all.len() - 20..]);
+    assert_eq!(replay, newer_tail(&snapshot, 20));
     assert!(
         follow.line(Duration::from_millis(500)).is_none(),
         "the replay is the newest 20 and nothing else"
