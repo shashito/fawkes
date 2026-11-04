@@ -258,8 +258,8 @@ struct Col {
 }
 
 impl Col {
-    fn new(head: &'static str, cells: &[String], rank: u8) -> Col {
-        let widest = cells.iter().map(|c| width_of(c)).max().unwrap_or(0);
+    fn new<'a>(head: &'static str, cells: impl Iterator<Item = &'a str>, rank: u8) -> Col {
+        let widest = cells.map(width_of).max().unwrap_or(0);
         Col {
             head,
             width: widest.max(width_of(head)),
@@ -373,15 +373,12 @@ fn draw_table(
 
 /// The state cell: symbol and word, and its colour.
 fn app_state(view: &AppView) -> (String, Color) {
-    let Some(status) = &view.status else {
-        return match view.link {
-            Link::Down(_) => ("◌ disconnected".into(), Color::Red),
-            _ => ("◌ connecting".into(), Color::Gray),
-        };
-    };
     if matches!(view.link, Link::Down(_)) {
         return ("◌ disconnected".into(), Color::Red);
     }
+    let Some(status) = &view.status else {
+        return ("◌ connecting".into(), Color::Gray);
+    };
     if let Some(step) = &status.busy {
         return (format!("⟳ {step}"), Color::Yellow);
     }
@@ -390,6 +387,13 @@ fn app_state(view: &AppView) -> (String, Color) {
         ProcessState::Stopped => ("○ stopped".into(), Color::Gray),
         ProcessState::Failed => ("✘ failed".into(), Color::Red),
     }
+}
+
+/// The uptime the daemon reported, plus the time since it did, so the screen keeps counting between updates.
+fn uptime(view: &AppView, reported: Option<f64>) -> String {
+    reported.map_or("-".to_string(), |u| {
+        duration(u + view.status_at.elapsed().as_secs_f64())
+    })
 }
 
 /// The newest generation that waits to be switched to.
@@ -418,9 +422,6 @@ fn draw_apps(frame: &mut Frame, app: &App, now: u64, area: Rect) {
             let process = status.map(|s| &s.process);
             let running = process.is_some_and(|p| p.state == ProcessState::Running);
             let fact = |value: String| if running { value } else { "-".to_string() };
-            let uptime = process.and_then(|p| p.uptime).map_or("-".to_string(), |u| {
-                duration(u + view.status_at.elapsed().as_secs_f64())
-            });
             let confirm = view.countdown(now);
             let style = if matches!(view.link, Link::Down(_)) {
                 dim()
@@ -439,7 +440,7 @@ fn draw_apps(frame: &mut Frame, app: &App, now: u64, area: Rect) {
                     confirm.map_or("-".into(), |left| format!("⏱ {}", mmss(left))),
                     fact(or_dash(process.and_then(|p| p.pid))),
                     fact(or_dash(process.map(|p| p.port))),
-                    fact(uptime),
+                    fact(uptime(view, process.and_then(|p| p.uptime))),
                     or_dash(process.map(|p| p.restarts)),
                 ],
                 confirm,
@@ -465,8 +466,7 @@ fn draw_apps(frame: &mut Frame, app: &App, now: u64, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, (head, rank))| {
-            let cells: Vec<String> = rows.iter().map(|r| r.cells[i].clone()).collect();
-            let mut col = Col::new(head, &cells, *rank);
+            let mut col = Col::new(head, rows.iter().map(|r| r.cells[i].as_str()), *rank);
             if *head == "APP" {
                 col.width = col.width.min(24);
             }
@@ -546,13 +546,11 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
         first.push(Span::raw(format!("  {} {}", g.id, g.label())));
     }
     if process.state == ProcessState::Running {
-        let uptime = process.uptime.map_or("-".to_string(), |u| {
-            duration(u + view.status_at.elapsed().as_secs_f64())
-        });
         first.push(Span::raw(format!(
-            "  pid {}  :{}  up {uptime}  restarts {}",
+            "  pid {}  :{}  up {}  restarts {}",
             or_dash(process.pid),
             process.port,
+            uptime(view, process.uptime),
             process.restarts
         )));
     } else {
@@ -668,17 +666,19 @@ fn generation_info(view: &AppView, g: &Generation) -> (String, Color) {
 }
 
 fn draw_generations(frame: &mut Frame, app: &App, view: &AppView, now: u64, area: Rect) {
-    let rows: Vec<[String; 5]> = view
+    let rows: Vec<(&Generation, [String; 5], Color)> = view
         .rows()
         .into_iter()
         .map(|g| {
-            [
+            let (info, info_color) = generation_info(view, g);
+            let cells = [
                 g.id.clone(),
                 g.label(),
                 g.state.as_str().to_string(),
                 generation_age(g, now),
-                generation_info(view, g).0,
-            ]
+                info,
+            ];
+            (g, cells, info_color)
         })
         .collect();
     let heads = [
@@ -688,21 +688,17 @@ fn draw_generations(frame: &mut Frame, app: &App, view: &AppView, now: u64, area
         ("AGE", 2),
         ("INFO", 0),
     ];
-    let mut cols: Vec<Col> = heads
+    let cols: Vec<Col> = heads
         .iter()
         .enumerate()
         .map(|(i, (head, rank))| {
-            let cells: Vec<String> = rows.iter().map(|r| r[i].clone()).collect();
-            Col::new(head, &cells, *rank)
+            let col = Col::new(head, rows.iter().map(|r| r.1[i].as_str()), *rank);
+            if *head == "INFO" { col.fill() } else { col }
         })
         .collect();
-    cols[4] = std::mem::replace(&mut cols[4], Col::new("", &[], 0)).fill();
-    let bodies: Vec<Body> = view
-        .rows()
+    let bodies: Vec<Body> = rows
         .into_iter()
-        .zip(rows)
-        .map(|(g, cells)| {
-            let info_color = generation_info(view, g).1;
+        .map(|(g, cells, info_color)| {
             let red = matches!(g.state, GenState::RolledBack | GenState::TestFailed);
             let cells = cells.into_iter().enumerate().map(|(i, text)| {
                 let cell = Cell::new(text);
@@ -784,14 +780,16 @@ fn draw_events(frame: &mut Frame, app: &App, view: &AppView, area: Rect) {
         view.frozen.unwrap_or(view.events.len())
     };
     let needle = app.filter.to_lowercase();
-    let events: Vec<&Event> = view
+    // The newest that fit, found from the end so a long backlog is not filtered whole on every frame.
+    let mut events: Vec<&Event> = view
         .events
         .iter()
         .take(shown)
+        .rev()
         .filter(|e| needle.is_empty() || event_text(e).to_lowercase().contains(&needle))
+        .take(body.height as usize)
         .collect();
-    let skip = events.len().saturating_sub(body.height as usize);
-    let events = &events[skip..];
+    events.reverse();
     let kind_width = events
         .iter()
         .map(|e| width_of(e.kind.as_str()))
