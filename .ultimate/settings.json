@@ -6,5 +6,12 @@
         "[ -d target ] || [ ! -d \"$ULTIMATE_SOURCE/target\" ] || cp -cR \"$ULTIMATE_SOURCE/target\" target"
       ]
     }
+  },
+  "lander": {
+    "checks": [
+      { "command": "cargo fmt --check", "timeout": 60 },
+      { "command": "cargo clippy --all-targets -- -D warnings", "timeout": 300 },
+      { "command": "cargo test", "timeout": 600 }
+    ]
   }
 }

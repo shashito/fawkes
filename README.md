@@ -38,3 +38,17 @@ Prototype. Everything in [DESIGN.md](DESIGN.md) is built except its **Later** se
 `test`, `switch`, `confirm`, automatic and manual `rollback`), `start`/`stop`/`restart` with crash restarts and
 backoff, `prune`, manifest reload on SIGHUP, and the `tui`. It is tested against a copy of an Ultimate fork, never a
 live install.
+
+## Running the tests
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+The toolchain is pinned in `rust-toolchain.toml`. The integration tests (`tests/core.rs`) run the real binary
+against the sample app in `examples/sample/`, so they need `git` and Node.js 22.13 or later on `PATH` (the app uses
+`node:sqlite`, which 22.5 to 22.12 only have behind `--experimental-sqlite`). Each test builds its own world under
+`/tmp/fk<port>` with a block of ports it claims for itself, so the suite runs in parallel, and several checkouts can
+run it at the same time.

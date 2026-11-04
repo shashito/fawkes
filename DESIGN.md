@@ -78,7 +78,9 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
 3. Snapshot every storage file into the target's `snapshot/` (SQLite online backup API). Stopping first means no
    write of the old generation lands after the snapshot, so a rollback loses nothing the old generation wrote.
 4. Mark the target `current` and write the step `pending` with its deadline (absolute time) to `state.json`, then
-   start the target on the live port. The intent is on disk before any process of the target exists, so a daemon
+   start the target on the live port. The deadline is wall-clock time, so it survives a daemon restart, and it also
+   runs on while the machine sleeps: a switch whose deadline passes during a sleep rolls back on wake, however
+   healthy the new generation was. Confirm before closing the lid, or give a longer `--deadline`. The intent is on disk before any process of the target exists, so a daemon
    that dies from here on rolls the switch back at its next start. If the target cannot be started, the switch is
    rolled back at once (below).
 5. Health-check it in the background and log `healthy` when it passes. Health never confirms: only `confirm` does.
@@ -216,6 +218,11 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
      then start the permanent generation.
 
 ## Manifest
+
+The manifest is trusted input, like a crontab or a unit file: its commands run with the daemon's user and
+environment, and the repository's code runs the same way once staged. Whoever can write the manifest or push to the
+repository can run anything as that user. Validation (below) catches mistakes, not attacks, so keep the manifest
+writable by its owner only.
 
 TOML, one file per app. Relative paths resolve against the manifest's directory. Strings in `install`, `start`,
 `health.command`, `health.url` and `env` values expand these templates:
