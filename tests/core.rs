@@ -1241,8 +1241,9 @@ fn a_reload_cannot_change_the_port_while_a_switch_has_stopped_the_old_app() {
     );
 }
 
-/// With `rollback_on_unhealthy`, the rollback is decided before `unhealthy` is logged, so a confirm sent the moment
-/// the event appears is refused as one for a generation being rolled back, and g2 ends rolled back.
+/// With `rollback_on_unhealthy`, a confirm sent the moment `unhealthy` appears is refused as one for a generation
+/// being rolled back, and g2 ends rolled back. That the decision comes before the event is pinned by the unit test
+/// in `daemon/supervisor.rs`; a client reading the event is too slow to see the order.
 #[test]
 fn a_confirm_sent_at_the_unhealthy_event_finds_the_rollback_decided() {
     let mut h = Harness::new("rollback_on_unhealthy = true");
@@ -1337,16 +1338,22 @@ fn log_follow_replays_the_newest_events_then_streams_new_ones_once() {
     // New events as they happen: exactly the ones after the replay, in order, none twice.
     h.ok(&["stop"]);
     h.ok(&["start"]);
-    let started = follow.until("the restart", 15, |e| {
-        e["kind"] == "started" && e["seq"].as_u64() > replay[19]["seq"].as_u64()
-    });
-    assert!(started["seq"].as_u64().unwrap() > replay[19]["seq"].as_u64().unwrap());
-    let healthy = follow.until("the health check", 15, |e| e["kind"] == "healthy");
-    assert!(healthy["seq"].as_u64() > started["seq"].as_u64());
+    let mut followed = Vec::new();
+    while followed
+        .last()
+        .is_none_or(|e: &Value| e["kind"] != "healthy")
+    {
+        followed.push(
+            follow
+                .next(Duration::from_secs(15))
+                .expect("the restart and its health check"),
+        );
+    }
     assert!(
         follow.line(Duration::from_millis(500)).is_none(),
         "nothing arrives twice"
     );
+    // Every event the daemon logged after the replay, none left out and in order.
     let newer: Vec<Value> = log()
         .as_array()
         .unwrap()
@@ -1354,9 +1361,10 @@ fn log_follow_replays_the_newest_events_then_streams_new_ones_once() {
         .filter(|e| e["seq"].as_u64() > replay[19]["seq"].as_u64())
         .cloned()
         .collect();
+    assert_eq!(followed, newer);
     let seqs: Vec<u64> = newer.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
-    assert!(newer.contains(&started) && newer.contains(&healthy));
+    assert!(followed.iter().any(|e| e["kind"] == "started"));
 
     // `-n` bounds the replay.
     let mut few = h.follow(&["-n", "3"]);
