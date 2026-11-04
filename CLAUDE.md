@@ -63,7 +63,8 @@ not built yet. Don't start one unless asked.
 - **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (the `ErrorCode` enum) and a
   readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon, CLI and
   TUI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
-- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command supports `--json`.
+- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `daemon` and `tui`
+  supports `--json`, and under it every failure, the client's own included, prints one error object.
 
 ## Dependencies
 
