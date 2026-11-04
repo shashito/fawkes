@@ -1,6 +1,7 @@
 //! Storage snapshots and restores with SQLite's online backup API, so a live WAL-mode database is copied
 //! consistently, uncheckpointed writes included.
 
+use crate::state::{with_suffix, write_durably};
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -33,12 +34,11 @@ fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
 /// Delete a database file together with its `-wal`, `-shm` and `-journal`.
 fn remove_database(path: &Path) -> Result<(), String> {
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        match std::fs::remove_file(&name) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot delete {}: {e}", Path::new(&name).display())),
+        let name = with_suffix(path, suffix);
+        if let Err(e) = std::fs::remove_file(&name)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!("cannot delete {}: {e}", name.display()));
         }
     }
     Ok(())
@@ -63,7 +63,7 @@ pub fn snapshot(home: &Path, storage: &[String], dir: &Path) -> Result<(), Strin
     }
     // Written last and durably: a rollback trusts a snapshot only through its index.
     let json = serde_json::to_vec_pretty(&index).map_err(|e| e.to_string())?;
-    crate::state::write_durably(&dir.join("index.json"), &json)
+    write_durably(&dir.join("index.json"), &json)
         .map_err(|e| format!("cannot write index.json: {e}"))
 }
 

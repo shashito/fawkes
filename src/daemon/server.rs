@@ -11,7 +11,7 @@ use std::time::Duration;
 
 /// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes tui` finds every daemon.
 pub(super) fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
-    let dir = crate::manifest::fawkes_home()?.join("run");
+    let dir = crate::manifest::run_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let link = dir.join(format!("{name}.sock"));
     if std::fs::read_link(&link).is_ok_and(|target| target != socket)
@@ -44,15 +44,13 @@ pub(super) fn bind(socket: &Path) -> Result<UnixListener, String> {
             socket.display()
         ));
     }
-    match std::fs::remove_file(socket) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(format!(
-                "cannot remove the old socket {}: {e}",
-                socket.display()
-            ));
-        }
+    if let Err(e) = std::fs::remove_file(socket)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "cannot remove the old socket {}: {e}",
+            socket.display()
+        ));
     }
     // Created 0600 from the start: no moment in which the umask's permissions apply. The umask is process-wide, so
     // this must run before the daemon starts its first thread.

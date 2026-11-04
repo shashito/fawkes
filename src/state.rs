@@ -289,18 +289,22 @@ pub fn refusal(g: &Generation, to: GenState) -> Error {
     })
 }
 
+/// `path` with `suffix` appended to its last component: `state.json` and `.bak` give `state.json.bak`.
+pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    name.into()
+}
+
 /// `state.json.bak` next to `state.json`.
 fn backup_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".bak");
-    name.into()
+    with_suffix(path, ".bak")
 }
 
 /// Write `bytes` to `path` so that any crash, a power loss included, leaves the old or the new file whole: a temp
 /// file, synced, renamed into place, then the directory synced so the rename is on disk too.
 pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    let tmp = with_suffix(path, ".tmp");
     let mut file = File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -534,6 +538,14 @@ fn open_append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+/// Keep `event` among the newest `RECENT_EVENTS`, forgetting the oldest.
+fn remember(recent: &mut VecDeque<Event>, event: Event) {
+    if recent.len() == RECENT_EVENTS {
+        recent.pop_front();
+    }
+    recent.push_back(event);
+}
+
 impl EventLog {
     pub fn open(path: PathBuf) -> std::io::Result<EventLog> {
         EventLog::with_limit(path, EVENT_LOG_BYTES)
@@ -551,10 +563,7 @@ impl EventLog {
                 .filter_map(|l| serde_json::from_str::<Event>(l).ok())
             {
                 last_seq = last_seq.max(event.seq);
-                if recent.len() == RECENT_EVENTS {
-                    recent.pop_front();
-                }
-                recent.push_back(event);
+                remember(&mut recent, event);
             }
         }
         Ok(EventLog {
@@ -596,10 +605,7 @@ impl EventLog {
         if self.file.write_all(line.as_bytes()).is_ok() {
             self.bytes += line.len() as u64;
         }
-        if self.recent.len() == RECENT_EVENTS {
-            self.recent.pop_front();
-        }
-        self.recent.push_back(event.clone());
+        remember(&mut self.recent, event.clone());
         if self.bytes >= self.limit {
             self.rotate();
         }

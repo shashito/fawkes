@@ -1,10 +1,10 @@
 //! The transactions (stage, test, switch, confirm, rollback) and the pruning of old generations.
 
-use super::{Daemon, Live, Slot, Why, lock};
-use crate::manifest::{Manifest, Vars};
+use super::{Daemon, Live, Slot, Why, lock, tenths};
+use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
-    Error, ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
+    ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
     RollbackResult, SwitchResult, TestInfo, err, invalid_state, not_found,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, refusal};
@@ -13,15 +13,25 @@ use std::io::Read;
 use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
-pub(super) fn restore_failed(id: &str) -> Error {
-    invalid_state(format!(
-        "{id} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore"
-    ))
+/// Refuse a command that acts on the live generation (start, stop, restart, switch, confirm) while a rollback's
+/// restore has failed and awaits `rollback`.
+pub(super) fn refuse_failed_restore(state: &State) -> R<()> {
+    match &state.txn {
+        Some(Txn::RollingBack {
+            pending,
+            restore_failed: true,
+            ..
+        }) => Err(invalid_state(format!(
+            "{} was rolled back but its storage could not be restored; `fawkes rollback` retries the restore",
+            pending.generation
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// How long the quick git calls (rev-parse, prune, remove) get.
@@ -150,7 +160,7 @@ impl Daemon {
                 });
                 Ok((id, reuse_from))
             })
-            .map_err(|e| err(e.code, format!("{}; nothing was staged", e.message)))?
+            .map_err(|e| e.with_hint("nothing was staged"))?
         };
         if let Err(e) = self.build(out, &m, &id, git_ref, &commit, &reuse_from) {
             // A failed install's log outlives the generation, for the agent to read.
@@ -246,13 +256,7 @@ impl Daemon {
         let Some(install) = &m.install else {
             return Ok(());
         };
-        let vars = Vars {
-            port: m.port,
-            home: m.home.clone(),
-            code: code.clone(),
-            generation: id.into(),
-            state: self.paths.root.clone(),
-        };
+        let vars = self.vars(m.port, &m.home, &code, id);
         let command = vars.expand_command(install);
         self.say(out, id, format!("installing: {command}"));
         self.run_install(m, &command, &code, &self.paths.install_log(id))
@@ -276,17 +280,9 @@ impl Daemon {
         code: &Path,
         log: &Path,
     ) -> Result<(), String> {
-        let mut child = process::spawn(
-            command,
-            code,
-            &[],
-            log,
-            &format!("install: {command}"),
-            Some(&self.paths.step_pid()),
-        )
-        .map_err(|e| e.to_string())?;
-        let pgid = child.id();
-        lock(&self.step_pgids).push(pgid);
+        let mut child = self
+            .spawn_step(command, code, &[], log, &format!("install: {command}"))
+            .map_err(|e| e.to_string())?;
         let give_up = Instant::now() + Duration::from_secs_f64(m.install_timeout);
         let result = loop {
             match child.try_wait() {
@@ -301,10 +297,31 @@ impl Daemon {
         };
         // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
         // outlives the stage.
-        process::stop_group(pgid, m.stop_timeout, Some(&mut child));
+        self.end_step(&mut child, m.stop_timeout);
+        result
+    }
+
+    /// Start an install or a test: the start wrapper records it in `step.pid` for a later daemon, and its group joins
+    /// those `shutdown` kills.
+    fn spawn_step(
+        &self,
+        command: &str,
+        cwd: &Path,
+        env: &process::Env,
+        log: &Path,
+        header: &str,
+    ) -> std::io::Result<Child> {
+        let child = process::spawn(command, cwd, env, log, header, Some(&self.paths.step_pid()))?;
+        lock(&self.step_pgids).push(child.id());
+        Ok(child)
+    }
+
+    /// End the install or test `child` together with everything left in its group, and forget it.
+    fn end_step(&self, child: &mut Child, stop_timeout: f64) {
+        let pgid = child.id();
+        process::stop_group(pgid, stop_timeout, Some(child));
         self.forget_step_pid_file();
         lock(&self.step_pgids).retain(|p| *p != pgid);
-        result
     }
 
     /// Remove generation `id` for good: its worktree, its directory (snapshot and logs included) and its record.
@@ -319,15 +336,13 @@ impl Daemon {
                 &["worktree", "remove", "--force", &code.to_string_lossy()],
             );
         }
-        match std::fs::remove_dir_all(self.paths.generation(id)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(format!(
-                    "cannot remove {}: {e}",
-                    self.paths.generation(id).display()
-                ));
-            }
+        if let Err(e) = std::fs::remove_dir_all(self.paths.generation(id))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!(
+                "cannot remove {}: {e}",
+                self.paths.generation(id).display()
+            ));
         }
         let _ = git(&m.repo, &["worktree", "prune"]);
         let mut inner = self.inner();
@@ -371,25 +386,23 @@ impl Daemon {
             format!("starting {id} on spare port {port} with a copy of the storage"),
         );
         let started = Instant::now();
-        let vars = self.vars(port, &test_home, &g);
+        let vars = self.vars(port, &test_home, &g.dir, id);
         let env = self.app_env(&m, &vars, "test");
         let log = self.paths.app_log(id);
-        let mut child = process::spawn(
-            &vars.expand_command(&m.start),
-            &g.dir,
-            &env,
-            &log,
-            &format!("start {id} test port {port}"),
-            Some(&self.paths.step_pid()),
-        )
-        .map_err(|e| {
-            err(
-                ErrorCode::StartFailed,
-                format!("cannot start {id} for its test: {e}"),
+        let mut child = self
+            .spawn_step(
+                &vars.expand_command(&m.start),
+                &g.dir,
+                &env,
+                &log,
+                &format!("start {id} test port {port}"),
             )
-        })?;
-        let pgid = child.id();
-        lock(&self.step_pgids).push(pgid);
+            .map_err(|e| {
+                err(
+                    ErrorCode::StartFailed,
+                    format!("cannot start {id} for its test: {e}"),
+                )
+            })?;
 
         let check = m.health_check(&vars);
         let result = process::wait_healthy(
@@ -400,9 +413,7 @@ impl Daemon {
             m.health.timeout,
             || matches!(child.try_wait(), Ok(None)),
         );
-        process::stop_group(pgid, m.stop_timeout, Some(&mut child));
-        self.forget_step_pid_file();
-        lock(&self.step_pgids).retain(|p| *p != pgid);
+        self.end_step(&mut child, m.stop_timeout);
         let _ = std::fs::remove_dir_all(&test_home);
         // Our test process is gone, so a port that is still taken was taken by someone else, most likely between
         // the probe and the app's bind: not the generation's fault, so its state and last result stay as they were.
@@ -419,7 +430,7 @@ impl Daemon {
             port,
             passed,
             at: now(),
-            seconds: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+            seconds: tenths(started.elapsed()),
             message: result
                 .as_ref()
                 .map_or_else(Clone::clone, |()| "healthy".into()),
@@ -466,21 +477,15 @@ impl Daemon {
     ) -> R<SwitchResult> {
         let _busy = self.begin(&format!("switch {id}"), Slot::Both)?;
         let m = self.manifest();
+        let unchanged = format!("{id} stays tested and nothing changed");
         let previous = {
             let inner = self.inner();
-            match &inner.store.state().txn {
-                Some(Txn::RollingBack {
-                    pending,
-                    restore_failed: true,
-                    ..
-                }) => return Err(restore_failed(&pending.generation)),
-                Some(txn) => {
-                    return Err(invalid_state(format!(
-                        "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
-                        txn.generation()
-                    )));
-                }
-                None => {}
+            refuse_failed_restore(inner.store.state())?;
+            if let Some(txn) = &inner.store.state().txn {
+                return Err(invalid_state(format!(
+                    "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
+                    txn.generation()
+                )));
             }
             let g = inner.store.state().find(id).ok_or_else(|| not_found(id))?;
             if !allowed(g.state, GenState::Current) {
@@ -500,12 +505,7 @@ impl Daemon {
                 });
                 Ok(())
             })
-            .map_err(|e| {
-                err(
-                    e.code,
-                    format!("{}; {id} stays tested and nothing changed", e.message),
-                )
-            })?;
+            .map_err(|e| e.with_hint(&unchanged))?;
         }
 
         // Stop first: no write of the old generation can land after the snapshot. A crash restart the old generation
@@ -530,10 +530,7 @@ impl Daemon {
             let Some(previous) = &previous else { return };
             // A daemon on its way out does not start what it is about to stop; its next start does.
             if had_app && !daemon.shutting_down() {
-                if let Err(e) = daemon.start_live(&mut inner, previous, Why::Fresh) {
-                    inner.live = Live::Failed;
-                    daemon.event(EventKind::Failed, Some(previous), e.message);
-                }
+                daemon.start_or_give_up(&mut inner, previous, Why::Fresh);
             } else if let Some((until, at)) = backoff {
                 // The backoff and the failed-start count stay as the crash left them.
                 inner.live = Live::Backoff { until, at };
@@ -543,10 +540,7 @@ impl Daemon {
         self.say(out, id, "snapshotting storage");
         if let Err(e) = storage::snapshot(&m.home, &m.storage, &self.paths.snapshot(id)) {
             resume(self);
-            return Err(err(
-                ErrorCode::StorageFailed,
-                format!("{e}; {id} stays tested and nothing changed"),
-            ));
+            return Err(err(ErrorCode::StorageFailed, e).with_hint(&unchanged));
         }
 
         // The request and the manifest both bound the deadline by MAX_DEADLINE, so this never saturates; saturating
@@ -588,10 +582,7 @@ impl Daemon {
         if let Err(e) = switched {
             drop(inner);
             resume(self);
-            return Err(err(
-                e.code,
-                format!("{}; {id} stays tested and nothing changed", e.message),
-            ));
+            return Err(e.with_hint(&unchanged));
         }
         if let Err(e) = self.start_live(&mut inner, id, Why::Fresh) {
             drop(inner);
@@ -624,12 +615,8 @@ impl Daemon {
 
     pub(super) fn confirm(&self, id: Option<&str>) -> R<Generation> {
         let mut inner = self.inner();
+        refuse_failed_restore(inner.store.state())?;
         match &inner.store.state().txn {
-            Some(Txn::RollingBack {
-                pending,
-                restore_failed: true,
-                ..
-            }) => return Err(restore_failed(&pending.generation)),
             Some(Txn::RollingBack {
                 pending, reason, ..
             }) => {
@@ -703,13 +690,10 @@ impl Daemon {
                 Ok(record)
             })
             .map_err(|e| {
-                err(
-                    e.code,
-                    format!(
-                        "{}; {} is still pending, confirm again",
-                        e.message, pending.generation
-                    ),
-                )
+                e.with_hint(format!(
+                    "{} is still pending, confirm again",
+                    pending.generation
+                ))
             })?;
         self.event(
             EventKind::Confirmed,
@@ -800,11 +784,8 @@ impl Daemon {
                 permanent.as_deref().unwrap_or("nothing")
             ),
         );
-        if let Some(permanent) = &permanent
-            && let Err(e) = self.start_live(&mut inner, permanent, Why::Fresh)
-        {
-            inner.live = Live::Failed;
-            self.event(EventKind::Failed, Some(permanent), e.message);
+        if let Some(permanent) = &permanent {
+            self.start_or_give_up(&mut inner, permanent, Why::Fresh);
         }
         Ok(RollbackResult {
             from: id,
@@ -846,11 +827,8 @@ impl Daemon {
                 permanent.as_deref().unwrap_or("nothing")
             ),
         );
-        if let Some(permanent) = &permanent
-            && let Err(e) = self.start_live(&mut inner, permanent, Why::Fresh)
-        {
-            inner.live = Live::Failed;
-            self.event(EventKind::Failed, Some(permanent), e.message);
+        if let Some(permanent) = &permanent {
+            self.start_or_give_up(&mut inner, permanent, Why::Fresh);
         }
         Ok(RollbackResult {
             from: id,

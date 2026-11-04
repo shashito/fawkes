@@ -1,6 +1,6 @@
 //! The `start`, `stop` and `restart` commands.
 
-use super::transactions::restore_failed;
+use super::transactions::refuse_failed_restore;
 use super::{Daemon, Inner, Live, Slot, Why};
 use crate::protocol::{ErrorCode, EventKind, Out, Process, R, err, invalid_state};
 use crate::state::Txn;
@@ -8,24 +8,18 @@ use std::sync::Arc;
 
 impl Daemon {
     pub(super) fn current_generation(inner: &Inner) -> R<String> {
-        match &inner.store.state().txn {
-            Some(Txn::RollingBack {
-                pending,
-                restore_failed: true,
-                ..
-            }) => return Err(restore_failed(&pending.generation)),
-            Some(Txn::RollingBack {
-                pending, reason, ..
-            }) => {
-                return Err(err(
-                    ErrorCode::Busy,
-                    format!(
-                        "{} is being rolled back ({reason}); try again when the rollback has finished",
-                        pending.generation
-                    ),
-                ));
-            }
-            _ => {}
+        refuse_failed_restore(inner.store.state())?;
+        if let Some(Txn::RollingBack {
+            pending, reason, ..
+        }) = &inner.store.state().txn
+        {
+            return Err(err(
+                ErrorCode::Busy,
+                format!(
+                    "{} is being rolled back ({reason}); try again when the rollback has finished",
+                    pending.generation
+                ),
+            ));
         }
         inner.store.state().current().map(String::from).ok_or_else(|| {
             invalid_state(
