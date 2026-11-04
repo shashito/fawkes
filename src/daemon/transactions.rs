@@ -4,7 +4,7 @@ use super::{Daemon, Live, Slot, Why, lock, tenths};
 use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
-    ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
+    Error, ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
     RollbackResult, SwitchResult, TestInfo, err, invalid_state, not_found,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, refusal};
@@ -687,10 +687,17 @@ impl Daemon {
                     pending.generation
                 ))
             })?;
+        // Apps confirm by name (the CLI sends their `FAWKES_GENERATION`), so a confirm that names none came from
+        // elsewhere, an operator most likely: the log says which it was.
+        let by = if id.is_some() {
+            "the confirm named it"
+        } else {
+            "the confirm named no generation"
+        };
         self.event(
             EventKind::Confirmed,
             Some(&pending.generation),
-            format!("{} is permanent", pending.generation),
+            format!("{} is permanent ({by})", pending.generation),
         );
         Ok(record)
     }
@@ -776,8 +783,11 @@ impl Daemon {
                 permanent.as_deref().unwrap_or("nothing")
             ),
         );
-        if let Some(permanent) = &permanent {
-            self.start_or_give_up(&mut inner, permanent, Why::Fresh);
+        if let Some(permanent) = &permanent
+            && !self.start_or_give_up(&mut inner, permanent, Why::Fresh)
+            && self.shutting_down()
+        {
+            return Err(left_to_next_start(&id, permanent));
         }
         Ok(RollbackResult {
             from: id,
@@ -819,8 +829,11 @@ impl Daemon {
                 permanent.as_deref().unwrap_or("nothing")
             ),
         );
-        if let Some(permanent) = &permanent {
-            self.start_or_give_up(&mut inner, permanent, Why::Fresh);
+        if let Some(permanent) = &permanent
+            && !self.start_or_give_up(&mut inner, permanent, Why::Fresh)
+            && self.shutting_down()
+        {
+            return Err(left_to_next_start(&id, permanent));
         }
         Ok(RollbackResult {
             from: id,
@@ -958,6 +971,17 @@ impl Daemon {
 }
 
 // ------------------------------------------------------ small helpers
+
+/// The answer to a rollback of `id` that ended while the daemon was shutting down: done, but `permanent` was not
+/// started, so an ok answer saying it runs would be wrong.
+fn left_to_next_start(id: &str, permanent: &str) -> Error {
+    err(
+        ErrorCode::Busy,
+        format!(
+            "{id} is rolled back, but the daemon is shutting down, so {permanent} was not started; the next daemon start runs it"
+        ),
+    )
+}
 
 /// Whether nothing listens on `port`, on the loopback address or on all addresses: an app may bind either.
 fn port_free(port: u16) -> bool {

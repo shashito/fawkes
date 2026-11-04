@@ -172,7 +172,10 @@ impl Daemon {
             self.forget_pid_file();
         }
         if let Some(reason) = rollback {
-            if let Err(e) = self.rollback_pending(&mut Out::none(), &reason) {
+            // A daemon that is shutting down has already logged what it did not start.
+            if let Err(e) = self.rollback_pending(&mut Out::none(), &reason)
+                && !self.shutting_down()
+            {
                 self.event(EventKind::Error, None, e.message);
             }
             return Pass::Acted;
@@ -424,12 +427,31 @@ impl Daemon {
         Ok(())
     }
 
-    /// `start_live`, giving the app up when it cannot start: the failure is logged and nothing retries it.
-    pub(super) fn start_or_give_up(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) {
-        if let Err(e) = self.start_live(inner, id, why) {
+    /// `start_live` of the permanent generation `id`, giving the app up when it cannot start: the failure is logged
+    /// and nothing retries it. A daemon on its way out starts nothing, which is no failure of the generation: its
+    /// next start runs it. Says whether the app started.
+    pub(super) fn start_or_give_up(
+        self: &Arc<Self>,
+        inner: &mut Inner,
+        id: &str,
+        why: Why,
+    ) -> bool {
+        let Err(e) = self.start_live(inner, id, why) else {
+            return true;
+        };
+        if self.shutting_down() {
+            self.event(
+                EventKind::Daemon,
+                Some(id),
+                format!(
+                    "{id} not started: the daemon is shutting down, and its next start runs {id}"
+                ),
+            );
+        } else {
             inner.live = Live::Failed;
             self.event(EventKind::Failed, Some(id), e.message);
         }
+        false
     }
 
     /// Whether process `pid` of generation `id` is still the live one when its health check gives up, i.e. whether
@@ -680,6 +702,7 @@ mod tests {
             hub: Hub(Mutex::new(Vec::new())),
             wake: Wake::new(),
             step_pgids: Mutex::new(Vec::new()),
+            echo: Mutex::new(None),
         }
     }
 
