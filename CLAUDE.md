@@ -29,7 +29,9 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   path: use `h.port` and `h.dir`, and never look for processes machine-wide (`pgrep`, `pkill`), since another
   suite's look the same. Have the app record its pid in a file instead.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
-  `process.rs`, `protocol.rs`, `daemon/mod.rs`, `tui.rs`).
+  `process.rs`, `protocol.rs`, `main.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`, `daemon/transactions.rs`,
+  `tui.rs`, `tui/net.rs`). The restart policy is the pure `after_exit` in `daemon/supervisor.rs`: test a change to
+  it there, in milliseconds, and keep the integration tests as end-to-end smoke tests.
 - To fix a bug, first write a test that reproduces it.
 - Never point a test or a manual run at a live app or a real `~/.fawkes`. Use a temp directory and a manifest in it.
 
