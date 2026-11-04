@@ -72,8 +72,10 @@ function state(host: ExtensionHost): FawkesState {
 function hold(host: ExtensionHost) {
   const s = shared(host)
   try {
-    host.harness().hold()
+    const harness = host.harness()
+    harness.hold()
     s.holding = true
+    deferRelease(host, harness)
     // Read by health.ts: a test run passes its health check only once this facet held the scheduler. Fawkes removes the
     // test home before every test, so the marker never outlives the run that wrote it.
     if (fawkes.kind === 'test') writeFileSync(join(host.home, HELD_MARKER), new Date().toISOString())
@@ -84,15 +86,31 @@ function hold(host: ExtensionHost) {
   }
 }
 
+type Releasable = { release(): void }
+const ownRelease = new WeakMap<Releasable, () => void>()
+
 /**
- * Release the hold this extension took. The pause extension holds the same scheduler with one flag: a pause the user
- * pressed stays until Play, and Play while a generation is pending releases this hold too (README, "The hold").
+ * The scheduler's hold is one flag, shared with the pause extension, whose Play (pressed, or its auto-play after a rate
+ * limit, which a copied storage carries into a test run) would end this hold too. While this extension holds, any other
+ * `release()` of this harness is set aside; this extension's own release lets the scheduler run unless the user's pause
+ * still holds it. Once per harness: a failed core swap opens a new one.
  */
+function deferRelease(host: ExtensionHost, harness: Releasable) {
+  if (ownRelease.has(harness)) return
+  const original = harness.release.bind(harness)
+  ownRelease.set(harness, original)
+  harness.release = () => {
+    if (!shared(host).holding) original()
+  }
+}
+
+/** Release the hold this extension took, unless the user's pause holds the scheduler too. */
 function release(host: ExtensionHost) {
   const s = shared(host)
   if (!s.holding) return
   s.holding = false
-  if (!host.want(PauseApi)?.paused()) host.harness().release()
+  const harness = host.harness()
+  if (!host.want(PauseApi)?.paused()) (ownRelease.get(harness) ?? harness.release.bind(harness))()
 }
 
 /**
@@ -109,7 +127,8 @@ async function confirmWhenReady(host: ExtensionHost, socket: string, generation:
       release(host)
       return
     }
-    if (status) {
+    // Confirmed already: wait for the status that says so, rather than confirm again and be refused.
+    if (status && s.confirming?.state !== 'confirmed') {
       const verdict = await mayConfirm(host)
       if (verdict.ok) {
         try {

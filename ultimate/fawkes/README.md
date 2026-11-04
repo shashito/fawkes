@@ -53,9 +53,10 @@ core swap) holds again until then.
 In a test run the hold fails closed: a hold that throws ends the process, and `health.ts` passes only once the
 facet wrote `fawkes-held` into the test home, so a generation that breaks this extension or the hold never goes live.
 
-The pause extension holds the same scheduler with one flag. Play while a generation is still pending (or in a test
-run) releases this hold too; pausing during an upgrade and playing before it is confirmed resumes work on the new
-code early.
+The pause extension holds the same scheduler with one flag, and its Play (pressed, or its auto-play after a rate limit,
+which a copied storage carries into a test run) would end this hold too. So while this extension holds, it sets
+every other `release()` of the harness aside; its own release then lets the scheduler run unless the user's pause
+still holds it. A counted hold in Ultimate would make that wrapper unnecessary.
 
 ## Status line
 
