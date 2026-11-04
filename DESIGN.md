@@ -74,6 +74,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   the first in `spare_ports` that is free on both `127.0.0.1` and `0.0.0.0`; a test that fails while another
   process holds its port afterwards is `port_in_use` and leaves the generation as it was. Only a tested
   generation can be switched to.
+  The copy of each database is one read, so it is consistent (and, in WAL mode, does not hold up the app's
+  writes); one that stays locked for 10 s fails the test with `storage_failed`.
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
 - **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
   start of the daemon always runs the permanent generation (Erlang/OTP release handler).

@@ -2,10 +2,20 @@
 //! consistently, uncheckpointed writes included.
 
 use crate::state::{with_suffix, write_durably};
+use rusqlite::backup::StepResult;
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long a copy waits for a database that another connection has locked, before it gives up. A copy takes the
+/// source in one read transaction, so only a writer holding an exclusive lock (rollback-journal mode, or
+/// `locking_mode=EXCLUSIVE`) can keep it out; no healthy app holds one for this long, and the step slot that
+/// `test` holds stays taken while the copy waits.
+const LOCKED_FOR: Duration = Duration::from_secs(10);
+
+/// How long a copy sleeps before it asks a locked database again.
+const LOCKED_RETRY: Duration = Duration::from_millis(10);
 
 /// One line of `snapshot/index.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -15,7 +25,9 @@ struct Entry {
     present: bool,
 }
 
-/// Copy the database `src` to a fresh file `dst`.
+/// Copy the database `src` to a fresh file `dst`, all pages in one step: one read transaction, so the copy is
+/// consistent, takes no pauses while the app is stopped, and, under WAL, neither blocks the app's writers nor
+/// restarts when they commit (a paced backup restarts on every write and may never end).
 fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
     let fail =
         |e: rusqlite::Error| format!("cannot copy {} to {}: {e}", src.display(), dst.display());
@@ -26,9 +38,24 @@ fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
     remove_database(dst)?;
     let from = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(fail)?;
     let mut to = Connection::open(dst).map_err(fail)?;
-    Backup::new(&from, &mut to)
-        .and_then(|b| b.run_to_completion(100, Duration::from_millis(10), None))
-        .map_err(fail)
+    let backup = Backup::new(&from, &mut to).map_err(fail)?;
+    let give_up = Instant::now() + LOCKED_FOR;
+    loop {
+        // `More` does not happen for -1 pages; stepping again is right if it ever does.
+        match backup.step(-1).map_err(fail)? {
+            StepResult::Done => return Ok(()),
+            StepResult::Busy | StepResult::Locked if Instant::now() >= give_up => {
+                return Err(format!(
+                    "cannot copy {} to {}: the database stayed locked for {} s",
+                    src.display(),
+                    dst.display(),
+                    LOCKED_FOR.as_secs()
+                ));
+            }
+            StepResult::Busy | StepResult::Locked => std::thread::sleep(LOCKED_RETRY),
+            _ => {}
+        }
+    }
 }
 
 /// Delete a database file together with its `-wal`, `-shm` and `-journal`.
@@ -97,6 +124,8 @@ pub fn copy(home: &Path, storage: &[String], dest: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn count(path: &Path) -> i64 {
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -144,5 +173,58 @@ mod tests {
         }
 
         drop((live, later));
+    }
+
+    #[test]
+    fn copy_of_a_database_written_all_the_while_finishes_and_is_consistent() {
+        let root = tempfile::tempdir().unwrap();
+        let (home, dest) = (root.path().join("home"), root.path().join("dest"));
+        std::fs::create_dir_all(&home).unwrap();
+        let live = home.join("a.sqlite");
+        // A few MB, so that a copy in steps of 100 pages needs dozens of steps.
+        let db = wal_database(&live, 0);
+        db.execute_batch(
+            "WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+             INSERT INTO t SELECT zeroblob(2000) FROM s",
+        )
+        .unwrap();
+        let before: i64 = db
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, live) = (stop.clone(), live.clone());
+            std::thread::spawn(move || {
+                let db = Connection::open(live).unwrap();
+                db.busy_timeout(Duration::from_secs(5)).unwrap();
+                while !stop.load(Ordering::Relaxed) {
+                    db.execute("INSERT INTO t VALUES (zeroblob(2000))", [])
+                        .unwrap();
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            })
+        };
+        // Bounded, so that a copy that never ends fails the test instead of hanging it.
+        let (done, copied) = std::sync::mpsc::channel();
+        let (copy_home, copy_dest) = (home.clone(), dest.clone());
+        std::thread::spawn(move || {
+            let _ = done.send(copy(&copy_home, &["a.sqlite".to_string()], &copy_dest));
+        });
+        let outcome = copied.recv_timeout(Duration::from_secs(5));
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        outcome
+            .expect("the copy did not finish while the app kept writing")
+            .unwrap();
+        let copy =
+            Connection::open_with_flags(dest.join("a.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let check: String = copy
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        assert!(count(&dest.join("a.sqlite")) >= before);
     }
 }
