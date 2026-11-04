@@ -411,4 +411,50 @@ mod tests {
             "waited {waited:?}"
         );
     }
+
+    #[test]
+    fn a_health_url_is_judged_by_its_status_line_alone() {
+        for host in ["127.0.0.1", "[::1]"] {
+            // Each answer promises a body it never sends, and its connection stays open until the checks are over:
+            // only a check that stops at the status line returns before its timeout.
+            let listener = std::net::TcpListener::bind(format!("{host}:0")).unwrap();
+            let url = format!(
+                "http://{host}:{}/health",
+                listener.local_addr().unwrap().port()
+            );
+            let answers = [
+                "200 OK",
+                "302 Found\r\nLocation: http://127.0.0.1:1/",
+                "503 Service Unavailable",
+            ];
+            let server = std::thread::spawn(move || {
+                let mut open = Vec::new();
+                for answer in answers {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    write!(stream, "HTTP/1.1 {answer}\r\nContent-Length: 1000\r\n\r\n").unwrap();
+                    open.push(stream);
+                }
+                open
+            });
+
+            let started = Instant::now();
+            let results = [http_get(&url), http_get(&url), http_get(&url)];
+            let waited = started.elapsed();
+
+            drop(server.join().unwrap());
+            assert_eq!(results[0], Ok(()), "{url}");
+            assert_eq!(
+                results[1],
+                Ok(()),
+                "{url}: a redirect is healthy, not followed"
+            );
+            assert_eq!(
+                results[2],
+                Err(format!(
+                    "{url} answered \"HTTP/1.1 503 Service Unavailable\""
+                ))
+            );
+            assert!(waited < Duration::from_secs(2), "{url} waited {waited:?}");
+        }
+    }
 }
