@@ -1,0 +1,77 @@
+Runs Ultimate's upgrades through the Fawkes supervisor: stage, test and switch a ref, and the new generation confirms itself once it works, or Fawkes rolls back code and storage.
+
+## Where it runs
+
+A user extension: link this folder into `~/.ultimate/extensions/fawkes`. Without a Fawkes daemon around it
+(`FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE` unset) it does nothing: no status-line item, no tool, no hold.
+
+Under a daemon, Ultimate runs from a generation (a git worktree of the clone at one commit), not from the clone
+itself, so a landing or a merge in the clone no longer goes live before it is installed and tested. Turn the built-in
+`update` extension off in that host (`"extensions": { "disable": ["update"] }`): it would move a clone the host does
+not run from.
+
+## The manifest
+
+`start.ts` is the manifest's `start` (see `examples/ultimate.toml` in the Fawkes repository):
+
+```toml
+start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/project"
+```
+
+- **Live** (`FAWKES_PHASE=live`): it runs `bin/ultimate.ts <project> --no-open` from the generation, Ultimate's own
+  supervisor, unchanged.
+- **Test** (`FAWKES_PHASE=test`): Fawkes gives the test run a copy of the storage, but `~`, `~/.ultimate` and the
+  project are the real ones. So the run is set up like an Ultimate preview, with the helpers of the generation under
+  test (`extensions/instance/server.ts`): a private user home inside the copy (`~/.ultimate` copied, the rest linked
+  back), a git guard that never pushes and moves only the preview's own branches, and `ULTIMATE_INSTANCE_OWNER`,
+  which turns off what previews skip. The preview's branch and checkouts are removed after the run.
+
+## The hold and the confirm
+
+The server facet holds Pi Durable's scheduler in `onOpen`, before the server resumes it:
+
+- **In a test run** for good: the copied storage's interrupted runs and queued work never start, while the page
+  answers Fawkes's health check.
+- **In a new live generation** until it is confirmed: a rollback then forgets nothing that ran on the new code.
+
+The pending generation confirms itself (`confirm <its generation>` over the socket) once every enabled extension's
+server facet loaded (a facet broken by a changed core or a missing package is what must not become permanent) and its
+page answers. It then releases the hold, unless the user paused the host meanwhile. If the checks never pass, the
+deadline runs out and Fawkes rolls back code and storage together. A restart of a generation that is already
+permanent releases the hold at once.
+
+## Status line
+
+One `subscribe` connection to the daemon (reconnecting with `since`, so no event is lost) keeps the generations,
+the status and the latest events. The item shows:
+
+- `✓ g7` (muted) while the running generation is current;
+- `↓ 3 new · upgrade` when the upgrade ref (`origin/main`) has commits the generation lacks (checked every 5
+  minutes from the clone, fetched by Check now or an upgrade);
+- `installing g8`, `testing g8`, `switching` during an upgrade;
+- `⏱ confirming 01:42` while the new generation awaits its confirm, with the reason in the popover when its checks
+  fail;
+- `g8 rolled back` or `upgrade failed`, in red, for an hour after it happened.
+
+The popover lists the newest generations with their state and the reason of a rollback, and offers Check now and
+Upgrade, or Confirm and Roll back while a switch is pending.
+
+## Actions
+
+- `state` (no arguments): what the status line shows.
+- `check` (no arguments): fetch the clone and count what an upgrade would bring.
+- `upgrade` `{ ref? }` (user-only): stage, test and switch `ref` (default `origin/main`) in the background.
+- `confirm` (user-only): confirm the pending generation now, without its own checks.
+- `rollback` (user-only): roll the pending generation back now.
+
+## For agents
+
+A live generation adds a prompt section (the generation's folder is the running host and is never edited; landed
+changes go live only through an upgrade; `restart` reboots the same generation) and the `fawkes` tool: `status`, or
+`upgrade {ref?}`.
+
+## Checks
+
+`ultimate/check` runs `test-env.test.ts` (the test run's environment against the clone's own preview helpers, so a
+change in Ultimate that breaks the isolation fails it) and type-checks both facets against the clone in `$ULTIMATE`
+(default `~/Code/ultimate`).

@@ -1,0 +1,50 @@
+#!/bin/sh
+# Checks the Ultimate extension in ultimate/fawkes: runs its tests, then type-checks its server and web facets against
+# the Ultimate clone it runs in ($ULTIMATE, default ~/Code/ultimate). Ultimate's own checks never see this folder, so
+# run it after changing the extension and before an upgrade. Exits non-zero on the first failure.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+ultimate=${ULTIMATE:-$HOME/Code/ultimate}
+[ -d "$ultimate/node_modules" ] || { echo "No Ultimate clone with node_modules at $ultimate; set ULTIMATE" >&2; exit 1; }
+
+echo "== tests"
+ULTIMATE="$ultimate" node --test "$here"/fawkes/*.test.ts
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cat > "$work/server.json" <<EOF
+{
+  "compilerOptions": {
+    "target": "ESNext", "module": "ESNext", "moduleResolution": "Bundler", "lib": ["ESNext", "DOM"],
+    "types": ["node"], "typeRoots": ["$ultimate/node_modules/@types"],
+    "paths": {
+      "ultimate/*": ["$ultimate/*"],
+      "@earendil-works/chord/context": ["$ultimate/node_modules/@earendil-works/chord/dist/context/index.d.ts"],
+      "*": ["$ultimate/node_modules/@types/*", "$ultimate/node_modules/*"]
+    },
+    "strict": true, "noEmit": true, "allowImportingTsExtensions": true, "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true, "skipLibCheck": true, "noUnusedLocals": true
+  },
+  "include": ["$here/fawkes/*.ts"]
+}
+EOF
+cat > "$work/web.json" <<EOF
+{
+  "compilerOptions": {
+    "target": "ESNext", "module": "ESNext", "moduleResolution": "Bundler", "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": ["$ultimate/node_modules/vite-plus/dist/client.d.ts"], "jsx": "react-jsx",
+    "paths": {
+      "@/*": ["$ultimate/web/src/*"], "ultimate/*": ["$ultimate/*"],
+      "*": ["$ultimate/node_modules/@types/*", "$ultimate/node_modules/*"]
+    },
+    "strict": true, "noEmit": true, "allowImportingTsExtensions": true, "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true, "skipLibCheck": true, "noUnusedLocals": true
+  },
+  "include": ["$here/fawkes/*.tsx"]
+}
+EOF
+echo "== server types"
+"$ultimate/node_modules/.bin/tsc" -p "$work/server.json"
+echo "== web types"
+"$ultimate/node_modules/.bin/tsc" -p "$work/web.json"
+echo "The fawkes extension passes."
