@@ -146,6 +146,7 @@ impl Daemon {
                     rolled_back_at: None,
                     rollback_reason: None,
                     failed_starts: 0,
+                    restore_abandoned_at: None,
                 });
                 Ok((id, reuse_from))
             })
@@ -796,6 +797,52 @@ impl Daemon {
             Some(&id),
             format!(
                 "{reason}; back to {}",
+                permanent.as_deref().unwrap_or("nothing")
+            ),
+        );
+        if let Some(permanent) = &permanent
+            && let Err(e) = self.start_live(&mut inner, permanent, Why::Fresh)
+        {
+            inner.live = Live::Failed;
+            self.event(EventKind::Failed, Some(permanent), e.message);
+        }
+        Ok(RollbackResult {
+            from: id,
+            to: permanent,
+            reason,
+        })
+    }
+
+    /// `rollback --keep-storage`: give up the restore of a rollback that failed (the caller holds the rollback
+    /// slots) and start the permanent generation on the storage as it is. The generation is `rolled_back` already; the
+    /// step ends and the generation records when its restore was given up. Only the operator decides this, because
+    /// the storage may be one the failed generation already migrated.
+    pub(super) fn abandon_restore(self: &Arc<Self>) -> R<RollbackResult> {
+        let mut inner = self.inner();
+        let Some(Txn::RollingBack {
+            pending,
+            reason,
+            restore_failed: true,
+        }) = inner.store.state().txn.clone()
+        else {
+            return Err(invalid_state(
+                "--keep-storage only gives up a restore that failed, and none has; `fawkes rollback` first",
+            ));
+        };
+        let id = pending.generation;
+        let permanent = inner.store.state().permanent.clone();
+        self.modify(&mut inner.store, |state| {
+            state.txn = None;
+            if let Some(g) = state.find_mut(&id) {
+                g.restore_abandoned_at = Some(now());
+            }
+            Ok(())
+        })?;
+        self.event(
+            EventKind::RolledBack,
+            Some(&id),
+            format!(
+                "{reason}; restore given up on request, storage kept as it was: {} now runs on storage that {id} may already have migrated",
                 permanent.as_deref().unwrap_or("nothing")
             ),
         );

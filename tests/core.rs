@@ -1015,3 +1015,79 @@ fn stop_during_a_crash_backoff_cancels_the_restart_and_answers_ok() {
     let (code, error) = h.fk(&["stop"]);
     assert_eq!((code, error["code"].as_str()), (1, Some("invalid_state")));
 }
+
+/// A restore that can never succeed (its snapshot is gone) blocks the app for good; `rollback --keep-storage` is the
+/// operator's way out, and only for that case. It ends the step, records that the restore was given up and starts the
+/// permanent generation on the storage as it is.
+#[test]
+fn rollback_keep_storage_gives_up_a_restore_that_failed() {
+    let mut h = Harness::new(4970, "");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    let refused = |args: &[&str], code: &str, says: &str| {
+        let (exit, error) = h.fk(args);
+        assert_eq!(
+            (exit, error["code"].as_str()),
+            (1, Some(code)),
+            "{args:?}: {error}"
+        );
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(says), "{args:?}: {message}");
+    };
+
+    // Nothing has failed: neither with a switch pending nor without one.
+    refused(
+        &["rollback", "--keep-storage"],
+        "invalid_state",
+        "only gives up a restore that failed",
+    );
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+    refused(
+        &["rollback", "--keep-storage"],
+        "invalid_state",
+        "only gives up a restore that failed",
+    );
+    assert_eq!(h.status()["pending"]["generation"], "g2");
+
+    std::fs::remove_dir_all(h.dir.join("s/generations/g2/snapshot")).unwrap();
+    refused(&["rollback"], "storage_failed", "could not be restored");
+    assert_eq!(h.status()["process"]["state"], "failed");
+    assert_eq!(h.get(), None);
+
+    let rolled = h.ok(&["rollback", "--keep-storage"]);
+    assert_eq!(
+        (
+            rolled["from"].as_str(),
+            rolled["to"].as_str(),
+            rolled["reason"].as_str()
+        ),
+        (Some("g2"), Some("g1"), Some("rollback requested")),
+        "{rolled}"
+    );
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    let status = h.status();
+    assert_eq!(status["pending"], Value::Null, "{status}");
+    assert_eq!(status["permanent"], "g1", "{status}");
+    assert_eq!(status["process"]["state"], "running", "{status}");
+    let g2 = h.generation("g2");
+    assert_eq!(g2["state"], "rolled_back", "{g2}");
+    assert!(g2["restore_abandoned_at"].is_string(), "{g2}");
+    assert_eq!(h.generation("g1")["restore_abandoned_at"], Value::Null);
+    assert!(
+        messages(&h, "rolled_back")
+            .last()
+            .is_some_and(|message| message.contains("may already have migrated")),
+    );
+    // Nothing is pending any more.
+    refused(&["rollback"], "invalid_state", "nothing to roll back");
+}

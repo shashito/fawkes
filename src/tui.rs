@@ -404,7 +404,13 @@ impl App {
                     }
                     None => String::new(),
                 };
-                return self.send("rollback".into(), Request::Rollback, Some(question));
+                return self.send(
+                    "rollback".into(),
+                    Request::Rollback {
+                        keep_storage: false,
+                    },
+                    Some(question),
+                );
             }
             KeyCode::Char('s') => return self.send("start".into(), Request::Start, None),
             KeyCode::Char('x') => return self.ask_app("stop", "Stop", Request::Stop),

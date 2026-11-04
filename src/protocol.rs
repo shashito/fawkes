@@ -100,7 +100,10 @@ pub enum Request {
         generation: Option<String>,
     },
     Prune,
-    Rollback,
+    Rollback {
+        /// Give up a restore that failed and run the permanent generation on the storage as it is.
+        keep_storage: bool,
+    },
     Status,
     History,
     Log {
@@ -149,7 +152,9 @@ impl Request {
                 generation: optional_text(&args, "generation"),
             },
             "prune" => Request::Prune,
-            "rollback" => Request::Rollback,
+            "rollback" => Request::Rollback {
+                keep_storage: args.get("keep_storage").and_then(Value::as_bool) == Some(true),
+            },
             "status" => Request::Status,
             "history" => Request::History,
             "log" => Request::Log {
@@ -177,7 +182,7 @@ impl Request {
             Request::Switch { .. } => "switch",
             Request::Confirm { .. } => "confirm",
             Request::Prune => "prune",
-            Request::Rollback => "rollback",
+            Request::Rollback { .. } => "rollback",
             Request::Status => "status",
             Request::History => "history",
             Request::Log { .. } => "log",
@@ -196,13 +201,13 @@ impl Serialize for Request {
                 deadline,
             } => json!({ "generation": generation, "deadline": deadline }),
             Request::Confirm { generation } => json!({ "generation": generation }),
+            Request::Rollback { keep_storage } => json!({ "keep_storage": keep_storage }),
             Request::Log { limit, follow } => json!({ "limit": limit, "follow": follow }),
             Request::Subscribe { limit, since } => json!({ "limit": limit, "since": since }),
             Request::Start
             | Request::Stop
             | Request::Restart
             | Request::Prune
-            | Request::Rollback
             | Request::Status
             | Request::History => json!({}),
         };
@@ -301,6 +306,9 @@ pub struct Generation {
     pub rolled_back_at: Option<String>,
     pub rollback_reason: Option<String>,
     pub failed_starts: u32,
+    /// When `rollback --keep-storage` gave up this generation's failed restore; null otherwise.
+    #[serde(default)]
+    pub restore_abandoned_at: Option<String>,
 }
 
 impl Generation {
@@ -665,7 +673,6 @@ mod tests {
             ("stop", Request::Stop),
             ("restart", Request::Restart),
             ("prune", Request::Prune),
-            ("rollback", Request::Rollback),
             ("status", Request::Status),
             ("history", Request::History),
         ] {
@@ -673,6 +680,20 @@ mod tests {
                 let line = format!(r#"{{"command":"{name}"{args}}}"#);
                 assert_eq!(parse(&line).unwrap(), request, "{line}");
             }
+        }
+        // `keep_storage` absent, null or false is the ordinary rollback.
+        for (args, keep_storage) in [
+            ("", false),
+            (r#","args":{"keep_storage":null}"#, false),
+            (r#","args":{"keep_storage":false}"#, false),
+            (r#","args":{"keep_storage":true}"#, true),
+        ] {
+            let line = format!(r#"{{"command":"rollback"{args}}}"#);
+            assert_eq!(
+                parse(&line).unwrap(),
+                Request::Rollback { keep_storage },
+                "{line}"
+            );
         }
         let stage = Request::Stage {
             git_ref: "main".into(),
@@ -813,7 +834,7 @@ mod tests {
                 limit: Some(100),
                 since: Some(7),
             },
-            Request::Rollback,
+            Request::Rollback { keep_storage: true },
         ] {
             assert_eq!(parse(&wire(request.clone())).unwrap(), request);
         }

@@ -112,10 +112,14 @@ impl Daemon {
                 Ok(record.into())
             }
             Request::Prune => self.prune(out).map(Reply::from),
-            Request::Rollback => {
+            Request::Rollback { keep_storage } => {
                 let _busy = self.begin("rollback", Slot::Both)?;
-                self.rollback_pending(out, "rollback requested")
-                    .map(Reply::from)
+                if keep_storage {
+                    self.abandon_restore().map(Reply::from)
+                } else {
+                    self.rollback_pending(out, "rollback requested")
+                        .map(Reply::from)
+                }
             }
             Request::Status => Ok(self.status().into()),
             Request::History => Ok(self.history().into()),
