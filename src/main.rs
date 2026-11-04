@@ -8,6 +8,7 @@ mod state;
 mod storage;
 mod tui;
 
+use clap::{Parser, Subcommand};
 use manifest::Manifest;
 use protocol::{
     ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
@@ -21,145 +22,146 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <command>
-
-  daemon  [--manifest FILE]      run the supervisor in the foreground
-  start | stop | restart         run the current generation (pending, else permanent)
-  stage <ref>                    check out and install a git ref as a new generation
-  test <gen>                     start it on a spare port with a copy of the storage
-  switch <gen> [--deadline SECS] go live; roll back unless confirmed in time
-  confirm [<gen>]                make the pending generation permanent
-  rollback [--keep-storage]      undo the pending switch now
-                                 --keep-storage gives up a restore that failed: the permanent generation then
-                                 runs on storage the failed generation may already have migrated
-  prune                          remove old generations beyond the manifest's `keep`
-  status | history               show the app and the generations
-  log [-n N] [--follow]          show the event log
-  tui                            full-screen live view and controls";
-
 /// Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 daemon unreachable.
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
 
-/// What the command line asks for: one of the two local programs, or a request to a daemon.
-enum Command {
-    Daemon,
-    Tui,
-    Send(Request),
-}
-
+/// A process supervisor whose upgrades are transactions: stage, test, switch, confirm, or roll back.
+#[derive(Parser)]
+#[command(
+    name = "fawkes",
+    disable_help_subcommand = true,
+    after_help = "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers."
+)]
 struct Cli {
+    /// Print the result as one JSON document, and progress as JSON lines on stderr
+    #[arg(long, global = true)]
     json: bool,
+    /// The app's manifest [default: fawkes.toml]
+    #[arg(long, global = true, value_name = "FILE")]
     manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "The daemon's socket [default: $FAWKES_SOCKET, else the manifest's]"
+    )]
     socket: Option<PathBuf>,
+    #[command(subcommand)]
     command: Command,
 }
 
-fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
-    let (mut json, mut manifest, mut socket) = (false, None, None);
-    let (mut count, mut follow, mut deadline) = (None, false, None);
-    let mut keep_storage = false;
-    let mut positional = Vec::new();
-    let mut args = args.into_iter();
-    let number = |flag: &str, value: Option<String>| -> Result<u64, String> {
-        let value = value.ok_or(format!("{flag} needs a value"))?;
-        value
-            .parse()
-            .map_err(|_| format!("{flag} needs a whole number, not `{value}`"))
-    };
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--json" => json = true,
-            "--follow" => follow = true,
-            "--keep-storage" => keep_storage = true,
-            "--manifest" => manifest = Some(args.next().ok_or("--manifest needs a file")?.into()),
-            "--socket" => socket = Some(args.next().ok_or("--socket needs a path")?.into()),
-            "--deadline" => deadline = Some(number("--deadline", args.next())?),
-            "-n" => count = Some(number("-n", args.next())?),
-            flag if flag.starts_with('-') => return Err(format!("unknown option `{flag}`")),
-            _ => positional.push(arg),
-        }
-    }
-    if positional.is_empty() {
-        return Err("missing command".into());
-    }
-    let name = positional.remove(0);
-    let wants = |n: std::ops::RangeInclusive<usize>| {
-        if n.contains(&positional.len()) {
-            Ok(())
-        } else {
-            Err(format!("`{name}` got the wrong number of arguments"))
-        }
-    };
-    // `positional[0]` is read only once `wants` has seen exactly one.
-    let command = match name.as_str() {
-        "daemon" => wants(0..=0).map(|()| Command::Daemon),
-        "tui" => wants(0..=0).map(|()| Command::Tui),
-        "start" => wants(0..=0).map(|()| Command::Send(Request::Start)),
-        "stop" => wants(0..=0).map(|()| Command::Send(Request::Stop)),
-        "restart" => wants(0..=0).map(|()| Command::Send(Request::Restart)),
-        "rollback" => wants(0..=0).map(|()| Command::Send(Request::Rollback { keep_storage })),
-        "prune" => wants(0..=0).map(|()| Command::Send(Request::Prune)),
-        "status" => wants(0..=0).map(|()| Command::Send(Request::Status)),
-        "history" => wants(0..=0).map(|()| Command::Send(Request::History)),
-        "log" => wants(0..=0).map(|()| {
-            Command::Send(Request::Log {
-                limit: count,
-                follow,
-            })
-        }),
-        "stage" => wants(1..=1).map(|()| {
-            Command::Send(Request::Stage {
-                git_ref: positional[0].clone(),
-            })
-        }),
-        "test" => wants(1..=1).map(|()| {
-            Command::Send(Request::Test {
-                generation: positional[0].clone(),
-            })
-        }),
-        "switch" => wants(1..=1).map(|()| {
-            Command::Send(Request::Switch {
-                generation: positional[0].clone(),
+/// What the command line asks for: one of the two local programs, or a request to a daemon.
+#[derive(Subcommand)]
+enum Command {
+    /// Run the supervisor in the foreground
+    Daemon,
+    /// Run the current generation (pending, else permanent)
+    Start,
+    /// Stop the app
+    Stop,
+    /// Stop the app and start the current generation again
+    Restart,
+    /// Check out and install a git ref as a new generation
+    Stage {
+        #[arg(value_name = "REF")]
+        git_ref: String,
+    },
+    /// Start a generation on a spare port with a copy of the storage
+    Test {
+        #[arg(value_name = "GEN")]
+        generation: String,
+    },
+    /// Go live; roll back unless confirmed in time
+    Switch {
+        #[arg(value_name = "GEN")]
+        generation: String,
+        /// Seconds to confirm in, 1 to 604800 [default: the manifest's `deadline`]
+        #[arg(long, value_name = "SECS")]
+        deadline: Option<u64>,
+    },
+    /// Make the pending generation permanent
+    Confirm {
+        #[arg(value_name = "GEN")]
+        generation: Option<String>,
+    },
+    /// Undo the pending switch now
+    Rollback {
+        /// Give up a restore that failed: the permanent generation then runs on storage the failed generation may
+        /// already have migrated
+        #[arg(long)]
+        keep_storage: bool,
+    },
+    /// Remove old generations beyond the manifest's `keep`
+    Prune,
+    /// Show the app, its process and the pending switch
+    Status,
+    /// Show the generations
+    History,
+    /// Show the event log
+    Log {
+        /// Show the last N events
+        #[arg(short = 'n', value_name = "N")]
+        limit: Option<u64>,
+        /// Keep printing events as they happen
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Full-screen live view and controls
+    Tui,
+}
+
+impl Command {
+    /// The request this command sends to the daemon; `daemon` and `tui` send none.
+    fn request(&self) -> Option<Request> {
+        Some(match self {
+            Command::Daemon | Command::Tui => return None,
+            Command::Start => Request::Start,
+            Command::Stop => Request::Stop,
+            Command::Restart => Request::Restart,
+            Command::Stage { git_ref } => Request::Stage {
+                git_ref: git_ref.clone(),
+            },
+            Command::Test { generation } => Request::Test {
+                generation: generation.clone(),
+            },
+            Command::Switch {
+                generation,
                 deadline,
-            })
-        }),
-        "confirm" => wants(0..=1).map(|()| {
-            Command::Send(Request::Confirm {
-                generation: positional.first().cloned(),
-            })
-        }),
-        other => Err(format!("unknown command `{other}`")),
-    }?;
-    if deadline.is_some() && name != "switch" {
-        return Err("--deadline belongs to `switch`".into());
+            } => Request::Switch {
+                generation: generation.clone(),
+                deadline: *deadline,
+            },
+            Command::Confirm { generation } => Request::Confirm {
+                generation: generation.clone(),
+            },
+            Command::Rollback { keep_storage } => Request::Rollback {
+                keep_storage: *keep_storage,
+            },
+            Command::Prune => Request::Prune,
+            Command::Status => Request::Status,
+            Command::History => Request::History,
+            Command::Log { limit, follow } => Request::Log {
+                limit: *limit,
+                follow: *follow,
+            },
+        })
     }
-    if keep_storage && name != "rollback" {
-        return Err("--keep-storage belongs to `rollback`".into());
-    }
-    if (count.is_some() || follow) && name != "log" {
-        return Err("-n and --follow belong to `log`".into());
-    }
-    Ok(Cli {
-        json,
-        manifest,
-        socket,
-        command,
-    })
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    let cli = match parse_cli(args) {
+    let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(message) => {
-            eprintln!("error: {message}\n\n{USAGE}");
-            return ExitCode::from(EXIT_USAGE);
+        Err(error) => {
+            // Nothing is left to report to if the terminal is gone.
+            let _ = error.print();
+            // `--help` is the one "error" that is not one.
+            return if error.use_stderr() {
+                ExitCode::from(EXIT_USAGE)
+            } else {
+                ExitCode::SUCCESS
+            };
         }
     };
     let manifest_path = cli.manifest.clone().unwrap_or_else(|| "fawkes.toml".into());
@@ -194,12 +196,12 @@ fn main() -> ExitCode {
         }
     };
     // `daemon` returned above, so what is left but a request is `tui`.
-    let Command::Send(request) = &cli.command else {
+    let Some(request) = cli.command.request() else {
         return ExitCode::from(tui::run(&tui::Target::One(socket)));
     };
     ExitCode::from(client(
         &cli,
-        request,
+        &request,
         &socket,
         &manifest_path,
         REQUEST_TIMEOUT,
@@ -499,6 +501,70 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::time::Instant;
 
+    fn parse(args: &str) -> Cli {
+        Cli::try_parse_from(["fawkes"].into_iter().chain(args.split_whitespace()))
+            .unwrap_or_else(|e| panic!("`{args}`: {e}"))
+    }
+
+    #[test]
+    fn global_options_go_before_or_after_the_command() {
+        for args in [
+            "--json --manifest f.toml --socket s.sock status",
+            "status --json --manifest f.toml --socket s.sock",
+            "--socket s.sock status --manifest f.toml --json",
+        ] {
+            let cli = parse(args);
+            assert!(cli.json, "{args}");
+            assert_eq!(cli.manifest, Some("f.toml".into()), "{args}");
+            assert_eq!(cli.socket, Some("s.sock".into()), "{args}");
+            assert_eq!(cli.command.request(), Some(Request::Status), "{args}");
+        }
+        let daemon = parse("daemon --manifest f.toml");
+        assert!(matches!(daemon.command, Command::Daemon));
+        assert_eq!(daemon.manifest, Some("f.toml".into()));
+    }
+
+    #[test]
+    fn each_command_sends_its_request() {
+        for (args, request) in [
+            (
+                "switch g3 --deadline 60",
+                Request::Switch {
+                    generation: "g3".into(),
+                    deadline: Some(60),
+                },
+            ),
+            (
+                "log -n 5 --follow",
+                Request::Log {
+                    limit: Some(5),
+                    follow: true,
+                },
+            ),
+            ("confirm", Request::Confirm { generation: None }),
+            (
+                "confirm g2",
+                Request::Confirm {
+                    generation: Some("g2".into()),
+                },
+            ),
+            (
+                "rollback --keep-storage",
+                Request::Rollback { keep_storage: true },
+            ),
+            // `help` is no command, so it can name a git ref.
+            (
+                "stage help",
+                Request::Stage {
+                    git_ref: "help".into(),
+                },
+            ),
+        ] {
+            assert_eq!(parse(args).command.request(), Some(request), "{args}");
+        }
+        assert_eq!(parse("tui").command.request(), None);
+    }
+
     #[test]
     fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
         let temp = tempfile::tempdir().unwrap();
@@ -515,7 +581,7 @@ mod tests {
             json: false,
             manifest: None,
             socket: Some(socket.clone()),
-            command: Command::Send(Request::Status),
+            command: Command::Status,
         };
 
         let started = Instant::now();

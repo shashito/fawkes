@@ -345,7 +345,9 @@ fawkes tui
 ```
 
 Global options, before or after the command: `--json`, `--manifest FILE` (default `./fawkes.toml`), `--socket PATH`.
-A client finds the daemon by `--socket`, else `FAWKES_SOCKET`, else `<state_dir>/fawkes.sock` from the manifest.
+A command's own options come after it. A client finds the daemon by `--socket`, else `FAWKES_SOCKET`, else
+`<state_dir>/fawkes.sock` from the manifest. `--help` (or `-h`), after `fawkes` or after a command, prints its usage
+and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`.
 
 `--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped.
 `--keep-storage` belongs to `rollback` (a usage error elsewhere): it gives up a restore that failed, and the permanent
@@ -576,6 +578,10 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 For the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
+- **clap** (no default features; `std`, `derive`, `help`, `usage`, `error-context`): the command line, declared as
+  one struct and one enum whose doc comments are the help text. It keeps the global options valid on either side of
+  the command, exits 2 on a usage error and gives every command its own `--help`, which a hand-written parser had
+  to spell out in a usage string kept in step by hand.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
 - **rusqlite** (features `bundled`, `backup`): the SQLite online backup API for consistent snapshots of live
@@ -597,11 +603,11 @@ For the daemon and CLI, plus ratatui for the TUI (see above), each replacing som
 For the tests only, **tempfile**: the unit tests' scratch directories, removed even when a test fails. The
 integration harness keeps `/tmp/fk<port>`, which belongs to its port claim and stays short for socket paths.
 
-Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
-`std::net::TcpStream`, which takes any host `to_socket_addrs` resolves, IPv6 literals such as `[::1]` included),
-threads instead of an async runtime, and the errors: `protocol::Error` is a code and a message, and the steps below it return `String` messages
-that become that message. anyhow's context chains would have to be flattened into every one of them, and thiserror
-would only add a `Display` nothing calls.
+Hand-written instead of a crate: the HTTP health check (one GET over `std::net::TcpStream`, which takes any host
+`to_socket_addrs` resolves, IPv6 literals such as `[::1]` included), threads instead of an async runtime, and the
+errors: `protocol::Error` is a code and a message, and the steps below it return `String` messages that become that
+message. anyhow's context chains would have to be flattened into every one of them, and thiserror would only add a
+`Display` nothing calls.
 
 ## Later
 

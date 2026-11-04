@@ -1305,3 +1305,33 @@ fn newer_tail(log: &Value, n: usize) -> Vec<Value> {
     let all = log.as_array().unwrap();
     all[all.len() - n..].to_vec()
 }
+
+#[test]
+fn a_usage_error_exits_2_and_help_exits_0() {
+    // None of these reach a daemon, so no harness is needed.
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(common::BIN)
+            .args(args)
+            .env_remove("FAWKES_SOCKET")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        (output.status.code(), stdout)
+    };
+    for args in [
+        &[][..],
+        &["help"],
+        &["frobnicate"],
+        &["status", "--keep-storage"],
+        &["switch", "g1", "--deadline", "soon"],
+        &["confirm", "g1", "g2"],
+        &["stage"],
+    ] {
+        assert_eq!(run(args).0, Some(2), "{args:?}");
+    }
+    for args in [&["--help"][..], &["switch", "--help"], &["status", "-h"]] {
+        let (code, stdout) = run(args);
+        assert_eq!(code, Some(0), "{args:?}");
+        assert!(stdout.contains("Usage: fawkes"), "{stdout}");
+    }
+}
