@@ -314,35 +314,32 @@ impl App {
                         };
                         return self.send(format!("stage {git_ref}"), request, None);
                     }
-                    KeyCode::Esc => {}
+                    KeyCode::Esc => return None,
                     KeyCode::Backspace => {
                         git_ref.pop();
-                        self.mode = Mode::Stage(git_ref);
                     }
-                    KeyCode::Char(c) => {
-                        git_ref.push(c);
-                        self.mode = Mode::Stage(git_ref);
-                    }
-                    _ => self.mode = Mode::Stage(git_ref),
+                    KeyCode::Char(c) => git_ref.push(c),
+                    _ => {}
                 }
+                self.mode = Mode::Stage(git_ref);
                 None
             }
             // Anything but `y` cancels: a stray key must not destroy anything.
             Mode::Ask(action, _) => (key.code == KeyCode::Char('y')).then_some(Cmd::Send(action)),
             Mode::Search => {
                 match key.code {
-                    KeyCode::Enter => {}
-                    KeyCode::Esc => self.filter.clear(),
+                    KeyCode::Enter => return None,
+                    KeyCode::Esc => {
+                        self.filter.clear();
+                        return None;
+                    }
                     KeyCode::Backspace => {
                         self.filter.pop();
-                        self.mode = Mode::Search;
                     }
-                    KeyCode::Char(c) => {
-                        self.filter.push(c);
-                        self.mode = Mode::Search;
-                    }
-                    _ => self.mode = Mode::Search,
+                    KeyCode::Char(c) => self.filter.push(c),
+                    _ => {}
                 }
+                self.mode = Mode::Search;
                 None
             }
             Mode::Help => {
