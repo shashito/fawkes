@@ -713,22 +713,35 @@ impl Daemon {
     }
 
     /// Change the state by the intent of a transaction step (a pending switch, a confirm, the end of a rollback).
-    /// The step fails when the save does: a daemon restart acts on what is on disk, not on what was meant.
+    /// The step fails when state.json cannot be written: a daemon restart acts on what is on disk, not on what was
+    /// meant. Once it is written the step stands, and a later failure of the save (its copy) is only reported.
     fn modify<T>(&self, store: &mut Store, change: impl FnOnce(&mut State) -> R<T>) -> R<T> {
-        store.modify(change).map_err(|unchanged| match unchanged {
-            Unchanged::Refused(e) => e,
-            Unchanged::Unsaved(e) => {
+        match store.modify(change) {
+            Ok((value, late)) => {
+                if let Some(e) = late {
+                    self.event(
+                        EventKind::Error,
+                        None,
+                        format!(
+                            "cannot write state.json completely: {e}; state.json itself is saved"
+                        ),
+                    );
+                }
+                Ok(value)
+            }
+            Err(Unchanged::Refused(e)) => Err(e),
+            Err(Unchanged::Unsaved(e)) => {
                 self.event(
                     EventKind::Error,
                     None,
                     format!("cannot write state.json: {e}"),
                 );
-                err(
+                Err(err(
                     ErrorCode::Internal,
                     format!("cannot write {}: {e}", self.paths.state_json().display()),
-                )
+                ))
             }
-        })
+        }
     }
 
     /// The pending switch's deadline. An unreadable one counts as passed, so the switch rolls back, and says so.
