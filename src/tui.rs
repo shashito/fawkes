@@ -909,4 +909,24 @@ mod tests {
             "no action without a selected app"
         );
     }
+
+    #[test]
+    fn p_asks_before_pruning_and_only_a_yes_sends_it_to_the_selected_app() {
+        let mut app = fixture(0);
+        let key = |c| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        // `blog` comes first; move to `sample` so the request has to follow the selection, not the first app.
+        app.apply(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(app.apply(key('p')), None, "p only asks");
+        assert!(matches!(&app.mode, Mode::Ask(_, q) if q == "Prune old generations of sample?"));
+        assert_eq!(app.apply(key('n')), None, "declining sends nothing");
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.apply(key('p')), None);
+        let Some(Cmd::Send(action)) = app.apply(key('y')) else {
+            panic!("y should send the prune");
+        };
+        assert_eq!(action.label, "prune");
+        assert_eq!(action.request, Request::Prune);
+        assert_eq!(action.socket, PathBuf::from("/tmp/fk/run/sample.sock"));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
 }
