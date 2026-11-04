@@ -327,6 +327,44 @@ fn a_confirm_racing_a_crash_of_the_pending_generation_is_refused() {
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
 }
 
+/// An app that confirms itself without naming its generation and without looking at `FAWKES_PHASE` runs `confirm`
+/// during its own test too, while another generation is pending: the CLI sends the caller's `FAWKES_GENERATION`, so
+/// the confirm is refused and the pending generation still has to vouch for itself.
+#[test]
+fn a_bare_confirm_from_a_test_run_cannot_confirm_another_pending_generation() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.commit("v3", "confirm-always");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+
+    h.ok(&["stage", "v3"]);
+    h.ok(&["test", "g3"]);
+    let answer = std::fs::read_to_string(h.dir.join("s/generations/g3/code/confirm.json")).unwrap();
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["code"], "invalid_state", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap()
+            .contains("g2 is the one waiting for confirm"),
+        "{answer}"
+    );
+    let status = h.status();
+    assert_eq!(
+        (
+            status["permanent"].as_str(),
+            status["pending"]["generation"].as_str()
+        ),
+        (Some("g1"), Some("g2")),
+        "{status}"
+    );
+}
+
 /// With `rollback_on_unhealthy`, a pending generation whose health check gives up rolls back at once, long before
 /// its confirm deadline.
 #[test]
@@ -530,6 +568,42 @@ fn a_request_that_arrives_in_pieces_is_answered() {
     assert_eq!(answer["ok"], true, "{answer}");
 }
 
+/// A daemon whose stderr reader has gone (`fawkes daemon 2>&1 | tee log`, then `tee` dies) supervises on: stderr is
+/// only a copy of the event log.
+#[test]
+fn a_daemon_whose_stderr_is_gone_keeps_supervising() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    h.start_daemon_with_stderr(writer);
+    make_permanent(&h, "v1", "g1");
+    h.signal_daemon(Signal::HUP);
+    h.wait("the reload to be logged", 10, || {
+        !messages_starting(&h, "daemon", "manifest reloaded").is_empty()
+    });
+    assert_eq!(h.status()["process"]["state"], "running");
+}
+
+/// A client whose reader has gone (`fawkes status | head -0`) still exits by the contract: the daemon's answer decides
+/// the exit code, and a followed log simply ends.
+#[test]
+fn a_client_whose_stdout_is_gone_exits_by_its_answer() {
+    let mut h = Harness::new("");
+    h.start_daemon();
+    // Nothing is pending, so the confirm is refused.
+    for (args, code) in [
+        (&["status"][..], 0),
+        (&["log", "--follow"], 0),
+        (&["confirm"], 1),
+    ] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let status = h.cli().args(args).stdout(writer).status().unwrap();
+        assert_eq!(status.code(), Some(code), "{args:?}: {status}");
+    }
+}
+
 /// A daemon that dies mid-stage leaves its install running; the next daemon stops it before it removes the cut-short
 /// generation, so nothing of the stage outlives the daemon that started it. Tests are recorded the same way.
 #[test]
@@ -537,9 +611,8 @@ fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
     let mut h = Harness::new(r"install = '''echo $$ > {state}/install.pid; exec sleep 600'''");
     h.commit("v1", "confirm");
     h.start_daemon();
-    let mut stage = std::process::Command::new(common::BIN)
-        .args(["--json", "--manifest"])
-        .arg(h.dir.join("fawkes.toml"))
+    let mut stage = h
+        .cli()
         .args(["stage", "v1"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -948,6 +1021,61 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
     assert_eq!(status["process"]["state"], "running", "{status}");
     assert_eq!(h.generation("g2")["state"], "tested");
     assert!(!h.versions().contains(&"v2".to_string()));
+}
+
+/// SIGTERM reaches the daemon while a requested rollback stops the pending generation: the rollback finishes, but a
+/// daemon on its way out starts nothing. It says so, without a `failed` event for the healthy permanent generation
+/// and without an ok answer that claims it runs; the next daemon start runs it.
+#[test]
+fn a_daemon_stopped_during_a_rollback_leaves_the_permanent_generation_to_its_next_start() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "slow-stop-never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+
+    let daemon_pid =
+        Pid::from_raw(i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap()).unwrap();
+    let (code, answer) = std::thread::scope(|scope| {
+        let rollback = scope.spawn(|| h.fk(&["rollback"]));
+        // g2 takes 1.5 s to leave after SIGTERM: the window for the daemon's own SIGTERM.
+        h.wait("the rollback to stop g2", 10, || {
+            !messages_starting(&h, "progress", "rolling back g2").is_empty()
+        });
+        // The pid is the daemon this test started.
+        kill_process(daemon_pid, Signal::TERM).unwrap();
+        rollback.join().unwrap()
+    });
+    assert_eq!(
+        (code, answer["code"].as_str()),
+        (1, Some("busy")),
+        "{answer}"
+    );
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap()
+            .contains("shutting down"),
+        "{answer}"
+    );
+    h.wait("the daemon to end", 15, || h.fk(&["status"]).0 == 3);
+    h.kill_daemon();
+
+    h.start_daemon();
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    assert_eq!(messages(&h, "failed"), Vec::<String>::new());
+    assert_eq!(
+        messages_starting(&h, "daemon", "g1 not started").len(),
+        1,
+        "{:?}",
+        messages(&h, "daemon")
+    );
+    assert_eq!(h.generation("g2")["state"], "rolled_back");
+    assert_eq!(h.status()["pending"], Value::Null);
 }
 
 /// A crash backoff shows as `restart_at` while `state` stays `stopped`, and `stop` during it cancels the restart and
@@ -1377,11 +1505,7 @@ fn newer_tail(log: &Value, n: usize) -> Vec<Value> {
 fn a_usage_error_exits_2_and_help_exits_0() {
     // None of these reach a daemon, so no harness is needed.
     let run = |args: &[&str]| {
-        let output = std::process::Command::new(common::BIN)
-            .args(args)
-            .env_remove("FAWKES_SOCKET")
-            .output()
-            .unwrap();
+        let output = common::fawkes().args(args).output().unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         (output.status.code(), stdout)
     };

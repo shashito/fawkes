@@ -2,9 +2,10 @@
 //!
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
-//! Lock order is `inner` before `manifest` before `log` before `hub` (`step_pgids` is only ever taken alone, and
-//! `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding one. Events
-//! go to the hub while `log` is held, so every subscriber sees them once and in `seq` order.
+//! Lock order is `inner` before `manifest` before `log` before `hub` and `echo` (`step_pgids` is only ever taken
+//! alone, and `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding
+//! one. Events go to the hub and to stderr's queue while `log` is held, so every subscriber sees them once and in
+//! `seq` order. No thread that may hold a lock writes stderr: a thread of its own does (`Echo`).
 //!
 //! Neither the accept loop nor the supervisor polls: the accept loop sleeps in `poll(2)` on the socket and a pipe the
 //! signal handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.
@@ -28,7 +29,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{FlockOperation, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -36,7 +37,7 @@ use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, sleep};
+use std::thread::{self, JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 /// Lock a mutex. Under `panic = "abort"` no mutex is ever poisoned, so the error arm cannot run.
@@ -247,6 +248,34 @@ impl Hub {
     }
 }
 
+/// How many lines stderr may fall behind before new ones are dropped.
+const ECHO_QUEUE: usize = 1024;
+
+/// The daemon's stderr: a copy of the event log for whoever watches the terminal, written by a thread of its own. An
+/// event's caller may hold `inner`, and a stderr that blocks (a terminal on hold) must not stall the daemon, nor one
+/// that fails (a closed terminal, a `| tee` that died) end it. Best effort: a line that cannot be written, or finds
+/// the queue full, is dropped, since `events.jsonl` is the record.
+struct Echo(SyncSender<String>);
+
+impl Echo {
+    /// Start the thread that writes to `to`. It ends once the `Echo` is gone and what was queued is written.
+    fn start(mut to: impl Write + Send + 'static) -> (Echo, JoinHandle<()>) {
+        let (lines, queued) = mpsc::sync_channel::<String>(ECHO_QUEUE);
+        let writer = thread::spawn(move || {
+            for line in queued {
+                // A failed write is no reason to stop: a terminal on hold takes lines again once it is released.
+                let _ = writeln!(to, "{line}");
+            }
+        });
+        (Echo(lines), writer)
+    }
+
+    fn line(&self, line: String) {
+        // Full only while stderr is stuck; the line is in `events.jsonl`.
+        let _ = self.0.try_send(line);
+    }
+}
+
 /// What the supervisor sleeps on: a count of changes, and a condvar to wait for the next one. Every change
 /// subscribers hear of (`Daemon::changed`) moves it, since whatever changes the picture may be for the supervisor to
 /// act on, and so do an exit of the live app and the start of shutdown. A waiter reads the count before it looks at
@@ -307,6 +336,8 @@ pub struct Daemon {
     wake: Wake,
     /// Process groups of running tests and installs, killed on shutdown.
     step_pgids: Mutex<Vec<u32>>,
+    /// Taken at the end of `run`, so stderr's writer finishes what is queued and ends.
+    echo: Mutex<Option<Echo>>,
 }
 
 /// The daemon's socket and its `<fawkes_home>/run/<name>.sock` link, removed when `run` returns however it returns,
@@ -366,6 +397,7 @@ impl Daemon {
         published.run_link = Some(register(&manifest.name, &socket)?);
         let (store, recovered) = Store::load(paths.state_json())?;
         let bin = std::env::current_exe().map_err(|e| e.to_string())?;
+        let (echo, echo_writer) = Echo::start(std::io::stderr());
 
         let daemon = Arc::new(Daemon {
             shutdown,
@@ -380,6 +412,7 @@ impl Daemon {
             hub: Hub(Mutex::new(Vec::new())),
             wake: Wake::new(),
             step_pgids: Mutex::new(Vec::new()),
+            echo: Mutex::new(Some(echo)),
         });
         daemon.event(
             EventKind::Daemon,
@@ -441,6 +474,10 @@ impl Daemon {
 
         daemon.serve(&listener, signals)?;
         daemon.shutdown();
+        // The last lines (`stopped`) still reach the terminal. Waits only while stderr blocks, and by now the app is
+        // stopped and nothing is left to supervise.
+        lock(&daemon.echo).take();
+        let _ = echo_writer.join();
         Ok(())
     }
 
@@ -491,7 +528,10 @@ impl Daemon {
     /// Carry out the rollback that startup found pending or under way; `reason` applies when it was not decided yet.
     fn roll_back_at_start(self: &Arc<Self>, reason: &str) -> Result<(), String> {
         let _busy = self.begin("rollback", Slot::Both).map_err(|e| e.message)?;
-        if let Err(e) = self.rollback_pending(&mut Out::none(), reason) {
+        // A daemon that is shutting down has already logged what it left undone, and what it did not start.
+        if let Err(e) = self.rollback_pending(&mut Out::none(), reason)
+            && !self.shutting_down()
+        {
             self.event(EventKind::Error, None, e.message);
         }
         Ok(())
@@ -716,7 +756,7 @@ impl Daemon {
         self.wake.notify();
     }
 
-    /// Record an event: stderr, events.jsonl, every subscriber. Anything but progress also changes the picture.
+    /// Record an event: events.jsonl, every subscriber, stderr. Anything but progress also changes the picture.
     fn event(
         &self,
         kind: EventKind,
@@ -730,20 +770,23 @@ impl Daemon {
             generation: generation.map(String::from),
             message: message.into(),
         };
-        eprintln!(
-            "{} {} {} {}",
-            event.at,
-            event.kind.as_str(),
-            event.generation.as_deref().unwrap_or("-"),
-            event.message
-        );
         // Subscribers get the event while the log is still held: `stream` joins the hub and reads its replay under
         // the same lock, so an event is in the replay or on the channel, never both and never neither, and the
-        // channel carries events in `seq` order. `hub.send` only `try_send`s, so holding the log across it is cheap.
+        // channel carries events in `seq` order. `hub.send` and `Echo::line` only `try_send`, so holding the log
+        // across them is cheap.
         let event = {
             let mut log = lock(&self.log);
             let event = log.append(event);
             self.broadcast(&Msg::Event(event.clone()));
+            if let Some(echo) = lock(&self.echo).as_ref() {
+                echo.line(format!(
+                    "{} {} {} {}",
+                    event.at,
+                    event.kind.as_str(),
+                    event.generation.as_deref().unwrap_or("-"),
+                    event.message
+                ));
+            }
             event
         };
         if kind != EventKind::Progress {
