@@ -15,7 +15,28 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 const APP_JS: &str = include_str!("../../examples/sample/app.js");
-pub const BIN: &str = env!("CARGO_BIN_EXE_fawkes");
+const BIN: &str = env!("CARGO_BIN_EXE_fawkes");
+
+/// The variables Fawkes gives the processes it starts. A suite run under a supervised app (a lander's `cargo test`
+/// inside an app Fawkes runs) inherits them, and the CLI would then talk to that app's live daemon (`FAWKES_SOCKET`)
+/// or confirm as its generation (`FAWKES_GENERATION`).
+const INHERITED: [&str; 5] = [
+    "FAWKES_SOCKET",
+    "FAWKES_GENERATION",
+    "FAWKES_PHASE",
+    "FAWKES_BIN",
+    "FAWKES_HOME",
+];
+
+/// `fawkes`, deaf to the Fawkes variables of the environment the tests run in. Every test builds the binary's
+/// command here (or through `Harness`), never with `Command::new` itself.
+pub fn fawkes() -> Command {
+    let mut command = Command::new(BIN);
+    for name in INHERITED {
+        command.env_remove(name);
+    }
+    command
+}
 
 /// Where the port blocks' lock files live, shared by every suite on the machine whatever worktree it runs from.
 const PORT_LOCKS: &str = "/tmp/fawkes-test-ports";
@@ -158,7 +179,12 @@ APP_HOME = "{{home}}"
             .append(true)
             .open(self.dir.join("daemon.log"))
             .unwrap();
-        let child = self.daemon_command().stderr(log).spawn().unwrap();
+        self.start_daemon_with_stderr(log);
+    }
+
+    /// `start_daemon` with the daemon's stderr going to `stderr` instead of `daemon.log`.
+    pub fn start_daemon_with_stderr(&mut self, stderr: impl Into<Stdio>) {
+        let child = self.daemon_command().stderr(stderr).spawn().unwrap();
         self.daemon = Some(child);
         self.wait("the daemon to answer", 10, || self.fk(&["status"]).0 == 0);
     }
@@ -234,7 +260,7 @@ APP_HOME = "{{home}}"
 
     /// `fawkes daemon` for this manifest, with its `run/` links kept inside the test directory.
     fn daemon_command(&self) -> Command {
-        let mut command = Command::new(BIN);
+        let mut command = fawkes();
         command
             .args(["daemon", "--manifest"])
             .arg(&self.manifest)
@@ -242,14 +268,11 @@ APP_HOME = "{{home}}"
         command
     }
 
-    /// `fawkes --json --manifest <manifest>`, deaf to a `FAWKES_SOCKET` of the environment the tests run in.
-    fn cli(&self) -> Command {
-        let mut command = Command::new(BIN);
-        command
-            .arg("--json")
-            .arg("--manifest")
-            .arg(&self.manifest)
-            .env_remove("FAWKES_SOCKET");
+    /// `fawkes --json --manifest <manifest>`, for a test that runs the client itself (in the background, or with
+    /// its output going somewhere of its own).
+    pub fn cli(&self) -> Command {
+        let mut command = fawkes();
+        command.arg("--json").arg("--manifest").arg(&self.manifest);
         command
     }
 

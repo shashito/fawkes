@@ -4,6 +4,8 @@
 // GET /crash makes it exit with status 7. ./MODE picks what it does after listening:
 //   confirm (default)  calls `fawkes confirm` when it runs live; during a test it only serves
 //   never              never confirms, so the confirm deadline rolls it back
+//   confirm-always     runs a bare `fawkes confirm` in every phase, its test included, as an app that neither names
+//                      itself nor looks at FAWKES_PHASE would (the answer goes to ./confirm.json)
 //   crash              exits with status 3 straight away, also in a test
 //   crash-live         like crash, but only when running live (so it passes its test)
 //   crash-confirm      when live: leaves a process that ignores SIGTERM in its group, has `fawkes confirm` sent from
@@ -11,6 +13,7 @@
 //                      status 3: a confirm racing the crash of the generation it confirms
 //   unhealthy-live     when live, answers every request with 500 and never confirms (it passes its test)
 //   slow-stop          like confirm, but takes 1.5 s to exit on SIGTERM
+//   slow-stop-never    like never, but takes 1.5 s to exit on SIGTERM
 //   slow-test          during a test, starts listening only after 6 s; live it confirms
 const { DatabaseSync } = require('node:sqlite');
 const http = require('node:http');
@@ -53,6 +56,9 @@ const listen = () => server.listen(Number(process.env.APP_PORT), '127.0.0.1', ()
     // confirm is refused) when this generation is merely restarted; that is fine.
     spawnSync(process.env.FAWKES_BIN, ['confirm', process.env.FAWKES_GENERATION], { stdio: 'inherit' });
   }
+  if (mode === 'confirm-always') {
+    spawnSync('/bin/sh', ['-c', '"$FAWKES_BIN" --json confirm > confirm.json'], { cwd: __dirname, stdio: 'inherit' });
+  }
 });
 if (mode === 'slow-test' && phase === 'test') setTimeout(listen, 6000);
 else listen();
@@ -62,5 +68,5 @@ process.on('SIGTERM', () => {
     server.close();
     db.close();
     process.exit(0);
-  }, mode === 'slow-stop' ? 1500 : 0);
+  }, mode.startsWith('slow-stop') ? 1500 : 0);
 });
