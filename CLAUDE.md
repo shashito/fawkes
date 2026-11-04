@@ -63,9 +63,9 @@ not built yet. Don't start one unless asked.
 
 ## Dependencies
 
-The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, rusqlite, rustix, signal-hook, jiff,
-libc and ratatui, and tempfile for the tests. Argument parsing, the HTTP health check and the thread-based
-concurrency are hand-written on purpose; errors stay `protocol::Error` and `String`, without anyhow or thiserror.
+The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rusqlite, rustix, signal-hook,
+jiff, libc and ratatui, and tempfile for the tests. The HTTP health check and the thread-based concurrency are
+hand-written on purpose, and errors stay `protocol::Error` and `String`, without anyhow or thiserror.
 
 A well-known crate is preferred over hand-written code when it removes a meaningful amount of code or `unsafe`, but
 ask before adding one (and never tokio: the threads are deliberate). Once one is agreed, add it to the Crates section
