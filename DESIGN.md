@@ -598,7 +598,10 @@ For the tests only, **tempfile**: the unit tests' scratch directories, removed e
 integration harness keeps `/tmp/fk<port>`, which belongs to its port claim and stays short for socket paths.
 
 Hand-written instead of a crate: argument parsing (fourteen commands, six options), the HTTP health check (one GET over
-`std::net::TcpStream` to localhost), threads instead of an async runtime.
+`std::net::TcpStream`, which takes any host `to_socket_addrs` resolves, IPv6 literals such as `[::1]` included),
+threads instead of an async runtime, and the errors: `protocol::Error` is a code and a message, and the steps below it return `String` messages
+that become that message. anyhow's context chains would have to be flattened into every one of them, and thiserror
+would only add a `Display` nothing calls.
 
 ## Later
 
