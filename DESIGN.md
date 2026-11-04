@@ -30,6 +30,10 @@ confirm deadline, and every 10 s while an app runs the `app.log` size cap). An i
 client does not wake at all; a client that follows the log (`subscribe`, `log --follow`, the TUI) has its thread
 look every 500 ms whether the client has gone.
 
+The daemon writes every event to stderr as a line, for whoever watches the terminal. That copy is best effort, from
+a thread of its own: a stderr that blocks or breaks (a closed terminal, a `| tee` that died) never stalls or ends the
+daemon, and lines it cannot take are dropped. `events.jsonl` is the record.
+
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
 `daemon` event naming the changed fields, or an `error` event saying why it was refused:
@@ -70,6 +74,9 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   the first in `spare_ports` that is free on both `127.0.0.1` and `0.0.0.0`; a test that fails while another
   process holds its port afterwards is `port_in_use` and leaves the generation as it was. Only a tested
   generation can be switched to.
+  The copy of each database is one read, so it is consistent (and, in WAL mode, does not hold up the app's
+  writes); one that stays locked for 10 s fails the test with `storage_failed`. The same bound holds for a switch's
+  snapshot (`storage_failed`, and the switch does not happen) and a rollback's restore (a failed restore, below).
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
 - **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
   start of the daemon always runs the permanent generation (Erlang/OTP release handler).
@@ -107,8 +114,13 @@ daemon start runs the permanent generation.
 ### Confirm
 
 `fawkes confirm [<gen>]`, normally called by the new generation itself once it knows it is healthy (Fawkes gives it
-`FAWKES_BIN`, `FAWKES_SOCKET` and `FAWKES_GENERATION`). The pending generation becomes `permanent`, the previous
-permanent becomes `retired`, the deadline is cleared. Confirming a generation that is not pending is `invalid_state`,
+`FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE`). An app confirms only when `FAWKES_PHASE` is
+`live`, and names itself: `"$FAWKES_BIN" confirm "$FAWKES_GENERATION"`. Its test run gets the same variables, with
+`FAWKES_PHASE=test`, while another generation may be pending. Without `<gen>` the CLI sends `$FAWKES_GENERATION`
+when it is set (and no `--socket` points it at another daemon), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
+an app, a bare `confirm` confirms whichever generation is pending. The `confirmed` event says whether the confirm
+named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
+deadline is cleared. Confirming a generation that is not pending is `invalid_state`,
 and so is confirming the pending generation while its process is not running (stopped, or exited and about to be
 rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The supervisor
 records a rollback (crash, missed deadline, failed health check) in the same step that learns of it, so a confirm
@@ -137,6 +149,10 @@ If the restore fails, the generation is still `rolled_back` (its code never runs
 `fawkes rollback` or the next daemon start retries the restore. The same holds when the restore worked but the end
 of the switch could not be written to `state.json`. A confirm after the deadline is refused, even if the rollback has
 not begun yet.
+
+A `SIGTERM` that arrives during a rollback (requested, automatic, or the one a daemon start carries out) lets it
+finish, but a daemon on its way out does not start the permanent generation: it logs a `daemon` event saying so (not
+`failed`), the next daemon start runs it, and a requested rollback is answered `busy` instead of ok.
 
 Rollback happens at most once per generation and only ever goes to the permanent generation. If that one then fails
 too, Fawkes does not roll further back; the restart policy below applies and the failure is reported in `status`.
@@ -363,7 +379,9 @@ generation then runs on storage that the failed generation may already have migr
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
-Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` the daemon is unreachable.
+Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` the daemon is unreachable. A stdout or stderr that
+cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
+decides, and `log --follow` ends with `0`.
 
 `start`, `confirm`, `status`, `history` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
 fail with exit 1, "the daemon did not answer in time". The other commands wait as long as their step runs, which the

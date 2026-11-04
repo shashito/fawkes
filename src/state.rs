@@ -254,24 +254,41 @@ pub fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     name.into()
 }
 
+/// `e`, saying which step of a save it ended.
+fn late_failure(step: &str, e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("could not {step}: {e}"))
+}
+
 /// `state.json.bak` next to `state.json`.
 fn backup_path(path: &Path) -> PathBuf {
     with_suffix(path, ".bak")
 }
 
 /// Write `bytes` to `path` so that any crash, a power loss included, leaves the old or the new file whole: a temp
-/// file, synced, renamed into place, then the directory synced so the rename is on disk too.
-pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// file, synced, renamed into place. Once this returns, `path` holds `bytes` for every reader; only the rename's
+/// durability is still open (`sync_directory`).
+fn write_in_place(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = with_suffix(path, ".tmp");
     let mut file = File::create(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Sync the directory of `path` so a rename into it is on disk too.
+fn sync_directory(path: &Path) -> std::io::Result<()> {
     let dir = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     File::open(dir)?.sync_all()
+}
+
+/// `write_in_place`, then `sync_directory`. A failure of the second step is an error too: this is for files whose
+/// only meaning is being durable (storage's `index.json`), where the caller has no earlier state to agree with.
+pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_in_place(path, bytes)?;
+    sync_directory(path)
 }
 
 impl State {
@@ -305,10 +322,19 @@ impl State {
 
     /// Write `state.json` durably, then the same content to `state.json.bak`. A crash leaves at least one of them
     /// whole, and `load` takes `state.json` whenever it can.
-    fn save(&self, path: &Path) -> std::io::Result<()> {
+    ///
+    /// `Err` means `state.json` is not in place: a restart reads what it read before. `Ok(Some(e))` means it is in
+    /// place, and so is what a restart reads, but a later step failed (the directory sync or the copy); `e` names it.
+    fn save(&self, path: &Path) -> std::io::Result<Option<std::io::Error>> {
         let bytes = serde_json::to_vec_pretty(self)?;
-        write_durably(path, &bytes)?;
-        write_durably(&backup_path(path), &bytes)
+        write_in_place(path, &bytes)?;
+        let late = sync_directory(path)
+            .map_err(|e| late_failure("sync the directory of state.json", &e))
+            .and_then(|()| {
+                write_durably(&backup_path(path), &bytes)
+                    .map_err(|e| late_failure("write state.json.bak", &e))
+            });
+        Ok(late.err())
     }
 
     pub fn find(&self, id: &str) -> Option<&Generation> {
@@ -444,15 +470,19 @@ impl Store {
         &self.state
     }
 
-    /// An intent (a switch, a confirm, the end of a rollback): applied to a copy and kept only once it is on disk,
-    /// because a daemon restart acts on what is on disk, not on what was meant. When `change` refuses or the save
-    /// fails, nothing changed.
-    pub fn modify<T>(&mut self, change: impl FnOnce(&mut State) -> R<T>) -> Result<T, Unchanged> {
+    /// An intent (a switch, a confirm, the end of a rollback): applied to a copy and kept once state.json is on
+    /// disk, because a daemon restart acts on what is on disk, not on what was meant. When `change` refuses or
+    /// state.json cannot be written, nothing changed. When state.json is in place but a later step of the save
+    /// failed, the change stands, as it does for a restart, and that failure comes back next to the value.
+    pub fn modify<T>(
+        &mut self,
+        change: impl FnOnce(&mut State) -> R<T>,
+    ) -> Result<(T, Option<std::io::Error>), Unchanged> {
         let mut next = self.state.clone();
         let value = change(&mut next).map_err(Unchanged::Refused)?;
-        next.save(&self.path).map_err(Unchanged::Unsaved)?;
+        let late = next.save(&self.path).map_err(Unchanged::Unsaved)?;
         self.state = next;
-        Ok(value)
+        Ok((value, late))
     }
 
     /// Bookkeeping (pids, counters, a test result, a decided rollback): kept in memory even when the save fails,
@@ -462,7 +492,11 @@ impl Store {
         change: impl FnOnce(&mut State) -> T,
     ) -> (T, Option<std::io::Error>) {
         let value = change(&mut self.state);
-        (value, self.state.save(&self.path).err())
+        let failed = self
+            .state
+            .save(&self.path)
+            .unwrap_or_else(|e| Some(late_failure("write state.json", &e)));
+        (value, failed)
     }
 }
 
@@ -998,6 +1032,26 @@ mod tests {
         });
         assert_eq!((value, store.state().next_id), ("done", 3));
         assert!(failed.is_some());
+    }
+
+    #[test]
+    fn a_store_agrees_with_state_json_when_only_the_copy_cannot_be_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        // A directory where the copy's temp file goes: state.json lands, the copy does not.
+        std::fs::create_dir(with_suffix(&backup_path(&path), ".tmp")).unwrap();
+        let (mut store, _) = Store::load(path.clone()).unwrap();
+
+        let ((), late) = store
+            .modify(|state| {
+                state.next_id = 9;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(late.unwrap().to_string().contains("state.json.bak"));
+        assert_eq!(store.state().next_id, 9);
+        assert_eq!(Store::load(path).unwrap().0.state().next_id, 9);
     }
 
     #[test]

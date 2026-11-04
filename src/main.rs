@@ -16,7 +16,8 @@ use protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::fmt::Display;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -83,7 +84,10 @@ enum Command {
     },
     /// Make the pending generation permanent
     Confirm {
-        #[arg(value_name = "GEN")]
+        #[arg(
+            value_name = "GEN",
+            help = "The generation that vouches for itself [default: $FAWKES_GENERATION, else the pending one]"
+        )]
         generation: Option<String>,
     },
     /// Undo the pending switch now
@@ -113,8 +117,11 @@ enum Command {
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon` and `tui` send none.
-    fn request(&self) -> Option<Request> {
+    /// The request this command sends to the daemon; `daemon` and `tui` send none. `own_generation` is
+    /// `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from it names that
+    /// generation, so an app's test run (or anything it left behind) cannot confirm another generation that happens to
+    /// be pending.
+    fn request(&self, own_generation: Option<&str>) -> Option<Request> {
         Some(match self {
             Command::Daemon | Command::Tui => return None,
             Command::Start => Request::Start,
@@ -134,7 +141,10 @@ impl Command {
                 deadline: *deadline,
             },
             Command::Confirm { generation } => Request::Confirm {
-                generation: generation.clone(),
+                generation: generation
+                    .as_deref()
+                    .or(own_generation.filter(|id| !id.is_empty()))
+                    .map(String::from),
             },
             Command::Rollback { keep_storage } => Request::Rollback {
                 keep_storage: *keep_storage,
@@ -169,7 +179,7 @@ fn main() -> ExitCode {
         return match daemon::Daemon::run(manifest_path, cli.socket) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("error: {message}");
+                warn(format!("error: {message}"));
                 ExitCode::from(EXIT_FAILED)
             }
         };
@@ -182,7 +192,7 @@ fn main() -> ExitCode {
         let run = match manifest::run_dir() {
             Ok(run) => run,
             Err(message) => {
-                eprintln!("error: {message}");
+                warn(format!("error: {message}"));
                 return ExitCode::from(EXIT_USAGE);
             }
         };
@@ -191,12 +201,17 @@ fn main() -> ExitCode {
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
         Err(message) => {
-            eprintln!("error: {message}");
+            warn(format!("error: {message}"));
             return ExitCode::from(EXIT_USAGE);
         }
     };
     // `daemon` returned above, so what is left but a request is `tui`.
-    let Some(request) = cli.command.request() else {
+    // Only towards the daemon that started the caller: generation ids repeat across apps, so another daemon, picked
+    // with `--socket`, may have a pending generation of the same name.
+    let own_generation = std::env::var("FAWKES_GENERATION")
+        .ok()
+        .filter(|_| cli.socket.is_none());
+    let Some(request) = cli.command.request(own_generation.as_deref()) else {
         return ExitCode::from(tui::run(&tui::Target::One(socket)));
     };
     ExitCode::from(client(
@@ -221,6 +236,17 @@ fn socket_path(cli: &Cli, manifest_path: &Path) -> Result<PathBuf, String> {
     Ok(manifest.paths().socket())
 }
 
+/// Print a line on stdout; false when it could not be written. A reader that has gone (`fawkes log --follow | head`)
+/// ends a followed log, but changes nothing about how a command went: the daemon's answer decides its exit code.
+fn say(line: impl Display) -> bool {
+    writeln!(std::io::stdout().lock(), "{line}").is_ok()
+}
+
+/// Print a line on stderr, best effort: a terminal that has gone is no reason to exit otherwise.
+fn warn(line: impl Display) {
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
 /// Send one request, show progress, render the answer. Returns the exit code. A quick command waits `timeout` for
 /// each line of the answer.
 fn client(
@@ -237,34 +263,33 @@ fn client(
             manifest_path.display()
         );
         if cli.json {
-            println!(
-                "{}",
+            say(
                 serde_json::to_string(&err(ErrorCode::DaemonUnreachable, message))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
             );
         } else {
-            eprintln!("error: {message}");
+            warn(format!("error: {message}"));
         }
         return EXIT_UNREACHABLE;
     };
     if request.write_to(&mut stream).is_err() {
-        eprintln!(
+        warn(format!(
             "error: the daemon on {} closed the connection",
             socket.display()
-        );
+        ));
         return EXIT_UNREACHABLE;
     }
     let follow = matches!(request, Request::Log { follow: true, .. });
     // A daemon that accepts and then never answers must not hang a quick command (`Request::is_quick`).
     if request.is_quick() && stream.set_read_timeout(Some(timeout)).is_err() {
-        eprintln!("error: cannot set a read timeout on the connection");
+        warn("error: cannot set a read timeout on the connection");
         return EXIT_FAILED;
     }
     for line in BufReader::new(stream).lines() {
         let line = match line {
             Ok(line) => line,
             Err(e) if timed_out(&e) => {
-                eprintln!("error: the daemon did not answer in time");
+                warn("error: the daemon did not answer in time");
                 return EXIT_FAILED;
             }
             Err(_) => break,
@@ -280,9 +305,11 @@ fn client(
             && let Some(event) = raw.get("event")
         {
             if follow {
-                println!("{event}");
+                if !say(event) {
+                    return 0;
+                }
             } else {
-                eprintln!("{event}");
+                warn(event);
             }
             continue;
         }
@@ -290,27 +317,38 @@ fn client(
             continue;
         };
         match message {
-            Line::Event { event } => match (follow, cli.json) {
-                (true, true) => println!("{}", raw["event"]),
-                (true, false) => println!("{}", render_event(&event)),
-                (false, true) => eprintln!("{}", raw["event"]),
-                (false, false) => eprintln!("{}", render_progress(&event)),
-            },
+            Line::Event { event } => {
+                let shown = match (follow, cli.json) {
+                    (true, true) => say(&raw["event"]),
+                    (true, false) => say(render_event(&event)),
+                    (false, true) => {
+                        warn(&raw["event"]);
+                        true
+                    }
+                    (false, false) => {
+                        warn(render_progress(&event));
+                        true
+                    }
+                };
+                if !shown {
+                    return 0;
+                }
+            }
             // Only `subscribe` sends these.
             Line::Status { .. } | Line::History { .. } => {}
             Line::Done { result, .. } => {
                 if cli.json {
-                    println!("{result}");
+                    say(result);
                 } else {
-                    println!("{}", render_result(request, &result));
+                    say(render_result(request, &result));
                 }
                 return 0;
             }
             Line::Failed { error, .. } => {
                 if cli.json {
-                    println!("{}", raw["error"]);
+                    say(&raw["error"]);
                 } else {
-                    eprintln!("error: {}", error.message);
+                    warn(format!("error: {}", error.message));
                 }
                 // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
                 return if error.code == ErrorCode::Usage {
@@ -324,10 +362,10 @@ fn client(
     if follow {
         return 0;
     }
-    eprintln!(
+    warn(format!(
         "error: the daemon on {} closed the connection without an answer",
         socket.display()
-    );
+    ));
     EXIT_FAILED
 }
 
@@ -517,7 +555,7 @@ mod tests {
             assert!(cli.json, "{args}");
             assert_eq!(cli.manifest, Some("f.toml".into()), "{args}");
             assert_eq!(cli.socket, Some("s.sock".into()), "{args}");
-            assert_eq!(cli.command.request(), Some(Request::Status), "{args}");
+            assert_eq!(cli.command.request(None), Some(Request::Status), "{args}");
         }
         let daemon = parse("daemon --manifest f.toml");
         assert!(matches!(daemon.command, Command::Daemon));
@@ -560,16 +598,28 @@ mod tests {
                 },
             ),
         ] {
-            assert_eq!(parse(args).command.request(), Some(request), "{args}");
+            assert_eq!(parse(args).command.request(None), Some(request), "{args}");
         }
-        assert_eq!(parse("tui").command.request(), None);
+        assert_eq!(parse("tui").command.request(None), None);
+    }
+
+    #[test]
+    fn a_bare_confirm_names_the_generation_the_caller_runs_as() {
+        let confirm = |args: &str, own: Option<&str>| match parse(args).command.request(own) {
+            Some(Request::Confirm { generation }) => generation,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(confirm("confirm", Some("g3")).as_deref(), Some("g3"));
+        assert_eq!(confirm("confirm g2", Some("g3")).as_deref(), Some("g2"));
+        assert_eq!(confirm("confirm", Some("")), None);
+        assert_eq!(confirm("confirm", None), None);
     }
 
     #[test]
     fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = temp.path().to_path_buf();
-        let socket = dir.join("fawkes.sock");
+        // Under /tmp: a socket path over about 100 bytes does not bind, and `$TMPDIR` can be that long.
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("fawkes.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         // Accepts and keeps the connection open without a word.
         let silent = std::thread::spawn(move || {

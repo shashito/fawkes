@@ -28,6 +28,9 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   limit. Tests, and suites in other worktrees, run in parallel without colliding, so never hard-code a port or a
   path: use `h.port` and `h.dir`, and never look for processes machine-wide (`pgrep`, `pkill`), since another
   suite's look the same. Have the app record its pid in a file instead.
+- Tests never build the binary's command themselves (`Command::new` of it): use `common::fawkes()`, `Harness::cli`
+  or `Harness::fk`. They drop the `FAWKES_*` variables a suite inherits when it runs inside an app Fawkes supervises,
+  which would otherwise send the test's requests to that app's live daemon.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
   `process.rs`, `protocol.rs`, `main.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`, `daemon/transactions.rs`,
   `tui.rs`, `tui/net.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is the pure
@@ -50,8 +53,9 @@ not built yet. Don't start one unless asked.
   daemon code paths, return `protocol::Error` with `?` and don't add `unwrap`/`expect`. They are fine in tests.
 - **A generation rolls back at most once.** Never add a path that rolls back a rolled-back generation.
 - **Locking** (see the header of `daemon/mod.rs`): never hold `inner` across a slow step (install, health check,
-  process stop). The lock order is `inner` → `manifest` → `log` → `hub` (`step_pgids` is only ever taken alone), and no
-  thread waits on another while holding one.
+  process stop). The lock order is `inner` → `manifest` → `log` → `hub` and `echo` (`step_pgids` is only ever taken
+  alone), and no thread waits on another while holding one. Nothing that may hold a lock writes stderr: event lines
+  go to it through `Echo`'s thread.
 - **Processes:** the app runs in its own process group, and stopping or crash handling signals the whole group
   (`process::kill_group`, rustix's `kill_process_group`), never just the child pid.
 - **Storage snapshots** use the SQLite online backup API (`storage.rs`), never a file copy, because a copy can miss
