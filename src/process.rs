@@ -380,4 +380,32 @@ mod tests {
         assert_eq!(leftover(&pid_file), None, "the group is gone");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn stop_group_does_not_wait_for_ever_on_a_leader_that_will_not_exit() {
+        let sleeper = || {
+            Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        // The leader is in a group of its own, so signalling the other group never reaches it and it never exits,
+        // as a process stuck in the kernel would not.
+        let mut leader = sleeper();
+        let mut other = sleeper();
+
+        let started = Instant::now();
+        let status = stop_group(other.id(), 0.2, Some(&mut leader));
+        let waited = started.elapsed();
+
+        kill_group(leader.id());
+        leader.wait().unwrap();
+        other.wait().unwrap();
+        assert_eq!(status, None);
+        assert!(
+            waited < Duration::from_millis(200) + KILL_WAIT + Duration::from_secs(1),
+            "waited {waited:?}"
+        );
+    }
 }

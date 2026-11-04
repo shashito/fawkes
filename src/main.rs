@@ -200,7 +200,13 @@ fn main() -> ExitCode {
     let Command::Send(request) = &cli.command else {
         return ExitCode::from(tui::run(tui::Target::One(socket)));
     };
-    ExitCode::from(client(&cli, request, &socket, &manifest_path))
+    ExitCode::from(client(
+        &cli,
+        request,
+        &socket,
+        &manifest_path,
+        REQUEST_TIMEOUT,
+    ))
 }
 
 /// `--socket`, else `FAWKES_SOCKET`, else the manifest's `<state_dir>/fawkes.sock`.
@@ -216,8 +222,15 @@ fn socket_path(cli: &Cli, manifest_path: &Path) -> Result<PathBuf, String> {
     Ok(manifest.state_dir().join("fawkes.sock"))
 }
 
-/// Send one request, show progress, render the answer. Returns the exit code.
-fn client(cli: &Cli, request: &Request, socket: &Path, manifest_path: &Path) -> u8 {
+/// Send one request, show progress, render the answer. Returns the exit code. A quick command waits `timeout` for
+/// each line of the answer.
+fn client(
+    cli: &Cli,
+    request: &Request,
+    socket: &Path,
+    manifest_path: &Path,
+    timeout: Duration,
+) -> u8 {
     let Ok(mut stream) = UnixStream::connect(socket) else {
         let message = format!(
             "no daemon answers on {}; start one with `fawkes daemon --manifest {}`",
@@ -255,7 +268,7 @@ fn client(cli: &Cli, request: &Request, socket: &Path, manifest_path: &Path) -> 
             | Request::Status
             | Request::History
             | Request::Log { follow: false, .. }
-    ) && stream.set_read_timeout(Some(REQUEST_TIMEOUT)).is_err()
+    ) && stream.set_read_timeout(Some(timeout)).is_err()
     {
         eprintln!("error: cannot set a read timeout on the connection");
         return EXIT_FAILED;
@@ -496,5 +509,53 @@ fn render_result(request: &Request, result: &Value) -> String {
                 .join("\n")
         }),
         Request::Subscribe { .. } => result.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::time::Instant;
+
+    #[test]
+    fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
+        let dir = std::env::temp_dir().join(format!("fk-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("fawkes.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // Accepts and keeps the connection open without a word.
+        let silent = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+            drop(stream);
+        });
+        let cli = Cli {
+            json: false,
+            manifest: None,
+            socket: Some(socket.clone()),
+            command: Command::Send(Request::Status),
+        };
+
+        let started = Instant::now();
+        let code = client(
+            &cli,
+            &Request::Status,
+            &socket,
+            Path::new("fawkes.toml"),
+            Duration::from_millis(300),
+        );
+        let waited = started.elapsed();
+
+        assert_eq!(code, EXIT_FAILED);
+        // The read timed out; the daemon had not closed the connection yet.
+        assert!(
+            waited >= Duration::from_millis(300),
+            "gave up after {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(2), "hung for {waited:?}");
+        silent.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

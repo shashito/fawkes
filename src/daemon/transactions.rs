@@ -1010,3 +1010,41 @@ fn clone_directory(from: &Path, to: &Path, timeout: Duration) -> Result<(), Stri
         Err(format!("cp {status}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hanging_command_is_ended_with_everything_it_left_running() {
+        let dir = std::env::temp_dir().join(format!("fk-bounded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("leader.pid");
+        // The shell records its pid (its group's id), starts a member in the background and waits for it.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(r#"echo $$ > "$0"; sleep 30 & wait"#)
+            .arg(&pid_file);
+
+        let started = Instant::now();
+        let result = run_bounded(command, Duration::from_millis(300), "sleeper");
+        let waited = started.elapsed();
+
+        let message = result.expect_err("a command that outlives its timeout");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        // The shell leads its group and the background member joined it.
+        let pgid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !process::group_alive(pgid),
+            "a member of the group survived"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

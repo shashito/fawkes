@@ -718,4 +718,57 @@ mod tests {
         hub.send(&Msg::Changed);
         assert!(reading.try_recv().is_ok() && lock(&hub.0).len() == 1);
     }
+
+    fn app_of(child: Child, generation: &str) -> App {
+        App {
+            child,
+            generation: generation.into(),
+            started: Instant::now(),
+            started_at: now(),
+        }
+    }
+
+    #[test]
+    fn stop_and_restart_leave_an_app_that_already_exited_to_the_supervisor() {
+        let dir = std::env::temp_dir().join(format!("fk-inner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (store, _) = Store::load(dir.join("state.json")).unwrap();
+        let mut inner = Inner {
+            store,
+            live: Live::Stopped,
+            last_exit: None,
+            last_started: None,
+            restarts: 0,
+            busy: None,
+            moving: None,
+        };
+
+        let mut crashed = std::process::Command::new("true").spawn().unwrap();
+        // `try_wait` keeps the status it reaps, so the call under test sees the exit too.
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while crashed.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < give_up, "`true` never exited");
+            sleep(Duration::from_millis(10));
+        }
+        inner.live = Live::Running(app_of(crashed, "g1"));
+        let refused = inner.take_running_alive().err().expect("an exited app");
+        assert_eq!(refused.code, ErrorCode::Busy);
+        assert!(
+            inner.running().is_some_and(|app| app.generation == "g1"),
+            "the exited app was taken out instead of left for `reap`"
+        );
+
+        let alive = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        inner.live = Live::Running(app_of(alive, "g2"));
+        let mut taken = inner.take_running_alive().unwrap().expect("a running app");
+        assert_eq!(taken.generation, "g2");
+        assert!(matches!(inner.live, Live::Stopped));
+        taken.child.kill().unwrap();
+        taken.child.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
