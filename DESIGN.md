@@ -131,6 +131,13 @@ not begun yet.
 Rollback happens at most once per generation and only ever goes to the permanent generation. If that one then fails
 too, Fawkes does not roll further back; the restart policy below applies and the failure is reported in `status`.
 
+A restore that can never succeed (a deleted or corrupt `snapshot/`) would keep the app down for good, so the
+operator can give it up: `fawkes rollback --keep-storage`. It is allowed only while the step is `rolling_back` with
+`restore_failed` (else `invalid_state`). It clears the step, leaves the generation `rolled_back` and records
+`restore_abandoned_at` on it, logs a `rolled_back` event saying the storage was kept as it was, and starts the
+permanent generation. **The risk:** the permanent generation then runs on storage that the failed generation may
+already have migrated. The result is that of an ordinary rollback.
+
 `fawkes rollback` with no pending switch is `invalid_state`; to go back past a confirm, `test` and `switch` to a
 retired generation.
 
@@ -322,7 +329,7 @@ fawkes stage    <ref>
 fawkes test     <gen>
 fawkes switch   <gen> [--deadline SECS]
 fawkes confirm  [<gen>]
-fawkes rollback
+fawkes rollback [--keep-storage]
 fawkes prune
 fawkes status
 fawkes log      [-n N] [--follow]
@@ -334,6 +341,8 @@ Global options, before or after the command: `--json`, `--manifest FILE` (defaul
 A client finds the daemon by `--socket`, else `FAWKES_SOCKET`, else `<state_dir>/fawkes.sock` from the manifest.
 
 `--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped.
+`--keep-storage` belongs to `rollback` (a usage error elsewhere): it gives up a restore that failed, and the permanent
+generation then runs on storage that the failed generation may already have migrated.
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
@@ -389,7 +398,7 @@ Results per command:
 | `test` | `generation` | the generation record (its `test` field holds port, outcome, duration) |
 | `switch` | `generation`, `deadline?` (seconds, `1..=604800`, else `usage`) | `generation`, `previous`, `deadline` |
 | `confirm` | `generation?` | the generation record, now permanent |
-| `rollback` | — | `from`, `to`, `reason` |
+| `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason` |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
 | `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes |
@@ -414,8 +423,11 @@ A generation record:
 ```json
 {"id": "g3", "ref": "main", "commit": "238c447f…", "state": "current", "dir": "/tmp/fawkes-sample/generations/g3/code",
  "staged_at": "…", "test": {"port": 4791, "passed": true, "at": "…", "seconds": 2.1, "message": "healthy"},
- "switched_at": "…", "confirmed_at": null, "rolled_back_at": null, "rollback_reason": null, "failed_starts": 0}
+ "switched_at": "…", "confirmed_at": null, "rolled_back_at": null, "rollback_reason": null, "failed_starts": 0,
+ "restore_abandoned_at": null}
 ```
+
+`restore_abandoned_at` is set on a rolled-back generation whose failed restore `rollback --keep-storage` gave up.
 
 `status`:
 

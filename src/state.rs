@@ -671,6 +671,7 @@ mod tests {
             rolled_back_at: None,
             rollback_reason: None,
             failed_starts: 0,
+            restore_abandoned_at: None,
         };
         let state = State {
             generations: vec![
@@ -966,6 +967,7 @@ mod tests {
                         rolled_back_at: None,
                         rollback_reason: None,
                         failed_starts: 0,
+                        restore_abandoned_at: None,
                     }],
                     ..State::default()
                 };

@@ -29,7 +29,9 @@ const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <c
   test <gen>                     start it on a spare port with a copy of the storage
   switch <gen> [--deadline SECS] go live; roll back unless confirmed in time
   confirm [<gen>]                make the pending generation permanent
-  rollback                       undo the pending switch now
+  rollback [--keep-storage]      undo the pending switch now
+                                 --keep-storage gives up a restore that failed: the permanent generation then
+                                 runs on storage the failed generation may already have migrated
   prune                          remove old generations beyond the manifest's `keep`
   status | history               show the app and the generations
   log [-n N] [--follow]          show the event log
@@ -60,6 +62,7 @@ struct Cli {
 fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
     let (mut json, mut manifest, mut socket) = (false, None, None);
     let (mut count, mut follow, mut deadline) = (None, false, None);
+    let mut keep_storage = false;
     let mut positional = Vec::new();
     let mut args = args.into_iter();
     let number = |flag: &str, value: Option<String>| -> Result<u64, String> {
@@ -72,6 +75,7 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
         match arg.as_str() {
             "--json" => json = true,
             "--follow" => follow = true,
+            "--keep-storage" => keep_storage = true,
             "--manifest" => manifest = Some(args.next().ok_or("--manifest needs a file")?.into()),
             "--socket" => socket = Some(args.next().ok_or("--socket needs a path")?.into()),
             "--deadline" => deadline = Some(number("--deadline", args.next())?),
@@ -98,7 +102,7 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
         "start" => wants(0..=0).map(|()| Command::Send(Request::Start)),
         "stop" => wants(0..=0).map(|()| Command::Send(Request::Stop)),
         "restart" => wants(0..=0).map(|()| Command::Send(Request::Restart)),
-        "rollback" => wants(0..=0).map(|()| Command::Send(Request::Rollback)),
+        "rollback" => wants(0..=0).map(|()| Command::Send(Request::Rollback { keep_storage })),
         "prune" => wants(0..=0).map(|()| Command::Send(Request::Prune)),
         "status" => wants(0..=0).map(|()| Command::Send(Request::Status)),
         "history" => wants(0..=0).map(|()| Command::Send(Request::History)),
@@ -133,6 +137,9 @@ fn parse_cli(args: Vec<String>) -> Result<Cli, String> {
     }?;
     if deadline.is_some() && name != "switch" {
         return Err("--deadline belongs to `switch`".into());
+    }
+    if keep_storage && name != "rollback" {
+        return Err("--keep-storage belongs to `rollback`".into());
     }
     if (count.is_some() || follow) && name != "log" {
         return Err("-n and --follow belong to `log`".into());
@@ -413,12 +420,17 @@ fn render_result(request: &Request, result: &Value) -> String {
         Request::Confirm { .. } => {
             typed(result, |g: Generation| format!("{} is now permanent", g.id))
         }
-        Request::Rollback => typed(result, |r: RollbackResult| {
+        Request::Rollback { keep_storage } => typed(result, |r: RollbackResult| {
             format!(
-                "rolled back {}; now running {} ({})",
+                "rolled back {}; now running {} ({}){}",
                 r.from,
                 or_dash(r.to),
-                r.reason
+                r.reason,
+                if *keep_storage {
+                    "; storage kept as it was"
+                } else {
+                    ""
+                }
             )
         }),
         Request::Prune => typed(result, |r: PruneResult| {
