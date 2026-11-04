@@ -793,6 +793,9 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
     assert_eq!(h.status()["pending"], Value::Null);
     assert_eq!(h.generation("g2")["state"], "tested");
+    // A stage whose record cannot be written fails before its worktree exists.
+    refused(&["stage", "v1"], "internal", "nothing was staged");
+    assert!(!h.dir.join("s/generations/g3").exists());
     std::fs::remove_dir(&blocker).unwrap();
 
     // The confirm: g2 stays pending and keeps running.

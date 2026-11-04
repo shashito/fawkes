@@ -278,6 +278,18 @@ fn client(cli: &Cli, request: &Request, socket: &Path, manifest_path: &Path) -> 
         let Ok(raw) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        // An event this client cannot read (a kind from a newer daemon) still reaches `--json`.
+        if cli.json
+            && let Some(event) = raw.get("event")
+            && Line::<Value>::deserialize(&raw).is_err()
+        {
+            if follow {
+                println!("{event}");
+            } else {
+                eprintln!("{event}");
+            }
+            continue;
+        }
         let Ok(message) = Line::<Value>::deserialize(&raw) else {
             continue;
         };
