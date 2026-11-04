@@ -497,12 +497,12 @@ unsafe extern "C" {
     fn tzset();
 }
 
-pub fn run(target: Target) -> u8 {
+pub fn run(target: &Target) -> u8 {
     // SAFETY: this runs before the TUI starts its threads, so none can be inside `localtime_r`; `draw::local_clock` relies on
     // the zone data this loads once, as `localtime_r` is not required to.
     unsafe { tzset() };
     let (tx, rx) = mpsc::channel();
-    match &target {
+    match target {
         Target::One(socket) => {
             let (tx, socket) = (tx.clone(), socket.clone());
             let key = socket.display().to_string();
@@ -533,7 +533,7 @@ pub fn run(target: Target) -> u8 {
             return 1;
         }
     };
-    let result = event_loop(&mut terminal, App::new(&target), &rx, &tx);
+    let result = event_loop(&mut terminal, App::new(target), &rx, &tx);
     ratatui::restore();
     match result {
         Ok(()) => 0,
@@ -799,9 +799,9 @@ mod tests {
         let key = |c| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         let press = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
         // Apps are sorted by name: `blog` first; the arrows move the app while the apps table has focus.
-        assert_eq!(app.current().map(|a| a.name()).as_deref(), Some("blog"));
+        assert_eq!(app.current().map(AppView::name).as_deref(), Some("blog"));
         app.apply(press(KeyCode::Down));
-        assert_eq!(app.current().map(|a| a.name()).as_deref(), Some("sample"));
+        assert_eq!(app.current().map(AppView::name).as_deref(), Some("sample"));
         // Newest first: g8 is selected. Tab moves focus, so `down` now moves the generation to g7.
         assert_eq!(
             app.current().and_then(AppView::selected_id).as_deref(),
@@ -810,7 +810,7 @@ mod tests {
         app.apply(press(KeyCode::Tab));
         assert!(app.focus == Focus::Generations);
         app.apply(key('j'));
-        assert_eq!(app.current().map(|a| a.name()).as_deref(), Some("sample"));
+        assert_eq!(app.current().map(AppView::name).as_deref(), Some("sample"));
         assert_eq!(
             app.current().and_then(AppView::selected_id).as_deref(),
             Some("g7")
@@ -891,7 +891,7 @@ mod tests {
             "{screen}"
         );
         app.apply(press(KeyCode::Esc));
-        assert!(app.filter.is_empty());
+        assert_eq!(app.filter, "");
         assert_eq!(app.apply(key('q')), Some(Cmd::Quit));
         // The selection stays on what is shown instead of following the sort order, so an app appearing (or
         // leaving) cannot move it and send an unasked `c` to another daemon; a selected app that leaves selects

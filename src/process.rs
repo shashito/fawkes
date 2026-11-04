@@ -67,6 +67,10 @@ fn signal_group(pgid: u32, signal: Signal) {
 
 /// When process `pid` started, in seconds since the epoch; None when there is no such process.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "epoch seconds and microseconds are far below 2^52, so the conversion is exact"
+)]
 fn start_time(pid: u32) -> Option<f64> {
     let pid = libc::c_int::try_from(pid).ok()?;
     // SAFETY: `proc_bsdinfo` is plain integers and byte arrays, for which zero is valid.
@@ -93,12 +97,16 @@ fn start_time(pid: u32) -> Option<f64> {
         .ok()?;
     let boot = boot_time()?;
     // SAFETY: sysconf only reads a configuration value.
-    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    (per_second > 0).then(|| boot + ticks / per_second as f64)
+    let per_second = u32::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    (per_second > 0).then(|| boot + ticks / f64::from(per_second))
 }
 
 /// When the machine booted, in seconds since the epoch; None when the system does not say.
 #[cfg(target_os = "macos")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "epoch seconds are far below 2^52, so the conversion is exact"
+)]
 fn boot_time() -> Option<f64> {
     // SAFETY: `timeval` is two integers, for which zero is valid.
     let mut boot: libc::timeval = unsafe { std::mem::zeroed() };
@@ -167,7 +175,7 @@ pub fn kill_group(pgid: u32) {
     signal_group(pgid, Signal::KILL);
 }
 
-/// How long `stop_group` waits for a SIGKILLed group to disappear. Bounded, because a process stuck in the kernel
+/// How long `stop_group` waits for a `SIGKILL`ed group to disappear. Bounded, because a process stuck in the kernel
 /// (uninterruptible sleep) outlives even SIGKILL for as long as it is stuck.
 const KILL_WAIT: Duration = Duration::from_secs(2);
 

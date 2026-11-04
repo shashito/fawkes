@@ -187,7 +187,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_USAGE);
             }
         };
-        return ExitCode::from(tui::run(tui::Target::Discover(home.join("run"))));
+        return ExitCode::from(tui::run(&tui::Target::Discover(home.join("run"))));
     }
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
@@ -198,7 +198,7 @@ fn main() -> ExitCode {
     };
     // `daemon` returned above, so what is left but a request is `tui`.
     let Command::Send(request) = &cli.command else {
-        return ExitCode::from(tui::run(tui::Target::One(socket)));
+        return ExitCode::from(tui::run(&tui::Target::One(socket)));
     };
     ExitCode::from(client(
         &cli,
@@ -386,16 +386,16 @@ fn render_generation(g: &Generation) -> String {
 fn render_process(p: &Process) -> String {
     let mut line = format!("{}  {}", p.state.as_str(), or_dash(p.generation.as_deref()));
     if p.state == ProcessState::Running {
-        line += &format!(
-            "  pid {}  port {}  up {}s",
+        line = format!(
+            "{line}  pid {}  port {}  up {}s",
             or_dash(p.pid),
             p.port,
             or_dash(p.uptime.map(|seconds| format!("{seconds:?}")))
         );
     }
-    line += &format!("  restarts {}", p.restarts);
+    line = format!("{line}  restarts {}", p.restarts);
     if let Some(at) = &p.restart_at {
-        line += &format!("  restart at {at}");
+        line = format!("{line}  restart at {at}");
     }
     if let Some(exit) = &p.last_exit {
         let how = match (exit.code, exit.signal) {
@@ -408,7 +408,7 @@ fn render_process(p: &Process) -> String {
         } else {
             "unrequested"
         };
-        line += &format!("\nlast exit: {how} ({who}) at {}", exit.at);
+        line = format!("{line}\nlast exit: {how} ({who}) at {}", exit.at);
     }
     line
 }

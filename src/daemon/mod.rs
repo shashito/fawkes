@@ -164,7 +164,7 @@ impl Drop for Busy<'_> {
             inner.moving = None;
         }
         drop(inner);
-        self.daemon.broadcast(Msg::Changed);
+        self.daemon.broadcast(&Msg::Changed);
     }
 }
 
@@ -373,7 +373,7 @@ impl Daemon {
                     thread::spawn(move || daemon.handle(stream));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    sleep(Duration::from_millis(20))
+                    sleep(Duration::from_millis(20));
                 }
                 Err(e) => {
                     daemon.event(EventKind::Error, None, format!("accept failed: {e}"));
@@ -598,8 +598,8 @@ impl Daemon {
         })
     }
 
-    fn broadcast(&self, msg: Msg) {
-        self.hub.send(&msg);
+    fn broadcast(&self, msg: &Msg) {
+        self.hub.send(msg);
     }
 
     /// Record an event: stderr, events.jsonl, every subscriber. Anything but progress also changes the picture.
@@ -629,11 +629,11 @@ impl Daemon {
         let event = {
             let mut log = lock(&self.log);
             let event = log.append(event);
-            self.broadcast(Msg::Event(event.clone()));
+            self.broadcast(&Msg::Event(event.clone()));
             event
         };
         if kind != EventKind::Progress {
-            self.broadcast(Msg::Changed);
+            self.broadcast(&Msg::Changed);
         }
         event
     }
@@ -666,7 +666,7 @@ impl Daemon {
             inner.moving = Some(step.into());
         }
         drop(inner);
-        self.broadcast(Msg::Changed);
+        self.broadcast(&Msg::Changed);
         Ok(Busy { daemon: self, slot })
     }
 

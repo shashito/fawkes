@@ -94,7 +94,7 @@ impl Daemon {
             return;
         }
         let mut inner = self.inner();
-        if self.restart_due(&inner)
+        if Self::restart_due(&inner)
             && let Some(id) = inner.store.state().permanent.clone()
             && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
         {
@@ -124,7 +124,7 @@ impl Daemon {
             Some("rollback")
         } else if exited {
             Some("reap")
-        } else if self.restart_due(&inner) {
+        } else if Self::restart_due(&inner) {
             Some("restart")
         } else {
             None
@@ -155,7 +155,7 @@ impl Daemon {
         }
     }
 
-    fn restart_due(&self, inner: &Inner) -> bool {
+    fn restart_due(inner: &Inner) -> bool {
         inner.store.state().txn.is_none()
             && matches!(inner.live, Live::Backoff { until, .. } if Instant::now() >= until)
     }
@@ -217,7 +217,7 @@ impl Daemon {
                     until: Instant::now() + after,
                     at: format_time(now_secs() + after.as_secs()),
                 };
-                message += &format!("; restarting in {}s", after.as_secs());
+                message = format!("{message}; restarting in {}s", after.as_secs());
             }
         }
         inner.last_exit = Some(exit);
@@ -324,7 +324,7 @@ impl Daemon {
     /// decided. The next supervision pass carries the rollback out.
     fn judge_unhealthy(&self, id: &str, pid: u32, roll_back: bool) -> bool {
         let mut inner = self.inner();
-        if !inner.running().is_some_and(|app| app.child.id() == pid) {
+        if inner.running().is_none_or(|app| app.child.id() != pid) {
             return false;
         }
         if roll_back
