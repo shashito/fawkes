@@ -1,5 +1,6 @@
 //! The manifest: one TOML file per app (see DESIGN.md, "Manifest").
 
+use crate::state::Paths;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -11,6 +12,11 @@ pub fn fawkes_home() -> Result<PathBuf, String> {
     }
     let home = std::env::var_os("HOME").ok_or("neither FAWKES_HOME nor HOME is set")?;
     Ok(Path::new(&home).join(".fawkes"))
+}
+
+/// `<fawkes_home>/run`, where every daemon links its socket as `<name>.sock` for `fawkes tui` to find.
+pub fn run_dir() -> Result<PathBuf, String> {
+    Ok(fawkes_home()?.join("run"))
 }
 
 /// The manifest as validated and resolved by `load`: paths absolute, `state_dir` decided, the health check one of
@@ -290,11 +296,7 @@ impl Manifest {
             ("home", self.home != new.home),
             ("storage", self.storage != new.storage),
         ];
-        let refused: Vec<&str> = fixed
-            .iter()
-            .filter(|(_, differs)| *differs)
-            .map(|(field, _)| *field)
-            .collect();
+        let refused = differing(&fixed);
         let mut problems = Vec::new();
         if !refused.is_empty() {
             problems.push(format!(
@@ -335,15 +337,14 @@ impl Manifest {
             ("health", self.health != new.health),
             ("env", self.env != new.env),
         ];
-        Ok(reloadable
-            .into_iter()
-            .filter(|(_, differs)| *differs)
-            .map(|(field, _)| field)
-            .collect())
+        Ok(differing(&reloadable))
     }
 
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+    /// The files of `state_dir`.
+    pub fn paths(&self) -> Paths {
+        Paths {
+            root: self.state_dir.clone(),
+        }
     }
 
     pub fn health_check(&self, vars: &Vars) -> Check {
@@ -352,6 +353,15 @@ impl Manifest {
             Check::Command(command) => Check::Command(vars.expand_command(command)),
         }
     }
+}
+
+/// The names of the fields that differ, in the order given.
+fn differing(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
+    fields
+        .iter()
+        .filter(|(_, differs)| *differs)
+        .map(|(field, _)| *field)
+        .collect()
 }
 
 impl Written {

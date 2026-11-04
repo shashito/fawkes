@@ -1,11 +1,11 @@
 //! The supervision loop: reaping and restarting the app, the health check, and the process and status reports.
 
-use super::{APP_LOG_BYTES, App, Daemon, Inner, Live, Slot, Why};
+use super::{APP_LOG_BYTES, App, Daemon, Inner, Live, Slot, Why, tenths};
 use crate::process;
 use crate::protocol::{
     ErrorCode, EventKind, History, LastExit, Out, Process, ProcessState, R, Status, err, not_found,
 };
-use crate::state::{Txn, format_time, now, now_secs, parse_time};
+use crate::state::{Txn, format_time, now_secs, parse_time, with_suffix};
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::Arc;
@@ -96,10 +96,8 @@ impl Daemon {
         let mut inner = self.inner();
         if Self::restart_due(&inner)
             && let Some(id) = inner.store.state().permanent.clone()
-            && let Err(e) = self.start_live(&mut inner, &id, Why::Crash)
         {
-            inner.live = Live::Failed;
-            self.event(EventKind::Failed, Some(&id), e.message);
+            self.start_or_give_up(&mut inner, &id, Why::Crash);
         }
     }
 
@@ -140,8 +138,7 @@ impl Daemon {
         };
         let log = self.paths.app_log(&id);
         if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > APP_LOG_BYTES) {
-            let mut old = log.clone().into_os_string();
-            old.push(".1");
+            let old = with_suffix(&log, ".1");
             let capped = std::fs::copy(&log, &old)
                 .and_then(|_| OpenOptions::new().write(true).open(&log))
                 .and_then(|file| file.set_len(0));
@@ -248,7 +245,7 @@ impl Daemon {
             .find(id)
             .cloned()
             .ok_or_else(|| not_found(id))?;
-        let vars = self.vars(m.port, &m.home, &g);
+        let vars = self.vars(m.port, &m.home, &g.dir, id);
         let env = self.app_env(&m, &vars, "live");
         std::fs::create_dir_all(&m.home)?;
         let child = process::spawn(
@@ -270,12 +267,7 @@ impl Daemon {
             inner.restarts += 1;
         }
         inner.last_started = Some(id.into());
-        inner.live = Live::Running(App {
-            child,
-            generation: id.into(),
-            started: Instant::now(),
-            started_at: now(),
-        });
+        inner.live = Live::Running(App::new(child, id));
         self.update(&mut inner.store, |state| {
             if why != Why::Crash
                 && let Some(g) = state.find_mut(id)
@@ -291,30 +283,37 @@ impl Daemon {
         );
 
         // Health never confirms: only `confirm` makes a generation permanent. With `rollback_on_unhealthy` a pending
-        // generation that gives up is rolled back by the supervisor without waiting for its deadline.
+        // generation that gives up is rolled back by the supervisor without waiting for its deadline. The thread
+        // takes only what it reads, so a manifest replaced by a reload is not kept alive for the whole check.
+        let check = m.health_check(&vars);
+        let (interval, timeout, roll_back) =
+            (m.health.interval, m.health.timeout, m.rollback_on_unhealthy);
+        let code = vars.code;
         let daemon = self.clone();
         let id = id.to_string();
         thread::spawn(move || {
-            let check = m.health_check(&vars);
-            let result = process::wait_healthy(
-                &check,
-                &vars.code,
-                &env,
-                m.health.interval,
-                m.health.timeout,
-                || daemon.is_running(pid),
-            );
+            let result = process::wait_healthy(&check, &code, &env, interval, timeout, || {
+                daemon.is_running(pid)
+            });
             match result {
                 Ok(()) => {
                     daemon.event(EventKind::Healthy, Some(&id), "health check passed");
                 }
-                Err(e) if daemon.judge_unhealthy(&id, pid, m.rollback_on_unhealthy) => {
+                Err(e) if daemon.judge_unhealthy(&id, pid, roll_back) => {
                     daemon.event(EventKind::Unhealthy, Some(&id), e);
                 }
                 Err(_) => {}
             }
         });
         Ok(())
+    }
+
+    /// `start_live`, giving the app up when it cannot start: the failure is logged and nothing retries it.
+    pub(super) fn start_or_give_up(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) {
+        if let Err(e) = self.start_live(inner, id, why) {
+            inner.live = Live::Failed;
+            self.event(EventKind::Failed, Some(id), e.message);
+        }
     }
 
     /// Whether process `pid` of generation `id` is still the live one when its health check gives up, i.e. whether
@@ -379,7 +378,7 @@ impl Daemon {
                 Some(app.generation.clone()),
                 Some(app.child.id()),
                 Some(app.started_at.clone()),
-                Some((app.started.elapsed().as_secs_f64() * 10.0).round() / 10.0),
+                Some(tenths(app.started.elapsed())),
             ),
             Live::Stopped | Live::Backoff { .. } | Live::Failed => (
                 if matches!(inner.live, Live::Failed) {
@@ -508,15 +507,7 @@ mod tests {
             manifest: Mutex::new(Arc::new(manifest)),
             socket: paths.socket(),
             bin: PathBuf::new(),
-            inner: Mutex::new(Inner {
-                store,
-                live: Live::Stopped,
-                last_exit: None,
-                last_started: None,
-                restarts: 0,
-                busy: None,
-                moving: None,
-            }),
+            inner: Mutex::new(Inner::new(store)),
             log: Mutex::new(EventLog::open(paths.events()).unwrap()),
             paths,
             hub: Hub(Mutex::new(Vec::new())),
@@ -540,12 +531,7 @@ mod tests {
         let pid = child.id();
         {
             let mut inner = daemon.inner();
-            inner.live = Live::Running(App {
-                child,
-                generation: "g2".into(),
-                started: Instant::now(),
-                started_at: now(),
-            });
+            inner.live = Live::Running(App::new(child, "g2"));
             inner
                 .store
                 .modify(|state| {

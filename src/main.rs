@@ -11,11 +11,11 @@ mod tui;
 use manifest::Manifest;
 use protocol::{
     ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
-    Request, RollbackResult, Status, SwitchResult, err,
+    REQUEST_TIMEOUT, Request, RollbackResult, Status, SwitchResult, err, timed_out,
 };
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -41,9 +41,6 @@ const USAGE: &str = "usage: fawkes [--json] [--manifest FILE] [--socket PATH] <c
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
-
-/// How long a quick command waits for the daemon's next line; the TUI's `REQUEST_TIMEOUT` is the same.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the command line asks for: one of the two local programs, or a request to a daemon.
 enum Command {
@@ -180,14 +177,14 @@ fn main() -> ExitCode {
         && cli.manifest.is_none()
         && std::env::var_os("FAWKES_SOCKET").is_none()
     {
-        let home = match manifest::fawkes_home() {
-            Ok(home) => home,
+        let run = match manifest::run_dir() {
+            Ok(run) => run,
             Err(message) => {
                 eprintln!("error: {message}");
                 return ExitCode::from(EXIT_USAGE);
             }
         };
-        return ExitCode::from(tui::run(&tui::Target::Discover(home.join("run"))));
+        return ExitCode::from(tui::run(&tui::Target::Discover(run)));
     }
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
@@ -219,7 +216,7 @@ fn socket_path(cli: &Cli, manifest_path: &Path) -> Result<PathBuf, String> {
     }
     let manifest = Manifest::load(manifest_path)
         .map_err(|e| format!("{e}; pass --manifest or --socket to say which daemon to talk to"))?;
-    Ok(manifest.state_dir().join("fawkes.sock"))
+    Ok(manifest.paths().socket())
 }
 
 /// Send one request, show progress, render the answer. Returns the exit code. A quick command waits `timeout` for
@@ -248,8 +245,7 @@ fn client(
         }
         return EXIT_UNREACHABLE;
     };
-    let sent = serde_json::to_string(request).map_err(std::io::Error::from);
-    if sent.and_then(|line| writeln!(stream, "{line}")).is_err() {
+    if request.write_to(&mut stream).is_err() {
         eprintln!(
             "error: the daemon on {} closed the connection",
             socket.display()
@@ -257,31 +253,15 @@ fn client(
         return EXIT_UNREACHABLE;
     }
     let follow = matches!(request, Request::Log { follow: true, .. });
-    // A daemon that accepts and then never answers must not hang `fawkes confirm`, which the app itself calls. Only
-    // quick commands get the limit: a stage, test, switch, stop, restart, rollback or prune can stay silent for as
-    // long as an install, a health check, a stop timeout or a removal takes, which the daemon bounds by the
-    // manifest's timeouts, and a followed log is silent between events by design.
-    if matches!(
-        request,
-        Request::Start
-            | Request::Confirm { .. }
-            | Request::Status
-            | Request::History
-            | Request::Log { follow: false, .. }
-    ) && stream.set_read_timeout(Some(timeout)).is_err()
-    {
+    // A daemon that accepts and then never answers must not hang a quick command (`Request::is_quick`).
+    if request.is_quick() && stream.set_read_timeout(Some(timeout)).is_err() {
         eprintln!("error: cannot set a read timeout on the connection");
         return EXIT_FAILED;
     }
     for line in BufReader::new(stream).lines() {
         let line = match line {
             Ok(line) => line,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
+            Err(e) if timed_out(&e) => {
                 eprintln!("error: the daemon did not answer in time");
                 return EXIT_FAILED;
             }
@@ -291,10 +271,11 @@ fn client(
         let Ok(raw) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let message = Line::<Value>::deserialize(&raw);
         // An event this client cannot read (a kind from a newer daemon) still reaches `--json`.
         if cli.json
+            && message.is_err()
             && let Some(event) = raw.get("event")
-            && Line::<Value>::deserialize(&raw).is_err()
         {
             if follow {
                 println!("{event}");
@@ -303,7 +284,7 @@ fn client(
             }
             continue;
         }
-        let Ok(message) = Line::<Value>::deserialize(&raw) else {
+        let Ok(message) = message else {
             continue;
         };
         match message {

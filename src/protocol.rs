@@ -19,6 +19,17 @@ use std::time::Duration;
 /// as gone, instead of stalling the step or the stream that writes to it.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a client waits for each line of the answer to a quick request (`Request::is_quick`).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether a read gave up because its timeout passed.
+pub fn timed_out(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 // ------------------------------------------------------------- errors
 
 /// The stable `code` of an error. Agents depend on the strings, so a code is added, never renamed.
@@ -48,6 +59,13 @@ pub enum ErrorCode {
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
+}
+
+impl Error {
+    /// The same error with `hint` (what changed, what to do next) after its message.
+    pub fn with_hint(self, hint: impl std::fmt::Display) -> Error {
+        err(self.code, format!("{}; {hint}", self.message))
+    }
 }
 
 pub type R<T> = Result<T, Error>;
@@ -188,6 +206,27 @@ impl Request {
             Request::Log { .. } => "log",
             Request::Subscribe { .. } => "subscribe",
         }
+    }
+
+    /// Whether the daemon answers at once, so a client gives up on a daemon that accepts and then never answers
+    /// (`fawkes confirm`, which the app itself calls, must not hang). Any other request can stay silent for as long as
+    /// an install, a health check, a stop timeout or a removal takes, which the daemon bounds by the manifest's
+    /// timeouts, and a followed log is silent between events by design.
+    pub fn is_quick(&self) -> bool {
+        matches!(
+            self,
+            Request::Start
+                | Request::Confirm { .. }
+                | Request::Status
+                | Request::History
+                | Request::Log { follow: false, .. }
+        )
+    }
+
+    /// Send the request as one line.
+    pub fn write_to(&self, stream: &mut impl Write) -> std::io::Result<()> {
+        let line = serde_json::to_string(self)?;
+        writeln!(stream, "{line}")
     }
 }
 
@@ -612,11 +651,12 @@ impl Out {
             return false;
         }
         // Nothing here can fail to serialize; a line that did would be skipped, not sent half.
-        let Ok(text) = serde_json::to_string(line) else {
+        let Ok(mut bytes) = serde_json::to_vec(line) else {
             return true;
         };
+        bytes.push(b'\n');
         if let Some(stream) = &mut self.stream {
-            self.gone = stream.write_all(format!("{text}\n").as_bytes()).is_err();
+            self.gone = stream.write_all(&bytes).is_err();
         }
         !self.gone
     }

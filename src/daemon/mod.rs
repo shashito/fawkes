@@ -18,7 +18,7 @@ use server::{bind, register};
 
 use crate::manifest::{Manifest, Vars};
 use crate::process;
-use crate::protocol::{ErrorCode, Event, EventKind, Generation, LastExit, Out, Pending, R, err};
+use crate::protocol::{ErrorCode, Event, EventKind, LastExit, Out, Pending, R, err};
 use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time};
 use rustix::fs::{FlockOperation, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -37,6 +37,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|_| std::process::abort())
 }
 
+/// Seconds, rounded to tenths: an uptime or a test's duration as the wire carries it.
+fn tenths(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 10.0).round() / 10.0
+}
+
 // ---------------------------------------------------------------- types
 
 /// The app process Fawkes started and owns.
@@ -45,6 +50,17 @@ struct App {
     generation: String,
     started: Instant,
     started_at: String,
+}
+
+impl App {
+    fn new(child: Child, generation: &str) -> App {
+        App {
+            child,
+            generation: generation.into(),
+            started: Instant::now(),
+            started_at: now(),
+        }
+    }
 }
 
 /// Why a process is being started; decides what happens to the restart counters.
@@ -89,6 +105,19 @@ struct Inner {
 }
 
 impl Inner {
+    /// Nothing running and no step in flight, over the state `store` holds.
+    fn new(store: Store) -> Inner {
+        Inner {
+            store,
+            live: Live::Stopped,
+            last_exit: None,
+            last_started: None,
+            restarts: 0,
+            busy: None,
+            moving: None,
+        }
+    }
+
     fn running(&self) -> Option<&App> {
         match &self.live {
             Live::Running(app) => Some(app),
@@ -115,9 +144,7 @@ impl Inner {
             Live::Stopped | Live::Backoff { .. } => None,
         }
     }
-}
 
-impl Inner {
     /// `take_running` for `stop` and `restart`, which act on what is running. An app that has already exited stays
     /// in place and the request is `busy`: the exit is a crash for the supervisor's `reap` to decide (a pending
     /// generation gets no retries), not a stop that was asked for.
@@ -148,6 +175,18 @@ enum Slot {
     Both,
 }
 
+impl Slot {
+    /// Takes the transaction step slot, `busy`.
+    fn step(self) -> bool {
+        matches!(self, Slot::Step | Slot::Both)
+    }
+
+    /// Takes the live process slot, `moving`.
+    fn live(self) -> bool {
+        matches!(self, Slot::Live | Slot::Both)
+    }
+}
+
 /// Held while a step runs; frees its slots on drop.
 struct Busy<'a> {
     daemon: &'a Daemon,
@@ -157,10 +196,10 @@ struct Busy<'a> {
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
         let mut inner = self.daemon.inner();
-        if matches!(self.slot, Slot::Step | Slot::Both) {
+        if self.slot.step() {
             inner.busy = None;
         }
-        if matches!(self.slot, Slot::Live | Slot::Both) {
+        if self.slot.live() {
             inner.moving = None;
         }
         drop(inner);
@@ -252,9 +291,7 @@ impl Daemon {
                 .map_err(|e| format!("cannot install the signal handlers: {e}"))?;
         }
         let manifest = Manifest::load(&manifest_path)?;
-        let paths = Paths {
-            root: manifest.state_dir().to_path_buf(),
-        };
+        let paths = manifest.paths();
         create_private_dir(&paths.root)?;
         let _lock = lock_state_dir(&paths)?;
         let log = EventLog::open(paths.events())
@@ -280,15 +317,7 @@ impl Daemon {
             paths,
             socket,
             bin,
-            inner: Mutex::new(Inner {
-                store,
-                live: Live::Stopped,
-                last_exit: None,
-                last_started: None,
-                restarts: 0,
-                busy: None,
-                moving: None,
-            }),
+            inner: Mutex::new(Inner::new(store)),
             log: Mutex::new(log),
             hub: Hub(Mutex::new(Vec::new())),
             step_pgids: Mutex::new(Vec::new()),
@@ -395,11 +424,8 @@ impl Daemon {
 
     fn start_permanent(self: &Arc<Self>) {
         let mut inner = self.inner();
-        if let Some(id) = inner.store.state().permanent.clone()
-            && let Err(e) = self.start_live(&mut inner, &id, Why::Fresh)
-        {
-            inner.live = Live::Failed;
-            self.event(EventKind::Failed, Some(&id), e.message);
+        if let Some(id) = inner.store.state().permanent.clone() {
+            self.start_or_give_up(&mut inner, &id, Why::Fresh);
         }
     }
 
@@ -646,23 +672,21 @@ impl Daemon {
 
     fn begin(&self, step: &str, slot: Slot) -> R<Busy<'_>> {
         let mut inner = self.inner();
-        let wants_step = matches!(slot, Slot::Step | Slot::Both);
-        let wants_live = matches!(slot, Slot::Live | Slot::Both);
-        let taken = if wants_step { inner.busy.clone() } else { None }.or(if wants_live {
-            inner.moving.clone()
-        } else {
-            None
-        });
+        let taken = inner
+            .busy
+            .as_ref()
+            .filter(|_| slot.step())
+            .or_else(|| inner.moving.as_ref().filter(|_| slot.live()));
         if let Some(other) = taken {
             return Err(err(
                 ErrorCode::Busy,
                 format!("{other} is in progress; try again when it has finished"),
             ));
         }
-        if wants_step {
+        if slot.step() {
             inner.busy = Some(step.into());
         }
-        if wants_live {
+        if slot.live() {
             inner.moving = Some(step.into());
         }
         drop(inner);
@@ -670,12 +694,14 @@ impl Daemon {
         Ok(Busy { daemon: self, slot })
     }
 
-    fn vars(&self, port: u16, home: &Path, g: &Generation) -> Vars {
+    /// What `{port}`, `{home}`, `{code}`, `{generation}` and `{state}` expand to for generation `id` checked out at
+    /// `code`.
+    fn vars(&self, port: u16, home: &Path, code: &Path, id: &str) -> Vars {
         Vars {
             port,
             home: home.to_path_buf(),
-            code: g.dir.clone(),
-            generation: g.id.clone(),
+            code: code.to_path_buf(),
+            generation: id.into(),
             state: self.paths.root.clone(),
         }
     }
@@ -719,30 +745,13 @@ mod tests {
         assert!(reading.try_recv().is_ok() && lock(&hub.0).len() == 1);
     }
 
-    fn app_of(child: Child, generation: &str) -> App {
-        App {
-            child,
-            generation: generation.into(),
-            started: Instant::now(),
-            started_at: now(),
-        }
-    }
-
     #[test]
     fn taking_the_app_for_stop_or_restart_leaves_one_that_already_exited_to_the_supervisor() {
         let dir = std::env::temp_dir().join(format!("fk-inner-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (store, _) = Store::load(dir.join("state.json")).unwrap();
-        let mut inner = Inner {
-            store,
-            live: Live::Stopped,
-            last_exit: None,
-            last_started: None,
-            restarts: 0,
-            busy: None,
-            moving: None,
-        };
+        let mut inner = Inner::new(store);
 
         let mut crashed = std::process::Command::new("true").spawn().unwrap();
         // `try_wait` keeps the status it reaps, so the call under test sees the exit too.
@@ -751,7 +760,7 @@ mod tests {
             assert!(Instant::now() < give_up, "`true` never exited");
             sleep(Duration::from_millis(10));
         }
-        inner.live = Live::Running(app_of(crashed, "g1"));
+        inner.live = Live::Running(App::new(crashed, "g1"));
         let refused = inner.take_running_alive().err().expect("an exited app");
         assert_eq!(refused.code, ErrorCode::Busy);
         assert!(
@@ -763,7 +772,7 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
-        inner.live = Live::Running(app_of(alive, "g2"));
+        inner.live = Live::Running(App::new(alive, "g2"));
         let mut taken = inner.take_running_alive().unwrap().expect("a running app");
         assert_eq!(taken.generation, "g2");
         assert!(matches!(inner.live, Live::Stopped));

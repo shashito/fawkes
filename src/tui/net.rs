@@ -2,9 +2,9 @@
 //! daemons, and the one-shot request an action sends.
 
 use super::Msg;
-use crate::protocol::{Line, Request};
+use crate::protocol::{Line, REQUEST_TIMEOUT, Request, timed_out};
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc::Sender;
@@ -13,7 +13,6 @@ use std::time::Duration;
 
 const RETRY: Duration = Duration::from_secs(1);
 const RESCAN: Duration = Duration::from_secs(3);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKLOG: u64 = 100;
 
 /// The keys of the apps that have a reader thread.
@@ -137,28 +136,26 @@ pub(super) fn scan(dir: &Path, active: &Active, tx: &Sender<Msg>) {
 
 fn open(socket: &Path, request: &Request) -> Result<UnixStream, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
-    let line = serde_json::to_string(request).map_err(|e| e.to_string())?;
-    writeln!(stream, "{line}").map_err(|e| e.to_string())?;
+    request.write_to(&mut stream).map_err(|e| e.to_string())?;
     Ok(stream)
 }
 
 /// One request: progress lines are skipped (they reach the screen through `subscribe`), the answer is the outcome.
 pub(super) fn request(socket: &Path, request: &Request) -> Result<(), String> {
     let stream = open(socket, request)?;
-    // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever. Only
-    // quick actions get the limit: a stage, test, switch, stop or prune can stay silent for as long as an install,
-    // a health check, a stop timeout or a removal takes, and the daemon bounds those by the manifest's timeouts.
-    if matches!(request, Request::Start | Request::Confirm { .. }) {
+    // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever.
+    if request.is_quick() {
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
             .map_err(|e| e.to_string())?;
     }
     for line in BufReader::new(stream).lines() {
-        let line = line.map_err(|e| match e.kind() {
-            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+        let line = line.map_err(|e| {
+            if timed_out(&e) {
                 "the daemon did not answer in time".to_string()
+            } else {
+                e.to_string()
             }
-            _ => e.to_string(),
         })?;
         match serde_json::from_str::<Line>(&line) {
             Ok(Line::Done { .. }) => return Ok(()),
@@ -173,6 +170,7 @@ pub(super) fn request(socket: &Path, request: &Request) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::mpsc;
