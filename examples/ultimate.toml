@@ -1,13 +1,18 @@
-# The Ultimate manifest (first user of Fawkes). The paths are placeholders.
+# The Ultimate manifest (first user of Fawkes). The paths are placeholders: `repo` is the Ultimate clone, `my-app` the
+# project the host serves, and `home` that project's state folder, `~/.ultimate/projects/<project>-<hash>`.
+# `start` is the wrapper of the Ultimate extension (ultimate/fawkes/README.md): Ultimate's own supervisor in a live run,
+# a preview-isolated core in a test run. Link ultimate/fawkes into ~/.ultimate/extensions/fawkes so a new generation
+# confirms itself, and turn the built-in `update` extension off in that project.
 name = "ultimate"
 repo = "/path/to/ultimate"
-home = "/path/to/.ultimate/projects/ultimate-<hash>"
+home = "/path/to/.ultimate/projects/my-app-<hash>"
 storage = ["state.sqlite", "trace.sqlite"]
 port = 4747
 spare_ports = [4790, 4799]
 install = "pnpm install --frozen-lockfile"
 reuse = ["node_modules"]
-start = "node bin/ultimate.ts --no-open"
+keep = 5
+start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/my-app"
 deadline = 120
 
 [health]
@@ -17,3 +22,4 @@ timeout = 120
 [env]
 ULTIMATE_HOME = "{home}"
 ULTIMATE_PORT = "{port}"
+# A daemon started by launchd instead of a terminal also needs PATH (node, pnpm, git) here.

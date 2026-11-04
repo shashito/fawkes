@@ -326,18 +326,21 @@ and `FAWKES_PHASE` (`test` or `live`).
 (or the repository's working tree when there is none): `cp -cR` on macOS (APFS `clonefile`, near-instant and no extra
 space), `cp -R --reflink=auto` elsewhere. The install then only reconciles the difference.
 
-The Ultimate manifest (first user; see `examples/ultimate.toml`):
+The Ultimate manifest (first user; see `examples/ultimate.toml`). Its `start` is the wrapper of the Ultimate extension
+in `ultimate/fawkes/`, which runs Ultimate for `<project>` from the generation and isolates a test run like an
+Ultimate preview (README there):
 
 ```toml
 name = "ultimate"
 repo = "/path/to/ultimate"
-home = "/path/to/.ultimate/projects/ultimate-<hash>"
+home = "/path/to/.ultimate/projects/my-app-<hash>"
 storage = ["state.sqlite", "trace.sqlite"]
 port = 4747
 spare_ports = [4790, 4799]
 install = "pnpm install --frozen-lockfile"
 reuse = ["node_modules"]
-start = "node bin/ultimate.ts --no-open"
+keep = 5
+start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/my-app"
 deadline = 120
 
 [health]
@@ -643,5 +646,4 @@ message. anyhow's context chains would have to be flattened into every one of th
 
 - `confirm = "health"` for apps that cannot call `confirm` themselves.
 - Storage that is not SQLite.
-- The Ultimate extension in `~/.ultimate/extensions/` that drives Fawkes for self-upgrades.
 - Falling back past the permanent generation when it crash-loops.
