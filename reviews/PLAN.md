@@ -82,6 +82,17 @@ protocol additions the user chose: `process.restart_at` shows a scheduled crash 
 
 ## Phase 4: tests and tooling (can run in parallel with phase 3)
 
+**Done:** every item below except `cargo-deny` and CI. Where the build differs from the item: the test seam is a pure
+`after_exit` with the time passed in as a value (`ran: Duration`), not a `Clock` trait, since nothing else needs
+a clock to be injected; `rust-toolchain.toml` tracks `stable` (the user's decision, so no second toolchain is
+installed), with `rust-version = "1.99"` as the floor; `cargo-deny` is not installed on this machine and installing
+it needs the user's OK, so it is skipped; CI waits for a remote. Node.js must be 22.13 or later, not 22.5: the
+sample app's `node:sqlite` is behind `--experimental-sqlite` before 22.13. `clippy.toml` raises
+`too_many_lines` to 150, above the longest transaction step. Also added: one test each for 03-review L1, L4, L7,
+L8, L10 and L11, the TUI's reconnect-gap check, its `p` key and its `request`, and a `lander.checks` list in
+`.ultimate/settings.json`. The tests found no bug. The harness claims each test's ports with a `flock` on
+`/tmp/fawkes-test-ports/<port>`, which closes to-do 1.
+
 - **Test seams:** an injectable `Clock` and a pure `after_exit(...) -> Outcome`, so backoff, the reset after
   `min_uptime` and the `failed` threshold run in milliseconds (1:A7, 2:§4.2).
 - **Integration tests still missing:** crash loop → backoff → `failed`, then `start` clears it; restore failure →
