@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_restart_leave_an_app_that_already_exited_to_the_supervisor() {
+    fn taking_the_app_for_stop_or_restart_leaves_one_that_already_exited_to_the_supervisor() {
         let dir = std::env::temp_dir().join(format!("fk-inner-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

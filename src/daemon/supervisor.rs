@@ -431,7 +431,14 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Hub;
     use super::*;
+    use crate::manifest::Manifest;
+    use crate::protocol::Pending;
+    use crate::state::{EventLog, Paths, Store};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
 
     const MIN_UPTIME: f64 = 10.0;
     const SHORT: Duration = Duration::from_secs(1);
@@ -477,5 +484,95 @@ mod tests {
             let (_, decided) = after_exit(failed_starts, ran, true, MIN_UPTIME, 3);
             assert_eq!(decided, Outcome::RollBack);
         }
+    }
+
+    /// A daemon over a scratch state directory, with no socket and no supervision thread.
+    fn scratch_daemon(dir: &Path) -> Daemon {
+        let manifest_path = dir.join("fawkes.toml");
+        std::fs::write(
+            &manifest_path,
+            "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\n\
+             spare_ports = [4791, 4795]\nstart = \"node app.js\"\n[health]\nurl = \"http://127.0.0.1:{port}/\"\n",
+        )
+        .unwrap();
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        let paths = Paths {
+            root: dir.join("state"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let (store, _) = Store::load(paths.state_json()).unwrap();
+        Daemon {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            reload: Arc::new(AtomicBool::new(false)),
+            manifest_path,
+            manifest: Mutex::new(Arc::new(manifest)),
+            socket: paths.socket(),
+            bin: PathBuf::new(),
+            inner: Mutex::new(Inner {
+                store,
+                live: Live::Stopped,
+                last_exit: None,
+                last_started: None,
+                restarts: 0,
+                busy: None,
+                moving: None,
+            }),
+            log: Mutex::new(EventLog::open(paths.events()).unwrap()),
+            paths,
+            hub: Hub(Mutex::new(Vec::new())),
+            step_pgids: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `rollback_on_unhealthy`: the call that finds the failing process still live decides the rollback itself, so
+    /// by the time its caller logs `unhealthy` a confirm already finds the rollback decided. The end-to-end test
+    /// cannot see the difference: the decision would win the race against a client reading the event either way.
+    #[test]
+    fn an_unhealthy_pending_generation_has_its_rollback_decided_before_the_event_is_logged() {
+        let dir = std::env::temp_dir().join(format!("fk-unhealthy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = scratch_daemon(&dir);
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        {
+            let mut inner = daemon.inner();
+            inner.live = Live::Running(App {
+                child,
+                generation: "g2".into(),
+                started: Instant::now(),
+                started_at: now(),
+            });
+            inner
+                .store
+                .modify(|state| {
+                    state.txn = Some(Txn::Pending(Pending {
+                        generation: "g2".into(),
+                        previous: Some("g1".into()),
+                        deadline: format_time(now_secs() + 120),
+                    }));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert!(
+            !daemon.judge_unhealthy("g2", pid + 1, true),
+            "not the live process"
+        );
+        assert_eq!(daemon.inner().store.state().rolling_back(), None);
+        assert!(daemon.judge_unhealthy("g2", pid, true));
+        assert_eq!(
+            daemon.inner().store.state().rolling_back(),
+            Some("health check failed")
+        );
+
+        let mut app = daemon.inner().take_running().unwrap();
+        app.child.kill().unwrap();
+        app.child.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

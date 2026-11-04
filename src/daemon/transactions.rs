@@ -1021,15 +1021,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let pid_file = dir.join("leader.pid");
-        // The shell records its pid (its group's id), starts a member in the background and waits for it.
+        // The shell starts a member in the background, then records its pid (its group's id) and waits: a written
+        // file means the group has the member to end. A second leaves the shell ample time to get there under load.
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg(r#"echo $$ > "$0"; sleep 30 & wait"#)
+            .arg(r#"sleep 30 & echo $$ > "$0"; wait"#)
             .arg(&pid_file);
 
         let started = Instant::now();
-        let result = run_bounded(command, Duration::from_millis(300), "sleeper");
+        let result = run_bounded(command, Duration::from_secs(1), "sleeper");
         let waited = started.elapsed();
 
         let message = result.expect_err("a command that outlives its timeout");
