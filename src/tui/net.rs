@@ -168,3 +168,190 @@ pub(super) fn request(socket: &Path, request: &Request) -> Result<(), String> {
     }
     Err("the daemon closed the connection without an answer".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+
+    /// A daemon that answers its connections one after another, each with the given lines, then closes it.
+    struct FakeDaemon {
+        socket: PathBuf,
+        served: Option<JoinHandle<Vec<String>>>,
+    }
+
+    impl FakeDaemon {
+        /// The socket path stays short: a path over about 100 bytes does not bind, and the temp dir is long.
+        fn start(name: &str, connections: Vec<Vec<Value>>) -> FakeDaemon {
+            let socket = PathBuf::from(format!("/tmp/fkt{}-{name}.sock", std::process::id()));
+            std::fs::remove_file(&socket).ok();
+            let listener = UnixListener::bind(&socket).unwrap();
+            let served = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for lines in connections {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = String::new();
+                    BufReader::new(stream.try_clone().unwrap())
+                        .read_line(&mut request)
+                        .unwrap();
+                    requests.push(request);
+                    for line in lines {
+                        writeln!(stream, "{line}").unwrap();
+                    }
+                }
+                requests
+            });
+            FakeDaemon {
+                socket,
+                served: Some(served),
+            }
+        }
+
+        /// The request lines received, after every connection has been served.
+        fn requests(&mut self) -> Vec<Request> {
+            let lines = self.served.take().unwrap().join().unwrap();
+            lines.iter().map(|l| Request::parse(l).unwrap()).collect()
+        }
+    }
+
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.socket).ok();
+        }
+    }
+
+    fn event(seq: u64) -> Value {
+        json!({ "event": { "seq": seq, "at": "2026-11-03T14:02:01Z", "kind": "progress",
+                           "generation": null, "message": format!("event {seq}") } })
+    }
+
+    fn status() -> Value {
+        json!({ "status": {
+            "name": "sample", "daemon_pid": 812, "permanent": null, "current": null, "busy": null,
+            "pending": null,
+            "process": { "state": "stopped", "generation": null, "pid": null, "port": 3000,
+                         "started_at": null, "uptime": null, "restarts": 0, "last_exit": null } } })
+    }
+
+    fn history() -> Value {
+        json!({ "history": { "generations": [] } })
+    }
+
+    fn describe(msg: &Msg) -> String {
+        match msg {
+            Msg::Up(_, _, resumed) => format!("up resumed={resumed}"),
+            Msg::Line(_, Line::Event { event }) => format!("event {}", event.seq),
+            Msg::Line(_, Line::Status { .. }) => "status".into(),
+            Msg::Line(_, Line::History { .. }) => "history".into(),
+            Msg::Line(..) => "other line".into(),
+            Msg::Down(_, why) => format!("down {why}"),
+            Msg::Gone(_) => "gone".into(),
+            Msg::Key(_) | Msg::Done(..) => "unexpected".into(),
+        }
+    }
+
+    #[test]
+    fn the_reader_reports_up_then_the_replay_and_snapshots_in_order_then_down() {
+        let mut daemon = FakeDaemon::start(
+            "reader",
+            vec![vec![event(1), event(2), status(), history()]],
+        );
+        let (tx, rx) = mpsc::channel();
+        let socket = daemon.socket.clone();
+        std::thread::spawn(move || reader("sample", &socket, None, &tx));
+        let seen: Vec<String> = rx.iter().take(6).map(|m| describe(&m)).collect();
+        // Dropping the receiver ends the reader at its next send, after the retry pause.
+        drop(rx);
+        assert_eq!(
+            seen,
+            [
+                "up resumed=false",
+                "event 1",
+                "event 2",
+                "status",
+                "history",
+                "down connection lost"
+            ]
+        );
+        assert_eq!(
+            daemon.requests(),
+            [Request::Subscribe {
+                limit: Some(BACKLOG),
+                since: None
+            }]
+        );
+    }
+
+    #[test]
+    fn a_reconnect_resumes_only_when_the_replay_continues_the_events_already_shown() {
+        let mut daemon = FakeDaemon::start(
+            "resume",
+            vec![
+                // The first connection: events up to 3.
+                vec![event(1), event(2), event(3), status(), history()],
+                // Continues at 4: resumed.
+                vec![event(4), event(5), status(), history()],
+                // Nothing happened meanwhile: the replay is empty and the snapshot comes first: resumed.
+                vec![status(), history()],
+                // The daemon logged more than the replay holds: the first event is 9, not 6: a gap.
+                vec![event(9), status(), history()],
+                // A log that started over numbers from 1 again: not a continuation.
+                vec![event(1), event(2), status(), history()],
+                // And the next reconnect asks after the new numbering.
+                vec![event(3), status(), history()],
+            ],
+        );
+        let mut last_seq = None;
+        let mut connect = || {
+            let (tx, rx) = mpsc::channel();
+            let (up, why) = follow("sample", &daemon.socket, &mut last_seq, &tx);
+            drop(tx);
+            assert!(up, "{why}");
+            rx.iter()
+                .find_map(|m| match m {
+                    Msg::Up(_, _, resumed) => Some(resumed),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let resumed: Vec<bool> = (0..6).map(|_| connect()).collect();
+        assert_eq!(resumed, [false, true, true, false, false, true]);
+        let since: Vec<Option<u64>> = daemon
+            .requests()
+            .into_iter()
+            .map(|r| match r {
+                Request::Subscribe { since, .. } => since,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(since, [None, Some(3), Some(5), Some(5), Some(9), Some(2)]);
+    }
+
+    #[test]
+    fn a_request_is_done_failed_with_the_daemons_message_or_unanswered() {
+        let mut daemon = FakeDaemon::start(
+            "request",
+            vec![
+                // Progress lines are skipped on the way to the outcome.
+                vec![event(1), json!({ "ok": true, "result": {} })],
+                vec![json!({ "ok": false,
+                             "error": { "code": "busy", "message": "switch is in progress" } })],
+                vec![event(2)],
+            ],
+        );
+        assert_eq!(request(&daemon.socket, &Request::Prune), Ok(()));
+        assert_eq!(
+            request(&daemon.socket, &Request::Prune),
+            Err("switch is in progress".into())
+        );
+        assert_eq!(
+            request(&daemon.socket, &Request::Prune),
+            Err("the daemon closed the connection without an answer".into())
+        );
+        assert_eq!(daemon.requests(), vec![Request::Prune; 3]);
+    }
+}
