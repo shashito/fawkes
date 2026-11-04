@@ -4,6 +4,8 @@
 mod common;
 use common::Harness;
 use serde_json::Value;
+use std::io::{BufRead, BufReader, Write};
+use std::time::Duration;
 
 #[test]
 fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
@@ -1089,4 +1091,275 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     );
     // Nothing is pending any more.
     refused(&["rollback"], "invalid_state", "nothing to roll back");
+}
+
+/// The messages of the events of `kind`, oldest first, that start with `prefix`.
+fn messages_starting(h: &Harness, kind: &str, prefix: &str) -> Vec<String> {
+    messages(h, kind)
+        .into_iter()
+        .filter(|message| message.starts_with(prefix))
+        .collect()
+}
+
+/// Make a generation `id` of `version` permanent, in a daemon that has none yet.
+fn make_permanent(h: &Harness, version: &str, id: &str) {
+    h.ok(&["stage", version]);
+    h.ok(&["test", id]);
+    h.ok(&["switch", id]);
+    h.wait("the generation to confirm itself", 15, || {
+        h.status()["permanent"] == id
+    });
+}
+
+/// SIGHUP applies what may change while the daemon runs and the next start uses it. A manifest that changes a fixed
+/// field is refused whole, the hot field edited along with it included.
+#[test]
+fn sighup_reloads_hot_fields_and_refuses_a_manifest_that_changes_a_fixed_one() {
+    let mut h = Harness::new("");
+    // The app's start command records what it was given, so the next start shows which manifest it ran under.
+    h.edit_manifest(
+        r#"start = "node app.js""#,
+        r#"start = "echo $MARK > $APP_HOME/mark; exec node app.js""#,
+    );
+    h.edit_manifest(
+        r#"APP_HOME = "{home}""#,
+        "APP_HOME = \"{home}\"\nMARK = \"one\"",
+    );
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    let mark = || std::fs::read_to_string(h.dir.join("home/mark")).unwrap();
+    assert_eq!(mark().trim(), "one");
+
+    h.edit_manifest(r#"MARK = "one""#, r#"MARK = "two""#);
+    h.edit_manifest("interval = 0.1", "interval = 0.2");
+    h.signal_daemon(libc::SIGHUP);
+    h.wait("the reload to be logged", 10, || {
+        !messages_starting(&h, "daemon", "manifest reloaded").is_empty()
+    });
+    assert_eq!(
+        messages_starting(&h, "daemon", "manifest reloaded"),
+        ["manifest reloaded, changed: health, env"]
+    );
+    assert_eq!(
+        mark().trim(),
+        "one",
+        "the running app is not touched by a reload"
+    );
+    h.ok(&["restart"]);
+    // The start command writes the mark before the app listens.
+    h.wait("v1 to answer after the restart", 10, || {
+        h.get().as_deref() == Some("v1")
+    });
+    assert_eq!(mark().trim(), "two", "the next start runs with the new env");
+
+    // A refused field refuses the whole manifest: `MARK` stays what it was.
+    h.edit_manifest(r#"MARK = "two""#, r#"MARK = "three""#);
+    h.edit_manifest(
+        r#"storage = ["app.sqlite"]"#,
+        r#"storage = ["app.sqlite", "other.sqlite"]"#,
+    );
+    h.signal_daemon(libc::SIGHUP);
+    h.wait("the refusal to be logged", 10, || {
+        !messages_starting(&h, "error", "manifest not reloaded").is_empty()
+    });
+    let refused = messages_starting(&h, "error", "manifest not reloaded");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].contains("storage can only change with a daemon restart"),
+        "{refused:?}"
+    );
+    h.ok(&["restart"]);
+    h.wait("v1 to answer after the restart", 10, || {
+        h.get().as_deref() == Some("v1")
+    });
+    assert_eq!(
+        mark().trim(),
+        "two",
+        "the old manifest stays whole after a refused reload"
+    );
+    assert_eq!(
+        messages_starting(&h, "daemon", "manifest reloaded").len(),
+        1
+    );
+}
+
+/// A reload cannot move `port` in the window of a switch between stopping the old app and starting the new one, when
+/// no app is in `live`: the switch announced the old port and the new generation serves on it.
+#[test]
+fn a_reload_cannot_change_the_port_while_a_switch_has_stopped_the_old_app() {
+    let mut h = Harness::new("");
+    h.commit("v1", "slow-stop");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+
+    // Edited now, applied only by the SIGHUP, so nothing is left to do inside g1's 1.5 s stop.
+    let port = h.port.to_string();
+    h.edit_manifest(
+        &format!("spare_ports = [{}, {}]", h.port + 1, h.port + 9),
+        &format!("spare_ports = [{}, {}]", h.port + 1, h.port + 8),
+    );
+    h.edit_manifest(
+        &format!("port = {port}\n"),
+        &format!("port = {}\n", h.port + 9),
+    );
+    let mut follow = h.follow(&[]);
+    std::thread::scope(|scope| {
+        let switch = scope.spawn(|| h.fk(&["switch", "g2"]));
+        follow.until("the switch to stop g1", 15, |e| {
+            e["message"] == "stopping g1"
+        });
+        h.signal_daemon(libc::SIGHUP);
+        let refused = follow.until("the reload to be refused", 15, |e| e["kind"] == "error");
+        let message = refused["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("manifest not reloaded")
+                && message.contains("port cannot change while switch g2 is in progress"),
+            "{message}"
+        );
+        assert_eq!(switch.join().unwrap().0, 0);
+    });
+
+    let started = format!("pid {} on port {port}", h.status()["process"]["pid"]);
+    h.wait("v2 to serve on the old port", 15, || {
+        h.get().as_deref() == Some("v2")
+    });
+    assert_eq!(h.status()["process"]["port"], h.port);
+    assert!(messages(&h, "started").contains(&started));
+    assert!(messages_starting(&h, "daemon", "manifest reloaded").is_empty());
+}
+
+/// With `rollback_on_unhealthy`, the rollback is decided before `unhealthy` is logged, so a confirm sent the moment
+/// the event appears is refused as one for a generation being rolled back, and g2 ends rolled back.
+#[test]
+fn a_confirm_sent_at_the_unhealthy_event_finds_the_rollback_decided() {
+    let mut h = Harness::new("rollback_on_unhealthy = true");
+    h.edit_manifest("timeout = 20", "timeout = 3");
+    h.edit_manifest("stop_timeout = 5", "stop_timeout = 3");
+    // g2 leaves a process that ignores SIGTERM in its group, so its rollback takes the whole stop timeout and a
+    // confirm has time to arrive while the rollback is under way.
+    h.edit_manifest(
+        r#"start = "node app.js""#,
+        r#"start = "if [ $FAWKES_GENERATION = g2 ] && [ $FAWKES_PHASE = live ]; then (trap '' TERM; sleep 4) & fi; exec node app.js""#,
+    );
+    h.commit("v1", "confirm");
+    h.commit("v2", "unhealthy-live");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+
+    let mut follow = h.follow(&[]);
+    // Connected beforehand: the daemon accepts only every 20 ms, and the confirm must go out with the event.
+    let mut raw = h.connect();
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    follow.until("g2's unhealthy event", 20, |e| {
+        e["kind"] == "unhealthy" && e["generation"] == "g2"
+    });
+    writeln!(
+        raw,
+        r#"{{"command": "confirm", "args": {{"generation": "g2"}}}}"#
+    )
+    .unwrap();
+    let mut answer = String::new();
+    BufReader::new(&raw).read_line(&mut answer).unwrap();
+    let answer: Value = serde_json::from_str(&answer).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["code"], "invalid_state", "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("is being rolled back (health check failed)"),
+        "{message}"
+    );
+
+    h.wait("g2 to be rolled back", 20, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert_eq!(h.generation("g2")["rollback_reason"], "health check failed");
+    assert_eq!(h.status()["permanent"], "g1");
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+}
+
+/// `log --follow` replays the newest 20 events (or `-n`), then prints each new one once as it happens, one JSON event
+/// per line.
+#[test]
+fn log_follow_replays_the_newest_events_then_streams_new_ones_once() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    // More than the 20 a follow replays by default.
+    while h.ok(&["log", "-n", "1000"])["events"]
+        .as_array()
+        .unwrap()
+        .len()
+        < 30
+    {
+        h.ok(&["stop"]);
+        h.ok(&["start"]);
+    }
+    h.wait("the health check to pass", 10, || {
+        h.ok(&["log", "-n", "1"])["events"][0]["kind"] == "healthy"
+    });
+    // Quiet: nothing is logged between the picture of the log and the follow.
+    let log = || h.ok(&["log", "-n", "1000"])["events"].clone();
+    let snapshot = log();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(log() == snapshot, "the daemon was not quiet");
+    let all = snapshot.as_array().unwrap();
+
+    let mut follow = h.follow(&[]);
+    let replay: Vec<Value> = (0..20)
+        .map(|_| {
+            follow
+                .next(Duration::from_secs(10))
+                .expect("a replayed event")
+        })
+        .collect();
+    assert_eq!(replay, all[all.len() - 20..]);
+    assert!(
+        follow.line(Duration::from_millis(500)).is_none(),
+        "the replay is the newest 20 and nothing else"
+    );
+
+    // New events as they happen: exactly the ones after the replay, in order, none twice.
+    h.ok(&["stop"]);
+    h.ok(&["start"]);
+    let started = follow.until("the restart", 15, |e| {
+        e["kind"] == "started" && e["seq"].as_u64() > replay[19]["seq"].as_u64()
+    });
+    assert!(started["seq"].as_u64().unwrap() > replay[19]["seq"].as_u64().unwrap());
+    let healthy = follow.until("the health check", 15, |e| e["kind"] == "healthy");
+    assert!(healthy["seq"].as_u64() > started["seq"].as_u64());
+    assert!(
+        follow.line(Duration::from_millis(500)).is_none(),
+        "nothing arrives twice"
+    );
+    let newer: Vec<Value> = log()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["seq"].as_u64() > replay[19]["seq"].as_u64())
+        .cloned()
+        .collect();
+    let seqs: Vec<u64> = newer.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+    assert!(newer.contains(&started) && newer.contains(&healthy));
+
+    // `-n` bounds the replay.
+    let mut few = h.follow(&["-n", "3"]);
+    let last_three: Vec<Value> = (0..3)
+        .map(|_| few.next(Duration::from_secs(10)).expect("a replayed event"))
+        .collect();
+    assert_eq!(last_three, newer_tail(&log(), 3));
+    assert!(few.line(Duration::from_millis(500)).is_none());
+}
+
+/// The last `n` events of a log.
+fn newer_tail(log: &Value, n: usize) -> Vec<Value> {
+    let all = log.as_array().unwrap();
+    all[all.len() - n..].to_vec()
 }
