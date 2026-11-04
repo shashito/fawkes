@@ -30,8 +30,9 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   suite's look the same. Have the app record its pid in a file instead.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
   `process.rs`, `protocol.rs`, `main.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`, `daemon/transactions.rs`,
-  `tui.rs`, `tui/net.rs`). The restart policy is the pure `after_exit` in `daemon/supervisor.rs`: test a change to
-  it there, in milliseconds, and keep the integration tests as end-to-end smoke tests.
+  `tui.rs`, `tui/net.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is the pure
+  `after_exit` in `daemon/supervisor.rs`: test a change to it there, in milliseconds, and keep the integration tests
+  as end-to-end smoke tests.
 - To fix a bug, first write a test that reproduces it.
 - Never point a test or a manual run at a live app or a real `~/.fawkes`. Use a temp directory and a manifest in it.
 
@@ -63,8 +64,9 @@ not built yet. Don't start one unless asked.
 ## Dependencies
 
 The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, rusqlite, rustix, signal-hook, jiff,
-libc and ratatui. Argument parsing, the HTTP health check and the thread-based concurrency are hand-written on
-purpose. thiserror is agreed but not used yet; it goes into the Crates section when it is. Don't add any other crate
+libc and ratatui, and tempfile for the tests. Argument parsing, the HTTP health check and the thread-based
+concurrency are hand-written on purpose. thiserror is agreed but not used yet; it goes into the Crates section when it
+is. Don't add any other crate
 (anyhow, clap, tokio, chrono, …) without asking. If one is agreed, add it to the Crates section
 too. Update a single dependency with `cargo update --precise`, never everything at once.
 

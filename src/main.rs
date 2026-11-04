@@ -501,9 +501,8 @@ mod tests {
 
     #[test]
     fn a_quick_command_gives_up_on_a_daemon_that_never_answers() {
-        let dir = std::env::temp_dir().join(format!("fk-cli-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let socket = dir.join("fawkes.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         // Accepts and keeps the connection open without a word.
@@ -537,6 +536,5 @@ mod tests {
         );
         assert!(waited < Duration::from_secs(2), "hung for {waited:?}");
         silent.join().unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

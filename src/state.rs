@@ -682,9 +682,8 @@ mod tests {
 
     #[test]
     fn the_event_log_rotates_by_size_and_tails_from_memory() {
-        let root = std::env::temp_dir().join(format!("fk-events-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("events.jsonl");
         let mut log = EventLog::with_limit(path.clone(), 4096).unwrap();
         for n in 0..RECENT_EVENTS + 10 {
@@ -705,14 +704,12 @@ mod tests {
         let tail = reopened.tail(3);
         assert_eq!(tail.len(), 3);
         assert_eq!(tail[2].message, format!("event {}", RECENT_EVENTS + 9));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn events_are_numbered_across_reopens_and_rotations() {
-        let root = std::env::temp_dir().join(format!("fk-seq-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("events.jsonl");
         // A line from before events were numbered loads as 0, and the first numbered event is 1.
         std::fs::write(
@@ -754,7 +751,6 @@ mod tests {
         assert_eq!(after(Some(64), Some(2)), [61, 63]);
         assert_eq!(after(None, None), Vec::<u64>::new());
         assert_eq!(after(None, Some(1)), [63]);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -817,9 +813,8 @@ mod tests {
 
     #[test]
     fn a_phase_two_state_json_loads_with_its_pending_switch_as_a_txn() {
-        let root = std::env::temp_dir().join(format!("fk-migrate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("state.json");
         let pending = pending_json();
         let load = |text: String| {
@@ -877,7 +872,6 @@ mod tests {
             serde_json::to_value(&again).unwrap(),
             serde_json::to_value(&state).unwrap()
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn pending_json() -> &'static str {
@@ -968,9 +962,8 @@ mod tests {
 
     #[test]
     fn a_store_keeps_an_intent_only_once_it_is_on_disk() {
-        let root = std::env::temp_dir().join(format!("fk-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("state.json");
         let (mut store, warning) = Store::load(path.clone()).unwrap();
         assert!(warning.is_none());
@@ -1005,14 +998,12 @@ mod tests {
         });
         assert_eq!((value, store.state().next_id), ("done", 3));
         assert!(failed.is_some());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn load_falls_back_to_the_copy_when_state_json_is_unreadable() {
-        let root = std::env::temp_dir().join(format!("fk-state-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
         let path = root.join("state.json");
         assert!(State::load(&path).unwrap().0.permanent.is_none());
 
@@ -1041,6 +1032,5 @@ mod tests {
         std::fs::write(&path, "{").unwrap();
         std::fs::write(backup_path(&path), "").unwrap();
         assert!(State::load(&path).unwrap_err().contains("delete both"));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

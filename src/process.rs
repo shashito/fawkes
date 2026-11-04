@@ -322,9 +322,8 @@ mod tests {
 
     #[test]
     fn a_leftover_is_only_the_process_that_wrote_its_pid_file() {
-        let dir = std::env::temp_dir().join(format!("fk-process-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let pid_file = dir.join("app.pid");
         let mut app = spawn(
             "exec sleep 30",
@@ -359,14 +358,12 @@ mod tests {
         app.wait().unwrap();
         file.set_modified(SystemTime::now()).unwrap();
         assert_eq!(leftover(&pid_file), None, "a process that is gone");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn a_group_whose_leader_has_exited_is_still_a_leftover() {
-        let dir = std::env::temp_dir().join(format!("fk-orphan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
         let pid_file = dir.join("app.pid");
         let mut leader = spawn(
             "sleep 30 & exit",
@@ -385,7 +382,6 @@ mod tests {
 
         stop_group(pgid, 1.0, None);
         assert_eq!(leftover(&pid_file), None, "the group is gone");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
