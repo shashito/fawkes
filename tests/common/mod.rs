@@ -4,11 +4,13 @@ use rusqlite::{Connection, OpenFlags};
 use rustix::fs::{FlockOperation, flock};
 use serde_json::Value;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 const APP_JS: &str = include_str!("../../examples/sample/app.js");
@@ -174,6 +176,47 @@ APP_HOME = "{{home}}"
         daemon.wait().unwrap();
     }
 
+    /// Send `signal` to the daemon this harness started (SIGHUP asks it to reload its manifest).
+    pub fn signal_daemon(&self, signal: i32) {
+        let daemon = self.daemon.as_ref().expect("the daemon was started");
+        // SAFETY: the pid is our own child's, which is not reaped while `self.daemon` holds it.
+        let sent = unsafe { libc::kill(daemon.id() as i32, signal) };
+        assert_eq!(sent, 0, "signal {signal} could not be sent to the daemon");
+    }
+
+    /// A connection to the daemon's socket, for a test that decides when its request goes out.
+    pub fn connect(&self) -> UnixStream {
+        let stream = UnixStream::connect(self.dir.join("s/fawkes.sock")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+    }
+
+    /// `fawkes --json log --follow <args>` running in the background, its output read line by line.
+    pub fn follow(&self, args: &[&str]) -> Follow {
+        let mut child = Command::new(BIN)
+            .arg("--json")
+            .arg("--manifest")
+            .arg(&self.manifest)
+            .args(["log", "--follow"])
+            .args(args)
+            .env_remove("FAWKES_SOCKET")
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, lines) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Follow { child, lines }
+    }
+
     /// Run `fawkes daemon` for this manifest in the foreground; its exit code and stderr.
     pub fn run_second_daemon(&self) -> (i32, String) {
         let output = Command::new(BIN)
@@ -275,6 +318,53 @@ APP_HOME = "{{home}}"
             .query_map([], |row| row.get(0))
             .map(|rows| rows.flatten().collect())
             .unwrap_or_default()
+    }
+}
+
+/// A followed log (`Harness::follow`): the events it prints, one JSON document per line.
+pub struct Follow {
+    child: Child,
+    lines: Receiver<String>,
+}
+
+impl Follow {
+    /// The next line as printed, or None when nothing came within `within` (or the command ended).
+    pub fn line(&mut self, within: Duration) -> Option<String> {
+        self.lines.recv_timeout(within).ok()
+    }
+
+    /// The next event; every line must be one JSON document.
+    pub fn next(&mut self, within: Duration) -> Option<Value> {
+        let line = self.line(within)?;
+        Some(
+            serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("`log --follow` printed non-JSON ({e}): {line}")),
+        )
+    }
+
+    /// Read events until `found` accepts one, and return it; the events passed over are dropped.
+    pub fn until(&mut self, what: &str, seconds: u64, found: impl Fn(&Value) -> bool) -> Value {
+        let give_up = Instant::now() + Duration::from_secs(seconds);
+        let mut passed = Vec::new();
+        while let Some(left) = give_up.checked_duration_since(Instant::now()) {
+            if let Some(event) = self.next(left) {
+                if found(&event) {
+                    return event;
+                }
+                passed.push(event.to_string());
+            }
+        }
+        panic!(
+            "timed out waiting for {what} in the followed log; events passed over:\n{}",
+            passed.join("\n")
+        );
+    }
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
