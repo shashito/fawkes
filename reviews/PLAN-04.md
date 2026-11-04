@@ -20,6 +20,14 @@ change, and the review team reviews each phase.
 
 ## Phase 5: safe to run Ultimate under (before the extension goes live)
 
+**Done:** every row below, 5.1 to 5.7, and the housekeeping line, each bug with a test that reproduced it first.
+Where the build differs from the row: stderr gets the event lines from a thread of its own (a bounded queue filled
+under the log lock), and a CLI whose stdout has gone keeps the exit code the daemon's answer gives (the review
+suggested 1), since a confirm that went through did not fail. The 10 s bound on a locked database applies to
+snapshot and restore too, so a lock holder cannot hang a switch or rollback while the app is down. 5.3's harness also
+drops `FAWKES_GENERATION`, `FAWKES_PHASE`, `FAWKES_BIN` and `FAWKES_HOME`, which 5.2 makes matter. 5.6 also covers
+`rollback --keep-storage` and the supervisor's crash restart.
+
 | # | Fix | From |
 |---|---|---|
 | 5.1 | `Daemon::event` writes stderr best-effort (`writeln!`, failure ignored with a comment) and outside `inner`. The CLI's stdout too: a closed pipe exits by the contract, not 134. | M3, L16 |
@@ -76,7 +84,8 @@ where they make the code simpler. The rest of L1–L3, L9–L12 and I1–I3 go i
 
 ## Housekeeping (with phase 5)
 
-`.gitignore` gains editor swap files (`.*.swp`); the untracked `.README.md.swp` is removed.
+`.gitignore` gains editor swap files (`.*.swp`); the untracked `.README.md.swp` is removed. **Done** (the ignore
+entry; the swap file in the user's checkout is left to them).
 
 ## Needs the user
 
