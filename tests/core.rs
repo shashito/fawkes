@@ -9,6 +9,9 @@
 
 mod common;
 use common::Harness;
+use rustix::process::{
+    Pid, Signal, kill_process, kill_process_group, test_kill_process, test_kill_process_group,
+};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::time::Duration;
@@ -256,8 +259,7 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
     let alive = |id: &str| {
         let dir = h.generation(id)["dir"].as_str().unwrap().to_string();
         let pid = read_pid(format!("{dir}/background.pid"));
-        // SAFETY: signal 0 only asks whether the process exists; nothing is sent.
-        unsafe { libc::kill(pid, 0) == 0 }
+        test_kill_process(pid).is_ok()
     };
 
     make_permanent(&h, "v1", "g1");
@@ -391,10 +393,8 @@ install_timeout = 1"#,
         "{error}"
     );
     let pid = read_pid(h.dir.join("s/install.pid"));
-    assert_ne!(
-        // SAFETY: signal 0 only asks whether the process group exists.
-        unsafe { libc::kill(-pid, 0) },
-        0,
+    assert!(
+        test_kill_process_group(pid).is_err(),
         "the hanging install's process group outlived its timeout"
     );
     for id in ["g1", "g2"] {
@@ -554,11 +554,10 @@ fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
     stage.wait().unwrap();
 
     h.start_daemon();
-    // SAFETY: signal 0 only asks whether the process group exists.
-    let alive = unsafe { libc::kill(-pid, 0) } == 0;
+    let alive = test_kill_process_group(pid).is_ok();
     if alive {
-        // SAFETY: the group is the orphaned install this test started.
-        unsafe { libc::killpg(pid, libc::SIGKILL) };
+        // The group is the orphaned install this test started.
+        let _ = kill_process_group(pid, Signal::KILL);
     }
     assert!(!alive, "the install outlived the daemon that started it");
     assert_eq!(h.ok(&["history"])["generations"], serde_json::json!([]));
@@ -851,15 +850,16 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
 
-    let daemon_pid = i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap();
+    let daemon_pid =
+        Pid::from_raw(i32::try_from(h.status()["daemon_pid"].as_i64().unwrap()).unwrap()).unwrap();
     let (code, answer) = std::thread::scope(|scope| {
         let switch = scope.spawn(|| h.fk(&["switch", "g2"]));
         // g1 takes 1.5 s to leave after SIGTERM: the window for the daemon's own SIGTERM.
         h.wait("the switch to stop g1", 10, || {
             messages(&h, "progress").contains(&"stopping g1".to_string())
         });
-        // SAFETY: the pid is the daemon this test started.
-        unsafe { libc::kill(daemon_pid, libc::SIGTERM) };
+        // The pid is the daemon this test started.
+        kill_process(daemon_pid, Signal::TERM).unwrap();
         switch.join().unwrap()
     });
     assert_ne!(code, 0, "{answer}");
@@ -1032,12 +1032,15 @@ fn refused(h: &Harness, args: &[&str], code: &str, says: &str) {
 }
 
 /// The pid a process wrote to `path`.
-fn read_pid(path: impl AsRef<std::path::Path>) -> i32 {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap()
+fn read_pid(path: impl AsRef<std::path::Path>) -> Pid {
+    Pid::from_raw(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap(),
+    )
+    .unwrap()
 }
 
 /// SIGHUP applies what may change while the daemon runs and the next start uses it. A manifest that changes a fixed
@@ -1062,7 +1065,7 @@ fn sighup_reloads_hot_fields_and_refuses_a_manifest_that_changes_a_fixed_one() {
 
     h.edit_manifest(r#"MARK = "one""#, r#"MARK = "two""#);
     h.edit_manifest("interval = 0.1", "interval = 0.2");
-    h.signal_daemon(libc::SIGHUP);
+    h.signal_daemon(Signal::HUP);
     h.wait("the reload to be logged", 10, || {
         !messages_starting(&h, "daemon", "manifest reloaded").is_empty()
     });
@@ -1088,7 +1091,7 @@ fn sighup_reloads_hot_fields_and_refuses_a_manifest_that_changes_a_fixed_one() {
         r#"storage = ["app.sqlite"]"#,
         r#"storage = ["app.sqlite", "other.sqlite"]"#,
     );
-    h.signal_daemon(libc::SIGHUP);
+    h.signal_daemon(Signal::HUP);
     h.wait("the refusal to be logged", 10, || {
         !messages_starting(&h, "error", "manifest not reloaded").is_empty()
     });
@@ -1141,7 +1144,7 @@ fn a_reload_cannot_change_the_port_while_a_switch_has_stopped_the_old_app() {
         follow.until("the switch to stop g1", 15, |e| {
             e["message"] == "stopping g1"
         });
-        h.signal_daemon(libc::SIGHUP);
+        h.signal_daemon(Signal::HUP);
         let refused = follow.until("the reload to be refused", 15, |e| e["kind"] == "error");
         let message = refused["message"].as_str().unwrap();
         assert!(

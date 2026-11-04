@@ -2,6 +2,7 @@
 
 use rusqlite::{Connection, OpenFlags};
 use rustix::fs::{FlockOperation, flock};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -171,11 +172,11 @@ APP_HOME = "{{home}}"
     }
 
     /// Send `signal` to the daemon this harness started (SIGHUP asks it to reload its manifest).
-    pub fn signal_daemon(&self, signal: i32) {
+    pub fn signal_daemon(&self, signal: Signal) {
         let daemon = self.daemon.as_ref().expect("the daemon was started");
-        // SAFETY: the pid is our own child's, which is not reaped while `self.daemon` holds it.
-        let sent = unsafe { libc::kill(i32::try_from(daemon.id()).unwrap(), signal) };
-        assert_eq!(sent, 0, "signal {signal} could not be sent to the daemon");
+        // The pid is our own child's, which is not reaped while `self.daemon` holds it.
+        kill_process(Pid::from_child(daemon), signal)
+            .unwrap_or_else(|e| panic!("{signal:?} could not be sent to the daemon: {e}"));
     }
 
     /// A connection to the daemon's socket, for a test that decides when its request goes out.
@@ -372,8 +373,8 @@ impl Drop for Follow {
 impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(mut daemon) = self.daemon.take() {
-            // SAFETY: the pid is our own child's, which is not reaped yet, so it cannot name another process.
-            unsafe { libc::kill(i32::try_from(daemon.id()).unwrap(), libc::SIGTERM) };
+            // The pid is our own child's, which is not reaped yet, so it cannot name another process.
+            let _ = kill_process(Pid::from_child(&daemon), Signal::TERM);
             let give_up = Instant::now() + Duration::from_secs(10);
             while daemon.try_wait().ok().flatten().is_none() && Instant::now() < give_up {
                 std::thread::sleep(Duration::from_millis(50));
@@ -385,9 +386,10 @@ impl Drop for Harness {
         if let Ok(text) = std::fs::read_to_string(self.dir.join("s/app.pid"))
             && let Ok(pid) = text.trim().parse::<i32>()
             && pid > 1
+            && let Some(group) = Pid::from_raw(pid)
         {
-            // SAFETY: `pid > 1` is neither our own group nor init's; the group is the app's, which must not outlive the test.
-            unsafe { libc::killpg(pid, libc::SIGKILL) };
+            // `pid > 1` is neither our own group nor init's; the group is the app's, which must not outlive the test.
+            let _ = kill_process_group(group, Signal::KILL);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
