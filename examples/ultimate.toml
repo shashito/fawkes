@@ -14,9 +14,12 @@ reuse = ["node_modules"]
 keep = 5
 start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/my-app"
 deadline = 120
+stop_timeout = 30               # a test run cleans up its preview branch after Ultimate has shut down
 
 [health]
-url = "http://127.0.0.1:{port}/"
+# The page answers, and in a test run the extension has held the scheduler, so a generation that breaks the hold never
+# goes live.
+command = "node /path/to/fawkes/ultimate/fawkes/health.ts"
 timeout = 120
 
 [env]

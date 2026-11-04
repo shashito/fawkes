@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -49,12 +49,16 @@ test('a test run gets a private user home, the git guard and an owner, like a pr
     assert.equal(readFileSync(join(privateHome, '.ultimate/settings.json'), 'utf8'), '{"real": true}')
     assert.equal(lstatSync(join(privateHome, '.ssh')).isSymbolicLink(), true)
     // The guard: pushes go nowhere, and only the preview's own branches move.
-    const config = readFileSync(join(home, 'preview.gitconfig'), 'utf8')
-    assert.match(config, /pushInsteadOf/)
-    assert.match(config, /reference-transaction/)
+    const config = join(home, 'preview.gitconfig')
+    assert.match(readFileSync(config, 'utf8'), /pushInsteadOf/)
+    assert.match(readFileSync(config, 'utf8'), /reference-transaction/)
+    // ...and git reads it in the project, through an include keyed on the project's real git directory.
+    const includes = Object.entries(env).filter(([key, value]) => key.startsWith('GIT_CONFIG_VALUE_') && value === config)
+    assert.ok(includes.length > 0)
     assert.equal(env.ULTIMATE_PREVIEW_BRANCH, instance.previewBranch(home))
     assert.ok(git('branch', '--list', env.ULTIMATE_PREVIEW_BRANCH!).toString().trim())
-    assert.ok(existsSync(join(home, 'preview.gitconfig')))
+    // Fawkes's variables pass through; role.ts, not previewEnv, keeps an inheriting Ultimate inert.
+    assert.equal(env.FAWKES_PHASE, 'test')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

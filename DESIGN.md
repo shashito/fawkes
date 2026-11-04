@@ -328,7 +328,10 @@ space), `cp -R --reflink=auto` elsewhere. The install then only reconciles the d
 
 The Ultimate manifest (first user; see `examples/ultimate.toml`). Its `start` is the wrapper of the Ultimate extension
 in `ultimate/fawkes/`, which runs Ultimate for `<project>` from the generation and isolates a test run like an
-Ultimate preview (README there):
+Ultimate preview (README there). Fawkes restores storage on a rollback, but not what the app did outside it, so the
+extension holds Ultimate's task scheduler in a test run and in a new live generation until that generation has
+confirmed itself: no agent work runs on code that may still roll back. Its `health.command` passes a test run only
+once that hold is in place.
 
 ```toml
 name = "ultimate"
@@ -342,9 +345,10 @@ reuse = ["node_modules"]
 keep = 5
 start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/my-app"
 deadline = 120
+stop_timeout = 30
 
 [health]
-url = "http://127.0.0.1:{port}/"
+command = "node /path/to/fawkes/ultimate/fawkes/health.ts"
 timeout = 120
 
 [env]

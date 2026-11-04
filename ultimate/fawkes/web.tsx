@@ -40,7 +40,7 @@ function itemOf(state: Supervised) {
   if (!state.connected) return 'disconnected'
   if (status?.pending) return 'pending'
   if (upgrade && !['done', 'failed'].includes(upgrade.step)) return 'upgrading'
-  if (upgrade?.step === 'failed') return 'failed'
+  if (upgrade?.step === 'failed' && Date.now() - upgrade.at < 3_600_000) return 'failed'
   const rolled = state.generations.at(-1)
   if (rolled?.state === 'rolled_back' && Date.now() - Date.parse(rolled.rolled_back_at ?? '') < 3_600_000)
     return 'rolled_back'

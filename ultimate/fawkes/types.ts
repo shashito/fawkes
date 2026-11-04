@@ -1,4 +1,7 @@
-/** What the Fawkes daemon reports (DESIGN.md, "Socket protocol") and what the extension shows. Browser-safe. */
+/**
+ * What the Fawkes daemon reports and what the extension shows. Browser-safe. The daemon's side is `src/protocol.rs`
+ * (`Status`, `Generation`, `Event`, `GenState`) and DESIGN.md, "Socket protocol": change them together.
+ */
 
 export type GenState =
   | 'staging'

@@ -12,11 +12,19 @@ not run from.
 
 ## The manifest
 
-`start.ts` is the manifest's `start` (see `examples/ultimate.toml` in the Fawkes repository):
+`start.ts` is the manifest's `start` and `health.ts` its `health.command` (see `examples/ultimate.toml` in the Fawkes
+repository; `stop_timeout = 30` leaves a test run time to clean up after Ultimate shut down):
 
 ```toml
 start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/project"
+
+[health]
+command = "node /path/to/fawkes/ultimate/fawkes/health.ts"
 ```
+
+`start.ts` names the home it prepared in `FAWKES_ULTIMATE_HOME`. The extension acts only in the Ultimate running with
+that home: a preview the live host starts, the lander's test servers or an agent's shell inherit Fawkes's variables
+but run with a home of their own, so they never confirm, upgrade or roll back the live app (`role.ts`).
 
 - **Live** (`FAWKES_PHASE=live`): it runs `bin/ultimate.ts <project> --no-open` from the generation, Ultimate's own
   supervisor, unchanged.
@@ -36,9 +44,18 @@ The server facet holds Pi Durable's scheduler in `onOpen`, before the server res
 
 The pending generation confirms itself (`confirm <its generation>` over the socket) once every enabled extension's
 server facet loaded (a facet broken by a changed core or a missing package is what must not become permanent) and its
-page answers. It then releases the hold, unless the user paused the host meanwhile. If the checks never pass, the
-deadline runs out and Fawkes rolls back code and storage together. A restart of a generation that is already
-permanent releases the hold at once.
+page answers. It lets go of the hold only when the daemon's status says the generation is permanent, whoever
+confirmed it (this facet, the Confirm button, the TUI), and not while the user paused the host. A refused or lost
+confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage together.
+A restart of a generation that is already permanent releases the hold at once; every reopen of the harness (a failed
+core swap) holds again until then.
+
+In a test run the hold fails closed: a hold that throws ends the process, and `health.ts` passes only once the
+facet wrote `fawkes-held` into the test home, so a generation that breaks this extension or the hold never goes live.
+
+The pause extension holds the same scheduler with one flag. Play while a generation is still pending (or in a test
+run) releases this hold too; pausing during an upgrade and playing before it is confirmed resumes work on the new
+code early.
 
 ## Status line
 

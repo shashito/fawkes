@@ -42,7 +42,7 @@ export function request<T>(
   socket: string,
   command: string,
   args?: Record<string, unknown>,
-  options: { progress?: (event: FawkesEvent) => void; timeout?: number; signal?: AbortSignal } = {},
+  options: { progress?: (event: FawkesEvent) => void; timeout?: number } = {},
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const connection = connect(socket)
@@ -51,12 +51,9 @@ export function request<T>(
       if (done) return
       done = true
       connection.destroy()
-      options.signal?.removeEventListener('abort', aborted)
       if (error) reject(error)
       else resolve(result as T)
     }
-    const aborted = () => finish(new FawkesError('aborted', `${command} was cancelled`))
-    options.signal?.addEventListener('abort', aborted, { once: true })
     connection.setTimeout(options.timeout ?? 10_000, () =>
       finish(new FawkesError('no_answer', `The Fawkes daemon did not answer ${command}`)),
     )
@@ -86,14 +83,10 @@ export type Stream = {
 }
 
 /**
- * Follow the daemon: replay the last `limit` events, then `status` and `history`, then every change. A dropped
- * connection reconnects after `retry` ms with the last `seq` seen, so no event is lost or repeated. Returns a stop.
+ * Follow the daemon: replay the last 50 events, then `status` and `history`, then every change. A dropped connection
+ * reconnects after 2 s with the last `seq` seen, so no event is lost or repeated. Returns a stop.
  */
-export function subscribe(
-  socket: string,
-  handlers: Stream,
-  options: { limit?: number; retry?: number } = {},
-) {
+export function subscribe(socket: string, handlers: Stream) {
   let stopped = false
   let since: number | undefined
   let current: Socket | undefined
@@ -105,7 +98,7 @@ export function subscribe(
     let failure: string | undefined
     connection.on('connect', () => {
       handlers.connected?.(true)
-      const args = since === undefined ? { limit: options.limit ?? 50 } : { since }
+      const args = since === undefined ? { limit: 50 } : { since }
       connection.write(JSON.stringify({ command: 'subscribe', args }) + '\n')
     })
     connection.on('error', (error) => (failure = error.message))
@@ -113,7 +106,7 @@ export function subscribe(
       if (current === connection) current = undefined
       if (stopped) return
       handlers.connected?.(false, failure)
-      timer = setTimeout(open, options.retry ?? 2000)
+      timer = setTimeout(open, 2000)
     })
     lines(connection, (line) => {
       if ('event' in line) {
