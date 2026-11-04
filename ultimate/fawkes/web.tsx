@@ -10,6 +10,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { actionRef, api, cn, defineWebExtension, formatAgo, useAction, useNow } from '@/sdk'
+import { awaitingConfirm, restoreFailed, rollbackNote } from './step.ts'
 import type { FawkesState, Generation } from './types.ts'
 
 type Supervised = Extract<FawkesState, { supervised: true }>
@@ -38,7 +39,9 @@ const countdown = (deadline: string, now: number) => {
 function itemOf(state: Supervised) {
   const { status, upgrade } = state
   if (!state.connected) return 'disconnected'
-  if (status?.pending) return 'pending'
+  if (awaitingConfirm(status)) return 'pending'
+  if (restoreFailed(status)) return 'restore_failed'
+  if (status?.pending && status.step === 'rolling_back') return 'rolling_back'
   if (upgrade && !['done', 'failed'].includes(upgrade.step)) return 'upgrading'
   if (upgrade?.step === 'failed' && Date.now() - upgrade.at < 3_600_000) return 'failed'
   const rolled = state.generations.at(-1)
@@ -88,9 +91,10 @@ function Generations({ state }: { state: Supervised }) {
 }
 
 function Popup({ state, act, busy }: { state: Supervised; act: (name: string) => void; busy?: string }) {
-  const now = useNow(1000, Boolean(state.status?.pending))
   const { status, upgrade, behind, confirming } = state
-  const pending = status?.pending
+  const pending = awaitingConfirm(status)
+  const now = useNow(1000, Boolean(pending))
+  const rollbackText = rollbackNote(status)
   return (
     <>
       <div className="border-b border-border/70 px-3 py-2 text-[11.5px]">
@@ -105,6 +109,12 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
           <div className="flex items-start gap-1.5 text-warning">
             <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
             <span>The Fawkes daemon does not answer{state.error ? `: ${state.error}` : ''}. Retrying.</span>
+          </div>
+        )}
+        {rollbackText && (
+          <div className={cn('flex items-start gap-1.5', restoreFailed(status) ? 'text-error' : 'text-warning')}>
+            <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
+            <span>{rollbackText}.</span>
           </div>
         )}
         {pending && (
@@ -182,6 +192,10 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
                 {busy === 'confirm' ? 'Confirming…' : 'Confirm'}
               </Button>
             </>
+          ) : restoreFailed(status) ? (
+            <Button className={smallButton} disabled={!!busy} onClick={() => act('rollback')} size="sm" variant="outline">
+              {busy === 'rollback' ? 'Rolling back…' : 'Roll back'}
+            </Button>
           ) : (
             <>
               <Button
@@ -223,7 +237,7 @@ function Fawkes() {
     const timer = setInterval(() => void refetch(), live ? 2000 : 30_000)
     return () => clearInterval(timer)
   }, [refetch, live])
-  const now = useNow(1000, Boolean(data?.supervised && data.status?.pending))
+  const now = useNow(1000, Boolean(data?.supervised && awaitingConfirm(data.status)))
   if (!data?.supervised) return null
   const act = (name: string) => {
     const ref = { check: CheckAction, upgrade: UpgradeAction, confirm: ConfirmAction, rollback: RollbackAction }[name]
@@ -239,7 +253,7 @@ function Fawkes() {
       })
   }
   const item = itemOf(data)
-  const pending = data.status?.pending
+  const pending = awaitingConfirm(data.status)
   const label =
     item === 'disconnected' ? (
       <>
@@ -250,6 +264,16 @@ function Fawkes() {
       <>
         <TimerIcon className="size-3" />
         {pending!.generation === data.generation ? 'confirming' : pending!.generation} {countdown(pending!.deadline, now)}
+      </>
+    ) : item === 'rolling_back' ? (
+      <>
+        <LoaderCircleIcon className="size-3 animate-spin" />
+        rolling back {data.status!.pending!.generation}
+      </>
+    ) : item === 'restore_failed' ? (
+      <>
+        <TriangleAlertIcon className="size-3" />
+        restore failed
       </>
     ) : item === 'upgrading' ? (
       <>
@@ -285,7 +309,7 @@ function Fawkes() {
             statusButton,
             item === 'current'
               ? 'text-muted-foreground/70 hover:text-foreground'
-              : ['failed', 'rolled_back', 'disconnected'].includes(item)
+              : ['failed', 'rolled_back', 'restore_failed', 'disconnected'].includes(item)
                 ? 'text-error'
                 : item === 'pending'
                   ? 'text-warning'

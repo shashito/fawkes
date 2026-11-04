@@ -10,6 +10,7 @@ import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
 import { request, subscribe } from './client.ts'
 import { mayConfirm } from './confirm.ts'
 import { HELD_MARKER, role } from './role.ts'
+import { awaitingConfirm, restoreFailed, rollbackNote } from './step.ts'
 import type { Confirming, FawkesEvent, FawkesState, Generation, Status, Upgrade } from './types.ts'
 
 const run = promisify(execFile)
@@ -116,7 +117,8 @@ function release(host: ExtensionHost) {
 /**
  * Confirm this generation once it is pending and proves it works here, then let the scheduler run. It stops only when
  * the daemon reports this generation is no longer pending (permanent: release; rolled back: this process is stopped);
- * a refused or lost confirm just goes round again on the next status.
+ * a refused or lost confirm just goes round again on the next status. While the switch is being rolled back it is
+ * still pending but no longer confirmable, and the hold stays until the rollback is done.
  */
 async function confirmWhenReady(host: ExtensionHost, socket: string, generation: string) {
   const s = shared(host)
@@ -128,7 +130,7 @@ async function confirmWhenReady(host: ExtensionHost, socket: string, generation:
       return
     }
     // Confirmed already: wait for the status that says so, rather than confirm again and be refused.
-    if (status && s.confirming?.state !== 'confirmed') {
+    if (status && awaitingConfirm(status) && s.confirming?.state !== 'confirmed') {
       const verdict = await mayConfirm(host)
       if (verdict.ok) {
         try {
@@ -200,7 +202,8 @@ async function check(host: ExtensionHost, fetch: boolean, ref = DEFAULT_REF) {
 function upgrade(host: ExtensionHost, socket: string, ref: string) {
   const s = shared(host)
   if (s.upgradeRun) throw new Error(`An upgrade to ${s.upgrade?.ref} is already running`)
-  if (s.status?.pending) throw new Error(`${s.status.pending.generation} still awaits its confirm`)
+  if (s.status?.pending)
+    throw new Error(rollbackNote(s.status) ?? `${s.status.pending.generation} still awaits its confirm`)
   if (s.status?.busy) throw new Error(`Fawkes is busy: ${s.status.busy}`)
   const step = (next: Partial<Upgrade>) => {
     s.upgrade = { ...(s.upgrade ?? { ref, step: 'fetching' }), ...next, at: Date.now() }
@@ -233,8 +236,10 @@ function describe(state: FawkesState) {
   if (!state.supervised) return 'This Ultimate does not run under Fawkes.'
   const { status, generations } = state
   if (!status) return `This Ultimate runs as ${state.generation}; the Fawkes daemon has not answered yet.`
+  const pending = awaitingConfirm(status)
+  const rollback = rollbackNote(status)
   const lines = [
-    `Running ${state.generation} (permanent ${status.permanent ?? 'none'}${status.pending ? `, ${status.pending.generation} pending until ${status.pending.deadline}` : ''}${status.busy ? `, busy: ${status.busy}` : ''}).`,
+    `Running ${state.generation} (permanent ${status.permanent ?? 'none'}${pending ? `, ${pending.generation} pending until ${pending.deadline}` : ''}${rollback ? `, ${rollback}` : ''}${status.busy ? `, busy: ${status.busy}` : ''}).`,
   ]
   for (const g of generations.slice(-6).reverse())
     lines.push(`${g.id} ${g.ref}@${g.commit.slice(0, 8)} ${g.state}${g.rollback_reason ? ` (${g.rollback_reason})` : ''}`)
@@ -269,15 +274,16 @@ export const actions = {
   /** No arguments → confirm the pending generation now, without waiting for its own checks. */
   async confirm(_args: unknown, { host }: { host: ExtensionHost }) {
     const socket = liveSocket()
-    const pending = shared(host).status?.pending
+    const pending = awaitingConfirm(shared(host).status)
     if (!pending) throw new Error('No generation awaits a confirm')
     await request(socket, 'confirm', { generation: pending.generation })
     return state(host)
   },
-  /** No arguments → roll the pending generation back to the permanent one now (code and storage). */
+  /** No arguments → roll the pending generation back to the permanent one now (code and storage), or retry a failed restore. */
   async rollback(_args: unknown, { host }: { host: ExtensionHost }) {
     const socket = liveSocket()
-    if (!shared(host).status?.pending) throw new Error('No generation awaits a confirm')
+    const { status } = shared(host)
+    if (!awaitingConfirm(status) && !restoreFailed(status)) throw new Error('No generation awaits a confirm')
     // The rollback stops this process when it is the pending one: its answer may never arrive.
     void request(socket, 'rollback', undefined, { timeout: 600_000 }).catch((error: unknown) =>
       host.notice(`Fawkes rollback: ${String(error)}`),

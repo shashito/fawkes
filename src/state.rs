@@ -1,6 +1,8 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
-use crate::protocol::{Error, Event, GenState, Generation, Pending, R, invalid_state, not_found};
+use crate::protocol::{
+    Error, Event, GenState, Generation, Pending, R, Step, invalid_state, not_found,
+};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -351,6 +353,22 @@ impl State {
             Some(Txn::Pending(pending) | Txn::RollingBack { pending, .. }) => Some(pending),
             _ => None,
         }
+    }
+
+    /// Where the transaction in flight is, for `status`.
+    pub fn step(&self) -> Option<Step> {
+        Some(match self.txn.as_ref()? {
+            Txn::Switching { .. } => Step::Switching,
+            Txn::Pending(_) => Step::Pending,
+            Txn::RollingBack {
+                restore_failed: false,
+                ..
+            } => Step::RollingBack,
+            Txn::RollingBack {
+                restore_failed: true,
+                ..
+            } => Step::RestoreFailed,
+        })
     }
 
     /// The reason of a rollback that is decided and not yet done, which can no longer be confirmed.

@@ -28,12 +28,18 @@ export type Generation = {
   failed_starts: number
 }
 
+/** Where the daemon's transaction is (`step` of the `status` result). */
+export type Step = 'switching' | 'pending' | 'rolling_back' | 'restore_failed'
+
 export type Status = {
   name: string
   daemon_pid: number
   permanent: string | null
   current: string | null
+  /** The live switch. It stays set while the switch is rolled back or its restore failed: read `step`. */
   pending: { generation: string; previous: string | null; deadline: string } | null
+  /** Absent from an older daemon's status. */
+  step?: Step | null
   busy: string | null
   process: {
     state: 'running' | 'stopped' | 'failed'

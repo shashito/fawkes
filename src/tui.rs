@@ -175,7 +175,7 @@ impl AppView {
 
     /// Seconds until the pending switch is rolled back, if one awaits confirm.
     fn countdown(&self, now: u64) -> Option<u64> {
-        let pending = self.status.as_ref()?.pending.as_ref()?;
+        let pending = self.status.as_ref()?.awaiting_confirm()?;
         let deadline = crate::state::parse_time(&pending.deadline).unwrap_or(0);
         Some(deadline.saturating_sub(now))
     }
@@ -382,7 +382,7 @@ impl App {
             KeyCode::Char('w') => return self.send_selected(true),
             KeyCode::Char('c') => {
                 let generation = self.current().and_then(|a| {
-                    let pending = a.status.as_ref()?.pending.as_ref()?;
+                    let pending = a.status.as_ref()?.awaiting_confirm()?;
                     Some(pending.generation.clone())
                 });
                 return self.send("confirm".into(), Request::Confirm { generation }, None);
@@ -736,6 +736,50 @@ mod tests {
         let quiet = render(&fixture(0), now);
         let footer = quiet.lines().last().unwrap();
         assert!(footer.trim_start().starts_with("? help"), "{footer}");
+    }
+
+    /// `pending` stays set while the switch is rolled back, so the screen reads `step`: no countdown, no `c confirm`.
+    #[test]
+    fn a_rollback_shows_no_confirm_countdown() {
+        let now = 1_000_000;
+        let with_step = |step: Option<&str>| {
+            let mut app = fixture(now + 102);
+            app.choose(1);
+            let AppView {
+                status: Some(status),
+                ..
+            } = &mut app.apps[1]
+            else {
+                panic!("the fixture has a status");
+            };
+            status.step = step.map(|s| typed(json!(s)));
+            render(&app, now)
+        };
+        let countdown = ["⏱", "awaiting confirm", "rollback target"];
+
+        // An older daemon sends no step, and its pending switch awaits its confirm.
+        let older = with_step(None);
+        let pending = with_step(Some("pending"));
+        for screen in [&older, &pending] {
+            for expected in countdown {
+                assert!(
+                    screen.contains(expected),
+                    "missing `{expected}` in\n{screen}"
+                );
+            }
+        }
+
+        let rolling_back = with_step(Some("rolling_back"));
+        let failed = with_step(Some("restore_failed"));
+        for screen in [&rolling_back, &failed] {
+            for unexpected in countdown {
+                assert!(!screen.contains(unexpected), "`{unexpected}` in\n{screen}");
+            }
+            let footer = screen.lines().last().unwrap();
+            assert!(footer.trim_start().starts_with("? help"), "{footer}");
+        }
+        assert!(rolling_back.contains("rolling back g7"), "{rolling_back}");
+        assert!(failed.contains("✘ restore failed, b retries"), "{failed}");
     }
 
     #[test]

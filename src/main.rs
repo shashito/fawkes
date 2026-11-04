@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use manifest::Manifest;
 use protocol::{
     ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
-    REQUEST_TIMEOUT, Request, RollbackResult, Status, SwitchResult, err, timed_out,
+    REQUEST_TIMEOUT, Request, RollbackResult, Status, Step, SwitchResult, err, timed_out,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -467,6 +467,37 @@ fn render_process(p: &Process) -> String {
     line
 }
 
+/// `pending` is also set while the switch is rolled back, so a confirm is asked for only when `step` allows one.
+fn render_status(s: &Status) -> String {
+    let note = if let Some(p) = s.awaiting_confirm() {
+        format!("  (waiting for confirm until {})", p.deadline)
+    } else {
+        let switch = s.pending.as_ref();
+        let generation = switch.map_or("the switch", |p| p.generation.as_str());
+        match (s.step, switch) {
+            (Some(Step::RollingBack), Some(p)) => format!(
+                "  (rolling back {} to {})",
+                p.generation,
+                or_dash(p.previous.as_deref())
+            ),
+            (Some(Step::RestoreFailed), _) => format!(
+                "\n{generation}'s storage could not be restored and the app is stopped; `fawkes rollback` retries it, `fawkes rollback --keep-storage` gives it up"
+            ),
+            _ => String::new(),
+        }
+    };
+    format!(
+        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nprocess {}",
+        s.name,
+        s.daemon_pid,
+        or_dash(s.busy.as_deref()),
+        or_dash(s.permanent.as_deref()),
+        or_dash(s.current.as_deref()),
+        note,
+        render_process(&s.process)
+    )
+}
+
 /// The answer to `request` as text. A result this client cannot read (a newer daemon's) is shown as the JSON it is.
 fn render_result(request: &Request, result: &Value) -> String {
     fn typed<T: serde::de::DeserializeOwned>(
@@ -526,21 +557,7 @@ fn render_result(request: &Request, result: &Value) -> String {
         Request::Start | Request::Stop | Request::Restart => {
             typed(result, |p: Process| render_process(&p))
         }
-        Request::Status => typed(result, |s: Status| {
-            let pending = s.pending.map_or_else(String::new, |p| {
-                format!("  (waiting for confirm until {})", p.deadline)
-            });
-            format!(
-                "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nprocess {}",
-                s.name,
-                s.daemon_pid,
-                or_dash(s.busy),
-                or_dash(s.permanent),
-                or_dash(s.current),
-                pending,
-                render_process(&s.process)
-            )
-        }),
+        Request::Status => typed(result, |s: Status| render_status(&s)),
         Request::History => typed(result, |h: History| {
             h.generations
                 .iter()
@@ -569,6 +586,7 @@ fn render_result(request: &Request, result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::Pending;
     use std::os::unix::net::UnixListener;
     use std::time::Instant;
 
@@ -646,6 +664,60 @@ mod tests {
         assert_eq!(confirm("confirm g2", Some("g3")).as_deref(), Some("g2"));
         assert_eq!(confirm("confirm", Some("")), None);
         assert_eq!(confirm("confirm", None), None);
+    }
+
+    fn status_in(step: Option<Step>, with_pending: bool) -> Status {
+        Status {
+            name: "sample".into(),
+            daemon_pid: 812,
+            permanent: Some("g1".into()),
+            current: Some("g2".into()),
+            pending: with_pending.then(|| Pending {
+                generation: "g2".into(),
+                previous: Some("g1".into()),
+                deadline: "2030-01-01T00:00:00Z".into(),
+            }),
+            step,
+            busy: None,
+            process: Process {
+                state: ProcessState::Stopped,
+                generation: Some("g2".into()),
+                pid: None,
+                port: 4790,
+                started_at: None,
+                uptime: None,
+                restarts: 0,
+                last_exit: None,
+                restart_at: None,
+            },
+        }
+    }
+
+    /// `pending` stays set during a rollback, so only `step` says whether a confirm is still possible.
+    #[test]
+    fn status_text_asks_for_a_confirm_only_while_the_switch_awaits_one() {
+        let text = |step, with_pending| render_status(&status_in(step, with_pending));
+        let waits = "waiting for confirm until 2030-01-01T00:00:00Z";
+        assert!(text(Some(Step::Pending), true).contains(waits));
+        // An older daemon sends no step.
+        assert!(text(None, true).contains(waits));
+        assert!(!text(None, false).contains("confirm"));
+
+        let rolling_back = text(Some(Step::RollingBack), true);
+        assert!(!rolling_back.contains("confirm"), "{rolling_back}");
+        assert!(
+            rolling_back.contains("rolling back g2 to g1"),
+            "{rolling_back}"
+        );
+
+        let failed = text(Some(Step::RestoreFailed), true);
+        assert!(!failed.contains("confirm"), "{failed}");
+        assert!(
+            failed.contains("g2's storage could not be restored")
+                && failed.contains("`fawkes rollback` retries it")
+                && failed.contains("`fawkes rollback --keep-storage` gives it up"),
+            "{failed}"
+        );
     }
 
     /// Run `status` against a daemon that accepts and then says nothing for 3 s; returns the exit code, what the

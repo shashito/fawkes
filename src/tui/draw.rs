@@ -5,7 +5,7 @@
 
 use super::{App, AppView, Focus, Link, Mode};
 use crate::or_dash;
-use crate::protocol::{Event, EventKind, GenState, Generation, LastExit, ProcessState};
+use crate::protocol::{Event, EventKind, GenState, Generation, LastExit, ProcessState, Step};
 use crate::state::parse_time;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -587,8 +587,9 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
         ));
     }
     let mut lines = vec![Line::from(first), Line::from(second)];
+    // `pending` stays set while the switch is rolled back; `step` says whether a confirm is still possible.
     if let Some(left) = view.countdown(now)
-        && let Some(pending) = &status.pending
+        && let Some(pending) = status.awaiting_confirm()
     {
         let rollback = match &pending.previous {
             Some(previous) => format!("rolls back to {previous} (code + storage)"),
@@ -602,6 +603,18 @@ fn detail_lines(view: &AppView, now: u64) -> Vec<Line<'static>> {
             Span::styled(mmss(left), countdown_style(left).bold()),
             Span::styled(format!(", or it {rollback}"), countdown_style(left)),
         ]));
+    } else if let (Some(step), Some(pending)) = (status.step, &status.pending) {
+        match step {
+            Step::RollingBack => lines.push(Line::from(Span::styled(
+                format!(" rolling back {}", pending.generation),
+                dim(),
+            ))),
+            Step::RestoreFailed => lines.push(Line::from(Span::styled(
+                " ✘ restore failed, b retries",
+                Style::new().fg(Color::Red),
+            ))),
+            Step::Switching | Step::Pending => {}
+        }
     }
     lines
 }
@@ -622,7 +635,7 @@ fn generation_age(g: &Generation, now: u64) -> String {
 /// The INFO column and the colour it takes, for one generation.
 fn generation_info(view: &AppView, g: &Generation) -> (String, Color) {
     let status = view.status.as_ref();
-    let pending = status.and_then(|s| s.pending.as_ref());
+    let pending = status.and_then(|s| s.awaiting_confirm());
     let test = g.test.as_ref();
     match g.state {
         GenState::Tested => (
@@ -877,7 +890,7 @@ fn keys_line(app: &App, width: u16) -> Line<'static> {
     let pending = app
         .current()
         .and_then(|a| a.status.as_ref())
-        .is_some_and(|s| s.pending.is_some());
+        .is_some_and(|s| s.awaiting_confirm().is_some());
     let mut items = vec![
         ("?", "help"),
         ("c", "confirm"),

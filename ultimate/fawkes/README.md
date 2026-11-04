@@ -69,10 +69,13 @@ the status and the latest events. The item shows:
 - `installing g8`, `testing g8`, `switching` during an upgrade;
 - `⏱ confirming 01:42` while the new generation awaits its confirm, with the reason in the popover when its checks
   fail;
+- `rolling back g8` while a rollback runs, and `restore failed` in red when its storage restore failed (the popover
+  offers Roll back, which retries it);
 - `g8 rolled back` or `upgrade failed`, in red, for an hour after it happened.
 
 The popover lists the newest generations with their state and the reason of a rollback, and offers Check now and
-Upgrade, or Confirm and Roll back while a switch is pending.
+Upgrade, or Confirm and Roll back while a switch awaits its confirm (the daemon's `status.step` says so: `pending`
+stays set while a switch is rolled back).
 
 ## Actions
 

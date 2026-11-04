@@ -565,6 +565,7 @@ impl Daemon {
             permanent: inner.store.state().permanent.clone(),
             current: inner.store.state().current().map(String::from),
             pending: inner.store.state().pending().cloned(),
+            step: inner.store.state().step(),
             busy: inner.busy.clone().or_else(|| inner.moving.clone()),
             process: self.process(&inner),
         }
@@ -582,7 +583,7 @@ mod tests {
     use super::super::{Hub, Wake};
     use super::*;
     use crate::manifest::Manifest;
-    use crate::protocol::{GenState, Generation, Pending};
+    use crate::protocol::{GenState, Generation, Pending, Step};
     use crate::state::{EventLog, Paths, Store};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -792,6 +793,52 @@ mod tests {
                 .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_)))),
             "the exit is still there for `reap`"
         );
+    }
+
+    /// `status` says what the transaction step is: `pending` stays set while a switch is rolled back, so a client
+    /// that read only it would offer a confirm that can no longer happen.
+    #[test]
+    fn status_names_the_transaction_step() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = scratch_daemon(temp.path());
+        let pending = || Pending {
+            generation: "g2".into(),
+            previous: Some("g1".into()),
+            deadline: "t".into(),
+        };
+        let rolling_back = |restore_failed| Txn::RollingBack {
+            pending: pending(),
+            reason: "unhealthy".into(),
+            restore_failed,
+        };
+        let cases = [
+            (None, None, false),
+            (
+                Some(Txn::Switching {
+                    generation: "g2".into(),
+                    previous: Some("g1".into()),
+                }),
+                Some(Step::Switching),
+                false,
+            ),
+            (Some(Txn::Pending(pending())), Some(Step::Pending), true),
+            (Some(rolling_back(false)), Some(Step::RollingBack), true),
+            (Some(rolling_back(true)), Some(Step::RestoreFailed), true),
+        ];
+        for (txn, step, has_pending) in cases {
+            let label = format!("{txn:?}");
+            daemon
+                .inner()
+                .store
+                .modify(|state| {
+                    state.txn = txn;
+                    Ok(())
+                })
+                .unwrap();
+            let status = daemon.status();
+            assert_eq!(status.step, step, "{label}");
+            assert_eq!(status.pending.is_some(), has_pending, "{label}");
+        }
     }
 
     /// `confirm` is the commit point, so each way it refuses must leave the switch as it was: a confirm that lands

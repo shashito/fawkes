@@ -388,12 +388,29 @@ impl Generation {
     }
 }
 
-/// A switch that waits for its confirm.
+/// A switch that is live and not yet confirmed. `Status::step` says whether it still awaits its confirm: while it is
+/// rolled back, or its restore failed, `pending` stays set and nothing can confirm it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pending {
     pub generation: String,
     pub previous: Option<String>,
     pub deadline: String,
+}
+
+/// Where the transaction in flight is. Clients read this, not the presence of `Status::pending`, to tell a switch that
+/// awaits its confirm from one that is being rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Step {
+    /// The live app is being stopped and its storage snapshotted; the target has not started.
+    Switching,
+    /// The switch is live and waits for `confirm` until its deadline.
+    Pending,
+    /// The rollback is decided and being carried out; it can no longer be confirmed.
+    RollingBack,
+    /// The storage restore of a rollback failed: the app stays stopped until `rollback` retries it or
+    /// `rollback --keep-storage` gives it up.
+    RestoreFailed,
 }
 
 /// What an entry of the event log is about.
@@ -528,10 +545,26 @@ pub struct Status {
     pub daemon_pid: u32,
     pub permanent: Option<String>,
     pub current: Option<String>,
+    /// The live switch, also while it is rolled back or its restore failed: read `step` to tell which.
     pub pending: Option<Pending>,
+    /// The transaction in flight, null when none. Absent from an older daemon's status, which then has no way to say
+    /// that `pending` is being rolled back.
+    #[serde(default)]
+    pub step: Option<Step>,
     /// The step in progress: a transaction step, else one that moves the live process (see DESIGN.md).
     pub busy: Option<String>,
     pub process: Process,
+}
+
+impl Status {
+    /// The pending switch, only while it still awaits its confirm. A status without `step` is an older daemon's, which
+    /// publishes `pending` for a switch that awaits its confirm and says nothing else.
+    pub fn awaiting_confirm(&self) -> Option<&Pending> {
+        match self.step {
+            Some(Step::Pending) | None => self.pending.as_ref(),
+            Some(_) => None,
+        }
+    }
 }
 
 /// The result of `history`, and the `history` line of a `subscribe` stream. Oldest first.
@@ -1043,6 +1076,7 @@ mod tests {
                 previous: Some("g2".into()),
                 deadline: "t".into(),
             }),
+            step: Some(Step::Pending),
             busy: None,
             process: Process {
                 state: ProcessState::Running,
@@ -1067,12 +1101,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"busy":null,"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
+            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
         );
         let Line::Status { status } = serde_json::from_str::<Line>(&text).unwrap() else {
             panic!("a status line reads as one");
         };
         assert_eq!(status.process.port, 4790);
+        assert_eq!(status.step, Some(Step::Pending));
+        // An older daemon's status has no `step`.
+        let older = text.replace(r#""step":"pending","#, "");
+        let Line::Status { status } = serde_json::from_str::<Line>(&older).unwrap() else {
+            panic!("a status line reads as one");
+        };
+        assert!(status.step.is_none() && status.pending.is_some());
         // Final lines: a stream ends with a null result, a failure carries its error.
         assert_eq!(
             serde_json::to_string(&Line::done(Reply::Streamed)).unwrap(),

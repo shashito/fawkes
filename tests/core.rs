@@ -98,6 +98,7 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     h.wait("v2 to serve", 5, || h.get().as_deref() == Some("v2"));
     assert!(h.versions().contains(&"v2".to_string()));
     assert_eq!(h.status()["pending"]["generation"], "g2");
+    assert_eq!(h.status()["step"], "pending");
 
     h.wait("the deadline to roll g2 back", 20, || {
         h.generation("g2")["state"] == "rolled_back"
@@ -905,6 +906,7 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     let status = h.status();
     assert_eq!(status["process"]["state"], "failed", "{status}");
     assert_eq!(status["pending"]["generation"], "g2", "{status}");
+    assert_eq!(status["step"], "restore_failed", "{status}");
     assert_eq!(h.generation("g2")["state"], "rolled_back");
     assert_eq!(h.get(), None);
     std::fs::remove_dir(&blocker).unwrap();

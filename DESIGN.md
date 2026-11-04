@@ -530,11 +530,20 @@ A generation record:
 
 ```json
 {"name": "sample", "daemon_pid": 812, "permanent": "g2", "current": "g3", "pending": {"generation": "g3",
- "previous": "g2", "deadline": "…"}, "busy": null,
+ "previous": "g2", "deadline": "…"}, "step": "pending", "busy": null,
  "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
              "uptime": 42.5, "restarts": 1,
              "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}, "restart_at": null}}
 ```
+
+`step` is where the transaction in flight is, null when none: `switching`, `pending` (the switch is live and awaits
+`confirm`), `rolling_back` (the rollback is decided and being carried out) or `restore_failed` (the restore failed and
+the app stays stopped until `rollback` retries it or `rollback --keep-storage` gives it up). `pending` stays set during
+`rolling_back` and `restore_failed`, because the generation is still live as far as `state.json` goes, so a client
+reads `step`, not the presence of `pending`, to know whether a confirm can still happen. A status without `step` is an
+older daemon's; its `pending` awaits a confirm. The text form of `fawkes status` says `waiting for confirm until …`
+only for `pending`, `rolling back gN to gM` for `rolling_back`, and for `restore_failed` that the storage could not be
+restored and which command retries or gives it up.
 
 `process.state` is `running`, `stopped` or `failed`; `uptime` is seconds, null when not running; `restarts` counts
 starts of the current generation after its first (crash restarts and `restart`) since it became current or the daemon
@@ -588,11 +597,13 @@ The screen, at 80 columns, during an upgrade (the clock and event times are loca
 - **State** is always symbol and word: `● running` green, `○ stopped` grey, `✘ failed` red (the whole row is red),
   `◌ disconnected` red (the row shows the last known picture, dimmed) and `⟳ <step>` yellow while the daemon is busy
   with a transaction step (`switch`, `rollback`, …).
-- **Countdown:** `⏱ mm:ss` while a switch awaits confirm, in the table and in the detail line; yellow, red and bold
-  under 15 s. The detail line says what a missed deadline does (`rolls back to g6 (code + storage)`). While a switch
-  is pending the footer puts `c confirm` first, highlighted.
+- **Countdown:** `⏱ mm:ss` while a switch awaits confirm (`step` is `pending`), in the table and in the detail line;
+  yellow, red and bold under 15 s. The detail line says what a missed deadline does (`rolls back to g6 (code +
+  storage)`). While a switch awaits confirm the footer puts `c confirm` first, highlighted. During `rolling_back` the
+  detail line says `rolling back g7` (dim) and shows no countdown; during `restore_failed` it says `✘ restore failed,
+  b retries` in red.
 - **Generations**, newest first, with a relative AGE (since its last state change) and an Argo-style INFO: the test
-  result, `live · awaiting confirm`, `rollback target` for the permanent generation while a switch is pending,
+  result, `live · awaiting confirm`, `rollback target` for the permanent generation while a switch awaits confirm,
   `✖ <reason>` for `rolled_back` rows (red) and `✖ test failed: …` for `test_failed` ones.
 - **Events** follow the newest line by default (kinds coloured: `switched` yellow; `rolled_back`, `failed`, `error`,
   `unhealthy`, an unrequested `exited` and `test_failed` red; `healthy`, `confirmed`, `tested` green; `progress`
