@@ -42,6 +42,19 @@ The semantics are borrowed, not invented:
 - **Confirm deadline**, after Junos `commit confirmed`: a switch that is not confirmed in time is reverted.
 - **No loops:** a generation rolls back at most once.
 
+## Installation
+
+Fawkes builds with stable Rust ([rustup](https://rustup.rs)) and needs `git` at run time. It runs on macOS; Linux is
+not tested yet. From a checkout of this repository:
+
+```sh
+cargo install --path . --locked
+```
+
+This builds a release binary (about half a minute, SQLite included) and puts `fawkes` in `~/.cargo/bin`, which rustup
+adds to your `PATH`. Run that installed copy rather than `target/`: a supervisor should not run from a build directory
+that the next `cargo build` replaces. To update, pull and run the same command again.
+
 ## Using it
 
 Each app gets a small TOML manifest: its repository, start and install commands, a health check (URL or command), the
