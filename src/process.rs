@@ -683,7 +683,7 @@ mod tests {
         let command = format!("echo $$ > {}; sleep 30 & sleep 30", pid_file.display());
 
         let started = Instant::now();
-        let result = run_check(&command, temp.path(), &[], Duration::from_millis(500));
+        let result = run_check(&command, temp.path(), &[], Duration::from_secs(1));
         let waited = started.elapsed();
 
         let pgid: u32 = std::fs::read_to_string(&pid_file)
