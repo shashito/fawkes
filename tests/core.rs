@@ -374,13 +374,13 @@ fn a_bare_confirm_from_a_test_run_cannot_confirm_another_pending_generation() {
 #[test]
 fn rollback_on_unhealthy_rolls_back_without_waiting_for_the_deadline() {
     let mut h = Harness::new("rollback_on_unhealthy = true");
-    h.edit_manifest("timeout = 20", "timeout = 3");
     h.commit("v1", "confirm");
     h.commit("v2", "unhealthy-live");
     h.start_daemon();
     make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
+    shorten_the_health_timeout(&h);
     let switched = std::time::Instant::now();
     h.ok(&["switch", "g2", "--deadline", "120"]);
     h.wait("g2's failed health check to roll it back", 20, || {
@@ -1416,6 +1416,19 @@ fn messages_starting(h: &Harness, kind: &str, prefix: &str) -> Vec<String> {
 }
 
 /// Stage `version` as generation `id`, test it, switch to it and wait for the app to confirm itself.
+/// Reload the manifest with a 3 s health timeout, so that an unhealthy pending generation rolls back soon. Done only
+/// once the generations have passed their tests and g1 is permanent: on a loaded machine a node app can take longer
+/// than 3 s to start, and would then fail its test or roll back.
+fn shorten_the_health_timeout(h: &Harness) {
+    h.edit_manifest("timeout = 20", "timeout = 3");
+    h.signal_daemon(Signal::HUP);
+    h.wait("the reload to be logged", 10, || {
+        messages_starting(h, "daemon", "manifest reloaded")
+            .iter()
+            .any(|message| message.contains("health"))
+    });
+}
+
 fn make_permanent(h: &Harness, version: &str, id: &str) {
     h.ok(&["stage", version]);
     h.ok(&["test", id]);
@@ -1579,7 +1592,6 @@ fn a_reload_cannot_change_the_port_while_a_switch_has_stopped_the_old_app() {
 #[test]
 fn a_confirm_sent_at_the_unhealthy_event_finds_the_rollback_decided() {
     let mut h = Harness::new("rollback_on_unhealthy = true");
-    h.edit_manifest("timeout = 20", "timeout = 3");
     h.edit_manifest("stop_timeout = 5", "stop_timeout = 3");
     // g2 leaves a process that ignores SIGTERM in its group, so its rollback takes the whole stop timeout and a
     // confirm has time to arrive while the rollback is under way.
@@ -1593,6 +1605,7 @@ fn a_confirm_sent_at_the_unhealthy_event_finds_the_rollback_decided() {
     make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
+    shorten_the_health_timeout(&h);
 
     let mut follow = h.follow(&[]);
     h.ok(&["switch", "g2", "--deadline", "120"]);
@@ -1866,7 +1879,6 @@ if (process.argv[2] === 'listen') {
 #[test]
 fn a_health_command_checks_the_test_and_the_pending_switch() {
     let mut h = Harness::new("rollback_on_unhealthy = true");
-    h.edit_manifest("timeout = 20", "timeout = 3");
     h.edit_manifest(
         r#"url = "http://127.0.0.1:{port}/""#,
         r#"command = 'curl -fsS http://127.0.0.1:{port}/ && test "$APP_PORT" = {port} && test -n "$FAWKES_PHASE"'"#,
@@ -1879,6 +1891,7 @@ fn a_health_command_checks_the_test_and_the_pending_switch() {
 
     h.ok(&["stage", "v2"]);
     assert_eq!(h.ok(&["test", "g2"])["state"], "tested");
+    shorten_the_health_timeout(&h);
     h.ok(&["switch", "g2", "--deadline", "120"]);
     h.wait("the failing health command to roll g2 back", 20, || {
         h.generation("g2")["state"] == "rolled_back"
