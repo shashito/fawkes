@@ -87,6 +87,27 @@ checks), then L36–L48 and I16–I18. These include the weak timing tests (L36�
 features without a test (L45), the validation table (L46), CLI text output (L47), and loading the example manifests
 DESIGN.md quotes (I17).
 
+**Done:** every row below but 8.6, which [PLAN-05.md](PLAN-05.md) dropped. The new tests found no bug. The production
+changes are the three seams the rows ask for: `run_check` takes its timeout, `APP_LOG_BYTES` is 64 bytes under
+`cfg(test)`, and the TUI's `request_within` takes its timeout. Where the build differs from the row: the sample app's
+`crash` mode is kept, and crashes only while the file `$CRASH_WHILE` names exists, so one generation fails its test
+and then passes it; `port_in_use` comes from a start command whose listener, in a session of its own, takes the spare
+port. Three tests the load runs showed to be flaky wait for conditions instead: the unhealthy-rollback tests get their
+3 s health timeout by a reload once their tests have passed, the busy-switch test holds the old app's stop until its
+refused `stop` is in, and the stop-window tests read the `progress` event from a followed log. The TUI tests written
+before 8.6 was dropped stay until the TUI goes. The suite grew from 76 unit and 34 integration tests to 104 and 41.
+
+| # | Fix | From |
+|---|---|---|
+| 8.1 | A failing test: `health_failed`, `test_failed`, switch refused, a retest that passes; `port_in_use` and no free spare port leave the generation unchanged. | M12 |
+| 8.2 | `health.command`: `run_check` unit tests (exit 0, exit 1, env, a hang whose group is gone), one core test for test and live, the both/neither manifest rows. | M14 |
+| 8.3 | Timing tests wait for conditions: the unhealthy-confirm race, the idle-wake bounds, `restart_at` around the switch in the backoff, `busy` checked, the rollback bound `< 10`. | L36–L40 |
+| 8.4 | `Harness::drop` ends `step.pid`'s group; harness and daemon git ignore the user's config and `GIT_*`; one `Harness::crash_app` without `kill(1)`. | L41, L42, L48 |
+| 8.5 | A namesake daemon and a shared `--socket` refused, `state.json` recovered from `.bak`, a stray generation directory removed, a daemon killed or stopped during a test frees the spare port; switching back to a retired generation, `git_failed`, prune without `keep`, `reuse`. | L44, L45, I16 |
+| 8.6 | TUI tests. **Dropped** by PLAN-05 (the TUI goes). | L43 |
+| 8.7 | Validation table rows (unknown keys, a reversed range, two problems in one error); `render_result` for every request; `--json` stdout and progress lines. | L46, L47 |
+| 8.8 | The log cap, an oversized request through `handle`, `exited` then `try_wait`, the example manifests and DESIGN.md's TOML load, `[::1]` skipped without IPv6, exhaustive wire enum lists, children killed on a failed assertion. | I16–I18 |
+
 ## Phase 9: TUI (dropped)
 
 **Dropped:** [PLAN-05.md](PLAN-05.md) removes the TUI in its phase 9, so M9, L22–L29 and I5–I6 are not built, and
