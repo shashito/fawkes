@@ -289,7 +289,7 @@ pub fn wait_healthy(
         }
         let last = match check {
             Check::Url(url) => http_get(url),
-            Check::Command(command) => run_check(command, cwd, env),
+            Check::Command(command) => run_check(command, cwd, env, COMMAND_TIMEOUT),
         };
         match last {
             Ok(()) => return Ok(()),
@@ -314,7 +314,7 @@ pub fn wait_healthy(
 /// A health command gets this long before it counts as failed.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn run_check(command: &str, cwd: &Path, env: &Env) -> Result<(), String> {
+fn run_check(command: &str, cwd: &Path, env: &Env, timeout: Duration) -> Result<(), String> {
     let mut child = Command::new("/bin/sh")
         .args(["-c", command])
         .current_dir(cwd)
@@ -325,7 +325,7 @@ fn run_check(command: &str, cwd: &Path, env: &Env) -> Result<(), String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("cannot run health command: {e}"))?;
-    let waited = wait_until(&mut child, Instant::now() + COMMAND_TIMEOUT);
+    let waited = wait_until(&mut child, Instant::now() + timeout);
     // Whatever the check left in its group ends with it, passed or not, and the wait for the group is bounded: a
     // command stuck in the kernel outlives SIGKILL, and must not hold the thread that runs the check.
     stop_group(child.id(), 0.0, Some(&mut child));
@@ -409,6 +409,15 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
+    /// Kills the group of a test's child when the test ends, so a failed assertion leaves nothing running.
+    struct KillGroup(u32);
+
+    impl Drop for KillGroup {
+        fn drop(&mut self) {
+            kill_group(self.0);
+        }
+    }
+
     #[test]
     fn a_leftover_is_only_the_process_that_wrote_its_pid_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -423,6 +432,7 @@ mod tests {
             Some(&pid_file),
         )
         .unwrap();
+        let _cleanup = KillGroup(app.id());
         let give_up = Instant::now() + Duration::from_secs(5);
         while std::fs::read_to_string(&pid_file).map_or(true, |text| !text.ends_with('\n')) {
             assert!(Instant::now() < give_up, "the wrapper never wrote its pid");
@@ -463,9 +473,10 @@ mod tests {
             Some(&pid_file),
         )
         .unwrap();
+        let pgid = leader.id();
+        let _cleanup = KillGroup(pgid);
         // Reaping the leader leaves the sleeping member alone in the group.
         leader.wait().unwrap();
-        let pgid = leader.id();
         assert!(group_alive(pgid), "the member outlives its leader");
         assert_eq!(leftover(&pid_file), Some(pgid));
 
@@ -486,6 +497,7 @@ mod tests {
         // as a process stuck in the kernel would not.
         let mut leader = sleeper();
         let mut other = sleeper();
+        let _cleanup = (KillGroup(leader.id()), KillGroup(other.id()));
 
         let started = Instant::now();
         let status = stop_group(other.id(), 0.2, Some(&mut leader));
@@ -506,7 +518,12 @@ mod tests {
         for host in ["127.0.0.1", "[::1]"] {
             // Each answer promises a body it never sends, and its connection stays open until the checks are over:
             // only a check that stops at the status line returns before its timeout.
-            let listener = std::net::TcpListener::bind(format!("{host}:0")).unwrap();
+            let listener = match std::net::TcpListener::bind(format!("{host}:0")) {
+                Ok(listener) => listener,
+                // A machine without IPv6 loopback has nothing to test there.
+                Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => continue,
+                Err(e) => panic!("cannot bind {host}: {e}"),
+            };
             let url = format!(
                 "http://{host}:{}/health",
                 listener.local_addr().unwrap().port()
@@ -596,7 +613,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("background.pid");
         let command = format!("sleep 30 & echo $! > {}", pid_file.display());
-        assert_eq!(run_check(&command, temp.path(), &[]), Ok(()));
+        assert_eq!(
+            run_check(&command, temp.path(), &[], COMMAND_TIMEOUT),
+            Ok(())
+        );
 
         let background: u32 = std::fs::read_to_string(&pid_file)
             .unwrap()
@@ -607,5 +627,73 @@ mod tests {
             start_time(background).is_none(),
             "the backgrounded `sleep` outlived the check"
         );
+    }
+
+    #[test]
+    fn a_child_that_has_exited_is_reaped_by_try_wait_after_the_notice() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _cleanup = KillGroup(child.id());
+
+        exited(&child)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no notice of the exit");
+
+        let status = child
+            .try_wait()
+            .unwrap()
+            .expect("the exit was not left for try_wait");
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn a_health_command_passes_on_exit_0_and_fails_on_any_other_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let check = |command| run_check(command, temp.path(), &[], COMMAND_TIMEOUT);
+
+        assert_eq!(check("exit 0"), Ok(()));
+        let failed = check("exit 1").unwrap_err();
+        assert!(
+            failed.contains("health command failed") && failed.contains("exit status: 1"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn a_health_command_runs_with_the_given_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = [("CHECK_PHASE".to_string(), "test".to_string())];
+        let command = r#"test "$CHECK_PHASE" = test"#;
+
+        assert_eq!(
+            run_check(command, temp.path(), &env, COMMAND_TIMEOUT),
+            Ok(())
+        );
+        assert!(run_check(command, temp.path(), &[], COMMAND_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn a_health_command_that_hangs_times_out_and_its_whole_group_is_killed() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("leader.pid");
+        // The shell is the group's leader (`process_group(0)`), so its pid is the group's id.
+        let command = format!("echo $$ > {}; sleep 30 & sleep 30", pid_file.display());
+
+        let started = Instant::now();
+        let result = run_check(&command, temp.path(), &[], Duration::from_millis(500));
+        let waited = started.elapsed();
+
+        let pgid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the command never ran")
+            .trim()
+            .parse()
+            .unwrap();
+        let _cleanup = KillGroup(pgid);
+        assert_eq!(result, Err("health command timed out".into()));
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        assert!(!group_alive(pgid), "the check's group outlived its timeout");
     }
 }

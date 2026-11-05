@@ -730,6 +730,203 @@ mod tests {
         );
     }
 
+    fn generation(id: &str, state: &str, reason: Option<&str>) -> Value {
+        serde_json::json!({
+            "id": id, "ref": "main", "commit": "0123456789abcdef", "state": state, "dir": "/w/g",
+            "staged_at": "t", "test": {"port": 4791, "passed": true, "at": "t", "seconds": 1.5, "message": "ok"},
+            "switched_at": null, "confirmed_at": null, "rolled_back_at": null, "rollback_reason": reason,
+            "failed_starts": 0
+        })
+    }
+
+    fn process(state: &str, last_exit: &Value) -> Value {
+        serde_json::json!({
+            "state": state, "generation": "g3", "pid": 812, "port": 4790, "started_at": "t",
+            "uptime": 12.5, "restarts": 1, "last_exit": last_exit, "restart_at": null
+        })
+    }
+
+    /// Every request, in the order of the cases below; the match makes a new variant fail to compile until it is
+    /// listed here.
+    fn position(request: &Request) -> usize {
+        match request {
+            Request::Start => 0,
+            Request::Stop => 1,
+            Request::Restart => 2,
+            Request::Stage { .. } => 3,
+            Request::Test { .. } => 4,
+            Request::Switch { .. } => 5,
+            Request::Confirm { .. } => 6,
+            Request::Prune => 7,
+            Request::Rollback { .. } => 8,
+            Request::Status => 9,
+            Request::History => 10,
+            Request::Log { .. } => 11,
+            Request::Subscribe { .. } => 12,
+        }
+    }
+
+    #[test]
+    fn each_result_is_rendered_as_a_sentence_with_its_key_facts() {
+        let g = |id: &str| id.to_string();
+        let exit = serde_json::json!({"at": "t", "code": null, "signal": 9, "requested": false});
+        let event = serde_json::json!({
+            "seq": 1, "at": "2030-01-01T00:00:00Z", "kind": "switched", "generation": "g3", "message": "went live"
+        });
+        let status = serde_json::json!({
+            "name": "sample", "daemon_pid": 99, "permanent": "g2", "current": "g3",
+            "pending": {"generation": "g3", "previous": "g2", "deadline": "2030-01-01T00:01:00Z"},
+            "step": "pending", "busy": null, "process": process("running", &Value::Null)
+        });
+        let cases = [
+            (
+                Request::Start,
+                process("running", &Value::Null),
+                vec![
+                    "running  g3",
+                    "pid 812",
+                    "port 4790",
+                    "up 12.5s",
+                    "restarts 1",
+                ],
+            ),
+            (
+                Request::Stop,
+                process("stopped", &exit),
+                vec![
+                    "stopped  g3",
+                    "restarts 1",
+                    "last exit: signal 9 (unrequested)",
+                ],
+            ),
+            (
+                Request::Restart,
+                process("failed", &Value::Null),
+                vec!["failed  g3", "restarts 1"],
+            ),
+            (
+                Request::Stage { git_ref: g("main") },
+                generation("g3", "staged", None),
+                vec!["staged g3", "main @ 01234567"],
+            ),
+            (
+                Request::Test {
+                    generation: g("g3"),
+                },
+                generation("g3", "tested", None),
+                vec![
+                    "g3 passed its test on port 4791 in 1.5s",
+                    "`fawkes switch g3` goes live",
+                ],
+            ),
+            (
+                Request::Switch {
+                    generation: g("g3"),
+                    deadline: None,
+                },
+                serde_json::json!({"generation": "g3", "previous": "g2", "deadline": "2030-01-01T00:01:00Z"}),
+                vec![
+                    "switched to g3 (previous: g2)",
+                    "confirm before 2030-01-01T00:01:00Z or it rolls back",
+                ],
+            ),
+            (
+                Request::Confirm { generation: None },
+                generation("g3", "permanent", None),
+                vec!["g3 is now permanent"],
+            ),
+            (
+                Request::Prune,
+                serde_json::json!({"removed": ["g1", "g2"], "kept": ["g3"]}),
+                vec!["removed g1, g2", "kept g3"],
+            ),
+            (
+                Request::Rollback { keep_storage: true },
+                serde_json::json!({"from": "g3", "to": "g2", "reason": "deadline passed"}),
+                vec![
+                    "rolled back g3",
+                    "now running g2 (deadline passed)",
+                    "storage kept as it was",
+                ],
+            ),
+            (
+                Request::Status,
+                status,
+                vec![
+                    "sample  daemon pid 99",
+                    "permanent g2  current g3",
+                    "waiting for confirm until 2030-01-01T00:01:00Z",
+                    "process running  g3",
+                ],
+            ),
+            (
+                Request::History,
+                serde_json::json!({"generations": [
+                    generation("g2", "permanent", None),
+                    generation("g3", "rolled_back", Some("unhealthy")),
+                ]}),
+                vec!["g2", "permanent", "g3", "rolled_back", "(unhealthy)"],
+            ),
+            (
+                Request::Log {
+                    limit: None,
+                    follow: false,
+                },
+                serde_json::json!({"events": [event]}),
+                vec!["2030-01-01T00:00:00Z", "switched", "g3", "went live"],
+            ),
+            (
+                Request::Subscribe {
+                    limit: None,
+                    since: None,
+                },
+                Value::Null,
+                vec!["null"],
+            ),
+        ];
+        let mut seen: Vec<usize> = cases
+            .iter()
+            .map(|(request, ..)| position(request))
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..cases.len()).collect::<Vec<_>>());
+        for (request, result, words) in cases {
+            let text = render_result(&request, &result);
+            for word in words {
+                assert!(text.contains(word), "{request:?}: {word:?} not in {text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_variable_parts_of_a_rendered_result_follow_the_result() {
+        let rolled_back = serde_json::json!({"from": "g3", "to": null, "reason": "no previous"});
+        let text = render_result(
+            &Request::Rollback {
+                keep_storage: false,
+            },
+            &rolled_back,
+        );
+        assert!(text.contains("now running -"), "{text}");
+        assert!(!text.contains("storage kept"), "{text}");
+
+        let nothing = serde_json::json!({"removed": [], "kept": ["g1"]});
+        assert_eq!(
+            render_result(&Request::Prune, &nothing),
+            "nothing to remove"
+        );
+
+        // A result this client cannot read is shown as the JSON it is.
+        let unknown = serde_json::json!({"from": "a newer daemon"});
+        let text = render_result(
+            &Request::Stage {
+                git_ref: "main".into(),
+            },
+            &unknown,
+        );
+        assert_eq!(text, unknown.to_string());
+    }
+
     /// Run `status` against a daemon that accepts and then says nothing for 3 s; returns the exit code, what the
     /// client printed on stdout, and how long it waited.
     fn status_from_a_silent_daemon(json: bool) -> (u8, String, Duration) {

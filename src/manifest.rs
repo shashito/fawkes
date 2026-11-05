@@ -684,11 +684,78 @@ url = "http://127.0.0.1:{port}/"
                 "health.url",
                 with("http://127.0.0.1:{port}/", "http://127.0.0.1:99999999999/"),
             ),
+            (
+                "[health] needs exactly one of url or command",
+                with("[health]", "[health]\ncommand = \"true\""),
+            ),
+            (
+                "[health] needs exactly one of url or command",
+                with("url = \"http://127.0.0.1:{port}/\"", "interval = 1.0"),
+            ),
+            (
+                "spare_ports must be [low, high]",
+                with("[4791, 4795]", "[4795, 4791]"),
+            ),
+            // `deny_unknown_fields`: a misspelt key is an error, never ignored.
+            ("stop_timout", with("start =", "stop_timout = 5\nstart =")),
+            ("intervall", with("[health]", "[health]\nintervall = 1.0")),
+            ("`start`", with("start = \"node app.js\"\n", "")),
         ];
         for (field, text) in cases {
             let err = scratch.load(&text).expect_err(&text);
             assert!(err.starts_with("invalid manifest "), "{err}");
             assert!(err.contains(field), "{field} not named in {err}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_two_problems_names_both_in_one_error() {
+        let text = with("start =", "stop_timeout = 0.0\nkeep = 0\nstart =");
+        let err = Scratch::new().load(&text).unwrap_err();
+        assert!(err.starts_with("invalid manifest "), "{err}");
+        assert!(
+            err.contains("stop_timeout") && err.contains("keep"),
+            "{err}"
+        );
+        assert_eq!(err.lines().count(), 1, "{err}");
+    }
+
+    /// The manifests the documentation shows: the example files, and every TOML sample in DESIGN.md. A copy goes
+    /// into a scratch directory, because `load` refuses a file that others can write.
+    #[test]
+    fn the_documented_example_manifests_load() {
+        let design = include_str!("../DESIGN.md");
+        let mut documented = vec![
+            (
+                "examples/sample/fawkes.toml".to_string(),
+                include_str!("../examples/sample/fawkes.toml").to_string(),
+            ),
+            (
+                "examples/ultimate.toml".to_string(),
+                include_str!("../examples/ultimate.toml").to_string(),
+            ),
+        ];
+        let blocks: Vec<&str> = design
+            .split("```toml\n")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+            .collect();
+        assert!(
+            blocks.len() >= 2,
+            "DESIGN.md has {} toml blocks",
+            blocks.len()
+        );
+        documented.extend(
+            blocks
+                .into_iter()
+                .enumerate()
+                .map(|(i, block)| (format!("DESIGN.md toml block {}", i + 1), block.to_string())),
+        );
+        for (source, text) in documented {
+            let manifest = Scratch::new()
+                .load(&text)
+                .unwrap_or_else(|e| panic!("{source}: {e}"));
+            assert!(manifest.home.is_absolute(), "{source}");
         }
     }
 
