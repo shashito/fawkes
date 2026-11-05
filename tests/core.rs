@@ -513,25 +513,34 @@ fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
 #[test]
 fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
     let mut h = Harness::new("");
-    h.commit("v1", "slow-stop");
+    // Live g1 leaves a process that ignores SIGTERM in its group until `{state}/release` exists, so the switch that
+    // stops g1 stays busy until the test lets it go on, however slowly the `stop` below arrives.
+    h.edit_manifest("stop_timeout = 5", "stop_timeout = 60");
+    h.edit_manifest(
+        r#"start = "node app.js""#,
+        r#"start = "if [ $FAWKES_GENERATION = g1 ] && [ $FAWKES_PHASE = live ]; then (trap '' TERM; while [ ! -e {state}/release ]; do sleep 0.05; done) & fi; exec node app.js""#,
+    );
+    h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.commit("v3", "slow-test");
     h.start_daemon();
     make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
+    // Staged before the switch, so the test of g3 starts well within g2's deadline.
+    h.ok(&["stage", "v3"]);
 
     std::thread::scope(|scope| {
         let switch = scope.spawn(|| h.fk(&["switch", "g2", "--deadline", "4"]));
-        h.wait("the switch to stop g1", 5, || {
+        h.wait("the switch to stop g1", 10, || {
             h.status()["busy"] == "switch g2"
         });
         let (code, error) = h.fk(&["stop"]);
         assert_eq!((code, error["code"].as_str()), (1, Some("busy")), "{error}");
+        std::fs::write(h.dir.join("s/release"), "").unwrap();
         assert_eq!(switch.join().unwrap().0, 0);
     });
 
-    h.ok(&["stage", "v3"]);
     std::thread::scope(|scope| {
         let test = scope.spawn(|| h.fk(&["test", "g3"]));
         h.wait("the test of g3 to start", 5, || {
