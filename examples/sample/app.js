@@ -6,7 +6,8 @@
 //   never              never confirms, so the confirm deadline rolls it back
 //   confirm-always     runs a bare `fawkes confirm` in every phase, its test included, as an app that neither names
 //                      itself nor looks at FAWKES_PHASE would (the answer goes to ./confirm.json)
-//   crash              exits with status 3 straight away, also in a test
+//   crash              exits with status 3 straight away, also in a test; with $CRASH_WHILE set, only while the file it
+//                      names exists (a marker that lets a test fail and then pass, as the code of a generation is fixed)
 //   crash-live         like crash, but only when running live (so it passes its test)
 //   crash-confirm      when live: leaves a process that ignores SIGTERM in its group, has `fawkes confirm` sent from
 //                      outside the group 0.3 s later (the answer goes to $APP_HOME/confirm.json), and exits with
@@ -28,7 +29,8 @@ const version = read('VERSION', 'dev');
 const mode = read('MODE', 'confirm');
 const phase = process.env.FAWKES_PHASE;
 
-if (mode === 'crash' || (mode === 'crash-live' && phase === 'live')) {
+const crashes = !process.env.CRASH_WHILE || fs.existsSync(process.env.CRASH_WHILE);
+if ((mode === 'crash' && crashes) || (mode === 'crash-live' && phase === 'live')) {
   console.error(`${version}: crashing on start`);
   process.exit(3);
 }

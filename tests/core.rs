@@ -1750,3 +1750,365 @@ fn a_usage_error_exits_2_and_help_exits_0() {
         assert!(stdout.contains("Usage: fawkes"), "{stdout}");
     }
 }
+
+// ------------------------------------------------ failing tests, health commands, retired generations, startup
+
+/// The sample app's `crash` mode crashes while `{state}/crash` exists, so the same generation fails its test and later
+/// passes it.
+fn crash_while_marked(h: &Harness) -> std::path::PathBuf {
+    h.edit_manifest(
+        r#"APP_HOME = "{home}""#,
+        "APP_HOME = \"{home}\"\nCRASH_WHILE = \"{state}/crash\"",
+    );
+    let marker = h.dir.join("s/crash");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "").unwrap();
+    marker
+}
+
+/// A generation whose test fails is `test_failed` and cannot be switched to, until a test of it passes.
+#[test]
+fn a_failing_test_leaves_the_generation_test_failed_until_a_retest_passes() {
+    let mut h = Harness::new("");
+    let marker = crash_while_marked(&h);
+    h.commit("v1", "crash");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+
+    refused(&h, &["test", "g1"], "health_failed", "g1 failed its test");
+    let g1 = h.generation("g1");
+    assert_eq!(g1["state"], "test_failed");
+    assert_eq!(g1["test"]["passed"], false);
+    assert_eq!(messages(&h, "test_failed").len(), 1);
+    refused(
+        &h,
+        &["switch", "g1"],
+        "invalid_state",
+        "g1 failed its last test",
+    );
+    assert_eq!(h.status()["process"]["state"], "stopped");
+
+    std::fs::remove_file(&marker).unwrap();
+    let g1 = h.ok(&["test", "g1"]);
+    assert_eq!(g1["state"], "tested");
+    assert_eq!(g1["test"]["passed"], true);
+    assert_eq!(messages(&h, "tested").len(), 1);
+    // `tested → tested` is allowed too.
+    assert_eq!(h.ok(&["test", "g1"])["state"], "tested");
+    h.ok(&["switch", "g1"]);
+}
+
+/// A test that cannot get a spare port, or whose spare port another process takes, blames no one: the generation stays
+/// as it was.
+#[test]
+fn a_test_without_a_free_spare_port_or_with_a_stolen_one_leaves_the_generation_unchanged() {
+    let mut h = Harness::new("");
+    // While `{state}/squat` exists, the start command has a listener of its own session take the spare port and
+    // then fails, so the port is still taken once the test's process group is gone.
+    let squat = h.dir.join("squat.js");
+    std::fs::write(
+        &squat,
+        r"const fs = require('node:fs');
+if (process.argv[2] === 'listen') {
+  require('node:net').createServer().listen(Number(process.argv[3]), '127.0.0.1', () =>
+    fs.writeFileSync(process.argv[4], String(process.pid)));
+} else {
+  require('node:child_process').spawn(process.execPath, [__filename, 'listen', ...process.argv.slice(2)],
+    { detached: true, stdio: 'ignore' }).unref();
+  setInterval(() => { if (fs.existsSync(process.argv[3])) process.exit(3); }, 50);
+}
+",
+    )
+    .unwrap();
+    h.edit_manifest(
+        r#"start = "node app.js""#,
+        &format!(
+            r#"start = "if [ -e {{state}}/squat ]; then exec node {} {{port}} {{state}}/squat.pid; fi; exec node app.js""#,
+            squat.display()
+        ),
+    );
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    let staged = h.ok(&["stage", "v1"]);
+    std::fs::write(h.dir.join("s/squat"), "").unwrap();
+
+    refused(
+        &h,
+        &["test", "g1"],
+        "port_in_use",
+        "was taken by another process",
+    );
+    assert_eq!(h.generation("g1"), staged, "the stolen port blamed g1");
+    assert!(
+        messages(&h, "error")
+            .iter()
+            .any(|message| message.contains("was taken by another process")),
+    );
+    assert_eq!(messages(&h, "test_failed").len(), 0);
+    // The listener is the one process this test has to end, by the pid it wrote.
+    let listener = read_pid(h.dir.join("s/squat.pid"));
+    kill_process(listener, Signal::KILL).unwrap();
+    std::fs::remove_file(h.dir.join("s/squat")).unwrap();
+    h.wait("the listener to release the spare port", 10, || {
+        std::net::TcpListener::bind(("127.0.0.1", h.port + 1)).is_ok()
+    });
+
+    let held: Vec<_> = (h.port + 1..=h.port + 9)
+        .map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap())
+        .collect();
+    refused(&h, &["test", "g1"], "start_failed", "no free spare port");
+    assert_eq!(h.generation("g1"), staged);
+    drop(held);
+    assert_eq!(h.ok(&["test", "g1"])["state"], "tested");
+}
+
+/// `health.command` is run with `{port}` expanded and the app's `[env]` and FAWKES_* variables, in the test and for a
+/// pending switch: a passing one lets the upgrade through, one that keeps failing rolls it back.
+#[test]
+fn a_health_command_checks_the_test_and_the_pending_switch() {
+    let mut h = Harness::new("rollback_on_unhealthy = true");
+    h.edit_manifest("timeout = 20", "timeout = 3");
+    h.edit_manifest(
+        r#"url = "http://127.0.0.1:{port}/""#,
+        r#"command = 'curl -fsS http://127.0.0.1:{port}/ && test "$APP_PORT" = {port} && test -n "$FAWKES_PHASE"'"#,
+    );
+    h.commit("v1", "confirm");
+    h.commit("v2", "unhealthy-live");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    assert_eq!(h.get().as_deref(), Some("v1"));
+
+    h.ok(&["stage", "v2"]);
+    assert_eq!(h.ok(&["test", "g2"])["state"], "tested");
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("the failing health command to roll g2 back", 20, || {
+        h.generation("g2")["state"] == "rolled_back"
+    });
+    assert_eq!(h.generation("g2")["rollback_reason"], "health check failed");
+    assert_eq!(h.status()["permanent"], "g1");
+}
+
+/// A retired generation is switched back to like any tested one; a missing ref is `git_failed`; `prune` without `keep`
+/// is `invalid_state`; and `reuse` directories are cloned from the repository, then from the permanent generation.
+#[test]
+fn a_retired_generation_is_switched_back_to_and_stage_and_prune_refuse_what_they_cannot_do() {
+    let mut h = Harness::new(r#"reuse = ["node_modules"]"#);
+    h.commit("v1", "confirm");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    // Untracked, so only `reuse` brings it into a worktree.
+    let modules = h.dir.join("repo/node_modules");
+    std::fs::create_dir(&modules).unwrap();
+    std::fs::write(modules.join("from-repo"), "").unwrap();
+    let code = |id: &str| {
+        h.dir
+            .join("s/generations")
+            .join(id)
+            .join("code/node_modules")
+    };
+
+    h.ok(&["stage", "v1"]);
+    assert!(
+        code("g1").join("from-repo").exists(),
+        "no permanent generation: cloned from the repository"
+    );
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    std::fs::write(code("g1").join("from-g1"), "").unwrap();
+    std::fs::remove_dir_all(&modules).unwrap();
+
+    make_permanent(&h, "v2", "g2");
+    assert!(
+        code("g2").join("from-g1").exists(),
+        "cloned from the permanent generation's worktree"
+    );
+    assert_eq!(h.generation("g1")["state"], "retired");
+
+    refused(
+        &h,
+        &["stage", "nope"],
+        "git_failed",
+        "`nope` is not a commit",
+    );
+    assert_eq!(
+        h.ok(&["history"])["generations"].as_array().unwrap().len(),
+        2
+    );
+    refused(&h, &["prune"], "invalid_state", "keep = N");
+    assert_eq!(
+        h.ok(&["history"])["generations"].as_array().unwrap().len(),
+        2
+    );
+
+    refused(&h, &["switch", "g1"], "invalid_state", "retired");
+    assert_eq!(h.ok(&["test", "g1"])["state"], "tested");
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself again", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.wait("v1 to serve", 10, || h.get().as_deref() == Some("v1"));
+    assert_eq!(h.generation("g2")["state"], "retired");
+}
+
+/// What the next daemon start does about what the last one left: a second daemon of the same name is refused without
+/// harming the first, an unreadable `state.json` is recovered from its copy and reported, and a generation directory
+/// no record owns is removed.
+#[test]
+fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_directory() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+
+    // Another state_dir, the same name and the same fawkes_home: the run link already answers.
+    let d = h.dir.display();
+    let manifest = std::fs::read_to_string(h.dir.join("fawkes.toml")).unwrap();
+    let other = h.dir.join("other.toml");
+    std::fs::write(
+        &other,
+        manifest
+            .replace(&format!("{d}/s\""), &format!("{d}/s2\""))
+            .replace(&format!("{d}/home\""), &format!("{d}/home2\"")),
+    )
+    .unwrap();
+    let output = common::fawkes()
+        .args(["daemon", "--manifest"])
+        .arg(&other)
+        .env("FAWKES_HOME", &h.dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("another daemon named t already runs"),
+        "{stderr}"
+    );
+    assert!(
+        !h.dir.join("s2/fawkes.sock").exists(),
+        "the refused daemon left its socket behind"
+    );
+    assert_eq!(
+        std::fs::read_link(h.dir.join("run/t.sock")).unwrap(),
+        std::fs::canonicalize(h.dir.join("s/fawkes.sock")).unwrap(),
+        "the first daemon's link was replaced"
+    );
+    assert_eq!(h.status()["name"], "t");
+
+    h.kill_daemon();
+    std::fs::write(h.dir.join("s/state.json"), "{ not json").unwrap();
+    std::fs::create_dir(h.dir.join("s/generations/g99")).unwrap();
+    h.start_daemon();
+    assert_eq!(h.generation("g1")["state"], "staged");
+    assert!(
+        messages(&h, "error")
+            .iter()
+            .any(|message| message.contains("recovered from")),
+        "{}",
+        h.daemon_log()
+    );
+    assert!(!h.dir.join("s/generations/g99").exists());
+    assert!(
+        messages(&h, "daemon")
+            .iter()
+            .any(|message| message.contains("g99") && message.contains("no generation owns"))
+    );
+}
+
+/// A daemon that dies or is stopped while a test runs leaves no test process on the spare port: SIGKILL (the next
+/// daemon ends it through `step.pid`) and SIGTERM (the daemon ends it itself on its way out).
+#[test]
+fn a_daemon_killed_or_stopped_during_a_test_leaves_the_spare_port_free() {
+    let mut h = Harness::new("");
+    // A check that never passes keeps the test running, with its app listening on the spare port.
+    h.edit_manifest(
+        r#"url = "http://127.0.0.1:{port}/""#,
+        r#"command = "test -e {state}/ready""#,
+    );
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["stage", "v1"]);
+    let spare = h.port + 1;
+    let listens = || std::net::TcpStream::connect(("127.0.0.1", spare)).is_ok();
+    let free = || std::net::TcpListener::bind(("127.0.0.1", spare)).is_ok();
+    let start_test = |h: &Harness| {
+        let test = h
+            .cli()
+            .args(["test", "g1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        h.wait("the test app to listen", 10, listens);
+        test
+    };
+
+    let mut test = start_test(&h);
+    h.kill_daemon();
+    test.wait().unwrap();
+    h.start_daemon();
+    h.wait("the next daemon to end the test left behind", 10, free);
+    assert_eq!(h.generation("g1")["state"], "staged");
+
+    let mut test = start_test(&h);
+    h.signal_daemon(Signal::TERM);
+    assert!(h.daemon_exits_within(Duration::from_secs(10)));
+    // The daemon SIGKILLs the test's group and exits without waiting for the kernel to reap it.
+    h.wait("the test app to leave the spare port", 10, free);
+    test.wait().unwrap();
+}
+
+/// `--json` keeps stdout to one JSON document and puts the progress of a step on stderr, one event object per line;
+/// without it the answer is text.
+#[test]
+fn json_output_is_one_document_on_stdout_and_progress_lines_on_stderr() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+
+    for args in [["stage", "v1"], ["switch", "g1"]] {
+        if args[0] == "switch" {
+            h.ok(&["test", "g1"]);
+        }
+        let output = h.cli().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let result: Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(
+            result["id"].as_str().or(result["generation"].as_str()),
+            Some("g1")
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.trim().is_empty(), "{args:?} narrated nothing");
+        for line in stderr.lines() {
+            let progress: Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("{args:?} wrote a line to stderr that is not JSON ({e}): {line}")
+            });
+            assert_eq!(progress["kind"], "progress", "{line}");
+            assert_eq!(progress["generation"], "g1", "{line}");
+        }
+    }
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+
+    let output = common::fawkes()
+        .arg("--manifest")
+        .arg(h.dir.join("fawkes.toml"))
+        .arg("status")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(serde_json::from_str::<Value>(&text).is_err(), "{text}");
+    for word in [
+        "t  daemon pid",
+        "permanent g1",
+        "current g1",
+        "process running",
+    ] {
+        assert!(text.contains(word), "{word:?} is not in:\n{text}");
+    }
+}
