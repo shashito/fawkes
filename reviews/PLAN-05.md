@@ -46,6 +46,14 @@ codes are added, never renamed.
 Why first: it is the largest deletion (`src/tui.rs` and `src/tui/draw.rs`, 2,001 lines; 93 crates down to 40),
 mechanical, and independent of the storage work. The extension keeps working as it is until phase 10.
 
+**Done:** 9.1 to 9.3. Measured against `bd2ccd1`: 93 crates down to 40, `src/` from 11,673 lines to 9,569, a clean
+debug build from 10.4 s to 7.0 s. Where the build differs from the rows: without `--since`, each daemon starts at the
+time `watch` started (by the events' `at`), so a daemon found later still shows its own start; a reconnect asks for
+every event after the last one printed (no `limit`), and a note on stderr names a gap the daemon could not fill; the
+queue to stdout is bounded, so a paused reader makes the daemon drop the stream and the reconnect resumes it. The
+TUI's one-shot `request` went with the actions that used it, and `Generation::label` with the screen. The unit and
+integration suites went from 104 and 41 tests to 81 and 42.
+
 | # | Change |
 |---|---|
 | 9.1 | Strip `src/tui.rs`, `src/tui/draw.rs`, the `tui` command, its tests (L43's included) and `ratatui`. `rustix` and `signal-hook` become direct dependencies (they were "already in the tree through crossterm"); fix that sentence in `DESIGN.md` → Crates, remove `DESIGN.md` → TUI, and fix the "Every command but `daemon` and `tui`" lines in `CLAUDE.md` and `main.rs` and "the same in the CLI, the socket and the TUI" in Lifecycle. Drop jiff's `tz-system` and `tzdb-zoneinfo` features if nothing but the TUI's local clock uses them. |

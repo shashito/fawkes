@@ -111,7 +111,8 @@ before 8.6 was dropped stay until the TUI goes. The suite grew from 76 unit and 
 ## Phase 9: TUI (dropped)
 
 **Dropped:** [PLAN-05.md](PLAN-05.md) removes the TUI in its phase 9, so M9, L22–L29 and I5–I6 are not built, and
-L43's TUI tests go with it.
+L43's TUI tests go with it. **Done** there: the TUI and its tests are gone, and the connection tests moved to
+`src/watch.rs`.
 
 ## Phase 10: quality and /simplify
 

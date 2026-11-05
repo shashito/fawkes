@@ -36,8 +36,8 @@ const EXIT_UNREACHABLE: u8 = 3;
     after_help = "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers."
 )]
 struct Cli {
-    /// Print the result (or the error) as one JSON document, and progress as JSON lines on stderr; `log --follow` and
-    /// `watch` print one event document per line. Not for `daemon`
+    /// Print the result (or the error) as one JSON document, and progress as JSON lines on stderr; `log --follow`
+    /// prints one event document per line, `watch` one `{"name", "event"}` document. Not for `daemon`
     #[arg(long, global = true)]
     json: bool,
     /// The app's manifest [default: fawkes.toml]
@@ -224,7 +224,8 @@ fn main() -> ExitCode {
         .filter(|_| cli.socket.is_none());
     // `daemon` and `watch` returned above, so every command left sends a request.
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
-        return ExitCode::from(EXIT_USAGE);
+        let message = "this command sends no request to a daemon".to_string();
+        return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
     };
     ExitCode::from(client(
         &cli,

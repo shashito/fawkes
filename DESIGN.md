@@ -423,9 +423,9 @@ JSON document, the `result` or the `error` object of the response below, and pro
 That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (arguments it cannot
 parse and a manifest that cannot be read are `usage`, no daemon on the socket, a connection that breaks or closes without an answer is
 `daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`). The exceptions are the
-streams, `log --follow` and `watch` (see Watch): stdout carries one event document per line, as they happen, and
-nothing else when the daemon ends the stream (in text mode too). `--json` does not apply to `daemon`, which prints
-text only.
+streams. `log --follow`: stdout carries one event document per line, as they happen, and nothing else when the
+daemon ends the stream (in text mode too). `watch` (see Watch): one `{"name", "event"}` document per event, for as
+long as it runs. `--json` does not apply to `daemon`, which prints text only.
 Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
 for `daemon` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
 cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
@@ -602,12 +602,15 @@ ultimate  2026-11-03T14:02:03Z  healthy     g7   health check passed
 (`--since 0` is all of them). Without it, each daemon starts at the time `watch` started: the events logged before
 are skipped, so a daemon found later still shows its own start.
 
-**Reconnect:** a stream that ends (a daemon killed or restarted, a `busy` refusal) is opened again every second with
+**Reconnect:** a stream that ends (a daemon killed or restarted, a `busy` refusal, or a stream the daemon dropped
+while a paused stdout held `watch` up: it buffers 1024 lines, then stops reading) is opened again every second with
 `since` set to the last `seq` printed, so the events logged meanwhile are printed once, in order. Events are missed
-only when the daemon no longer keeps them (more than 1000 since) or its log started over (numbering from 1 again),
-and a note says which. Notes go to stderr, as text in both modes: `ultimate: the connection was lost;
-reconnecting`, `ultimate: connected again`, `ultimate: events 6 to 8 were missed: the daemon no longer keeps them`,
-`ultimate: the daemon's event log started over`, and the message of a refusal.
+only when the daemon no longer keeps them (more than 1000 since), which a note says, or when its log started over
+(its files were removed, and it numbers from 1 again): the new log's events up to the reconnect are not replayed,
+and a note says so only if the next event is numbered at or below the last one printed. Notes go to stderr, as text
+in both modes, once per outage: `ultimate: the connection was lost; reconnecting` (or the refusal's message and `; retrying`), `ultimate:
+connected again`, `ultimate: events 6 to 8 were missed: the daemon no longer keeps them`, `ultimate: the daemon's
+event log started over`. Until the first `status` line names the app, a note names the socket.
 
 **End:** `watch` runs until it is stopped, or until a line cannot be written to stdout (a reader that has gone, as in
 `| head`), which it notices at the next event and ends with `0`.

@@ -1121,8 +1121,15 @@ fn watch_follows_every_daemon_of_a_fawkes_home_across_a_daemon_restart() {
     u.start_daemon();
     let mut watch = t.watch(&["--since", "0"]);
     let mut seen: Vec<(String, Value)> = Vec::new();
-    // Read the watch until `app` has printed a `staged` event for `generation`.
+    // Read the watch until `app` has printed a `staged` event for `generation`, or find it among what was read: the two
+    // daemons' events reach the watch in either order.
     let mut until_staged = |app: &str, generation: &str| {
+        let staged = |name: &str, event: &Value| {
+            name == app && event["kind"] == "staged" && event["generation"] == generation
+        };
+        if seen.iter().any(|(name, event)| staged(name, event)) {
+            return;
+        }
         let give_up = Instant::now() + Duration::from_secs(30);
         loop {
             let left = give_up.saturating_duration_since(Instant::now());
@@ -1133,7 +1140,7 @@ fn watch_follows_every_daemon_of_a_fawkes_home_across_a_daemon_restart() {
             let line: Value = serde_json::from_str(&line).unwrap();
             let (name, event) = (line["name"].as_str().unwrap(), &line["event"]);
             seen.push((name.to_string(), event.clone()));
-            if name == app && event["kind"] == "staged" && event["generation"] == generation {
+            if staged(name, event) {
                 return;
             }
         }

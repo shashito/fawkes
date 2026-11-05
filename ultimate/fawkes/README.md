@@ -46,9 +46,9 @@ The pending generation confirms itself (`confirm <its generation>` over the sock
 server facet loaded (a facet broken by a changed core or a missing package is what must not become permanent) and its
 page answers. It lets go of the hold only when the daemon's status says the generation is permanent, whoever
 confirmed it (this facet, the Confirm button, `fawkes confirm`), and not while the user paused the host. A refused or
-lost confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage together.
-A restart of a generation that is already permanent releases the hold at once; every reopen of the harness (a failed
-core swap) holds again until then.
+lost confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage
+together. A restart of a generation that is already permanent releases the hold at once; every reopen of the harness
+(a failed core swap) holds again until then.
 
 In a test run the hold fails closed: a hold that throws ends the process, and `health.ts` passes only once the
 facet wrote `fawkes-held` into the test home, so a generation that breaks this extension or the hold never goes live.

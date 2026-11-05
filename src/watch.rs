@@ -10,11 +10,14 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 const RETRY: Duration = Duration::from_secs(1);
 const RESCAN: Duration = Duration::from_secs(3);
+/// The lines waiting for stdout. A stdout that blocks (a paused pager) then blocks the readers, the daemon drops a
+/// stream that falls behind, and the reconnect resumes it with `since`, instead of `watch` buffering without bound.
+const QUEUE: usize = 1024;
 
 /// The daemons `watch` follows.
 pub enum Target {
@@ -58,7 +61,7 @@ pub fn run(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let start = since.map_or_else(|| Start::At(now_secs()), Start::After);
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(QUEUE);
     match target {
         Target::One(socket) => {
             let reader = Reader::new(socket, true, start, json, tx);
@@ -85,7 +88,7 @@ pub fn run(
 
 /// Every few seconds, start a reader for each `<name>.sock` link in `dir` that has none. A reader follows its link for
 /// as long as `watch` runs, so a daemon that stops and starts again continues where it was.
-fn scan(dir: &Path, start: Start, json: bool, tx: &Sender<Msg>) {
+fn scan(dir: &Path, start: Start, json: bool, tx: &SyncSender<Msg>) {
     let mut following = HashSet::new();
     loop {
         let links = std::fs::read_dir(dir).into_iter().flatten().flatten();
@@ -105,6 +108,8 @@ enum Ended {
     Unanswered(String),
     /// The stream ended after the daemon had answered.
     Lost,
+    /// The daemon refused the stream with this message (`busy`: too many connections).
+    Refused(String),
     /// The printing thread is gone.
     Stop,
 }
@@ -129,11 +134,11 @@ struct Reader {
     single: bool,
     start: Start,
     json: bool,
-    tx: Sender<Msg>,
+    tx: SyncSender<Msg>,
 }
 
 impl Reader {
-    fn new(socket: &Path, single: bool, start: Start, json: bool, tx: Sender<Msg>) -> Reader {
+    fn new(socket: &Path, single: bool, start: Start, json: bool, tx: SyncSender<Msg>) -> Reader {
         Reader {
             socket: socket.to_path_buf(),
             single,
@@ -157,9 +162,18 @@ impl Reader {
                     return;
                 }
                 Ended::Unanswered(_) => {}
+                // Said once per outage, however many retries it takes; the next stream says `connected again`.
+                Ended::Lost | Ended::Refused(_) if seen.lost => {}
                 Ended::Lost => {
                     seen.lost = true;
                     if !self.note(&seen, "the connection was lost; reconnecting") {
+                        return;
+                    }
+                }
+                Ended::Refused(why) => {
+                    seen.answered = true;
+                    seen.lost = true;
+                    if !self.note(&seen, &format!("{why}; retrying")) {
                         return;
                     }
                 }
@@ -189,6 +203,15 @@ impl Reader {
         let mut held = Vec::new();
         let mut answered = false;
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            let Ok(raw) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Ok(message) = Line::<Value>::deserialize(&raw) else {
+                continue;
+            };
+            if let Line::Failed { error, .. } = message {
+                return Ended::Refused(error.message);
+            }
             if !answered {
                 answered = true;
                 seen.answered = true;
@@ -199,24 +222,12 @@ impl Reader {
                     }
                 }
             }
-            let Ok(raw) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let Ok(message) = Line::<Value>::deserialize(&raw) else {
-                continue;
-            };
             match message {
                 Line::Event { event } => held.push((event, raw)),
                 Line::Status { status } => {
                     seen.name.get_or_insert(status.name);
                 }
-                // A daemon that refused the stream (`busy`: too many connections); the reader tries again.
-                Line::Failed { error, .. } => {
-                    if !self.note(seen, &error.message) {
-                        return Ended::Stop;
-                    }
-                }
-                Line::History { .. } | Line::Done { .. } => {}
+                Line::History { .. } | Line::Done { .. } | Line::Failed { .. } => {}
             }
             if seen.name.is_some() {
                 for (event, raw) in held.drain(..) {
@@ -302,7 +313,7 @@ mod tests {
     use crate::state::parse_time;
     use serde_json::json;
     use std::os::unix::net::UnixListener;
-    use std::sync::mpsc::{self, Receiver};
+    use std::sync::mpsc::Receiver;
     use std::thread::JoinHandle;
 
     /// A daemon that answers its connections one after another, each with the given lines, then closes it.
@@ -383,7 +394,7 @@ mod tests {
         start: Start,
         json: bool,
     ) -> (Reader, Receiver<Msg>) {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = sync_channel(QUEUE);
         (Reader::new(&daemon.socket, single, start, json, tx), rx)
     }
 
@@ -501,21 +512,29 @@ mod tests {
             )]
         );
 
-        // Once it answered, a lost connection is retried, and the events continue.
+        // A refusal is an answer: it is retried, like a lost connection once the daemon answered, and the events
+        // continue. Each outage is said once, however many retries it takes.
+        let busy =
+            json!({ "ok": false, "error": { "code": "busy", "message": "too many connections" } });
         let daemon = FakeDaemon::start(vec![
+            vec![busy.clone()],
             vec![status(), event(1)],
+            vec![busy],
             vec![],
             vec![event(2), status()],
         ]);
         let (reader, rx) = reader_of(&daemon, true, Start::After(0), false);
         std::thread::spawn(move || reader.run());
-        let msgs: Vec<String> = rx.iter().take(5).map(describe).collect();
+        let msgs: Vec<String> = rx.iter().take(7).map(describe).collect();
+        // Before the first status line, the daemon is named by its socket.
+        let socket = daemon.socket.display();
         assert_eq!(
             msgs,
             [
+                format!("note: {socket}: too many connections; retrying"),
+                format!("note: {socket}: connected again"),
                 format!("sample  {AT}  progress    -    event 1"),
                 "note: sample: the connection was lost; reconnecting".into(),
-                // The connection that closed without a line is retried quietly, not counted as one more loss.
                 "note: sample: connected again".into(),
                 format!("sample  {AT}  progress    -    event 2"),
                 "note: sample: the connection was lost; reconnecting".into(),
@@ -532,7 +551,7 @@ mod tests {
             .unwrap();
         // Not a link to a daemon: connecting to it would fail, but it is never tried.
         std::fs::write(dir.path().join("notes.txt"), "").unwrap();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = sync_channel(QUEUE);
         let path = dir.path().to_path_buf();
         std::thread::spawn(move || scan(&path, Start::After(0), true, &tx));
         let first = rx.recv_timeout(Duration::from_secs(5)).map(describe);
