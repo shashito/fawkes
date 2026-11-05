@@ -87,18 +87,20 @@ checks), then L36–L48 and I16–I18. These include the weak timing tests (L36�
 features without a test (L45), the validation table (L46), CLI text output (L47), and loading the example manifests
 DESIGN.md quotes (I17).
 
-## Phase 9: TUI
+## Phase 9: TUI (dropped)
 
-M9 (the selected app leaves: draw the other apps and let the arrows pick one, render test first), then L22–L29 and
-I5–I6: modifier keys, terminal restoration, an error line counted as up, long notices, `DarkGray`, AGE, and binding
-the rollback dialog to its generation.
+**Dropped:** [PLAN-05.md](PLAN-05.md) removes the TUI in its phase 9, so M9, L22–L29 and I5–I6 are not built, and
+L43's TUI tests go with it.
 
 ## Phase 10: quality and /simplify
 
+**Runs last,** after PLAN-05's phase 12, since PLAN-05 rewrites the files it would polish. P2 (one bounded-child
+runner) moves into PLAN-05's phase 10, which needs it for the hooks; L49 is cut down to toml's default features,
+ratatui and rusqlite being gone.
+
 L54 and L56 (one "exited" accessor and one parsed deadline remove five sites each), L55 (one `LastExit`
-description), P9 (an exhaustive destructure in `Manifest::reload`), P2 (one bounded-child runner), L49 (trim
-ratatui's, rusqlite's and toml's default features, which drops the second date library), L33 (durations parsed
-once), L34 (`let _ =` that matters), L57–L61 (literals, stale comments, names), I23–I26, and the rest of P1–P24
+description), P9 (an exhaustive destructure in `Manifest::reload`), L49 (trim toml's default features), L33
+(durations parsed once), L34 (`let _ =` that matters), L57–L61 (literals, stale comments, names), I23–I26, and the rest of P1–P24
 where they make the code simpler. The rest of L1–L3, L9–L12 and I1–I3 go in the phase that touches their file.
 
 ## Housekeeping (with phase 5)
