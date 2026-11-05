@@ -63,6 +63,15 @@ it does not know, and does not replay events of an unknown kind (their `seq` sti
 
 ## Phase 7: security hardening
 
+**Done:** every row below, 7.1 to 7.4, and I8, each bug with a test that reproduced it first. Where the build differs
+from the row: `home` gets the same check as `state_dir` (a symlink or another user's is refused at daemon start), but a
+missing one is created `0700` and an existing one keeps its mode. The manifest is refused, not warned about, when
+another user (root excepted) owns it or others can write it; group-writable passes, for a umask of `002`. The `.git`
+check I9 suggested and ownership of the directories above `state_dir` are not checked. Restored files keep their mode
+but not their owner. The harness keeps `/tmp/fawkes-test-ports` and `/tmp/fk<port>`, since the fixed lock directory
+is how suites in other worktrees see each other's claims, and fails a test on one another user created or can write.
+A foreign-owned `state_dir` is tested as a unit test with an injected uid; an integration test would need root.
+
 | # | Fix | From |
 |---|---|---|
 | 7.1 | Refuse a symlinked or foreign-owned `state_dir`, canonicalize it as `Paths.root`, and check `home` the same way; move the examples and DESIGN.md's example off `/tmp`. | M5 |

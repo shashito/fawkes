@@ -227,7 +227,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    storage. It must be a directory the daemon's user owns, and it is never followed through a symlink: one that is a
    symlink, or another user's, is refused before its mode is touched, since whoever controls it could run code as
    the daemon's user from it. From then on the daemon uses its resolved path (symlinks in the components above it
-   resolved), so swapping one of them later redirects nothing; `status`, events and generation `dir`s show that path.
+   resolved), so swapping one of them later redirects nothing; events, generation `dir`s, `{state}` and `FAWKES_SOCKET` show
+   that path.
    `home` is checked the same way; a missing one is created `0700`, an existing one keeps its mode. `<fawkes_home>`
    and its `run/` are created `0700` when missing.
 2. Take an exclusive `flock` on `<state_dir>/lock`, held for the daemon's life; refuse to start when another daemon
@@ -443,7 +444,8 @@ error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with
 ## Socket protocol
 
 `<state_dir>/fawkes.sock`, mode `0600`, newline-delimited JSON, one request per connection. Keep the state directory
-path short: Unix socket paths are limited to about 100 bytes.
+path short: Unix socket paths are limited to about 100 bytes, counted on the resolved path (on macOS `/tmp` and `/var`
+resolve to `/private/…`).
 
 Request:
 

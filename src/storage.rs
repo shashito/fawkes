@@ -32,8 +32,9 @@ struct Entry {
 /// consistent, takes no pauses while the app is stopped, and, under WAL, neither blocks the app's writers nor
 /// restarts when they commit (a paced backup restarts on every write and may never end).
 ///
-/// `dst` gets the mode of `src` before any page is written, so a snapshot keeps the live file's mode and a restore
-/// gives it back; SQLite gives the `-wal`, `-shm` and `-journal` it creates later the mode of the database.
+/// `dst` is created `0600`, private and writable while the pages go in, and gets the mode of `src` once they are
+/// in, so a snapshot keeps the live file's mode, a read-only one included, and a restore gives it back; SQLite gives
+/// the `-wal` and `-shm` the app creates later the mode of the database.
 fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
     let fail =
         |e: rusqlite::Error| format!("cannot copy {} to {}: {e}", src.display(), dst.display());
@@ -50,7 +51,6 @@ fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
         .create_new(true)
         .mode(0o600)
         .open(dst)
-        .and_then(|file| file.set_permissions(permissions))
         .map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
     let from = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(fail)?;
     let mut to = Connection::open(dst).map_err(fail)?;
@@ -59,7 +59,10 @@ fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
     loop {
         // `More` does not happen for -1 pages; stepping again is right if it ever does.
         match backup.step(-1).map_err(fail)? {
-            StepResult::Done => return Ok(()),
+            StepResult::Done => {
+                return std::fs::set_permissions(dst, permissions)
+                    .map_err(|e| format!("cannot set the mode of {}: {e}", dst.display()));
+            }
             StepResult::Busy | StepResult::Locked if Instant::now() >= give_up => {
                 return Err(format!(
                     "cannot copy {} to {}: the database stayed locked for {} s",
@@ -288,6 +291,14 @@ mod tests {
         let db = Connection::open(&live).unwrap();
         db.execute("INSERT INTO t VALUES (2)", []).unwrap();
         assert_eq!(mode(&with_suffix(&live, "-wal")), 0o600);
+        drop(db);
+
+        // A file the app only reads is copied all the same, and stays read-only.
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o444)).unwrap();
+        snapshot(&home, &["a.sqlite".to_string()], &snap).unwrap();
+        restore(&home, &snap).unwrap();
+        assert_eq!(mode(&live), 0o444);
+        assert_eq!(count(&live), 2);
     }
 
     #[test]

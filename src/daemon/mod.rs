@@ -677,9 +677,10 @@ fn private_state_dir(dir: &Path, owner: u32) -> Result<PathBuf, String> {
     let root =
         std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
     // The directory checked and chmodded above, not one put in its place since.
+    let inspect = |e: std::io::Error| format!("cannot inspect state_dir {}: {e}", dir.display());
     let (checked, resolved) = (
-        opened.metadata().map_err(|e| e.to_string())?,
-        std::fs::metadata(&root).map_err(|e| e.to_string())?,
+        opened.metadata().map_err(inspect)?,
+        std::fs::metadata(&root).map_err(inspect)?,
     );
     if (checked.dev(), checked.ino()) != (resolved.dev(), resolved.ino()) {
         return Err(format!(
@@ -712,7 +713,10 @@ fn owned_dir(dir: &Path, what: &str, owner: u32) -> Result<File, String> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
         .open(dir)
         .map_err(|e| format!("cannot open {what} {}: {e}", dir.display()))?;
-    let found = opened.metadata().map_err(|e| e.to_string())?.uid();
+    let found = opened
+        .metadata()
+        .map_err(|e| format!("cannot inspect {what} {}: {e}", dir.display()))?
+        .uid();
     if found != owner {
         return Err(format!(
             "{what} {} belongs to uid {found}, not to this daemon's user (uid {owner}); set {what} to a directory of \
