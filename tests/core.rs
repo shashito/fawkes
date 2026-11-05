@@ -1812,6 +1812,8 @@ fn a_test_without_a_free_spare_port_or_with_a_stolen_one_leaves_the_generation_u
 if (process.argv[2] === 'listen') {
   require('node:net').createServer().listen(Number(process.argv[3]), '127.0.0.1', () =>
     fs.writeFileSync(process.argv[4], String(process.pid)));
+  // Should the test fail before it ends the listener, the listener ends itself.
+  setTimeout(() => process.exit(), 60000);
 } else {
   require('node:child_process').spawn(process.execPath, [__filename, 'listen', ...process.argv.slice(2)],
     { detached: true, stdio: 'ignore' }).unref();
