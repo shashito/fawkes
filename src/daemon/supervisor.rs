@@ -586,14 +586,10 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Hub, Wake};
+    use super::super::tests::{KillOnDrop, scratch_daemon};
     use super::*;
-    use crate::manifest::Manifest;
     use crate::protocol::{GenState, Generation, Pending, Step};
-    use crate::state::{EventLog, Paths, Store};
     use std::path::PathBuf;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
 
     const MIN_UPTIME: f64 = 10.0;
     const SHORT: Duration = Duration::from_secs(1);
@@ -687,38 +683,6 @@ mod tests {
         );
     }
 
-    /// A daemon over a scratch state directory, with no socket and no supervision thread.
-    fn scratch_daemon(dir: &Path) -> Daemon {
-        let manifest_path = dir.join("fawkes.toml");
-        std::fs::write(
-            &manifest_path,
-            "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\n\
-             spare_ports = [4791, 4795]\nstart = \"node app.js\"\n[health]\nurl = \"http://127.0.0.1:{port}/\"\n",
-        )
-        .unwrap();
-        let manifest = Manifest::load(&manifest_path).unwrap();
-        let paths = Paths {
-            root: dir.join("state"),
-        };
-        std::fs::create_dir_all(&paths.root).unwrap();
-        let (store, _) = Store::load(paths.state_json()).unwrap();
-        Daemon {
-            shutdown: Arc::new(AtomicBool::new(false)),
-            reload: Arc::new(AtomicBool::new(false)),
-            manifest_path,
-            manifest: Mutex::new(Arc::new(manifest)),
-            socket: paths.socket(),
-            bin: PathBuf::new(),
-            inner: Mutex::new(Inner::new(store)),
-            log: Mutex::new(EventLog::open(paths.events()).unwrap()),
-            paths,
-            hub: Hub(Mutex::new(Vec::new())),
-            wake: Wake::new(),
-            step_pgids: Mutex::new(Vec::new()),
-            echo: Mutex::new(None),
-        }
-    }
-
     /// `rollback_on_unhealthy`: the call that finds the failing process still live decides the rollback itself, so
     /// by the time its caller logs `unhealthy` a confirm already finds the rollback decided. The end-to-end test
     /// cannot see the difference: the decision would win the race against a client reading the event either way.
@@ -732,6 +696,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
+        let _reaper = KillOnDrop(pid);
         {
             let mut inner = daemon.inner();
             inner.live = Live::Running(App::new(child, "g2"));
@@ -758,10 +723,6 @@ mod tests {
             daemon.inner().store.state().rolling_back(),
             Some("health check failed")
         );
-
-        let mut app = daemon.inner().take_running().unwrap();
-        app.child.kill().unwrap();
-        app.child.wait().unwrap();
     }
 
     /// The app's exit ends its health check at once, possibly before the supervisor has reaped it: a crash is for
@@ -940,5 +901,43 @@ mod tests {
             );
         }
         assert_pending();
+    }
+
+    /// The live generation's `app.log` over the cap is copied to `app.log.1` and emptied; at the cap, or with no
+    /// live process, it is left alone.
+    #[test]
+    fn an_app_log_over_the_cap_moves_to_app_log_1_and_starts_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = scratch_daemon(temp.path());
+        let log = daemon.paths.app_log("g1");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let full = "x".repeat(usize::try_from(APP_LOG_BYTES).unwrap());
+
+        std::fs::write(&log, format!("{full}y")).unwrap();
+        daemon.cap_app_log();
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            APP_LOG_BYTES + 1,
+            "nothing is live: nothing is capped"
+        );
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let _reaper = KillOnDrop(child.id());
+        daemon.inner().live = Live::Running(App::new(child, "g1"));
+        std::fs::write(&log, &full).unwrap();
+        daemon.cap_app_log();
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), full, "at the cap");
+        assert!(!with_suffix(&log, ".1").exists());
+
+        std::fs::write(&log, format!("{full}y")).unwrap();
+        daemon.cap_app_log();
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        assert_eq!(
+            std::fs::read_to_string(with_suffix(&log, ".1")).unwrap(),
+            format!("{full}y")
+        );
     }
 }

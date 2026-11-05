@@ -292,8 +292,45 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::scratch_daemon;
     use super::*;
-    use std::io::Write;
+    use crate::protocol::Line;
+    use std::io::{BufRead, BufReader, Write};
+
+    /// What `handle` answers to a client that sends `bytes` and then listens.
+    fn answer(daemon: &Arc<Daemon>, bytes: Vec<u8>) -> Line {
+        let (server, client) = UnixStream::pair().unwrap();
+        // The client writes while the daemon reads: more than a socket buffer holds would block a single thread.
+        let mut writer = client.try_clone().unwrap();
+        let sender = std::thread::spawn(move || {
+            // The daemon may stop reading and answer before the last byte is sent.
+            let _ = writer.write_all(&bytes);
+        });
+        let open = Arc::new(AtomicUsize::new(0));
+        daemon
+            .clone()
+            .handle(server, Admission::take(&open).unwrap());
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        sender.join().unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn a_request_over_the_limit_is_answered_usage_and_a_request_within_it_is_served() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(scratch_daemon(temp.path()));
+
+        let oversized = vec![b'x'; usize::try_from(MAX_REQUEST).unwrap() + 6 * 1024];
+        let Line::Failed { error, .. } = answer(&daemon, oversized) else {
+            panic!("an oversized request should fail");
+        };
+        assert_eq!(error.code, ErrorCode::Usage);
+        assert!(error.message.contains("longer than"), "{}", error.message);
+
+        let status = answer(&daemon, b"{\"command\":\"status\"}\n".to_vec());
+        assert!(matches!(status, Line::Done { .. }), "{status:?}");
+    }
 
     #[test]
     fn a_request_trickled_past_the_deadline_is_refused_not_waited_for() {

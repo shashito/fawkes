@@ -223,8 +223,12 @@ enum Msg {
     Changed,
 }
 
-/// How large a generation's `logs/app.log` grows before the watcher moves it to `app.log.1`.
+/// How large a generation's `logs/app.log` grows before the watcher moves it to `app.log.1`. Small under test, so
+/// a test fills it with a few bytes.
+#[cfg(not(test))]
 const APP_LOG_BYTES: u64 = 10 << 20;
+#[cfg(test)]
+const APP_LOG_BYTES: u64 = 64;
 
 /// The longest request line a client may send, in bytes.
 const MAX_REQUEST: u64 = 64 * 1024;
@@ -950,7 +954,56 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::process::{Signal, WaitOptions, kill_process, waitpid};
     use std::sync::mpsc::RecvTimeoutError;
+
+    /// Kills and reaps a child a test spawned when it goes out of scope, so a failed assertion leaves no process
+    /// running. For children the test does not wait for itself: a reaped pid may belong to someone else by then.
+    pub(super) struct KillOnDrop(pub(super) u32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let pid = i32::try_from(self.0)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw);
+            if let Some(pid) = pid {
+                let _ = kill_process(pid, Signal::KILL);
+                let _ = waitpid(Some(pid), WaitOptions::empty());
+            }
+        }
+    }
+
+    /// A daemon over a scratch state directory, with no socket and no supervision thread.
+    pub(super) fn scratch_daemon(dir: &Path) -> Daemon {
+        let manifest_path = dir.join("fawkes.toml");
+        std::fs::write(
+            &manifest_path,
+            "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\n\
+             spare_ports = [4791, 4795]\nstart = \"node app.js\"\n[health]\nurl = \"http://127.0.0.1:{port}/\"\n",
+        )
+        .unwrap();
+        let manifest = Manifest::load(&manifest_path).unwrap();
+        let paths = Paths {
+            root: dir.join("state"),
+        };
+        std::fs::create_dir_all(&paths.root).unwrap();
+        let (store, _) = Store::load(paths.state_json()).unwrap();
+        Daemon {
+            shutdown: Arc::new(AtomicBool::new(false)),
+            reload: Arc::new(AtomicBool::new(false)),
+            manifest_path,
+            manifest: Mutex::new(Arc::new(manifest)),
+            socket: paths.socket(),
+            bin: PathBuf::new(),
+            inner: Mutex::new(Inner::new(store)),
+            log: Mutex::new(EventLog::open(paths.events()).unwrap()),
+            paths,
+            hub: Hub(Mutex::new(Vec::new())),
+            wake: Wake::new(),
+            step_pgids: Mutex::new(Vec::new()),
+            echo: Mutex::new(None),
+        }
+    }
 
     #[test]
     fn a_subscriber_that_falls_behind_is_dropped_not_buffered_without_limit() {
@@ -997,12 +1050,11 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
+        let _reaper = KillOnDrop(alive.id());
         inner.live = Live::Running(App::new(alive, "g2"));
-        let mut taken = inner.take_running_alive().unwrap().expect("a running app");
+        let taken = inner.take_running_alive().unwrap().expect("a running app");
         assert_eq!(taken.generation, "g2");
         assert!(matches!(inner.live, Live::Stopped));
-        taken.child.kill().unwrap();
-        taken.child.wait().unwrap();
     }
 
     fn mode(path: &Path) -> u32 {

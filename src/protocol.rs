@@ -794,6 +794,84 @@ mod tests {
         e.message
     }
 
+    /// For a wire enum: the name of every variant, as a literal, once. The match has no wildcard, so a new variant
+    /// does not compile until it is listed here, and the `ALL` list the tests walk is built from the same lines.
+    macro_rules! wire_names {
+        ($name_of:ident, $all:ident: $type:ident { $($variant:ident => $name:literal),+ $(,)? }) => {
+            fn $name_of(value: $type) -> &'static str {
+                match value {
+                    $($type::$variant => $name),+
+                }
+            }
+
+            const $all: &[$type] = &[$($type::$variant),+];
+        };
+    }
+
+    wire_names!(error_code_name, ERROR_CODES: ErrorCode {
+        Usage => "usage",
+        NotFound => "not_found",
+        InvalidState => "invalid_state",
+        Busy => "busy",
+        GitFailed => "git_failed",
+        InstallFailed => "install_failed",
+        HealthFailed => "health_failed",
+        StorageFailed => "storage_failed",
+        StartFailed => "start_failed",
+        PortInUse => "port_in_use",
+        Internal => "internal",
+        DaemonUnreachable => "daemon_unreachable",
+        NoAnswer => "no_answer",
+        Unknown => "unknown",
+    });
+
+    wire_names!(gen_state_name, GEN_STATES: GenState {
+        Staging => "staging",
+        Staged => "staged",
+        TestFailed => "test_failed",
+        Tested => "tested",
+        Current => "current",
+        Permanent => "permanent",
+        Retired => "retired",
+        RolledBack => "rolled_back",
+        Unknown => "unknown",
+    });
+
+    wire_names!(event_kind_name, EVENT_KINDS: EventKind {
+        Daemon => "daemon",
+        Progress => "progress",
+        Started => "started",
+        Healthy => "healthy",
+        Unhealthy => "unhealthy",
+        Exited => "exited",
+        Failed => "failed",
+        Stopped => "stopped",
+        Staged => "staged",
+        Tested => "tested",
+        TestFailed => "test_failed",
+        Switched => "switched",
+        Confirmed => "confirmed",
+        RolledBack => "rolled_back",
+        Pruned => "pruned",
+        Error => "error",
+        Unknown => "unknown",
+    });
+
+    wire_names!(process_state_name, PROCESS_STATES: ProcessState {
+        Running => "running",
+        Stopped => "stopped",
+        Failed => "failed",
+        Unknown => "unknown",
+    });
+
+    wire_names!(step_name, STEPS: Step {
+        Switching => "switching",
+        Pending => "pending",
+        RollingBack => "rolling_back",
+        RestoreFailed => "restore_failed",
+        Unknown => "unknown",
+    });
+
     #[test]
     fn a_request_parses_in_every_shape_clients_send() {
         // Commands without arguments: `args` absent, null, empty, or carrying keys nobody reads.
@@ -1017,20 +1095,8 @@ mod tests {
 
     #[test]
     fn every_error_code_keeps_its_string() {
-        for (code, name) in [
-            (ErrorCode::Usage, "usage"),
-            (ErrorCode::NotFound, "not_found"),
-            (ErrorCode::InvalidState, "invalid_state"),
-            (ErrorCode::Busy, "busy"),
-            (ErrorCode::GitFailed, "git_failed"),
-            (ErrorCode::InstallFailed, "install_failed"),
-            (ErrorCode::HealthFailed, "health_failed"),
-            (ErrorCode::StorageFailed, "storage_failed"),
-            (ErrorCode::StartFailed, "start_failed"),
-            (ErrorCode::PortInUse, "port_in_use"),
-            (ErrorCode::Internal, "internal"),
-            (ErrorCode::DaemonUnreachable, "daemon_unreachable"),
-        ] {
+        for &code in ERROR_CODES {
+            let name = error_code_name(code);
             assert_eq!(serde_json::to_value(code).unwrap(), json!(name));
             assert_eq!(
                 serde_json::from_value::<ErrorCode>(json!(name)).unwrap(),
@@ -1072,10 +1138,10 @@ mod tests {
         assert_eq!((event.seq, event.kind), (7, EventKind::Unknown));
 
         for name in [
-            GenState::Unknown.as_str(),
-            EventKind::Unknown.as_str(),
-            ProcessState::Unknown.as_str(),
-            Step::Unknown.as_str(),
+            gen_state_name(GenState::Unknown),
+            event_kind_name(EventKind::Unknown),
+            process_state_name(ProcessState::Unknown),
+            step_name(Step::Unknown),
         ] {
             assert_eq!(name, "unknown");
         }
@@ -1086,44 +1152,21 @@ mod tests {
         fn wire(value: &impl Serialize) -> Value {
             serde_json::to_value(value).unwrap()
         }
-        for state in [
-            GenState::Staging,
-            GenState::Staged,
-            GenState::TestFailed,
-            GenState::Tested,
-            GenState::Current,
-            GenState::Permanent,
-            GenState::Retired,
-            GenState::RolledBack,
-        ] {
-            assert_eq!(wire(&state), json!(state.as_str()));
+        for &state in GEN_STATES {
+            assert_eq!(wire(&state), json!(gen_state_name(state)));
+            assert_eq!(state.as_str(), gen_state_name(state));
         }
-        for kind in [
-            EventKind::Daemon,
-            EventKind::Progress,
-            EventKind::Started,
-            EventKind::Healthy,
-            EventKind::Unhealthy,
-            EventKind::Exited,
-            EventKind::Failed,
-            EventKind::Stopped,
-            EventKind::Staged,
-            EventKind::Tested,
-            EventKind::TestFailed,
-            EventKind::Switched,
-            EventKind::Confirmed,
-            EventKind::RolledBack,
-            EventKind::Pruned,
-            EventKind::Error,
-        ] {
-            assert_eq!(wire(&kind), json!(kind.as_str()));
+        for &kind in EVENT_KINDS {
+            assert_eq!(wire(&kind), json!(event_kind_name(kind)));
+            assert_eq!(kind.as_str(), event_kind_name(kind));
         }
-        for state in [
-            ProcessState::Running,
-            ProcessState::Stopped,
-            ProcessState::Failed,
-        ] {
-            assert_eq!(wire(&state), json!(state.as_str()));
+        for &state in PROCESS_STATES {
+            assert_eq!(wire(&state), json!(process_state_name(state)));
+            assert_eq!(state.as_str(), process_state_name(state));
+        }
+        for &step in STEPS {
+            assert_eq!(wire(&step), json!(step_name(step)));
+            assert_eq!(step.as_str(), step_name(step));
         }
     }
 

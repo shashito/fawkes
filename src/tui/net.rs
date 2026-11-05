@@ -142,11 +142,16 @@ fn open(socket: &Path, request: &Request) -> Result<UnixStream, String> {
 
 /// One request: progress lines are skipped (they reach the screen through `subscribe`), the answer is the outcome.
 pub(super) fn request(socket: &Path, request: &Request) -> Result<(), String> {
+    request_within(socket, request, REQUEST_TIMEOUT)
+}
+
+/// `request`, waiting at most `timeout` for each line of the answer to a quick request.
+fn request_within(socket: &Path, request: &Request, timeout: Duration) -> Result<(), String> {
     let stream = open(socket, request)?;
     // A daemon that accepts and then hangs must not leave the action thread and its notice waiting for ever.
     if request.is_quick() {
         stream
-            .set_read_timeout(Some(REQUEST_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(|e| e.to_string())?;
     }
     for line in BufReader::new(stream).lines() {
@@ -178,15 +183,27 @@ mod tests {
 
     /// A daemon that answers its connections one after another, each with the given lines, then closes it.
     struct FakeDaemon {
+        /// The socket's directory: under `/tmp`, because a socket path over about 100 bytes does not bind and the
+        /// default temp dir is long. Unique, so tests in parallel never share a socket.
+        _dir: tempfile::TempDir,
         socket: PathBuf,
         served: Option<JoinHandle<Vec<String>>>,
     }
 
     impl FakeDaemon {
-        /// The socket path stays short: a path over about 100 bytes does not bind, and the temp dir is long.
-        fn start(name: &str, connections: Vec<Vec<Value>>) -> FakeDaemon {
-            let socket = PathBuf::from(format!("/tmp/fkt{}-{name}.sock", std::process::id()));
-            std::fs::remove_file(&socket).ok();
+        fn start(connections: Vec<Vec<Value>>) -> FakeDaemon {
+            FakeDaemon::serve(connections, None)
+        }
+
+        /// A daemon with one connection, which stays open after its lines until the returned sender is dropped.
+        fn held(lines: Vec<Value>) -> (FakeDaemon, mpsc::Sender<()>) {
+            let (release, gate) = mpsc::channel();
+            (FakeDaemon::serve(vec![lines], Some(gate)), release)
+        }
+
+        fn serve(connections: Vec<Vec<Value>>, gate: Option<mpsc::Receiver<()>>) -> FakeDaemon {
+            let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+            let socket = dir.path().join("d.sock");
             let listener = UnixListener::bind(&socket).unwrap();
             let served = std::thread::spawn(move || {
                 let mut requests = Vec::new();
@@ -200,10 +217,15 @@ mod tests {
                     for line in lines {
                         writeln!(stream, "{line}").unwrap();
                     }
+                    if let Some(gate) = &gate {
+                        // Ends when the sender is dropped.
+                        let _ = gate.recv();
+                    }
                 }
                 requests
             });
             FakeDaemon {
+                _dir: dir,
                 socket,
                 served: Some(served),
             }
@@ -213,12 +235,6 @@ mod tests {
         fn requests(&mut self) -> Vec<Request> {
             let lines = self.served.take().unwrap().join().unwrap();
             lines.iter().map(|l| Request::parse(l).unwrap()).collect()
-        }
-    }
-
-    impl Drop for FakeDaemon {
-        fn drop(&mut self) {
-            std::fs::remove_file(&self.socket).ok();
         }
     }
 
@@ -254,10 +270,7 @@ mod tests {
 
     #[test]
     fn the_reader_reports_up_then_the_replay_and_snapshots_in_order_then_down() {
-        let mut daemon = FakeDaemon::start(
-            "reader",
-            vec![vec![event(1), event(2), status(), history()]],
-        );
+        let mut daemon = FakeDaemon::start(vec![vec![event(1), event(2), status(), history()]]);
         let (tx, rx) = mpsc::channel();
         let socket = daemon.socket.clone();
         std::thread::spawn(move || reader("sample", &socket, None, &tx));
@@ -286,23 +299,20 @@ mod tests {
 
     #[test]
     fn a_reconnect_resumes_only_when_the_replay_continues_the_events_already_shown() {
-        let mut daemon = FakeDaemon::start(
-            "resume",
-            vec![
-                // The first connection: events up to 3.
-                vec![event(1), event(2), event(3), status(), history()],
-                // Continues at 4: resumed.
-                vec![event(4), event(5), status(), history()],
-                // Nothing happened meanwhile: the replay is empty and the snapshot comes first: resumed.
-                vec![status(), history()],
-                // The daemon logged more than the replay holds: the first event is 9, not 6: a gap.
-                vec![event(9), status(), history()],
-                // A log that started over numbers from 1 again: not a continuation.
-                vec![event(1), event(2), status(), history()],
-                // And the next reconnect asks after the new numbering.
-                vec![event(3), status(), history()],
-            ],
-        );
+        let mut daemon = FakeDaemon::start(vec![
+            // The first connection: events up to 3.
+            vec![event(1), event(2), event(3), status(), history()],
+            // Continues at 4: resumed.
+            vec![event(4), event(5), status(), history()],
+            // Nothing happened meanwhile: the replay is empty and the snapshot comes first: resumed.
+            vec![status(), history()],
+            // The daemon logged more than the replay holds: the first event is 9, not 6: a gap.
+            vec![event(9), status(), history()],
+            // A log that started over numbers from 1 again: not a continuation.
+            vec![event(1), event(2), status(), history()],
+            // And the next reconnect asks after the new numbering.
+            vec![event(3), status(), history()],
+        ]);
         let mut last_seq = None;
         let mut connect = || {
             let (tx, rx) = mpsc::channel();
@@ -331,16 +341,13 @@ mod tests {
 
     #[test]
     fn a_request_is_done_failed_with_the_daemons_message_or_unanswered() {
-        let mut daemon = FakeDaemon::start(
-            "request",
-            vec![
-                // Progress lines are skipped on the way to the outcome.
-                vec![event(1), json!({ "ok": true, "result": {} })],
-                vec![json!({ "ok": false,
+        let mut daemon = FakeDaemon::start(vec![
+            // Progress lines are skipped on the way to the outcome.
+            vec![event(1), json!({ "ok": true, "result": {} })],
+            vec![json!({ "ok": false,
                              "error": { "code": "busy", "message": "switch is in progress" } })],
-                vec![event(2)],
-            ],
-        );
+            vec![event(2)],
+        ]);
         assert_eq!(request(&daemon.socket, &Request::Prune), Ok(()));
         assert_eq!(
             request(&daemon.socket, &Request::Prune),
@@ -351,5 +358,131 @@ mod tests {
             Err("the daemon closed the connection without an answer".into())
         );
         assert_eq!(daemon.requests(), vec![Request::Prune; 3]);
+    }
+
+    /// A discovered reader for `socket`, as the scanner starts it; what it sends arrives on the receiver.
+    fn discovered(
+        key: &str,
+        socket: &Path,
+    ) -> (Active, mpsc::Receiver<Msg>, std::thread::JoinHandle<()>) {
+        let active = Active::default();
+        active.lock().unwrap().insert(key.into());
+        let (tx, rx) = mpsc::channel();
+        let (key, socket, shared) = (key.to_string(), socket.to_path_buf(), active.clone());
+        let reading = std::thread::spawn(move || reader(&key, &socket, Some(&shared), &tx));
+        (active, rx, reading)
+    }
+
+    fn first_messages(rx: &mpsc::Receiver<Msg>, count: usize) -> Vec<String> {
+        rx.iter().take(count).map(|m| describe(&m)).collect()
+    }
+
+    #[test]
+    fn a_link_that_never_answered_is_not_listed_and_its_reader_ends() {
+        // A daemon that closes without an answer, and a link that leads nowhere.
+        let silent = FakeDaemon::start(vec![vec![]]);
+        let nowhere = silent.socket.with_file_name("nowhere.sock");
+        for (key, socket) in [("silent", &silent.socket), ("nowhere", &nowhere)] {
+            let (active, rx, reading) = discovered(key, socket);
+            reading.join().unwrap();
+            assert_eq!(rx.iter().count(), 0, "{key} was shown");
+            assert!(active.lock().unwrap().is_empty(), "{key} stayed active");
+        }
+    }
+
+    #[test]
+    fn an_app_whose_socket_is_still_there_is_shown_down_and_kept_for_a_retry() {
+        let daemon = FakeDaemon::start(vec![vec![event(1), status(), history()]]);
+        let (active, rx, _reading) = discovered("sample", &daemon.socket);
+        assert_eq!(
+            first_messages(&rx, 5),
+            [
+                "up resumed=false",
+                "event 1",
+                "status",
+                "history",
+                "down connection lost"
+            ]
+        );
+        // Not gone: the reader retries, so the scanner must not start a second one.
+        assert!(active.lock().unwrap().contains("sample"));
+        // The reader ends at its next send, after the retry pause.
+        drop(rx);
+    }
+
+    #[test]
+    fn an_app_whose_link_is_gone_when_the_connection_ends_leaves_the_list_for_good() {
+        let (daemon, release) = FakeDaemon::held(vec![event(1), status(), history()]);
+        let (active, rx, reading) = discovered("sample", &daemon.socket);
+        assert_eq!(
+            first_messages(&rx, 4),
+            ["up resumed=false", "event 1", "status", "history"]
+        );
+        // The daemon stopped: its socket is removed, and then it hangs up.
+        std::fs::remove_file(&daemon.socket).unwrap();
+        drop(release);
+        assert_eq!(first_messages(&rx, 1), ["gone"]);
+        reading.join().unwrap();
+        assert!(
+            active.lock().unwrap().is_empty(),
+            "the scanner could not start a fresh reader"
+        );
+        assert_eq!(rx.iter().count(), 0);
+    }
+
+    #[test]
+    fn the_scanner_starts_a_reader_for_each_sock_link_and_for_nothing_else() {
+        let daemon = FakeDaemon::start(vec![vec![status(), history()]]);
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        std::os::unix::fs::symlink(&daemon.socket, dir.path().join("sample.sock")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("dead.sock"))
+            .unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "").unwrap();
+        let active = Active::default();
+        let (tx, rx) = mpsc::channel();
+        let (path, shared) = (dir.path().to_path_buf(), active.clone());
+        std::thread::spawn(move || scan(&path, &shared, &tx));
+
+        let up = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(
+            matches!(&up, Msg::Up(key, socket, false)
+                if key == "sample" && *socket == dir.path().join("sample.sock")),
+            "{}",
+            describe(&up)
+        );
+        // `dead` never answers and so leaves again; `notes.txt` was never taken for an app.
+        let give_up = std::time::Instant::now() + Duration::from_secs(5);
+        while *active.lock().unwrap() != HashSet::from(["sample".to_string()]) {
+            assert!(std::time::Instant::now() < give_up, "{:?}", active.lock());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_quick_request_to_a_daemon_that_accepts_and_stays_silent_times_out() {
+        let (daemon, _release) = FakeDaemon::held(vec![]);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            request_within(&daemon.socket, &Request::Status, Duration::from_millis(100)),
+            Err("the daemon did not answer in time".into())
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_long_request_is_not_cut_short_by_the_timeout() {
+        let (daemon, release) = FakeDaemon::held(vec![]);
+        // The daemon hangs up well after the timeout would have fired on a quick request.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            drop(release);
+        });
+        let stage = Request::Stage {
+            git_ref: "main".into(),
+        };
+        assert_eq!(
+            request_within(&daemon.socket, &stage, Duration::from_millis(100)),
+            Err("the daemon closed the connection without an answer".into())
+        );
     }
 }

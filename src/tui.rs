@@ -864,37 +864,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn keys_pick_an_app_and_a_generation_ask_before_destroying_and_prompt_for_a_ref() {
+    fn key(c: char) -> Msg {
+        press(KeyCode::Char(c))
+    }
+
+    fn press(code: KeyCode) -> Msg {
+        Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn name_of_current(app: &App) -> Option<String> {
+        app.current().map(AppView::name)
+    }
+
+    fn selected_generation(app: &App) -> Option<String> {
+        app.current().and_then(AppView::selected_id)
+    }
+
+    /// The fixture with `sample` (the second app, sorted by name) chosen.
+    fn on_sample() -> App {
         let mut app = fixture(0);
-        let key = |c| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        let press = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
-        // Apps are sorted by name: `blog` first; the arrows move the app while the apps table has focus.
-        assert_eq!(app.current().map(AppView::name).as_deref(), Some("blog"));
         app.apply(press(KeyCode::Down));
-        assert_eq!(app.current().map(AppView::name).as_deref(), Some("sample"));
-        // Newest first: g8 is selected. Tab moves focus, so `down` now moves the generation to g7.
-        assert_eq!(
-            app.current().and_then(AppView::selected_id).as_deref(),
-            Some("g8")
-        );
+        assert_eq!(name_of_current(&app).as_deref(), Some("sample"));
+        app
+    }
+
+    fn sent(cmd: Option<Cmd>) -> Action {
+        let Some(Cmd::Send(action)) = cmd else {
+            panic!("expected a request, got {cmd:?}");
+        };
+        action
+    }
+
+    #[test]
+    fn the_arrows_move_the_app_while_the_apps_have_focus_and_the_generation_after_tab() {
+        let mut app = fixture(0);
+        // Apps are sorted by name: `blog` first.
+        assert_eq!(name_of_current(&app).as_deref(), Some("blog"));
+        app.apply(press(KeyCode::Down));
+        assert_eq!(name_of_current(&app).as_deref(), Some("sample"));
+        // Newest first: g8 is selected. Tab moves focus, so `j` now moves the generation to g7.
+        assert_eq!(selected_generation(&app).as_deref(), Some("g8"));
         app.apply(press(KeyCode::Tab));
         assert!(app.focus == Focus::Generations);
         app.apply(key('j'));
-        assert_eq!(app.current().map(AppView::name).as_deref(), Some("sample"));
-        assert_eq!(
-            app.current().and_then(AppView::selected_id).as_deref(),
-            Some("g7")
-        );
-        // `w` asks, naming the target; anything but `y` cancels; `y` aims the request at the current app.
+        assert_eq!(name_of_current(&app).as_deref(), Some("sample"));
+        assert_eq!(selected_generation(&app).as_deref(), Some("g7"));
+        app.apply(key('k'));
+        assert_eq!(selected_generation(&app).as_deref(), Some("g8"));
+    }
+
+    #[test]
+    fn a_switch_asks_naming_the_target_and_only_y_sends_it_to_the_current_app() {
+        let mut app = on_sample();
+        app.apply(press(KeyCode::Tab));
+        app.apply(key('j'));
         assert_eq!(app.apply(key('w')), None);
         assert!(matches!(&app.mode, Mode::Ask(_, q) if q == "Switch sample to g7?"));
-        assert_eq!(app.apply(key('n')), None);
+        assert_eq!(app.apply(key('n')), None, "anything but y cancels");
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.apply(key('w')), None);
-        let Some(Cmd::Send(action)) = app.apply(key('y')) else {
-            panic!("y should send the switch");
-        };
+        let action = sent(app.apply(key('y')));
         assert_eq!(action.label, "switch g7");
         assert_eq!(
             action.request,
@@ -904,7 +933,11 @@ mod tests {
             }
         );
         assert_eq!(action.socket, PathBuf::from("/tmp/fk/run/sample.sock"));
-        // `b`, `x` and `r` ask too; Esc closes the dialog.
+    }
+
+    #[test]
+    fn rollback_stop_and_restart_ask_and_escape_closes_the_dialog() {
+        let mut app = on_sample();
         for (k, question) in [
             ('b', "Roll back sample to g6?"),
             ('x', "Stop sample?"),
@@ -912,44 +945,70 @@ mod tests {
         ] {
             assert_eq!(app.apply(key(k)), None);
             assert!(matches!(&app.mode, Mode::Ask(_, q) if q == question));
-            app.apply(press(KeyCode::Esc));
+            assert_eq!(app.apply(press(KeyCode::Esc)), None);
             assert!(matches!(app.mode, Mode::Normal));
         }
-        // `n` types a ref inline.
+    }
+
+    #[test]
+    fn n_types_a_ref_inline_and_enter_stages_it() {
+        let mut app = on_sample();
         app.apply(key('n'));
         "main".chars().for_each(|c| {
             app.apply(key(c));
         });
-        let Some(Cmd::Send(action)) = app.apply(press(KeyCode::Enter)) else {
-            panic!("enter should send the stage");
-        };
+        app.apply(press(KeyCode::Backspace));
+        app.apply(key('n'));
+        let action = sent(app.apply(press(KeyCode::Enter)));
+        assert_eq!(action.label, "stage main");
         assert_eq!(
             action.request,
             Request::Stage {
                 git_ref: "main".into()
             }
         );
-        // `t`, `s` and `c` need no question; `c` names the pending generation.
-        assert!(matches!(app.apply(key('t')), Some(Cmd::Send(_))));
-        let Some(Cmd::Send(action)) = app.apply(key('s')) else {
-            panic!("s should start");
-        };
-        assert_eq!(action.request, Request::Start);
-        let Some(Cmd::Send(action)) = app.apply(key('c')) else {
-            panic!("c should confirm");
-        };
+        // Esc abandons the prompt, and an empty ref is not sent.
+        app.apply(key('n'));
+        assert_eq!(app.apply(press(KeyCode::Enter)), None);
+        assert!(matches!(&app.mode, Mode::Stage(r) if r.is_empty()));
+        assert_eq!(app.apply(press(KeyCode::Esc)), None);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn test_start_and_confirm_send_at_once_and_confirm_names_the_pending_generation() {
+        let mut app = on_sample();
+        let action = sent(app.apply(key('t')));
         assert_eq!(
             action.request,
+            Request::Test {
+                generation: "g8".into()
+            }
+        );
+        assert_eq!(sent(app.apply(key('s'))).request, Request::Start);
+        assert_eq!(
+            sent(app.apply(key('c'))).request,
             Request::Confirm {
                 generation: Some("g7".into())
             }
         );
-        // The old S/X/R and digit bindings are gone; `q` quits.
+    }
+
+    #[test]
+    fn q_quits_and_the_retired_bindings_do_nothing() {
+        let mut app = on_sample();
         for k in ['S', 'X', 'R', '2'] {
             assert_eq!(app.apply(key(k)), None);
             assert!(matches!(app.mode, Mode::Normal));
         }
-        // `f` pauses the events pane, `/` filters it, Esc clears the filter.
+        assert_eq!(app.apply(key('q')), Some(Cmd::Quit));
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.apply(Msg::Key(ctrl_c)), Some(Cmd::Quit));
+    }
+
+    #[test]
+    fn f_pauses_the_events_pane_slash_filters_it_and_escape_clears_the_filter() {
+        let mut app = on_sample();
         app.apply(key('f'));
         assert!(!app.follow);
         app.apply(key('/'));
@@ -963,41 +1022,163 @@ mod tests {
         );
         app.apply(press(KeyCode::Esc));
         assert_eq!(app.filter, "");
-        assert_eq!(app.apply(key('q')), Some(Cmd::Quit));
-        // The selection stays on what is shown instead of following the sort order, so an app appearing (or
-        // leaving) cannot move it and send an unasked `c` to another daemon; a selected app that leaves selects
-        // nothing.
+    }
+
+    /// The selection stays on what is shown instead of following the sort order, so an app appearing cannot move it
+    /// and send an unasked `c` to another daemon.
+    #[test]
+    fn an_app_appearing_does_not_move_the_selection() {
+        let mut app = fixture(0);
         app.current = None;
         assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
         app.apply(Msg::Up("aaa".into(), "/tmp/fk/run/aaa.sock".into(), false));
         assert_eq!(app.current().map(|a| a.key.as_str()), Some("blog"));
-        app.apply(Msg::Gone("blog".into()));
-        assert_eq!(app.apps.len(), 2);
+        assert_eq!(app.apps.len(), 3);
+    }
+
+    /// A selected app that leaves selects nothing, so no action falls through to another app. The body of the screen
+    /// is not asserted: it hides the other apps until an arrow key picks one.
+    #[test]
+    fn a_selected_app_that_leaves_selects_nothing_and_an_arrow_picks_another() {
+        let now = 1_000_000;
+        let mut app = fixture(now + 102);
+        app.choose(1);
+        app.apply(Msg::Gone("sample".into()));
         assert!(app.current().is_none());
-        assert_eq!(
-            app.apply(key('c')),
-            None,
-            "no action without a selected app"
+        assert!(render(&app, now).contains(" fawkes  1 app"));
+        for k in ['c', 's', 't', 'n'] {
+            assert_eq!(app.apply(key(k)), None, "{k} reached an app");
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+        assert!(app.notice.as_ref().is_some_and(|(_, error)| *error));
+
+        app.apply(press(KeyCode::Down));
+        assert_eq!(name_of_current(&app).as_deref(), Some("blog"));
+        assert!(render(&app, now).contains("blog"));
+    }
+
+    #[test]
+    fn another_app_leaving_changes_nothing_on_the_screen_but_the_count() {
+        let now = 1_000_000;
+        let mut app = fixture(now + 102);
+        app.choose(1);
+        app.apply(Msg::Gone("blog".into()));
+        app.apply(Msg::Gone("never-listed".into()));
+        assert_eq!(name_of_current(&app).as_deref(), Some("sample"));
+        let screen = render(&app, now);
+        assert!(
+            screen.contains(" fawkes  1 app") && screen.contains("CONFIRM"),
+            "{screen}"
         );
     }
 
     #[test]
     fn p_asks_before_pruning_and_only_a_yes_sends_it_to_the_selected_app() {
-        let mut app = fixture(0);
-        let key = |c| Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        // `blog` comes first; move to `sample` so the request has to follow the selection, not the first app.
-        app.apply(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        // `blog` comes first; `sample` is chosen so the request has to follow the selection, not the first app.
+        let mut app = on_sample();
         assert_eq!(app.apply(key('p')), None, "p only asks");
         assert!(matches!(&app.mode, Mode::Ask(_, q) if q == "Prune old generations of sample?"));
         assert_eq!(app.apply(key('n')), None, "declining sends nothing");
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.apply(key('p')), None);
-        let Some(Cmd::Send(action)) = app.apply(key('y')) else {
-            panic!("y should send the prune");
-        };
+        let action = sent(app.apply(key('y')));
         assert_eq!(action.label, "prune");
         assert_eq!(action.request, Request::Prune);
         assert_eq!(action.socket, PathBuf::from("/tmp/fk/run/sample.sock"));
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    fn event_numbered(seq: u64) -> protocol::Event {
+        typed(
+            json!({ "seq": seq, "at": "2026-11-03T14:02:01Z", "kind": "progress",
+                      "generation": null, "message": format!("event {seq}") }),
+        )
+    }
+
+    fn seqs(view: &AppView) -> Vec<u64> {
+        view.events.iter().map(|e| e.seq).collect()
+    }
+
+    fn up(app: &mut App, resumed: bool) {
+        app.apply(Msg::Up(
+            "sample".into(),
+            "/tmp/fk/run/sample.sock".into(),
+            resumed,
+        ));
+    }
+
+    #[test]
+    fn a_resumed_connection_keeps_the_events_and_a_fresh_one_starts_the_pane_over() {
+        let mut app = fixture(0);
+        let sample = |app: &App| app.apps[1].events.len();
+        assert_eq!(sample(&app), 3);
+
+        app.apply(Msg::Down("sample".into(), "connection lost".into()));
+        assert!(matches!(&app.apps[1].link, Link::Down(why) if why == "connection lost"));
+        up(&mut app, true);
+        assert!(app.apps[1].link == Link::Up);
+        assert_eq!(
+            sample(&app),
+            3,
+            "a resumed connection sends only what is new"
+        );
+        // The replay that follows is appended after what was already there.
+        app.apply(Msg::Line(
+            "sample".into(),
+            Line::Event {
+                event: event_numbered(4),
+            },
+        ));
+        assert_eq!(sample(&app), 4);
+
+        // A replay with a gap, or a daemon whose log started over, replaces the pane.
+        up(&mut app, false);
+        assert_eq!(sample(&app), 0);
+        assert_eq!(app.apps[1].frozen, None);
+    }
+
+    #[test]
+    fn a_paused_pane_stays_paused_across_a_reconnect() {
+        let mut app = fixture(0);
+        app.apply(key('f'));
+        assert_eq!(app.apps[1].frozen, Some(3));
+        up(&mut app, true);
+        assert_eq!(app.apps[1].frozen, Some(3), "the events on screen are kept");
+        // A fresh replay starts the paused pane empty while the backlog arrives.
+        up(&mut app, false);
+        assert_eq!(app.apps[1].frozen, Some(0));
+        assert!(app.apps[1].events.is_empty());
+    }
+
+    #[test]
+    fn the_event_list_is_capped_and_a_paused_view_keeps_showing_the_same_events() {
+        let mut view = AppView::new("sample".into(), "/tmp/fk/run/sample.sock".into());
+        for seq in 1..=MAX_EVENTS as u64 {
+            view.push_event(event_numbered(seq));
+        }
+        assert_eq!(view.events.len(), MAX_EVENTS);
+        // Paused on the oldest three.
+        view.frozen = Some(3);
+        view.push_event(event_numbered(MAX_EVENTS as u64 + 1));
+        assert_eq!(view.events.len(), MAX_EVENTS);
+        assert_eq!(
+            view.events.front().map(|e| e.seq),
+            Some(2),
+            "oldest dropped"
+        );
+        assert_eq!(view.frozen, Some(2));
+        let shown: Vec<u64> = view.events.iter().take(2).map(|e| e.seq).collect();
+        assert_eq!(shown, [2, 3], "the still-shown events are the same ones");
+        // Everything paused on drops out: the pane is empty, never negative.
+        for seq in 0..5 {
+            view.push_event(event_numbered(MAX_EVENTS as u64 + 2 + seq));
+        }
+        assert_eq!(view.frozen, Some(0));
+        assert_eq!(seqs(&view).len(), MAX_EVENTS);
+        // Following: the cap alone.
+        view.frozen = None;
+        view.push_event(event_numbered(10_000));
+        assert_eq!(view.frozen, None);
+        assert_eq!(view.events.len(), MAX_EVENTS);
     }
 }
