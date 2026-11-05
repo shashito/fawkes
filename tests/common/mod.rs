@@ -39,6 +39,34 @@ pub fn fawkes() -> Command {
     command
 }
 
+/// Git variables that point a command at a repository other than the one it runs in.
+const GIT_REDIRECTS: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+];
+
+/// Make the git that `command` runs, or whose children run it, ignore the user's configuration (hooks, signing,
+/// aliases) and any repository a `GIT_*` variable of the environment names, such as a suite started from a git hook
+/// would carry: the tests would otherwise act on that repository.
+fn isolate_git(command: &mut Command) -> &mut Command {
+    for name in GIT_REDIRECTS {
+        command.env_remove(name);
+    }
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+}
+
+/// `git`, isolated from the user's setup (`isolate_git`), with an identity for commits and tags.
+pub fn git() -> Command {
+    let mut command = Command::new("git");
+    isolate_git(&mut command).args(["-c", "user.name=t", "-c", "user.email=t@t"]);
+    command
+}
+
 /// Where the port blocks' lock files live, shared by every suite on the machine whatever worktree it runs from. A
 /// fixed path, so suites find each other's claims, and so another local user could create it first: `ours` refuses it
 /// then.
@@ -189,17 +217,7 @@ APP_HOME = "{{home}}"
     }
 
     fn git(&self, args: &[&str]) {
-        let status = Command::new("git")
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "tag.gpgsign=false",
-            ])
+        let status = git()
             .args(args)
             .current_dir(self.dir.join("repo"))
             .stdout(Stdio::null())
@@ -312,7 +330,29 @@ APP_HOME = "{{home}}"
             .args(["daemon", "--manifest"])
             .arg(&self.manifest)
             .env("FAWKES_HOME", self.manifest.parent().unwrap());
+        // The daemon runs git for its worktrees and snapshots.
+        isolate_git(&mut command);
         command
+    }
+
+    /// SIGKILL the running app, as a crash would, and wait until the daemon has reaped it: the status no longer
+    /// shows its pid, whether the app is stopped for a backoff or already restarted (waiting for `stopped` could
+    /// miss a restart that came in between), and the daemon is done with the reap, which refuses other requests as
+    /// `busy` until then.
+    pub fn crash_app(&self) {
+        let pid = self.status()["process"]["pid"]
+            .as_i64()
+            .expect("the app is running");
+        // The pid is the live app's, which the daemon has not reaped yet.
+        kill_process(
+            Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+            Signal::KILL,
+        )
+        .unwrap_or_else(|e| panic!("the app (pid {pid}) could not be killed: {e}"));
+        self.wait("the crash to be reaped", 5, || {
+            let status = self.status();
+            status["process"]["pid"].as_i64() != Some(pid) && status["busy"].is_null()
+        });
     }
 
     /// `fawkes --json --manifest <manifest>`, for a test that runs the client itself (in the background, or with
@@ -466,14 +506,18 @@ impl Drop for Harness {
             let _ = daemon.kill();
             let _ = daemon.wait();
         }
-        // The daemon stops its app; if it died abnormally, a leftover app must not keep the port.
-        if let Ok(text) = std::fs::read_to_string(self.dir.join("s/app.pid"))
-            && let Ok(pid) = text.trim().parse::<i32>()
-            && pid > 1
-            && let Some(group) = Pid::from_raw(pid)
-        {
-            // `pid > 1` is neither our own group nor init's; the group is the app's, which must not outlive the test.
-            let _ = kill_process_group(group, Signal::KILL);
+        // The daemon stops its app and any install or test; if it died abnormally, a leftover must not keep the port
+        // or run on.
+        for file in ["s/app.pid", "s/step.pid"] {
+            if let Ok(text) = std::fs::read_to_string(self.dir.join(file))
+                && let Ok(pid) = text.trim().parse::<i32>()
+                && pid > 1
+                && let Some(group) = Pid::from_raw(pid)
+            {
+                // `pid > 1` is neither our own group nor init's; the group is the one the file names, which must
+                // not outlive the test.
+                let _ = kill_process_group(group, Signal::KILL);
+            }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
