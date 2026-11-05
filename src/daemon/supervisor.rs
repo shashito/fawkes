@@ -10,7 +10,8 @@ use crate::protocol::{
     ErrorCode, EventKind, History, LastExit, Out, Process, ProcessState, R, Status, err, not_found,
 };
 use crate::state::{Txn, format_time, now_secs, parse_time, with_suffix};
-use std::fs::OpenOptions;
+use std::fs::{DirBuilder, OpenOptions};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -353,12 +354,17 @@ impl Daemon {
             .ok_or_else(|| not_found(id))?;
         let vars = self.vars(m.port, &m.home, &g.dir, id);
         let env = self.app_env(&m, &vars, "live");
-        std::fs::create_dir_all(&m.home).map_err(|e| {
-            err(
-                ErrorCode::StartFailed,
-                format!("cannot create the home {} for {id}: {e}", m.home.display()),
-            )
-        })?;
+        // Private like the one the daemon's start creates, should it have been removed since.
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&m.home)
+            .map_err(|e| {
+                err(
+                    ErrorCode::StartFailed,
+                    format!("cannot create the home {} for {id}: {e}", m.home.display()),
+                )
+            })?;
         let child = process::spawn(
             &vars.expand_command(&m.start),
             &g.dir,

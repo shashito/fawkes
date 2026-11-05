@@ -4,9 +4,10 @@ use rusqlite::{Connection, OpenFlags};
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use serde_json::Value;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -38,7 +39,9 @@ pub fn fawkes() -> Command {
     command
 }
 
-/// Where the port blocks' lock files live, shared by every suite on the machine whatever worktree it runs from.
+/// Where the port blocks' lock files live, shared by every suite on the machine whatever worktree it runs from. A
+/// fixed path, so suites find each other's claims, and so another local user could create it first: `ours` refuses it
+/// then.
 const PORT_LOCKS: &str = "/tmp/fawkes-test-ports";
 /// Blocks of ten ports from 20000 to 29999: below the ephemeral ranges of macOS (49152) and Linux (32768), so no
 /// outgoing connection takes one.
@@ -52,11 +55,26 @@ fn claim_ports() -> (u16, File) {
     // Spread the starting points, so concurrent suites and the tests within one rarely try the same blocks.
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let offset = std::process::id() + NEXT.fetch_add(7, Ordering::Relaxed);
-    std::fs::create_dir_all(PORT_LOCKS).unwrap();
+    if let Err(e) = DirBuilder::new().mode(0o700).create(PORT_LOCKS) {
+        assert_eq!(
+            e.kind(),
+            ErrorKind::AlreadyExists,
+            "cannot create {PORT_LOCKS}: {e}"
+        );
+    }
+    ours(Path::new(PORT_LOCKS));
     for i in 0..u32::from(BLOCKS) {
         let block = u16::try_from(offset.wrapping_add(i) % u32::from(BLOCKS)).unwrap();
         let base = FIRST_PORT + block * 10;
-        let lock = File::create(format!("{PORT_LOCKS}/{base}")).unwrap();
+        // Neither truncated nor followed, should someone have put a link to another file in its place.
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(format!("{PORT_LOCKS}/{base}"))
+            .unwrap_or_else(|e| panic!("cannot open the lock {PORT_LOCKS}/{base}: {e}"));
         if flock(&lock, FlockOperation::NonBlockingLockExclusive).is_ok()
             && (base..base + 10).all(port_free)
         {
@@ -66,6 +84,23 @@ fn claim_ports() -> (u16, File) {
     panic!(
         "no free block of ten ports between {FIRST_PORT} and {}",
         FIRST_PORT + BLOCKS * 10
+    );
+}
+
+/// Fail the test unless `dir` is a directory of this user's that nobody else can write to: one another local user
+/// created first, or can change, would let them replace the files the test writes there, the manifest among them, whose
+/// commands the daemon runs as this user.
+fn ours(dir: &Path) {
+    let found = std::fs::symlink_metadata(dir)
+        .unwrap_or_else(|e| panic!("cannot inspect {}: {e}", dir.display()));
+    let me = rustix::process::geteuid().as_raw();
+    assert!(
+        found.is_dir() && found.uid() == me && found.mode() & 0o022 == 0,
+        "{} is not a directory only this user (uid {me}) can write to (uid {}, mode {:o}); remove it and run the \
+         tests again",
+        dir.display(),
+        found.uid(),
+        found.mode() & 0o7777
     );
 }
 
@@ -89,10 +124,22 @@ impl Harness {
     /// manifest's top-level keys.
     pub fn new(extra: &str) -> Harness {
         let (port, ports) = claim_ports();
-        // A run that was killed may have left the directory; the claim makes it ours now.
+        // A run that was killed may have left the directory; the claim makes it ours to remove. Created afresh, not
+        // with `create_dir_all`, so a directory someone else made in the meantime fails the test instead of being used.
         let dir = PathBuf::from(format!("/tmp/fk{port}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(
+                e.kind(),
+                ErrorKind::NotFound,
+                "cannot remove {}, which another user may own: {e}; remove it and run the tests again",
+                dir.display()
+            );
+        }
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+        std::fs::create_dir(dir.join("repo")).unwrap();
         let h = Harness {
             manifest: dir.join("fawkes.toml"),
             dir,

@@ -402,8 +402,10 @@ impl Daemon {
                 .map_err(|e| format!("cannot install the signal handlers: {e}"))?;
         }
         let manifest = Manifest::load(&manifest_path)?;
-        let paths = manifest.paths();
-        create_private_dir(&paths.root)?;
+        let owner = rustix::process::geteuid().as_raw();
+        let mut paths = manifest.paths();
+        paths.root = private_state_dir(&paths.root, owner)?;
+        owned_dir(&manifest.home, "home", owner)?;
         let _lock = lock_state_dir(&paths)?;
         let log = EventLog::open(paths.events())
             .map_err(|e| format!("cannot open the event log: {e}"))?;
@@ -662,16 +664,63 @@ impl Daemon {
     }
 }
 
-/// Create the state directory (and missing parents) readable by its owner only, and tighten one that exists: it holds
-/// the app's logs and copies of its storage.
-fn create_private_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+/// The state directory as `Paths.root`: created (with missing parents) readable by its owner only, or an existing one
+/// tightened to that, since it holds the app's logs and copies of its storage. Refused when it is a symlink or not
+/// `owner`'s (`owned_dir`), before anything changes its mode. The result is the resolved path, so every later use
+/// reaches this directory even if a component of the manifest's path is swapped for a symlink meanwhile.
+fn private_state_dir(dir: &Path, owner: u32) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let opened = owned_dir(dir, "state_dir", owner)?;
+    opened
+        .set_permissions(std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("cannot make {} private: {e}", dir.display()))?;
+    let root =
+        std::fs::canonicalize(dir).map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
+    // The directory checked and chmodded above, not one put in its place since.
+    let (checked, resolved) = (
+        opened.metadata().map_err(|e| e.to_string())?,
+        std::fs::metadata(&root).map_err(|e| e.to_string())?,
+    );
+    if (checked.dev(), checked.ino()) != (resolved.dev(), resolved.ino()) {
+        return Err(format!(
+            "state_dir {} was replaced while the daemon checked it; start the daemon again",
+            dir.display()
+        ));
+    }
+    Ok(root)
+}
+
+/// Create `dir` (with missing parents) as `0700` when it is missing, and open it, refusing a symlink or a directory
+/// another user owns: whoever owns it, or can point the link elsewhere, could run code as the daemon's user from it or
+/// read the app's storage. `what` names it in the messages (`state_dir`, `home`).
+fn owned_dir(dir: &Path, what: &str, owner: u32) -> Result<File, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{what} {} is a symbolic link, which fawkes never follows; set {what} to the directory it points at",
+            dir.display()
+        ));
+    }
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .and_then(|()| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)))
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // O_NOFOLLOW: the directory checked is the one opened, even if a symlink took its place since the check above.
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| format!("cannot open {what} {}: {e}", dir.display()))?;
+    let found = opened.metadata().map_err(|e| e.to_string())?.uid();
+    if found != owner {
+        return Err(format!(
+            "{what} {} belongs to uid {found}, not to this daemon's user (uid {owner}); set {what} to a directory of \
+             this user's, or remove that one",
+            dir.display()
+        ));
+    }
+    Ok(opened)
 }
 
 /// Take the exclusive `flock` on `<state_dir>/lock`, held as long as the returned file lives: one daemon per state
@@ -950,5 +999,68 @@ mod tests {
         assert!(matches!(inner.live, Live::Stopped));
         taken.child.kill().unwrap();
         taken.child.wait().unwrap();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_state_dir_is_created_or_tightened_to_0700_and_resolved() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let fresh = temp.path().join("a/b/state");
+        let root = private_state_dir(&fresh, me).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+        assert_eq!(root, std::fs::canonicalize(&fresh).unwrap());
+
+        let open = temp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_state_dir(&open, me).unwrap();
+        assert_eq!(mode(&open), 0o700);
+
+        // Reached through a symlinked parent, the root is the real path, so a later swap of that parent redirects
+        // nothing.
+        let parent = temp.path().join("parent");
+        std::os::unix::fs::symlink(temp.path().join("a"), &parent).unwrap();
+        let root = private_state_dir(&parent.join("b/state"), me).unwrap();
+        assert_eq!(root, std::fs::canonicalize(&fresh).unwrap());
+
+        let home = temp.path().join("home");
+        owned_dir(&home, "home", me).unwrap();
+        assert_eq!(mode(&home), 0o700);
+    }
+
+    #[test]
+    fn a_symlinked_or_foreign_state_dir_is_refused_before_any_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let refused = private_state_dir(&link, me).unwrap_err();
+        assert!(refused.contains("symbolic link"), "{refused}");
+        assert_eq!(mode(&real), 0o755, "the symlink's target was chmodded");
+
+        // Another user's directory, as the check sees it when the daemon's user is someone else.
+        let refused = private_state_dir(&real, me + 1).unwrap_err();
+        assert!(refused.contains("belongs to uid"), "{refused}");
+        assert_eq!(mode(&real), 0o755, "another user's directory was chmodded");
+
+        let refused = owned_dir(&link, "home", me).unwrap_err();
+        assert!(
+            refused.contains("home") && refused.contains("symbolic link"),
+            "{refused}"
+        );
+        assert!(owned_dir(&real, "home", me + 1).is_err());
+        owned_dir(&real, "home", me).unwrap();
+        assert_eq!(mode(&real), 0o755, "an existing home keeps its mode");
     }
 }

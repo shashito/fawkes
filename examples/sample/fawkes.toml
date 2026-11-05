@@ -3,8 +3,8 @@
 #   fawkes stage HEAD && fawkes test g1 && fawkes switch g1
 name = "sample"
 repo = "../sample-repo"            # git repository generations are cut from
-state_dir = "/tmp/fawkes-sample"   # keep it short: the socket path is limited to about 100 bytes
-home = "/tmp/sample-home"          # the app's own state directory
+# state_dir defaults to ~/.fawkes/sample; keep a custom one short, since the socket path is limited to about 100 bytes
+home = "sample-home"               # the app's own state directory, next to this file
 storage = ["app.sqlite"]           # SQLite files relative to home, snapshotted at every switch
 port = 4790                        # live port
 spare_ports = [4791, 4799]         # inclusive range for `test`

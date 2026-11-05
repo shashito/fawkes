@@ -145,8 +145,11 @@ Code and storage roll back together:
    effort: rolling back is the safe direction, and a `state.json` that still says `pending` rolls back at the next
    start anyway.
 2. Stop the pending generation.
-3. Restore every storage file from the pending generation's `snapshot/` (backup API into the live path; a file that
-   did not exist at snapshot time is deleted together with its `-wal`, `-shm` and `-journal`).
+3. Restore every storage file from the pending generation's `snapshot/` (backup API into the live path, with the
+   mode the live file had at snapshot time, which SQLite gives its `-wal` and `-shm` too; a file that did not exist
+   at snapshot time is deleted together with its `-wal`, `-shm` and `-journal`). An `index.json` naming a path that
+   `storage` validation would refuse, or a file that is not `<n>.sqlite`, fails the restore before any file is
+   touched.
 4. Clear the step, then start the permanent generation again (none on a first-ever switch).
 
 If the restore fails, the generation is still `rolled_back` (its code never runs again), but the step stays in
@@ -221,7 +224,12 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 ### Daemon start
 
 1. Create `state_dir` with mode `0700` (an existing one is set to it): it holds the app's logs and copies of its
-   storage.
+   storage. It must be a directory the daemon's user owns, and it is never followed through a symlink: one that is a
+   symlink, or another user's, is refused before its mode is touched, since whoever controls it could run code as
+   the daemon's user from it. From then on the daemon uses its resolved path (symlinks in the components above it
+   resolved), so swapping one of them later redirects nothing; `status`, events and generation `dir`s show that path.
+   `home` is checked the same way; a missing one is created `0700`, an existing one keeps its mode. `<fawkes_home>`
+   and its `run/` are created `0700` when missing.
 2. Take an exclusive `flock` on `<state_dir>/lock`, held for the daemon's life; refuse to start when another daemon
    holds it. The kernel releases it when the process ends, however it ends, so it is never stale.
 3. Bind the socket: refuse when a daemon of another state directory answers on it (a `--socket` shared by two
@@ -255,7 +263,9 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 The manifest is trusted input, like a crontab or a unit file: its commands run with the daemon's user and
 environment, and the repository's code runs the same way once staged. Whoever can write the manifest or push to the
 repository can run anything as that user. Validation (below) catches mistakes, not attacks, so keep the manifest
-writable by its owner only.
+writable by its owner only. Fawkes refuses to read (to start a daemon, reload, or find the socket) a manifest owned by
+another user than the one running it, root excepted, or one that other users can write; group-writable passes, as
+under a umask of `002` with a group of one's own. The error says which, and to `chmod o-w` it.
 
 TOML, one file per app. Relative paths resolve against the manifest's directory. Strings in `install`, `start`,
 `health.command`, `health.url` and `env` values expand these templates:
@@ -278,8 +288,8 @@ working for paths without special characters, so commands use the bare template,
 ```toml
 name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
-state_dir = "/tmp/fawkes-sample"   # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes (absolute)
-home = "/tmp/sample-home"      # the app's own state directory
+# state_dir = "state"         # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes (absolute)
+home = "sample-home"           # the app's own state directory
 storage = ["app.sqlite"]       # SQLite files relative to home, snapshotted at switch
 port = 4790                    # live port
 spare_ports = [4791, 4799]     # inclusive range for `test`
@@ -427,7 +437,7 @@ Errors read as a sentence that says what to do next, for example:
 
 ```
 error: g4 was rolled back at 2026-11-03T14:02:11Z (missed confirm deadline); stage the ref again for a new generation
-error: no daemon answers on /tmp/fawkes-sample/fawkes.sock; start one with `fawkes daemon --manifest fawkes.toml`
+error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with `fawkes daemon --manifest fawkes.toml`
 ```
 
 ## Socket protocol
@@ -527,7 +537,7 @@ holds:
 A generation record:
 
 ```json
-{"id": "g3", "ref": "main", "commit": "238c447f…", "state": "current", "dir": "/tmp/fawkes-sample/generations/g3/code",
+{"id": "g3", "ref": "main", "commit": "238c447f…", "state": "current", "dir": "/Users/me/.fawkes/sample/generations/g3/code",
  "staged_at": "…", "test": {"port": 4791, "passed": true, "at": "…", "seconds": 2.1, "message": "healthy"},
  "switched_at": "…", "confirmed_at": null, "rolled_back_at": null, "rollback_reason": null, "failed_starts": 0,
  "restore_abandoned_at": null}
@@ -714,7 +724,9 @@ For the daemon and CLI, plus ratatui for the TUI (see above), each replacing som
   macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
 
 For the tests only, **tempfile**: the unit tests' scratch directories, removed even when a test fails. The
-integration harness keeps `/tmp/fk<port>`, which belongs to its port claim and stays short for socket paths.
+integration harness keeps `/tmp/fk<port>`, which belongs to its port claim and stays short for socket paths. It and
+`/tmp/fawkes-test-ports` must be the test user's own (a test fails on one another user created or can write), and the
+harness creates `/tmp/fk<port>` afresh, `0700`, so none of its files is ever one someone else put there.
 
 Hand-written instead of a crate: the HTTP health check (one GET over `std::net::TcpStream`, which takes any host
 `to_socket_addrs` resolves, IPv6 literals such as `[::1]` included), threads instead of an async runtime, and the

@@ -4,6 +4,7 @@ use super::{Daemon, MAX_REQUEST, Msg, Slot, lock};
 use crate::protocol::{ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, err};
 use rustix::fs::Mode;
 use std::io::{ErrorKind, Read};
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +15,12 @@ use std::time::{Duration, Instant};
 /// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes tui` finds every daemon.
 pub(super) fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
     let dir = crate::manifest::run_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // 0700, and so is a `fawkes_home` created with it: the names in it say which apps run here.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let link = dir.join(format!("{name}.sock"));
     if std::fs::read_link(&link).is_ok_and(|target| target != socket)
         && UnixStream::connect(&link).is_ok()

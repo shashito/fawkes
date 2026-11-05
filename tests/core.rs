@@ -14,6 +14,8 @@ use rustix::process::{
 };
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -567,6 +569,109 @@ fn a_request_that_arrives_in_pieces_is_answered() {
     BufReader::new(&stream).read_line(&mut line).unwrap();
     let answer: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(answer["ok"], true, "{answer}");
+}
+
+/// The daemon's answer to a raw request that `send` writes from a thread of its own, since the daemon may answer, and
+/// close, before all of it is written.
+fn answer_to(h: &Harness, send: impl FnOnce(&mut UnixStream) + Send + 'static) -> Value {
+    let stream = h.connect();
+    let mut writer = stream.try_clone().unwrap();
+    let sender = std::thread::spawn(move || send(&mut writer));
+    let mut line = String::new();
+    BufReader::new(&stream).read_line(&mut line).unwrap();
+    sender.join().unwrap();
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("no answer ({e}): {line:?}"))
+}
+
+/// The request bounds of the socket protocol: 64 KiB, and one 5 s deadline for the whole line however it trickles.
+#[test]
+fn a_request_too_long_or_too_slow_is_refused_with_usage() {
+    let mut h = Harness::new("");
+    h.start_daemon();
+
+    // 64 KiB and one byte, the newline included.
+    let padding = "x".repeat(64 * 1024 - r#"{"command": "status", "args": {"pad": ""}}"#.len());
+    let request = format!("{{\"command\": \"status\", \"args\": {{\"pad\": \"{padding}\"}}}}\n");
+    assert_eq!(request.len(), 64 * 1024 + 1);
+    let answer = answer_to(&h, move |stream| {
+        // Refused once the daemon has stopped reading; the answer says why.
+        let _ = stream.write_all(request.as_bytes());
+    });
+    assert_eq!(answer["error"]["code"], "usage", "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("longer than"),
+        "{answer}"
+    );
+    // One byte less is a request like any other.
+    let padding = &padding[1..];
+    let request = format!(r#"{{"command": "status", "args": {{"pad": "{padding}"}}}}"#);
+    let answer = answer_to(&h, move |stream| writeln!(stream, "{request}").unwrap());
+    assert_eq!(answer["ok"], true, "{answer}");
+
+    // A byte every 500 ms keeps every read well within the deadline, but not the request.
+    let started = Instant::now();
+    let answer = answer_to(&h, |stream| {
+        for byte in br#"{"command": "status"}"# {
+            if stream.write_all(&[*byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+    let took = started.elapsed();
+    assert_eq!(answer["error"]["code"], "usage", "{answer}");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("within 5 s"),
+        "{answer}"
+    );
+    assert!(
+        took >= Duration::from_secs(5) && took < Duration::from_secs(8),
+        "answered after {took:?}"
+    );
+}
+
+fn mode(path: impl AsRef<std::path::Path>) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// What other users must not reach: the socket, the state directory (also when it existed with a looser mode), the
+/// `run/` links and a home the daemon creates.
+#[test]
+fn the_socket_state_dir_run_dir_and_a_new_home_are_private() {
+    let mut h = Harness::new("");
+    std::fs::create_dir(h.dir.join("s")).unwrap();
+    std::fs::set_permissions(h.dir.join("s"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    h.start_daemon();
+    assert_eq!(mode(h.dir.join("s/fawkes.sock")), 0o600);
+    assert_eq!(mode(h.dir.join("s")), 0o700);
+    // The harness points FAWKES_HOME at its directory.
+    assert_eq!(mode(h.dir.join("run")), 0o700);
+    assert_eq!(mode(h.dir.join("home")), 0o700);
+}
+
+/// A state directory that is a symlink is refused before anything is done to it: its owner, or whoever owns the
+/// directory the link is in, could point it at a directory of their own and run code as the daemon's user.
+#[test]
+fn a_symlinked_state_dir_is_refused() {
+    let h = Harness::new("");
+    let real = h.dir.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&real, h.dir.join("s")).unwrap();
+    let (code, stderr) = h.run_second_daemon();
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains("is a symbolic link"), "{stderr}");
+    assert_eq!(mode(&real), 0o755);
+    assert!(
+        std::fs::read_dir(&real).unwrap().next().is_none(),
+        "the daemon wrote into the link's target"
+    );
 }
 
 /// A daemon whose stderr reader has gone (`fawkes daemon 2>&1 | tee log`, then `tee` dies) supervises on: stderr is

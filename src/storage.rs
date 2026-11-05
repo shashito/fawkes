@@ -1,10 +1,13 @@
 //! Storage snapshots and restores with SQLite's online backup API, so a live WAL-mode database is copied
 //! consistently, uncheckpointed writes included.
 
+use crate::manifest::is_inside;
 use crate::state::{with_suffix, write_durably};
 use rusqlite::backup::StepResult;
 use rusqlite::{Connection, OpenFlags, backup::Backup};
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -28,6 +31,9 @@ struct Entry {
 /// Copy the database `src` to a fresh file `dst`, all pages in one step: one read transaction, so the copy is
 /// consistent, takes no pauses while the app is stopped, and, under WAL, neither blocks the app's writers nor
 /// restarts when they commit (a paced backup restarts on every write and may never end).
+///
+/// `dst` gets the mode of `src` before any page is written, so a snapshot keeps the live file's mode and a restore
+/// gives it back; SQLite gives the `-wal`, `-shm` and `-journal` it creates later the mode of the database.
 fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
     let fail =
         |e: rusqlite::Error| format!("cannot copy {} to {}: {e}", src.display(), dst.display());
@@ -36,6 +42,16 @@ fn backup_file(src: &Path, dst: &Path) -> Result<(), String> {
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     remove_database(dst)?;
+    let permissions = std::fs::metadata(src)
+        .map_err(|e| format!("cannot read {}: {e}", src.display()))?
+        .permissions();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dst)
+        .and_then(|file| file.set_permissions(permissions))
+        .map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
     let from = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(fail)?;
     let mut to = Connection::open(dst).map_err(fail)?;
     let backup = Backup::new(&from, &mut to).map_err(fail)?;
@@ -107,6 +123,23 @@ pub fn restore(home: &Path, dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("no usable snapshot in {}: {e}", dir.display()))?;
     let index: Vec<Entry> =
         serde_json::from_str(&text).map_err(|e| format!("corrupt snapshot index: {e}"))?;
+    // Checked again, as the manifest's `storage` was: whatever wrote this file, a restore deletes and writes only
+    // inside `home`, and reads only the snapshot's own files.
+    let snapshot_file = |file: &str| {
+        file.strip_suffix(".sqlite")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if let Some(entry) = index
+        .iter()
+        .find(|entry| !is_inside(&entry.path) || !snapshot_file(&entry.file))
+    {
+        return Err(format!(
+            "corrupt snapshot index in {}: {:?} as {:?} is not a storage file of home; the storage was left as it is",
+            dir.display(),
+            entry.path,
+            entry.file
+        ));
+    }
     for entry in index {
         let live = home.join(&entry.path);
         if entry.present {
@@ -233,5 +266,47 @@ mod tests {
             .unwrap();
         assert_eq!(check, "ok");
         assert!(count(&dest.join("a.sqlite")) >= before);
+    }
+
+    #[test]
+    fn a_restored_database_keeps_the_mode_it_had_at_the_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::tempdir().unwrap();
+        let (home, snap) = (root.path().join("home"), root.path().join("snap"));
+        std::fs::create_dir_all(&home).unwrap();
+        let live = home.join("a.sqlite");
+        drop(wal_database(&live, 1));
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o600)).unwrap();
+        snapshot(&home, &["a.sqlite".to_string()], &snap).unwrap();
+        assert_eq!(mode(&snap.join("0.sqlite")), 0o600);
+
+        restore(&home, &snap).unwrap();
+        assert_eq!(mode(&live), 0o600);
+        assert_eq!(count(&live), 1);
+        // The app's next write creates the WAL with the database's mode.
+        let db = Connection::open(&live).unwrap();
+        db.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        assert_eq!(mode(&with_suffix(&live, "-wal")), 0o600);
+    }
+
+    #[test]
+    fn a_snapshot_index_that_points_outside_home_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (home, snap) = (root.path().join("home"), root.path().join("snap"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        let outside = root.path().join("outside.sqlite");
+        std::fs::write(&outside, "keep me").unwrap();
+        for (path, file) in [
+            ("../outside.sqlite", "0.sqlite"),
+            ("a.sqlite", "../outside.sqlite"),
+        ] {
+            let index = format!(r#"[{{"path": "{path}", "file": "{file}", "present": false}}]"#);
+            std::fs::write(snap.join("index.json"), index).unwrap();
+            let refused = restore(&home, &snap).unwrap_err();
+            assert!(refused.contains("corrupt snapshot index"), "{refused}");
+            assert!(outside.exists(), "{path} was deleted");
+        }
     }
 }

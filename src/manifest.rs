@@ -4,6 +4,9 @@ use crate::state::Paths;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links the TUI discovers.
@@ -218,7 +221,7 @@ fn shell_quote(value: String) -> String {
 }
 
 /// Whether a `storage` or `reuse` entry stays inside the directory it is joined onto.
-fn is_inside(entry: &str) -> bool {
+pub(crate) fn is_inside(entry: &str) -> bool {
     !entry.is_empty()
         && Path::new(entry)
             .components()
@@ -226,6 +229,30 @@ fn is_inside(entry: &str) -> bool {
         && Path::new(entry)
             .components()
             .any(|part| matches!(part, Component::Normal(_)))
+}
+
+/// Refuse a manifest whose owner is neither `owner` (the euid) nor root, or that other users can write: its commands
+/// run as `owner`, so whoever can change it can run code as that user. Group-writable passes, as under a umask of
+/// `002` with a group of one's own.
+fn trusted(path: &Path, metadata: &std::fs::Metadata, owner: u32) -> Result<(), String> {
+    let found = metadata.uid();
+    if found != owner && found != 0 {
+        return Err(format!(
+            "manifest {} belongs to uid {found}, not to this user (uid {owner}) or root, and its commands would run as \
+             this user; use a manifest of this user's",
+            path.display()
+        ));
+    }
+    if metadata.mode() & 0o002 != 0 {
+        return Err(format!(
+            "manifest {} can be changed by other users (mode {:o}), and its commands would run as this user; \
+             run `chmod o-w {}`",
+            path.display(),
+            metadata.mode() & 0o7777,
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a raw `health.url` template is `http://` with an explicit port after the host: `{port}`, or a number
@@ -247,8 +274,17 @@ fn has_port(url: &str) -> bool {
 impl Manifest {
     /// Read and validate a manifest; relative paths resolve against its directory.
     pub fn load(path: &Path) -> Result<Manifest, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
+        let cannot_read =
+            |e: std::io::Error| format!("cannot read manifest {}: {e}", path.display());
+        // One open file for the check and the read, so the text read is the file checked.
+        let mut file = File::open(path).map_err(cannot_read)?;
+        trusted(
+            path,
+            &file.metadata().map_err(cannot_read)?,
+            rustix::process::geteuid().as_raw(),
+        )?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(cannot_read)?;
         let written: Written = toml::from_str(&text)
             .map_err(|e| format!("invalid manifest {}: {e}", path.display()))?;
         // Without exactly one of url and command there is no check, and `problems` says so among the rest.
@@ -539,6 +575,27 @@ url = "http://127.0.0.1:{port}/"
         let m = Scratch::new().load(VALID).unwrap();
         assert_eq!(m.name, "app");
         assert!(m.home.is_absolute());
+    }
+
+    #[test]
+    fn a_manifest_others_may_write_or_another_user_owns_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new();
+        let path = scratch.0.path().join("fawkes.toml");
+        std::fs::write(&path, VALID).unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let metadata = || std::fs::metadata(&path).unwrap();
+        let set =
+            |mode| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        set(0o664);
+        trusted(&path, &metadata(), me).unwrap();
+        let refused = trusted(&path, &metadata(), me + 1).unwrap_err();
+        assert!(refused.contains("belongs to uid"), "{refused}");
+        set(0o646);
+        let refused = trusted(&path, &metadata(), me).unwrap_err();
+        assert!(refused.contains("changed by other users"), "{refused}");
+        assert!(Manifest::load(&path).unwrap_err().contains("chmod o-w"));
     }
 
     #[test]
