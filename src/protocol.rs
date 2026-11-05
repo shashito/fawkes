@@ -1,6 +1,6 @@
 //! The socket protocol: requests, errors, the typed records and results that cross the wire, and the writer that
-//! sends response lines. The daemon, the CLI and the TUI all compile against these types, so a renamed field or a new
-//! error code is a compile error in every one of them, not a missing key at run time.
+//! sends response lines. The daemon and the CLI (`watch` included) compile against these types, so a renamed field or a
+//! new error code is a compile error in both, not a missing key at run time.
 
 use crate::manifest::MAX_DEADLINE;
 use crate::state::now;
@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-/// How long one write to a client may block. A client that stops reading (a suspended TUI, a paused pager) then counts
-/// as gone, instead of stalling the step or the stream that writes to it.
+/// How long one write to a client may block. A client that stops reading (a suspended `watch`, a paused pager) then
+/// counts as gone, instead of stalling the step or the stream that writes to it.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long a client waits for each line of the answer to a quick request (`Request::is_quick`).
@@ -385,11 +385,6 @@ impl Generation {
     /// The first eight characters of the commit.
     pub fn short_commit(&self) -> String {
         self.commit.chars().take(8).collect()
-    }
-
-    /// `ref@commit8`
-    pub fn label(&self) -> String {
-        format!("{}@{}", self.git_ref, self.short_commit())
     }
 }
 

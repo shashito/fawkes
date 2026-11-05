@@ -376,7 +376,7 @@ struct Published {
 
 impl Drop for Published {
     fn drop(&mut self) {
-        // Best effort: a leftover socket file is replaced by the next daemon, a dead link skipped by the TUI.
+        // Best effort: a leftover socket file is replaced by the next daemon, a dead link retried quietly by `watch`.
         let _ = std::fs::remove_file(&self.socket);
         if let Some(link) = &self.run_link
             && std::fs::read_link(link).is_ok_and(|target| target == self.socket)

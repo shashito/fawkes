@@ -9,7 +9,7 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-/// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links the TUI discovers.
+/// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links `watch` discovers.
 pub fn fawkes_home() -> Result<PathBuf, String> {
     fawkes_home_from(std::env::var_os("FAWKES_HOME"), std::env::var_os("HOME"))
 }
@@ -36,7 +36,7 @@ fn fawkes_home_from(
     }
 }
 
-/// `<fawkes_home>/run`, where every daemon links its socket as `<name>.sock` for `fawkes tui` to find.
+/// `<fawkes_home>/run`, where every daemon links its socket as `<name>.sock` for `fawkes watch` to find.
 pub fn run_dir() -> Result<PathBuf, String> {
     Ok(fawkes_home()?.join("run"))
 }

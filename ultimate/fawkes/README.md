@@ -45,8 +45,8 @@ The server facet holds Pi Durable's scheduler in `onOpen`, before the server res
 The pending generation confirms itself (`confirm <its generation>` over the socket) once every enabled extension's
 server facet loaded (a facet broken by a changed core or a missing package is what must not become permanent) and its
 page answers. It lets go of the hold only when the daemon's status says the generation is permanent, whoever
-confirmed it (this facet, the Confirm button, the TUI), and not while the user paused the host. A refused or lost
-confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage together.
+confirmed it (this facet, the Confirm button, `fawkes confirm`), and not while the user paused the host. A refused or
+lost confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage together.
 A restart of a generation that is already permanent releases the hold at once; every reopen of the harness (a failed
 core swap) holds again until then.
 

@@ -67,7 +67,7 @@ fawkes stage main                         # → g1
 fawkes test g1
 fawkes switch g1                          # the new generation then runs `fawkes confirm`
 fawkes status
-fawkes tui                                # every supervised app on one screen
+fawkes watch                              # every supervised app's events, one line each
 ```
 
 Every command takes `--json` and answers with readable errors and stable error codes, made for agents. The same
@@ -78,7 +78,7 @@ commands are available over the daemon's Unix socket, with a live event stream f
 
 A working prototype. Everything in [DESIGN.md](DESIGN.md) is built except its **Later** section: the transaction
 (`stage`, `test`, `switch`, `confirm`, automatic and manual `rollback`), `start`, `stop` and `restart` with crash
-restarts and backoff, `prune`, manifest reload on SIGHUP, and the `tui`. It has been tested against a copy of an
+restarts and backoff, `prune`, manifest reload on SIGHUP, and `watch`. It has been tested against a copy of an
 Ultimate fork, never a live install. It runs on macOS; the Linux code paths have not been compiled or tested yet.
 
 ## Running the tests

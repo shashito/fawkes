@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-/// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes tui` finds every daemon.
+/// Link the socket as `<fawkes_home>/run/<name>.sock`, where `fawkes watch` finds every daemon.
 pub(super) fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
     let dir = crate::manifest::run_dir()?;
     // 0700, and so is a `fawkes_home` created with it: the names in it say which apps run here.

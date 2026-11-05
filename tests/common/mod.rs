@@ -141,6 +141,8 @@ pub struct Harness {
     pub dir: PathBuf,
     pub port: u16,
     manifest: PathBuf,
+    /// The daemon's `FAWKES_HOME`, where it links its socket in `run/`: `dir`, unless `share_fawkes_home` set another.
+    fawkes_home: PathBuf,
     daemon: Option<Child>,
     /// The claim on `port..port + 10` and on `dir`, released when the harness drops (after `drop` cleaned up).
     _ports: File,
@@ -170,6 +172,7 @@ impl Harness {
         std::fs::create_dir(dir.join("repo")).unwrap();
         let h = Harness {
             manifest: dir.join("fawkes.toml"),
+            fawkes_home: dir.clone(),
             dir,
             port,
             daemon: None,
@@ -295,23 +298,26 @@ APP_HOME = "{{home}}"
 
     /// `fawkes --json log --follow <args>` running in the background, its output read line by line.
     pub fn follow(&self, args: &[&str]) -> Follow {
-        let mut child = self
-            .cli()
-            .args(["log", "--follow"])
+        let mut command = self.cli();
+        command.args(["log", "--follow"]).args(args);
+        Follow::spawn(command)
+    }
+
+    /// Start this harness's daemon with `other`'s `FAWKES_HOME`, so both link their sockets in one `run/`.
+    pub fn share_fawkes_home(&mut self, other: &Harness) {
+        self.fawkes_home.clone_from(&other.fawkes_home);
+    }
+
+    /// `fawkes --json watch <args>` over every daemon of this harness's `FAWKES_HOME`, running in the background.
+    pub fn watch(&self, args: &[&str]) -> Follow {
+        let mut command = fawkes();
+        command
+            .args(["--json", "watch"])
             .args(args)
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (send, lines) = channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if send.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Follow { child, lines }
+            .env("FAWKES_HOME", &self.fawkes_home)
+            // Its notes of connections lost and regained would land in the suite's output.
+            .stderr(Stdio::null());
+        Follow::spawn(command)
     }
 
     /// Run `fawkes daemon` for this manifest in the foreground; its exit code and stderr.
@@ -329,7 +335,7 @@ APP_HOME = "{{home}}"
         command
             .args(["daemon", "--manifest"])
             .arg(&self.manifest)
-            .env("FAWKES_HOME", self.manifest.parent().unwrap());
+            .env("FAWKES_HOME", &self.fawkes_home);
         // The daemon runs git for its worktrees and snapshots.
         isolate_git(&mut command);
         command
@@ -446,13 +452,27 @@ APP_HOME = "{{home}}"
     }
 }
 
-/// A followed log (`Harness::follow`): the events it prints, one JSON document per line.
+/// A followed log (`Harness::follow`) or a watch (`Harness::watch`): the events it prints, one JSON document per line.
 pub struct Follow {
     child: Child,
     lines: Receiver<String>,
 }
 
 impl Follow {
+    fn spawn(mut command: Command) -> Follow {
+        let mut child = command.stdout(Stdio::piped()).spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, lines) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Follow { child, lines }
+    }
+
     /// The next line as printed, or None when nothing came within `within` (or the command ended).
     pub fn line(&mut self, within: Duration) -> Option<String> {
         self.lines.recv_timeout(within).ok()
@@ -463,7 +483,7 @@ impl Follow {
         let line = self.line(within)?;
         Some(
             serde_json::from_str(&line)
-                .unwrap_or_else(|e| panic!("`log --follow` printed non-JSON ({e}): {line}")),
+                .unwrap_or_else(|e| panic!("the follow printed non-JSON ({e}): {line}")),
         )
     }
 

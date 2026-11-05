@@ -6,7 +6,7 @@ mod process;
 mod protocol;
 mod state;
 mod storage;
-mod tui;
+mod watch;
 
 use clap::{Parser, Subcommand};
 use manifest::Manifest;
@@ -36,8 +36,8 @@ const EXIT_UNREACHABLE: u8 = 3;
     after_help = "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers."
 )]
 struct Cli {
-    /// Print the result (or the error) as one JSON document, and progress as JSON lines on stderr; `log --follow` prints
-    /// one event document per line. Not for `daemon` and `tui`
+    /// Print the result (or the error) as one JSON document, and progress as JSON lines on stderr; `log --follow` and
+    /// `watch` print one event document per line. Not for `daemon`
     #[arg(long, global = true)]
     json: bool,
     /// The app's manifest [default: fawkes.toml]
@@ -113,18 +113,23 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
-    /// Full-screen live view and controls
-    Tui,
+    /// Print the events of every daemon in `<fawkes_home>/run/` as they happen, one line each with the app's name
+    /// first; `--manifest` or `--socket` names one daemon instead
+    Watch {
+        /// Start after event N of each daemon, as far back as it keeps them [default: from now]
+        #[arg(long, value_name = "N")]
+        since: Option<u64>,
+    },
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon` and `tui` send none. `own_generation` is
+    /// The request this command sends to the daemon; `daemon` and `watch` send none. `own_generation` is
     /// `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from it names that
     /// generation, so an app's test run (or anything it left behind) cannot confirm another generation that happens to
     /// be pending.
     fn request(&self, own_generation: Option<&str>) -> Option<Request> {
         Some(match self {
-            Command::Daemon | Command::Tui => return None,
+            Command::Daemon | Command::Watch { .. } => return None,
             Command::Start => Request::Start,
             Command::Stop => Request::Stop,
             Command::Restart => Request::Restart,
@@ -202,36 +207,24 @@ fn main() -> ExitCode {
             }
         };
     }
-    if matches!(cli.command, Command::Tui)
-        && cli.socket.is_none()
-        && cli.manifest.is_none()
-        && std::env::var_os("FAWKES_SOCKET").is_none()
-    {
-        let run = match manifest::run_dir() {
-            Ok(run) => run,
-            Err(message) => {
-                warn(format!("error: {message}"));
-                return ExitCode::from(EXIT_USAGE);
-            }
-        };
-        return ExitCode::from(tui::run(&tui::Target::Discover(run)));
+    let mut stdout = std::io::stdout().lock();
+    if let Command::Watch { since } = cli.command {
+        return ExitCode::from(run_watch(&cli, since, &manifest_path, &mut stdout));
     }
-    // Not locked once for the whole run: the TUI may still be started below, and its panic hook writes stdout.
-    let mut stdout = std::io::stdout();
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
         Err(message) => {
             return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
         }
     };
-    // `daemon` returned above, so what is left but a request is `tui`.
     // Only towards the daemon that started the caller: generation ids repeat across apps, so another daemon, picked
     // with `--socket`, may have a pending generation of the same name.
     let own_generation = std::env::var("FAWKES_GENERATION")
         .ok()
         .filter(|_| cli.socket.is_none());
+    // `daemon` and `watch` returned above, so every command left sends a request.
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
-        return ExitCode::from(tui::run(&tui::Target::One(socket)));
+        return ExitCode::from(EXIT_USAGE);
     };
     ExitCode::from(client(
         &cli,
@@ -241,6 +234,33 @@ fn main() -> ExitCode {
         REQUEST_TIMEOUT,
         &mut stdout,
     ))
+}
+
+/// `fawkes watch`: every daemon linked in `<fawkes_home>/run/`, unless `--manifest`, `--socket` or `FAWKES_SOCKET`
+/// names one, which must then answer. Returns the exit code.
+fn run_watch(cli: &Cli, since: Option<u64>, manifest_path: &Path, out: &mut dyn Write) -> u8 {
+    let target = if cli.socket.is_none()
+        && cli.manifest.is_none()
+        && std::env::var_os("FAWKES_SOCKET").is_none()
+    {
+        manifest::run_dir().map(watch::Target::Discover)
+    } else {
+        socket_path(cli, manifest_path).map(watch::Target::One)
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
+    };
+    match watch::run(&target, cli.json, since, out) {
+        Ok(()) => 0,
+        Err(why) => {
+            let message = format!(
+                "{why}; start one with `fawkes daemon --manifest {}`",
+                manifest_path.display()
+            );
+            fail(cli.json, out, ErrorCode::DaemonUnreachable, message)
+        }
+    }
 }
 
 /// Whether the command line has `--json` before any `--`, for an error clap found before it could say.
@@ -661,7 +681,11 @@ mod tests {
         ] {
             assert_eq!(parse(args).command.request(None), Some(request), "{args}");
         }
-        assert_eq!(parse("tui").command.request(None), None);
+        assert_eq!(parse("watch --since 3").command.request(None), None);
+        assert!(matches!(
+            parse("watch --since 3").command,
+            Command::Watch { since: Some(3) }
+        ));
     }
 
     #[test]

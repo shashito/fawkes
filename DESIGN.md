@@ -13,7 +13,7 @@ implements all of it except where a section says **later**.
 
 `fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive). It is the parent of the
 app's live process and the only writer of the state directory. Every other command (`start`, `stop`, `restart`,
-`stage`, `test`, `switch`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `tui`) is a thin client that
+`stage`, `test`, `switch`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `watch`) is a thin client that
 sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
 manifest.
 
@@ -32,8 +32,8 @@ the app, one per running child waits for its exit, and short-lived ones run heal
 The accept thread sleeps in `poll(2)` on the socket and on a pipe the signal handlers write to; the supervisor
 sleeps until the app exits, a request changes something, or its next timer runs out (a crash restart's backoff, the
 confirm deadline, and every 10 s while an app runs the `app.log` size cap). An idle daemon without an app or a
-client does not wake at all; a client that follows the log (`subscribe`, `log --follow`, the TUI) has its thread
-look every 500 ms whether the client has gone.
+client does not wake at all; a client that follows the log (`subscribe`, as `watch` does, and `log --follow`) has
+its thread look every 500 ms whether the client has gone.
 
 The daemon writes every event to stderr as a line, for whoever watches the terminal. That copy is best effort, from
 a thread of its own: a stderr that blocks or breaks (a closed terminal, a `| tee` that died) never stalls or ends the
@@ -188,7 +188,7 @@ stage or test and gets `busy` while one runs. Without `keep` it is `invalid_stat
 
 ### Lifecycle: start, stop, restart
 
-The usual supervisor actions, the same in the CLI, the socket and the TUI. They act on the *current* generation:
+The usual supervisor actions, the same in the CLI and the socket. They act on the *current* generation:
 the pending one while a switch awaits confirm, else the permanent one. They never change generations, the confirm
 deadline or storage; only `switch`, `confirm` and rollback do.
 
@@ -406,7 +406,7 @@ fawkes prune
 fawkes status
 fawkes log      [-n N] [--follow]
 fawkes history
-fawkes tui
+fawkes watch    [--since N]
 ```
 
 Global options, before or after the command: `--json`, `--manifest FILE` (default `./fawkes.toml`), `--socket PATH`.
@@ -422,9 +422,10 @@ Output: readable text by default, progress lines on stderr while a step runs. Wi
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
 That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (arguments it cannot
 parse and a manifest that cannot be read are `usage`, no daemon on the socket, a connection that breaks or closes without an answer is
-`daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`). The one exception is
-`log --follow`, a stream: stdout carries one event document per line, as they happen, and nothing else when the
-daemon ends the stream (in text mode too). `--json` does not apply to `daemon` and `tui`, which print text only.
+`daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`). The exceptions are the
+streams, `log --follow` and `watch` (see Watch): stdout carries one event document per line, as they happen, and
+nothing else when the daemon ends the stream (in text mode too). `--json` does not apply to `daemon`, which prints
+text only.
 Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
 for `daemon` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
 cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
@@ -481,7 +482,7 @@ The same goes for the other enumerations a newer daemon may extend: a client rea
 leaving a stale picture. `unknown` is never written: a daemon does not send it, and refuses a `state.json` with a
 generation in a state it does not know (see Daemon start). An event of a kind it does not know, in an `events.jsonl` a
 newer fawkes wrote, is not replayed; its `seq` still counts. `--json` prints the event line as the daemon sent it, so an
-agent sees the real kind. The TUI draws an unknown value in grey.
+agent sees the real kind. In text, `log` and `watch` print it as `unknown`.
 
 Results per command:
 
@@ -501,7 +502,7 @@ Results per command:
 | `history` | — | `generations`, oldest first |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
 
-`subscribe` is the stream for live clients such as the TUI. With `limit` it first replays that many recent events as
+`subscribe` is the stream for live clients such as `watch`. With `limit` it first replays that many recent events as
 `{"event": …}` lines. With `since` (a `seq`) it instead replays the events after that number that are still in memory
 (the newest 1000), at most `limit` of them when both are given; a client that lost its connection resumes with the last
 `seq` it saw. A `since` at or above the next `seq` (the daemon's log started over) is ignored, so a client never waits
@@ -574,91 +575,42 @@ its backoff (`state` is `stopped` then), null otherwise. `busy` names the step i
 `switch g3`, `rollback`, `prune`), else one that moves the live process (`start`, `stop`, `restart`, or the
 supervisor's `reap`, `restart` and `rollback`).
 
-## TUI
+## Watch
 
-`fawkes tui` is a full-screen terminal client of the same socket. One window shows every supervised app: a table with
-one row per app, and below it the selected app's detail, generations and events, as sketched below. It holds one
-`subscribe` connection per daemon, so every row stays live, and sends ordinary one-shot requests for the actions,
-always to the selected app. It holds no state of its own and works against daemons started elsewhere; quitting it
-never affects an app. `fawkes tui --socket PATH` (or `--manifest`) shows that one app only.
+`fawkes watch [--since N]` prints the events of every supervised app as they happen, one line per event with the
+app's name first: for a person at a terminal, or an agent reading `--json`. It holds one `subscribe` stream per daemon
+and no state of its own, so it works against daemons started elsewhere, and quitting it never affects an app.
+`--manifest`, `--socket` or `FAWKES_SOCKET` names one daemon instead, which must answer the first connection: if it
+does not, `watch` fails with `daemon_unreachable` (exit 3).
 
 **Discovery:** each daemon links its socket as `<fawkes_home>/run/<name>.sock` when it starts and removes the link
 when it stops (a daemon with a custom `state_dir` is found the same way). `fawkes_home` is `$FAWKES_HOME`, default
-`~/.fawkes`. The TUI lists that folder, skips links nobody answers on, and rescans every few seconds so daemons
-started later appear. Two daemons with the same `name` are refused at start (the link already answers).
+`~/.fawkes`. `watch` lists that folder every 3 s, so daemons started later are followed too, and retries a link nobody
+answers on (a daemon that stopped or crashed) quietly every second. Two daemons with the same `name` are refused at
+start (the link already answers).
 
-The screen, at 80 columns, during an upgrade (the clock and event times are local; the daemon stores UTC):
+**Lines:** in text, the app's name and the event as `log` prints it. Under `--json`, the `subscribe` event line with
+the name in front, `{"name": "ultimate", "event": {…}}`, the event as the daemon sent it. stdout carries nothing else.
 
 ```
- fawkes  3 apps                                                     14:02:31
- ST         APP        LIVE  PERM  STAGED  CONFIRM    PID    PORT  UP     RST
-▌● running  ultimate   g7    g6    g8      ⏱ 01:42    9001   4747  3m12s  1  ▐
- ● running  blog       g3    g3    -       -          4188   3000  5d     0
- ✘ failed   worker     g5    g5    -       -          -      -     -      4
-─ ultimate ────────────────────────────────────────────────────────────────────
- ● running  g7 main@238c447f  pid 9001  :4747  up 3m12s  restarts 1
-   last exit SIGTERM (requested) · health ✔ 14:02:03
- ⏱ confirm g7 within 01:42, or it rolls back to g6 (code + storage)
- GEN  REF             STATE        AGE   INFO
- g8   feat@91aa2c01   tested       1m    ✔ test 2.1s on :4791
- g7   main@238c447f   current      3m    live · awaiting confirm
- g6   main@bf0ad442   permanent    2d    rollback target
- g5   main@0c1d2e3f   rolled_back  3d    ✖ missed confirm deadline
-─ events ──────────────────────────────────────────────────────────────────────
- 14:02:01 switched  g7  switched from g6; confirm before 14:04:01
- 14:02:03 healthy   g7  health check passed
- 14:02:40 tested    g8  test passed on port 4791 in 2.1s
- c confirm  ? help  b rollback  n stage  t test  w switch  s/x/r start/stop/restart
+ultimate  2026-11-03T14:02:01Z  switched    g7   switched from g6; confirm before 2026-11-03T14:04:01Z
+blog  2026-11-03T14:02:02Z  exited      g3   exited with code 1 (unrequested)
+ultimate  2026-11-03T14:02:03Z  healthy     g7   health check passed
 ```
 
-- **Layout:** no boxes around panes. A one-line header (app count, `N disconnected` when daemons dropped, the clock),
-  the apps table, then one-line title rules (`─ name ───`) over the selected app's detail, generations and events,
-  and a one-line footer. Only dialogs and the help overlay are boxed. The selection is a full-width reverse bar with
-  `▌ ▐` marks at both ends (dimmed while the other list has focus).
-- **State** is always symbol and word: `● running` green, `○ stopped` grey, `✘ failed` red (the whole row is red),
-  `◌ disconnected` red (the row shows the last known picture, dimmed) and `⟳ <step>` yellow while the daemon is busy
-  with a transaction step (`switch`, `rollback`, …).
-- **Countdown:** `⏱ mm:ss` while a switch awaits confirm (`step` is `pending`), in the table and in the detail line;
-  yellow, red and bold under 15 s. The detail line says what a missed deadline does (`rolls back to g6 (code +
-  storage)`). While a switch awaits confirm the footer puts `c confirm` first, highlighted. During `rolling_back` the
-  detail line says `rolling back g7` (dim) and shows no countdown; during `restore_failed` it says `✘ restore failed,
-  b retries` in red.
-- **Generations**, newest first, with a relative AGE (since its last state change) and an Argo-style INFO: the test
-  result, `live · awaiting confirm`, `rollback target` for the permanent generation while a switch awaits confirm,
-  `✖ <reason>` for `rolled_back` rows (red) and `✖ test failed: …` for `test_failed` ones.
-- **Events** follow the newest line by default (kinds coloured: `switched` yellow; `rolled_back`, `failed`, `error`,
-  `unhealthy`, an unrequested `exited` and `test_failed` red; `healthy`, `confirmed`, `tested` green; `progress`
-  grey). `f` pauses the pane (the title says `paused`), `z` zooms it to full screen and back, `/` filters events by
-  text (any case; Enter keeps the filter, Esc clears it).
-- **Narrow terminals:** columns go in this order: PERM, RST, STAGED, UP, PID, PORT, LIVE (ST, APP and CONFIRM stay;
-  the generations list drops AGE). The footer drops whole items from the end, never part of a label. Nothing panics
-  on a tiny terminal; panes simply get no room.
-- **Notices:** the last action's result (`✓ switch g3`, or the daemon's error in red) sits at the right end of the
-  footer until the next key.
+**Where it starts:** `--since N` starts after event N of each daemon, as far back as the newest 1000 it keeps
+(`--since 0` is all of them). Without it, each daemon starts at the time `watch` started: the events logged before
+are skipped, so a daemon found later still shows its own start.
 
-Keys:
+**Reconnect:** a stream that ends (a daemon killed or restarted, a `busy` refusal) is opened again every second with
+`since` set to the last `seq` printed, so the events logged meanwhile are printed once, in order. Events are missed
+only when the daemon no longer keeps them (more than 1000 since) or its log started over (numbering from 1 again),
+and a note says which. Notes go to stderr, as text in both modes: `ultimate: the connection was lost;
+reconnecting`, `ultimate: connected again`, `ultimate: events 6 to 8 were missed: the daemon no longer keeps them`,
+`ultimate: the daemon's event log started over`, and the message of a refusal.
 
-| Key | Does |
-|---|---|
-| `↑` `↓` `j` `k` | select an app; a generation while the generations list has focus |
-| `Tab` | move focus between the apps table and the generations list (the focused list's header is highlighted); `t` and `w` act on the selected generation |
-| `s` `x` `r` | start, stop, restart the app |
-| `n` | stage: type a ref inline, Enter stages it |
-| `t` | test the selected generation |
-| `w` | switch to the selected generation |
-| `c` | confirm the pending generation |
-| `b` | roll back the pending generation |
-| `p` | prune old generations beyond the manifest's `keep` |
-| `f` `z` `/` | pause/follow, zoom, filter the events |
-| `?` | help overlay listing every key |
-| `q`, Ctrl-C | quit |
-| Esc | close the prompt, dialog, help or filter |
-
-`w`, `b`, `p`, `x` and `r` ask first in a small centered dialog naming the target (`Switch demo to g4? y/N`); only `y`
-confirms. A failed action shows the daemon's error message in the footer.
-
-Crate: **ratatui** (with its re-exported `crossterm` backend, so one dependency), the standard Rust TUI library;
-hand-written ANSI would need its own diffing, resize and raw-mode handling.
+**End:** `watch` runs until it is stopped, or until a line cannot be written to stdout (a reader that has gone, as in
+`| head`), which it notices at the next event and ends with `0`.
 
 ## On-disk layout
 
@@ -696,7 +648,7 @@ hand-written ANSI would need its own diffing, resize and raw-mode handling.
 
 ## Crates
 
-For the daemon and CLI, plus ratatui for the TUI (see above), each replacing something not worth hand-writing:
+For the daemon and CLI, each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
 - **clap** (no default features; `std`, `derive`, `help`, `usage`, `error-context`): the command line, declared as
@@ -713,15 +665,12 @@ For the daemon and CLI, plus ratatui for the TUI (see above), each replacing som
   `waitid` with `WNOWAIT`, which waits for a child's exit without reaping it, so the `Child` that owns it still
   reaps it. One waiting thread per child is the same code on macOS and Linux, where kqueue's `NOTE_EXIT` and a
   pidfd would need one path each. Its typed `Pid` refuses 0, so a corrupt
-  pid never signals our own group. The tests signal processes through it too, without `unsafe`. Already in the tree
-  through ratatui's crossterm.
+  pid never signals our own group. The tests signal processes through it too, without `unsafe`.
 - **signal-hook** (no default features): SIGTERM, SIGINT and SIGHUP set atomic flags and then write to the accept
   loop's self-pipe, installed with `sigaction` and `SA_RESTART`; hand-written handlers would need `unsafe` for the
-  same thing. Also already in the tree.
-- **jiff** (no default features; `std`, `tz-system`, `tzdb-zoneinfo`): UTC timestamps in `state.json`, the event
-  log and the protocol, and the TUI's local clock, read from the system's zone database. It replaces hand-written
-  calendar arithmetic and the `localtime_r`/`tzset` calls, which needed `unsafe` and had to load the zone before
-  any thread started.
+  same thing.
+- **jiff** (no default features; `std`): UTC timestamps in `state.json`, the event log and the protocol, and the
+  times `watch` compares to its start. It replaces hand-written calendar arithmetic.
 - **libc:** what neither std nor rustix has: a process's start time for the leftover-app check (`proc_pidinfo` on
   macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
 

@@ -1107,6 +1107,69 @@ fn subscribe_since_replays_the_events_after_a_sequence_number() {
     assert!(next.get("history").is_some(), "{next}");
 }
 
+/// `watch` follows every daemon of one `fawkes_home` and prints each app's events once, in `seq` order, with the
+/// app's name first; a daemon killed and started again is resumed where it left off, its restart's events included.
+#[test]
+fn watch_follows_every_daemon_of_a_fawkes_home_across_a_daemon_restart() {
+    let mut t = Harness::new("");
+    let mut u = Harness::new("");
+    u.edit_manifest(r#"name = "t""#, r#"name = "u""#);
+    u.share_fawkes_home(&t);
+    t.commit("v1", "confirm");
+    u.commit("v1", "confirm");
+    t.start_daemon();
+    u.start_daemon();
+    let mut watch = t.watch(&["--since", "0"]);
+    let mut seen: Vec<(String, Value)> = Vec::new();
+    // Read the watch until `app` has printed a `staged` event for `generation`.
+    let mut until_staged = |app: &str, generation: &str| {
+        let give_up = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = give_up.saturating_duration_since(Instant::now());
+            let line = watch.line(left).unwrap_or_else(|| {
+                panic!("no `staged` {generation} of {app} in the watch; it printed:\n{seen:?}")
+            });
+            assert!(line.starts_with(r#"{"name":"#), "{line}");
+            let line: Value = serde_json::from_str(&line).unwrap();
+            let (name, event) = (line["name"].as_str().unwrap(), &line["event"]);
+            seen.push((name.to_string(), event.clone()));
+            if name == app && event["kind"] == "staged" && event["generation"] == generation {
+                return;
+            }
+        }
+    };
+    t.ok(&["stage", "v1"]);
+    u.ok(&["stage", "v1"]);
+    until_staged("t", "g1");
+    until_staged("u", "g1");
+
+    u.kill_daemon();
+    u.start_daemon();
+    u.ok(&["stage", "v1"]);
+    until_staged("u", "g2");
+
+    let watched = |app: &str| -> Vec<Value> {
+        seen.iter()
+            .filter(|(name, _)| name == app)
+            .map(|(_, event)| event.clone())
+            .collect()
+    };
+    // Every event `u` logged, both daemons' alike, the second one's start among them: none missed, none twice.
+    assert_eq!(
+        watched("u"),
+        u.ok(&["log", "-n", "1000"])["events"].as_array().unwrap()[..]
+    );
+    let daemon_events = watched("u")
+        .iter()
+        .filter(|e| e["kind"] == "daemon")
+        .count();
+    assert!(daemon_events >= 2, "{:?}", watched("u"));
+    // `t` is still logging (its stage's last lines may follow the `staged` event): what came is its log's start.
+    let t_log = t.ok(&["log", "-n", "1000"])["events"].clone();
+    let t_watched = watched("t");
+    assert_eq!(t_watched, t_log.as_array().unwrap()[..t_watched.len()]);
+}
+
 /// SIGTERM reaches the daemon while a switch is stopping the old app: the target never ran, so the switch is given up
 /// (the target stays tested and the answer says why), and the next daemon start runs the permanent generation.
 #[test]

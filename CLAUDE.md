@@ -16,7 +16,7 @@ cargo test
 
 All three are clean on `main`. Treat any warning or failure as yours: don't assume it was already there.
 
-- Run the narrowest test first (`cargo test --test core <name>`, `cargo test tui::`), then the whole suite.
+- Run the narrowest test first (`cargo test --test core <name>`, `cargo test watch::`), then the whole suite.
 - Use debug builds. Don't build with `--release` unless asked.
 
 ## Tests
@@ -33,7 +33,7 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   which would otherwise send the test's requests to that app's live daemon.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
   `process.rs`, `protocol.rs`, `main.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`, `daemon/transactions.rs`,
-  `tui.rs`, `tui/net.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is the pure
+  `watch.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is the pure
   `after_exit` in `daemon/supervisor.rs`: test a change to it there, in milliseconds, and keep the integration tests
   as end-to-end smoke tests.
 - To fix a bug, first write a test that reproduces it.
@@ -61,15 +61,15 @@ not built yet. Don't start one unless asked.
 - **Storage snapshots** use the SQLite online backup API (`storage.rs`), never a file copy, because a copy can miss
   WAL contents.
 - **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (the `ErrorCode` enum) and a
-  readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon, CLI and
-  TUI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
-- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `daemon` and `tui`
+  readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon and the
+  CLI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
+- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `daemon`
   supports `--json`, and under it every failure, the client's own included, prints one error object.
 
 ## Dependencies
 
 The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rusqlite, rustix, signal-hook,
-jiff, libc and ratatui, and tempfile for the tests. The HTTP health check and the thread-based concurrency are
+jiff and libc, and tempfile for the tests. The HTTP health check and the thread-based concurrency are
 hand-written on purpose, and errors stay `protocol::Error` and `String`, without anyhow or thiserror.
 
 A well-known crate is preferred over hand-written code when it removes a meaningful amount of code or `unsafe`, but
@@ -90,12 +90,10 @@ with what it replaces. Update a single dependency with `cargo update --precise`,
 - Prefer `#[expect(...)]` with a reason over `#[allow(...)]`, and delete dead code instead of silencing the lint.
 - Imports go at the top of the file in the existing order: `crate::` first, then external crates, then `std`.
 - Use full-word names, and keep a struct next to its `impl`.
-- TUI: use the named ANSI colors already in `tui/draw.rs` (`Color::Green`, `Cyan`, `Red`, `Gray`, `Reset`), not
-  RGB or indexed colors, so it reads well in any terminal theme.
 
 ## Commits
 
-- The subject describes the behavior in plain language (`tui: show local times`, `Automatic rollback needs only
-  the live slot: …`). An optional `area:` prefix names the part touched (`tui:`, `feat:`).
+- The subject describes the behavior in plain language (`watch: name the app first`, `Automatic rollback needs
+  only the live slot: …`). An optional `area:` prefix names the part touched (`watch:`, `feat:`).
 - Commit only when asked. Don't commit scratch files such as `review*.md`.
 - Keep trailers that are already present (e.g. `Ultimate-Conversation:`), and don't invent new ones.
