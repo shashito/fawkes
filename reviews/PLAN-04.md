@@ -40,6 +40,16 @@ drops `FAWKES_GENERATION`, `FAWKES_PHASE`, `FAWKES_BIN` and `FAWKES_HOME`, which
 
 ## Phase 6: the contract's edges
 
+**Done:** every row below, 6.1 to 6.8, each bug with a test that reproduced it first. Where the build differs from
+the row: the connection cap is 64, and a connection counts from accept until its request turns out to be a stream;
+the client reads a `busy` answer the daemon left even when its own write failed, or when the daemon closed before the
+client set its read timeout (macOS refuses it then). `status.step` is `switching`,
+`pending`, `rolling_back` or `restore_failed` (null without a transaction), and a client without it from an older
+daemon treats `pending` as before; the Ultimate extension reads it too. A clap usage error under `--json` is the
+`usage` object as well. A relative `FAWKES_HOME` (or `HOME`) is refused rather than resolved, and `fawkes daemon` exits
+2 for a manifest it cannot load. With `Unknown` decoded, the daemon refuses a `state.json` holding a generation state
+it does not know, and does not replay events of an unknown kind (their `seq` still counts).
+
 | # | Fix | From |
 |---|---|---|
 | 6.1 | A per-request 5 s deadline instead of per `read(2)`, and a cap on concurrent non-streaming connections (`busy` past it). | M6 |

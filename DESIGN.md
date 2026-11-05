@@ -409,8 +409,8 @@ generation then runs on storage that the failed generation may already have migr
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
-That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (a manifest that
-cannot be read is `usage`, no daemon on the socket, a connection that breaks or closes without an answer is
+That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (arguments it cannot
+parse and a manifest that cannot be read are `usage`, no daemon on the socket, a connection that breaks or closes without an answer is
 `daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`). The one exception is
 `log --follow`, a stream: stdout carries one event document per line, as they happen, and nothing else when the
 daemon ends the stream (in text mode too). `--json` does not apply to `daemon` and `tui`, which print text only.
@@ -467,7 +467,8 @@ A client treats a code it does not know as a failed command.
 The same goes for the other enumerations a newer daemon may extend: a client reads an event `kind`, a generation
 `state`, a `process.state` or a `step` it does not know as `unknown` and keeps the line, instead of dropping it and
 leaving a stale picture. `unknown` is never written: a daemon does not send it, and refuses a `state.json` with a
-generation in a state it does not know (see Daemon start). `--json` prints the event line as the daemon sent it, so an
+generation in a state it does not know (see Daemon start). An event of a kind it does not know, in an `events.jsonl` a
+newer fawkes wrote, is not replayed; its `seq` still counts. `--json` prints the event line as the daemon sent it, so an
 agent sees the real kind. The TUI draws an unknown value in grey.
 
 Results per command:

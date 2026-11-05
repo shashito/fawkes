@@ -1,7 +1,7 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
 use crate::protocol::{
-    Error, Event, GenState, Generation, Pending, R, Step, invalid_state, not_found,
+    Error, Event, EventKind, GenState, Generation, Pending, R, Step, invalid_state, not_found,
 };
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -590,7 +590,11 @@ impl EventLog {
                 .filter_map(|l| serde_json::from_str::<Event>(l).ok())
             {
                 last_seq = last_seq.max(event.seq);
-                remember(&mut recent, event);
+                // A kind from a newer fawkes would be replayed as `unknown`, its real kind lost; its `seq` still
+                // counts, so numbering goes on after it.
+                if event.kind != EventKind::Unknown {
+                    remember(&mut recent, event);
+                }
             }
         }
         Ok(EventLog {
@@ -820,6 +824,26 @@ mod tests {
         assert_eq!(after(Some(64), Some(2)), [61, 63]);
         assert_eq!(after(None, None), Vec::<u64>::new());
         assert_eq!(after(None, Some(1)), [63]);
+    }
+
+    #[test]
+    fn an_event_of_a_kind_from_a_newer_fawkes_is_not_replayed_but_keeps_its_number() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"seq":1,"at":"2026-11-03T14:00:01Z","kind":"daemon","generation":null,"message":"a"}"#,
+                "\n",
+                r#"{"seq":2,"at":"2026-11-03T14:00:02Z","kind":"quarantined","generation":"g1","message":"b"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut log = EventLog::with_limit(path, 4096).unwrap();
+        let kinds: Vec<EventKind> = log.tail(10).iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [EventKind::Daemon]);
+        assert_eq!(log.append(event(0)).seq, 3);
     }
 
     #[test]

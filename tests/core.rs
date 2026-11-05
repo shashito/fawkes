@@ -1628,6 +1628,17 @@ fn a_usage_error_exits_2_and_help_exits_0() {
     ] {
         assert_eq!(run(args).0, Some(2), "{args:?}");
     }
+    // Under `--json` the usage error is the error object on stdout, like every other failure.
+    for args in [&["--json", "status", "--bogus"][..], &["stage", "--json"]] {
+        let (code, stdout) = run(args);
+        assert_eq!(code, Some(2), "{args:?}");
+        let error: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(error["code"], "usage", "{stdout}");
+        assert!(
+            error["message"].as_str().unwrap().contains("Usage: fawkes"),
+            "{stdout}"
+        );
+    }
     for args in [&["--help"][..], &["switch", "--help"], &["status", "-h"]] {
         let (code, stdout) = run(args);
         assert_eq!(code, Some(0), "{args:?}");

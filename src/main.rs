@@ -164,10 +164,21 @@ impl Command {
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
+        // `--help` is the one "error" that is not one.
+        Err(error) if error.use_stderr() && json_asked() => {
+            // The arguments could not be read, but an agent that asked for `--json` still parses stdout.
+            let message = error.render().to_string();
+            let message = message.trim().trim_start_matches("error: ").to_string();
+            return ExitCode::from(fail(
+                true,
+                &mut std::io::stdout(),
+                ErrorCode::Usage,
+                message,
+            ));
+        }
         Err(error) => {
             // Nothing is left to report to if the terminal is gone.
             let _ = error.print();
-            // `--help` is the one "error" that is not one.
             return if error.use_stderr() {
                 ExitCode::from(EXIT_USAGE)
             } else {
@@ -205,7 +216,8 @@ fn main() -> ExitCode {
         };
         return ExitCode::from(tui::run(&tui::Target::Discover(run)));
     }
-    let mut stdout = std::io::stdout().lock();
+    // Not locked once for the whole run: the TUI may still be started below, and its panic hook writes stdout.
+    let mut stdout = std::io::stdout();
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
         Err(message) => {
@@ -229,6 +241,14 @@ fn main() -> ExitCode {
         REQUEST_TIMEOUT,
         &mut stdout,
     ))
+}
+
+/// Whether the command line has `--json` before any `--`, for an error clap found before it could say.
+fn json_asked() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--json")
 }
 
 /// `--socket`, else `FAWKES_SOCKET`, else the manifest's `<state_dir>/fawkes.sock`.
@@ -298,20 +318,15 @@ fn client(
         );
         return fail(cli.json, out, ErrorCode::DaemonUnreachable, message);
     };
-    if request.write_to(&mut stream).is_err() {
-        let message = format!(
-            "the daemon on {} closed the connection before the request was sent; check that it is running with `fawkes status`",
-            socket.display()
-        );
-        return fail(cli.json, out, ErrorCode::DaemonUnreachable, message);
-    }
+    // A daemon with no place for another connection answers `busy` and closes without reading, which can fail the
+    // write: its answer is still there to be read.
+    let sent = request.write_to(&mut stream).is_ok();
     let follow = matches!(request, Request::Log { follow: true, .. });
-    // A daemon that accepts and then never answers must not hang a quick command (`Request::is_quick`).
-    if request.is_quick()
-        && let Err(e) = stream.set_read_timeout(Some(timeout))
-    {
-        let message = format!("cannot set a read timeout on the connection: {e}");
-        return fail(cli.json, out, ErrorCode::Internal, message);
+    // A daemon that accepts and then never answers must not hang a quick command (`Request::is_quick`). On macOS the
+    // timeout cannot be set (EINVAL) once the daemon has closed its end, which a quick answer or a refusal does at
+    // once; reading what it left needs no timeout then, so the failure is ignored.
+    if request.is_quick() || !sent {
+        let _ = stream.set_read_timeout(Some(timeout));
     }
     for line in BufReader::new(stream).lines() {
         let line = match line {
@@ -380,10 +395,17 @@ fn client(
     if follow {
         return 0;
     }
-    let message = format!(
-        "the daemon on {} closed the connection without an answer; `fawkes status` shows whether it is running",
-        socket.display()
-    );
+    let message = if sent {
+        format!(
+            "the daemon on {} closed the connection without an answer; `fawkes status` shows whether it is running",
+            socket.display()
+        )
+    } else {
+        format!(
+            "the daemon on {} closed the connection before the request was sent; check that it is running with `fawkes status`",
+            socket.display()
+        )
+    };
     fail(cli.json, out, ErrorCode::DaemonUnreachable, message)
 }
 
@@ -741,6 +763,49 @@ mod tests {
         let waited = started.elapsed();
         silent.join().unwrap();
         (code, String::from_utf8(out).unwrap(), waited)
+    }
+
+    /// A daemon may answer and close before the client is done sending (a refusal for too many connections), or
+    /// before it sets its read timeout (a quick answer); the client reads the answer either way.
+    #[test]
+    fn an_answer_from_a_daemon_that_already_closed_is_still_read() {
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temp.path().join("fawkes.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let rounds = 200;
+        let daemon = std::thread::spawn(move || {
+            for _ in 0..rounds {
+                let (mut stream, _) = listener.accept().unwrap();
+                writeln!(
+                    stream,
+                    r#"{{"ok":false,"error":{{"code":"busy","message":"m"}}}}"#
+                )
+                .unwrap();
+            }
+        });
+        let cli = Cli {
+            json: true,
+            manifest: None,
+            socket: Some(socket.clone()),
+            command: Command::Status,
+        };
+        for _ in 0..rounds {
+            let mut out = Vec::new();
+            let code = client(
+                &cli,
+                &Request::Status,
+                &socket,
+                Path::new("fawkes.toml"),
+                Duration::from_secs(2),
+                &mut out,
+            );
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(
+                (code, out.as_str()),
+                (EXIT_FAILED, "{\"code\":\"busy\",\"message\":\"m\"}\n")
+            );
+        }
+        daemon.join().unwrap();
     }
 
     #[test]
