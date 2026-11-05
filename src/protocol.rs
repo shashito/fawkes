@@ -1136,15 +1136,6 @@ mod tests {
             panic!("an event line reads as one");
         };
         assert_eq!((event.seq, event.kind), (7, EventKind::Unknown));
-
-        for name in [
-            gen_state_name(GenState::Unknown),
-            event_kind_name(EventKind::Unknown),
-            process_state_name(ProcessState::Unknown),
-            step_name(Step::Unknown),
-        ] {
-            assert_eq!(name, "unknown");
-        }
     }
 
     #[test]

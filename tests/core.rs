@@ -536,8 +536,9 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
             h.status()["busy"] == "switch g2"
         });
         let (code, error) = h.fk(&["stop"]);
-        assert_eq!((code, error["code"].as_str()), (1, Some("busy")), "{error}");
+        // Released before the assertion, so a failing one does not wait out the switch's 60 s stop.
         std::fs::write(h.dir.join("s/release"), "").unwrap();
+        assert_eq!((code, error["code"].as_str()), (1, Some("busy")), "{error}");
         assert_eq!(switch.join().unwrap().0, 0);
     });
 
@@ -1424,7 +1425,6 @@ fn messages_starting(h: &Harness, kind: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// Stage `version` as generation `id`, test it, switch to it and wait for the app to confirm itself.
 /// Reload the manifest with a 3 s health timeout, so that an unhealthy pending generation rolls back soon. Done only
 /// once the generations have passed their tests and g1 is permanent: on a loaded machine a node app can take longer
 /// than 3 s to start, and would then fail its test or roll back.
@@ -1438,6 +1438,7 @@ fn shorten_the_health_timeout(h: &Harness) {
     });
 }
 
+/// Stage `version` as generation `id`, test it, switch to it and wait for the app to confirm itself.
 fn make_permanent(h: &Harness, version: &str, id: &str) {
     h.ok(&["stage", version]);
     h.ok(&["test", id]);
@@ -1772,6 +1773,59 @@ fn a_usage_error_exits_2_and_help_exits_0() {
 
 // ------------------------------------------------ failing tests, health commands, retired generations, startup
 
+/// Ends, when dropped, the process whose pid is in the file, if it wrote one: a listener in a session of its own,
+/// which neither the daemon nor `Harness` would end, and which must not keep a port after a failed assertion.
+struct EndListener(std::path::PathBuf);
+
+impl Drop for EndListener {
+    fn drop(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(&self.0)
+            && let Ok(pid) = text.trim().parse::<i32>()
+            && pid > 1
+            && let Some(pid) = Pid::from_raw(pid)
+        {
+            // Best effort: a listener that has already ended needs nothing.
+            let _ = kill_process(pid, Signal::KILL);
+        }
+    }
+}
+
+/// Run `fawkes daemon` for `manifest` (with `--socket`, if given), which must refuse to start: exit 1 within 10 s.
+/// Its stderr. One that starts after all is killed, so the test fails rather than hangs.
+fn refused_daemon(
+    h: &Harness,
+    manifest: &std::path::Path,
+    socket: Option<&std::path::Path>,
+) -> String {
+    let mut command = common::fawkes();
+    if let Some(socket) = socket {
+        command.arg("--socket").arg(socket);
+    }
+    let mut daemon = command
+        .args(["daemon", "--manifest"])
+        .arg(manifest)
+        .env("FAWKES_HOME", &h.dir)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let give_up = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= give_up {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+            panic!("the daemon for {} was not refused", manifest.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut daemon.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    stderr
+}
+
 /// The sample app's `crash` mode crashes while `{state}/crash` exists, so the same generation fails its test and later
 /// passes it.
 fn crash_while_marked(h: &Harness) -> std::path::PathBuf {
@@ -1851,6 +1905,7 @@ if (process.argv[2] === 'listen') {
     h.commit("v1", "confirm");
     h.start_daemon();
     let staged = h.ok(&["stage", "v1"]);
+    let listener = EndListener(h.dir.join("s/squat.pid"));
     std::fs::write(h.dir.join("s/squat"), "").unwrap();
 
     refused(
@@ -1866,9 +1921,8 @@ if (process.argv[2] === 'listen') {
             .any(|message| message.contains("was taken by another process")),
     );
     assert_eq!(messages(&h, "test_failed").len(), 0);
-    // The listener is the one process this test has to end, by the pid it wrote.
-    let listener = read_pid(h.dir.join("s/squat.pid"));
-    kill_process(listener, Signal::KILL).unwrap();
+    assert!(h.dir.join("s/squat.pid").exists(), "the listener never ran");
+    drop(listener);
     std::fs::remove_file(h.dir.join("s/squat")).unwrap();
     h.wait("the listener to release the spare port", 10, || {
         std::net::TcpListener::bind(("127.0.0.1", h.port + 1)).is_ok()
@@ -1995,16 +2049,24 @@ fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_dir
             .replace(&format!("{d}/home\""), &format!("{d}/home2\"")),
     )
     .unwrap();
-    let output = common::fawkes()
-        .args(["daemon", "--manifest"])
-        .arg(&other)
-        .env("FAWKES_HOME", &h.dir)
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let stderr = refused_daemon(&h, &other, None);
     assert!(
         stderr.contains("another daemon named t already runs"),
+        "{stderr}"
+    );
+    // Another name and state_dir, but the first daemon's socket (`--socket`): never taken over.
+    let namesake = std::fs::read_to_string(&other).unwrap();
+    let third = h.dir.join("third.toml");
+    std::fs::write(
+        &third,
+        namesake
+            .replacen("name = \"t\"", "name = \"u\"", 1)
+            .replace(&format!("{d}/s2\""), &format!("{d}/s3\"")),
+    )
+    .unwrap();
+    let stderr = refused_daemon(&h, &third, Some(&h.dir.join("s/fawkes.sock")));
+    assert!(
+        stderr.contains("another daemon already answers on"),
         "{stderr}"
     );
     assert!(

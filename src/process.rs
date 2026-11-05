@@ -409,12 +409,15 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
-    /// Kills the group of a test's child when the test ends, so a failed assertion leaves nothing running.
+    /// Kills the group of a test's child when a failed assertion ends the test, so it leaves nothing running. Only
+    /// then: a test that passed has ended and reaped the group itself, and its id may already be another process's.
     struct KillGroup(u32);
 
     impl Drop for KillGroup {
         fn drop(&mut self) {
-            kill_group(self.0);
+            if std::thread::panicking() {
+                kill_group(self.0);
+            }
         }
     }
 
@@ -636,7 +639,6 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let _cleanup = KillGroup(child.id());
 
         exited(&child)
             .recv_timeout(Duration::from_secs(5))
@@ -694,6 +696,14 @@ mod tests {
         let _cleanup = KillGroup(pgid);
         assert_eq!(result, Err("health command timed out".into()));
         assert!(waited < Duration::from_secs(5), "waited {waited:?}");
-        assert!(!group_alive(pgid), "the check's group outlived its timeout");
+        // The killed `sleep`s are gone once whoever inherited them has reaped them.
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while group_alive(pgid) {
+            assert!(
+                Instant::now() < give_up,
+                "the check's group outlived its timeout"
+            );
+            sleep(Duration::from_millis(10));
+        }
     }
 }
