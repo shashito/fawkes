@@ -93,6 +93,33 @@ changes go live only through an upgrade; `restart` reboots the same generation) 
 
 ## Checks
 
-`ultimate/check` runs `test-env.test.ts` (the test run's environment against the clone's own preview helpers, so a
-change in Ultimate that breaks the isolation fails it) and type-checks both facets against the clone in `$ULTIMATE`
+`ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases) and `test-env.test.ts` (the test run's
+environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it) and
+type-checks both facets against the clone in `$ULTIMATE`
 (default `~/Code/ultimate`).
+
+## Storage hooks
+
+Fawkes keeps no storage code of its own: `storage.ts` snapshots, restores and copies Ultimate's two databases,
+`state.sqlite` and `trace.sqlite` in the project's home, as three hooks of the manifest:
+
+```toml
+[hooks]
+snapshot  = "node /path/to/fawkes/ultimate/fawkes/storage.ts snapshot {home} {snapshot}"
+restore   = "node /path/to/fawkes/ultimate/fawkes/storage.ts restore {snapshot} {home}"
+test_copy = "node /path/to/fawkes/ultimate/fawkes/storage.ts test-copy {home} {test_home}"
+```
+
+- **snapshot** (after the live app stopped) copies each database present into the snapshot directory and writes
+  `index.json` last, so a snapshot counts once it is whole.
+- **restore** (after the failed generation stopped, before the old one starts) checks the whole snapshot first: no
+  index, a corrupt one, a name that is not one of the two files or a missing copy fails with nothing touched. Then
+  each database is copied beside the live file and renamed over it, after its `-wal`, `-shm` and `-journal` were
+  removed; a file that did not exist at the snapshot is deleted with them. Every file is as it was or wholly
+  restored, and a restore that failed is safe to run again.
+- **test-copy** (while the app runs and writes) copies each database present into the test home, rows that are still
+  only in the `-wal` included.
+
+A database is copied with `VACUUM INTO` (one read transaction, waiting up to 10 s for a lock), never with a file copy,
+which loses the `-wal`. Each copy keeps the mode of its source, a read-only file included. Exit 0 is success, 1 a failed
+step with the file and the reason on stderr, 2 a usage error. It needs `node:sqlite` (Node 22.13 or newer).
