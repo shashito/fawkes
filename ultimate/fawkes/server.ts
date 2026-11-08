@@ -9,6 +9,7 @@ import type { ExtensionHost } from 'ultimate/server/extensions.ts'
 import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
 import { request, subscribe } from './client.ts'
 import { mayConfirm } from './confirm.ts'
+import { deferRelease, releaseHold } from './hold.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { awaitingConfirm, restoreFailed, rollbackNote } from './step.ts'
 import type { Confirming, FawkesEvent, FawkesState, Generation, Status, Upgrade } from './types.ts'
@@ -76,7 +77,7 @@ function hold(host: ExtensionHost) {
     const harness = host.harness()
     harness.hold()
     s.holding = true
-    deferRelease(host, harness)
+    deferRelease(harness, () => shared(host).holding)
     // Read by health.ts: a test run passes its health check only once this facet held the scheduler. Fawkes removes the
     // test home before every test, so the marker never outlives the run that wrote it.
     if (fawkes.kind === 'test') writeFileSync(join(host.home, HELD_MARKER), new Date().toISOString())
@@ -87,31 +88,12 @@ function hold(host: ExtensionHost) {
   }
 }
 
-type Releasable = { release(): void }
-const ownRelease = new WeakMap<Releasable, () => void>()
-
-/**
- * The scheduler's hold is one flag, shared with the pause extension, whose Play (pressed, or its auto-play after a rate
- * limit, which a copied storage carries into a test run) would end this hold too. While this extension holds, any other
- * `release()` of this harness is set aside; this extension's own release lets the scheduler run unless the user's pause
- * still holds it. Once per harness: a failed core swap opens a new one.
- */
-function deferRelease(host: ExtensionHost, harness: Releasable) {
-  if (ownRelease.has(harness)) return
-  const original = harness.release.bind(harness)
-  ownRelease.set(harness, original)
-  harness.release = () => {
-    if (!shared(host).holding) original()
-  }
-}
-
-/** Release the hold this extension took, unless the user's pause holds the scheduler too. */
+/** Release the hold this extension took, unless the user's pause holds the scheduler too (`hold.ts`). */
 function release(host: ExtensionHost) {
   const s = shared(host)
   if (!s.holding) return
   s.holding = false
-  const harness = host.harness()
-  if (!host.want(PauseApi)?.paused()) (ownRelease.get(harness) ?? harness.release.bind(harness))()
+  releaseHold(host.harness(), host.want(PauseApi)?.paused() ?? false)
 }
 
 /**

@@ -425,6 +425,13 @@ install_timeout = 1"#,
         (1, Some("install_failed")),
         "{error}"
     );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("install for g1 failed (exit status: 1); see "),
+        "{error}"
+    );
     let (code, error) = h.fk(&["stage", "v2"]);
     assert_eq!(
         (code, error["code"].as_str()),
@@ -848,7 +855,7 @@ fn a_test_copy_hook_that_hangs_is_ended_with_its_group_and_leaves_no_copy() {
 #[test]
 fn the_storage_hooks_run_from_the_permanent_generation() {
     let mut h = Harness::new("");
-    for hook in ["snapshot", "restore"] {
+    for hook in ["snapshot", "restore", "test_copy"] {
         h.edit_manifest(
             &format!("{hook} = \"node"),
             &format!("{hook} = \"pwd -P >> {{state}}/{hook}-dirs && node"),
@@ -873,9 +880,97 @@ fn the_storage_hooks_run_from_the_permanent_generation() {
         format!("{}\n{g1}\n", repo.display()),
         "the first switch has no permanent generation, the second has g1"
     );
+    assert_eq!(dirs("test_copy"), format!("{}\n{g1}\n", repo.display()));
     assert_eq!(dirs("restore"), format!("{g1}\n"));
     // v2's row is gone: the restore went through, and g1 started again.
     assert_eq!(h.versions(), ["v1", "v1"]);
+}
+
+/// A switch without a `snapshot` hook leaves no snapshot behind, not even one an earlier switch to the same generation
+/// took: a `restore` added later would put that old storage back.
+#[test]
+fn a_switch_without_a_snapshot_hook_removes_an_earlier_snapshot() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    make_permanent(&h, "v2", "g2");
+    let snapshot = h.dir.join("s/generations/g1/snapshot");
+    assert!(snapshot.join("index.json").exists());
+
+    h.edit_manifest(common::HOOKS, "");
+    h.signal_daemon(Signal::HUP);
+    h.wait("the reload to be logged", 10, || {
+        messages_starting(&h, "daemon", "manifest reloaded")
+            .iter()
+            .any(|message| message.contains("hooks"))
+    });
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    assert!(!snapshot.exists(), "g1's old snapshot survived the switch");
+}
+
+/// A daemon killed while a restore hook runs leaves the hook behind; the next daemon stops it through `hook.pid`
+/// before it runs the restore again, and finishes the rollback.
+#[test]
+fn a_daemon_killed_during_a_restore_hook_stops_it_and_restores_again() {
+    let mut h = Harness::new("");
+    h.edit_manifest(
+        r#"restore = "node hooks.js restore {snapshot} {home}""#,
+        r"restore = '''if [ -e {state}/hang ]; then echo $$ > {state}/hook.pgid; exec sleep 600; fi; node hooks.js restore {snapshot} {home}'''",
+    );
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+
+    std::fs::write(h.dir.join("s/hang"), "").unwrap();
+    let mut rollback = h
+        .cli()
+        .arg("rollback")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid_file = h.dir.join("s/hook.pgid");
+    h.wait("the restore hook to run", 10, || {
+        std::fs::read_to_string(&pid_file).is_ok_and(|text| text.ends_with('\n'))
+    });
+    let pid = read_pid(&pid_file);
+    h.kill_daemon();
+    rollback.wait().unwrap();
+    assert!(
+        test_kill_process_group(pid).is_ok(),
+        "the hook ended with its daemon"
+    );
+
+    std::fs::remove_file(h.dir.join("s/hang")).unwrap();
+    h.start_daemon();
+    let alive = test_kill_process_group(pid).is_ok();
+    if alive {
+        // The group is the orphaned hook this test started.
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+    assert!(
+        !alive,
+        "the restore hook outlived the daemon that started it"
+    );
+    h.wait("v1 to serve again", 15, || h.get().as_deref() == Some("v1"));
+    assert_eq!(h.generation("g2")["state"], "rolled_back");
+    assert_eq!(h.versions(), ["v1", "v1"]);
+    assert!(
+        messages(&h, "daemon")
+            .iter()
+            .any(|message| message.starts_with("stopped the snapshot or restore hook")),
+    );
 }
 
 /// A manifest without hooks gets a code-only rollback: the old generation starts on the storage the rolled-back one

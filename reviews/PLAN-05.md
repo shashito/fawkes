@@ -65,6 +65,18 @@ integration suites went from 104 and 41 tests to 81 and 42.
 Why now: it removes the only app-specific code and the `rusqlite` dependency, and the extension (#2227) moves onto
 the hook contract in the same branch, so no build of Fawkes ever runs Ultimate without its storage covered.
 
+**Done:** 10.1 to 10.9. Measured against `f8adf51`: 40 crates down to 32, `src/` from 9,589 lines to 9,581, a clean
+debug build from 8.2 s to 6.9 s. Where the build differs from the rows: in every hook `{home}` is the live home, and
+`test_copy` writes into a template of its own, `{test_home}` (the test's empty home, which the test run then gets as
+`{home}`), so the copy's source and target are both named; `{snapshot}` and `{test_home}` are refused outside their
+hooks. `restore` needs `snapshot` as well as the other way round. `snapshot` and `restore` are tracked in a new
+`hook.pid`, because an automatic rollback restores beside a stage or test that holds `step.pid`; `test_copy` uses
+`step.pid`. `hooks` reloads with SIGHUP (default `timeout` 600 s), and a switch without a `snapshot` hook removes an
+earlier snapshot of its generation, so a `restore` added later fails instead of putting old storage back. Hook output
+goes to `generations/<id>/logs/hooks.log`. The extension's hold logic moved into `ultimate/fawkes/hold.ts` with a test
+of its own (the review of `1007cf5..63f249b`). The unit and integration suites went from 81 and 42 tests to 77 and
+46; the extension's from 4 to 13.
+
 | # | Change |
 |---|---|
 | 10.1 | Manifest: `storage = [...]` goes (a manifest that still has it fails to load, naming `[hooks]`). New optional `[hooks]` table: `snapshot`, `restore`, `test_copy`, each a shell command run via `/bin/sh -c` with the app's `[env]` plus `FAWKES_*`, and `timeout` (seconds, its own default, bounded like the other durations). A new template `{snapshot}`: a directory Fawkes creates per generation (`generations/<id>/snapshot/`, kept). `snapshot` and `restore` come together, and `snapshot` requires `test_copy`; validation names the hook that is missing. |

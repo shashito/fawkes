@@ -253,7 +253,7 @@ impl Daemon {
         // Fawkes's own environment, so package managers find their real caches.
         self.run_step(
             m,
-            "install",
+            &format!("install for {id}"),
             &command,
             &code,
             &[],
@@ -264,10 +264,7 @@ impl Daemon {
         .map_err(|e| {
             err(
                 ErrorCode::InstallFailed,
-                format!(
-                    "install for {id} failed ({e}); see {}",
-                    self.paths.failed_install_log().display()
-                ),
+                format!("{e}; see {}", self.paths.failed_install_log().display()),
             )
         })
     }
@@ -363,13 +360,15 @@ impl Daemon {
         })
     }
 
-    /// The `snapshot` hook of a switch to `id`, into a `snapshot/` made afresh: one left by an earlier switch to the
-    /// same generation (a retired one switched to again) must not mix with this one.
-    fn snapshot(&self, m: &Manifest, id: &str, command: &str) -> R<()> {
+    /// The snapshot of a switch to `id`: the `snapshot` hook into a `snapshot/` made afresh, or none without the
+    /// hook. A snapshot an earlier switch to the same generation took (a retired one switched to again) goes either
+    /// way: it must neither mix with this one nor be what a `restore` added later puts back.
+    fn snapshot(&self, out: &mut Out, m: &Manifest, id: &str) -> R<()> {
         let dir = self.paths.snapshot(id);
         let fresh = match std::fs::remove_dir_all(&dir) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => std::fs::create_dir_all(&dir),
+            _ if m.hooks.snapshot.is_some() => std::fs::create_dir_all(&dir),
+            _ => Ok(()),
         };
         fresh.map_err(|e| {
             err(
@@ -377,6 +376,10 @@ impl Daemon {
                 format!("cannot make {} afresh: {e}", dir.display()),
             )
         })?;
+        let Some(command) = &m.hooks.snapshot else {
+            return Ok(());
+        };
+        self.say(out, id, "snapshotting storage");
         self.run_hook(m, "snapshot", command, id, m.port, Place::Snapshot(dir))
     }
 
@@ -641,12 +644,9 @@ impl Daemon {
             }
         };
 
-        if let Some(snapshot) = &m.hooks.snapshot {
-            self.say(out, id, "snapshotting storage");
-            if let Err(e) = self.snapshot(&m, id, snapshot) {
-                resume(self);
-                return Err(e.with_hint(&unchanged));
-            }
+        if let Err(e) = self.snapshot(out, &m, id) {
+            resume(self);
+            return Err(e.with_hint(&unchanged));
         }
 
         // The request and the manifest both bound the deadline by MAX_DEADLINE, so this never saturates; saturating

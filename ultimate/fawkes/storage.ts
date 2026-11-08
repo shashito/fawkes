@@ -18,7 +18,7 @@ import {
   statSync,
   writeSync,
 } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 /** The storage of Ultimate's home; the index of a snapshot names nothing else. */
@@ -47,6 +47,16 @@ const remove = (path: string) => rmSync(path, { force: true })
 
 const modeOf = (path: string) => statSync(path).mode & 0o777
 
+/** Sync the directory of `path`, so a rename into it survives a power loss too. */
+function syncDirectory(path: string) {
+  const fd = openSync(dirname(path), 'r')
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
 /** Write a file durably: a temp file beside it, flushed, then renamed, so it is whole or not there. */
 function writeAtomic(path: string, text: string) {
   const temp = `${path}.tmp`
@@ -59,6 +69,7 @@ function writeAtomic(path: string, text: string) {
     closeSync(fd)
   }
   renameSync(temp, path)
+  syncDirectory(path)
 }
 
 /**
@@ -162,6 +173,7 @@ function restore(dir: string, home: string) {
       // The failed generation's log would replay onto the restored pages.
       for (const stale of withCompanions(live).slice(1)) remove(stale)
       renameSync(temp, live)
+      syncDirectory(live)
     } catch (error) {
       remove(temp)
       throw new Error(`cannot restore ${live} from ${join(dir, name)}: ${message(error)}`)

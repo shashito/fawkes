@@ -418,7 +418,8 @@ shell command run via `/bin/sh -c`, with `{home}` the live home:
 
 - `snapshot`: at a switch, after the old generation has stopped and before the target is marked `current`. It
   copies the storage into `{snapshot}`, `generations/<target>/snapshot/`, which Fawkes makes afresh just before
-  and keeps until the generation is pruned.
+  and keeps until the generation is pruned. A switch without the hook removes the one an earlier switch to the same
+  generation took, so a `restore` added later fails instead of putting old storage back.
 - `restore`: at every rollback, after the pending generation has stopped and before the permanent one starts. It
   puts back the storage from `{snapshot}`. It must be **safe to run again after it failed** (`fawkes rollback` and
   the next daemon start retry it), and leave every file either as it was or wholly restored (write beside it, then
