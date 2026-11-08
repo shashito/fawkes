@@ -8,12 +8,9 @@ use crate::protocol::{
     RollbackResult, SwitchResult, TestInfo, err, invalid_state, not_found,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, refusal};
-use crate::storage;
-use std::io::Read;
 use std::net::TcpListener;
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
@@ -56,6 +53,12 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
+/// The directory a storage hook works on besides the live home: a switch's snapshot, or a test's home.
+enum Place {
+    Snapshot(PathBuf),
+    TestHome(PathBuf),
+}
+
 /// How long the quick git calls (rev-parse, prune, remove) get.
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -63,60 +66,22 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     git_within(repo, args, GIT_TIMEOUT)
 }
 
-/// Run git in `repo` for at most `timeout`; its stdout, trimmed, on success and its stderr on failure.
+/// Run git in `repo` for at most `timeout`, so a hanging git can neither hold the step slot for ever nor outlive
+/// its group; its stdout, trimmed, on success and its stderr on failure.
 fn git_within(repo: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(repo).args(args);
-    let (status, stdout, stderr) = run_bounded(command, timeout, "git")?;
-    if status.success() {
-        Ok(stdout.trim().to_string())
-    } else {
-        Err(stderr.trim().to_string())
-    }
-}
-
-/// Read `pipe` to its end on a thread: a child that writes more than a pipe holds would otherwise wait for a reader
-/// that only reads once it has exited.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
-    thread::spawn(move || {
-        let mut text = Vec::new();
-        if let Some(mut pipe) = pipe {
-            // A read error ends the capture; what came before is still the useful part.
-            let _ = pipe.read_to_end(&mut text);
-        }
-        String::from_utf8_lossy(&text).into_owned()
-    })
-}
-
-/// Run `command` in its own process group for at most `timeout`, so a hanging child (a git hook, a huge copy) can
-/// neither hold the step slot for ever nor outlive its group: on a timeout the whole group is ended, and a child
-/// that left processes behind takes them with it. Gives its exit status, stdout and stderr.
-fn run_bounded(
-    mut command: Command,
-    timeout: Duration,
-    what: &str,
-) -> Result<(ExitStatus, String, String), String> {
-    let mut child = command
-        .stdin(Stdio::null())
+    command
+        .arg("-C")
+        .arg(repo)
+        .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("cannot run {what}: {e}"))?;
-    let pgid = child.id();
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let Some(status) = process::wait_until(&mut child, Instant::now() + timeout)
-        .map_err(|e| format!("{what}: {e}"))?
-    else {
-        // The readers are left to finish on their own: a group stuck in the kernel keeps its pipes open.
-        process::stop_group(pgid, 0.0, Some(&mut child));
-        return Err(format!("{what} timed out after {}s", timeout.as_secs()));
-    };
-    // Whatever the child left running would keep the pipes open, and the readers waiting.
-    process::stop_group(pgid, 0.0, Some(&mut child));
-    let output = |reader: thread::JoinHandle<String>| reader.join().unwrap_or_default();
-    Ok((status, output(stdout), output(stderr)))
+        .stderr(Stdio::piped());
+    let finished = process::run_bounded(&mut command, timeout, 0.0, "git", |_| {})?;
+    if finished.status.success() {
+        Ok(finished.stdout.trim().to_string())
+    } else {
+        Err(finished.stderr.trim().to_string())
+    }
 }
 
 impl Daemon {
@@ -285,45 +250,138 @@ impl Daemon {
         let vars = self.vars(m.port, &m.home, &code, id);
         let command = vars.expand_command(install);
         self.say(out, id, format!("installing: {command}"));
-        self.run_install(m, &command, &code, &self.paths.install_log(id))
-            .map_err(|e| {
-                err(
-                    ErrorCode::InstallFailed,
-                    format!(
-                        "install for {id} failed ({e}); see {}",
-                        self.paths.failed_install_log().display()
-                    ),
-                )
-            })
+        // Fawkes's own environment, so package managers find their real caches.
+        self.run_step(
+            m,
+            "install",
+            &command,
+            &code,
+            &[],
+            &self.paths.install_log(id),
+            &self.paths.step_pid(),
+            Duration::from_secs_f64(m.install_timeout),
+        )
+        .map_err(|e| {
+            err(
+                ErrorCode::InstallFailed,
+                format!(
+                    "install for {id} failed ({e}); see {}",
+                    self.paths.failed_install_log().display()
+                ),
+            )
+        })
     }
 
-    /// Run the install command in the worktree, in its own process group and with Fawkes's own environment (so
-    /// package managers find their real caches), for at most `install_timeout` seconds.
-    fn run_install(
+    /// Run the install or a storage hook to its end, for at most `timeout` (`process::run_bounded`, stopped like
+    /// the app on a timeout): the start wrapper records its group in `pid_file` for a later daemon, and the group
+    /// joins those `shutdown` kills while it runs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the install and each hook differ in every one of them"
+    )]
+    fn run_step(
         &self,
         m: &Manifest,
+        what: &str,
         command: &str,
-        code: &Path,
+        cwd: &Path,
+        env: &process::Env,
         log: &Path,
+        pid_file: &Path,
+        timeout: Duration,
     ) -> Result<(), String> {
-        let mut child = self
-            .spawn_step(command, code, &[], log, &format!("install: {command}"))
-            .map_err(|e| e.to_string())?;
-        let until = Instant::now() + Duration::from_secs_f64(m.install_timeout);
-        let result = match process::wait_until(&mut child, until) {
-            Ok(Some(status)) if status.success() => Ok(()),
-            Ok(Some(status)) => Err(status.to_string()),
-            Err(e) => Err(e.to_string()),
-            Ok(None) => Err(format!("timed out after {}s", m.install_timeout)),
-        };
-        // A timed-out install still runs, and a finished one may have left processes in its group: nothing of it
-        // outlives the stage.
-        self.end_step(&mut child, m.stop_timeout);
-        result
+        let mut shell = process::shell(
+            command,
+            cwd,
+            env,
+            log,
+            &format!("{what}: {command}"),
+            Some(pid_file),
+        )
+        .map_err(|e| format!("cannot run {what}: {e}"))?;
+        let mut group = None;
+        let finished = process::run_bounded(&mut shell, timeout, m.stop_timeout, what, |pgid| {
+            group = Some(pgid);
+            lock(&self.step_pgids).push(pgid);
+        });
+        // Best effort: `leftover` never mistakes a stale file for a live step.
+        let _ = std::fs::remove_file(pid_file);
+        if let Some(pgid) = group {
+            lock(&self.step_pgids).retain(|p| *p != pgid);
+        }
+        let finished = finished?;
+        if finished.status.success() {
+            Ok(())
+        } else {
+            Err(format!("{what} failed ({})", finished.status))
+        }
     }
 
-    /// Start an install or a test: the start wrapper records it in `step.pid` for a later daemon, and its group joins
-    /// those `shutdown` kills.
+    /// Run the storage hook `name` for generation `id` (DESIGN.md → Hooks) from the permanent generation's worktree,
+    /// or the repository before the first confirm: never from a generation that may still roll back, so code under
+    /// suspicion never decides how the storage is copied or restored. `{home}` is the live home; `place` is the
+    /// hook's own directory, `{snapshot}` or `{test_home}`. A non-zero exit or a timeout is `storage_failed`.
+    fn run_hook(
+        &self,
+        m: &Manifest,
+        name: &str,
+        command: &str,
+        id: &str,
+        port: u16,
+        place: Place,
+    ) -> R<()> {
+        let permanent = self.inner().store.state().permanent.clone();
+        let cwd = permanent.map_or_else(|| m.repo.clone(), |p| self.paths.code(&p));
+        let mut vars = self.vars(port, &m.home, &cwd, id);
+        let (phase, pid_file) = match place {
+            Place::Snapshot(dir) => {
+                vars.snapshot = Some(dir);
+                ("live", self.paths.hook_pid())
+            }
+            Place::TestHome(dir) => {
+                vars.test_home = Some(dir);
+                ("test", self.paths.step_pid())
+            }
+        };
+        let env = self.app_env(m, &vars, phase);
+        let log = self.paths.hook_log(id);
+        self.run_step(
+            m,
+            &format!("the {name} hook"),
+            &vars.expand_command(command),
+            &cwd,
+            &env,
+            &log,
+            &pid_file,
+            Duration::from_secs_f64(m.hooks.timeout),
+        )
+        .map_err(|e| {
+            err(
+                ErrorCode::StorageFailed,
+                format!("{e}; see {}", log.display()),
+            )
+        })
+    }
+
+    /// The `snapshot` hook of a switch to `id`, into a `snapshot/` made afresh: one left by an earlier switch to the
+    /// same generation (a retired one switched to again) must not mix with this one.
+    fn snapshot(&self, m: &Manifest, id: &str, command: &str) -> R<()> {
+        let dir = self.paths.snapshot(id);
+        let fresh = match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => std::fs::create_dir_all(&dir),
+        };
+        fresh.map_err(|e| {
+            err(
+                ErrorCode::StorageFailed,
+                format!("cannot make {} afresh: {e}", dir.display()),
+            )
+        })?;
+        self.run_hook(m, "snapshot", command, id, m.port, Place::Snapshot(dir))
+    }
+
+    /// Start a test: the start wrapper records it in `step.pid` for a later daemon, and its group joins those
+    /// `shutdown` kills.
     fn spawn_step(
         &self,
         command: &str,
@@ -337,7 +395,7 @@ impl Daemon {
         Ok(child)
     }
 
-    /// End the install or test `child` together with everything left in its group, and forget it.
+    /// End the test `child` together with everything left in its group, and forget it.
     fn end_step(&self, child: &mut Child, stop_timeout: f64) {
         let pgid = child.id();
         process::stop_group(pgid, stop_timeout, Some(child));
@@ -407,13 +465,27 @@ impl Daemon {
                 ),
             )
         })?;
-        storage::copy(&m.home, &m.storage, &test_home)
-            .map_err(|e| err(ErrorCode::StorageFailed, e))?;
+        // Without hooks the test home stays empty: never the live one, which the test must not touch.
+        let with = match &m.hooks.test_copy {
+            Some(test_copy) => {
+                self.say(out, id, "copying the storage for the test");
+                self.run_hook(
+                    &m,
+                    "test_copy",
+                    test_copy,
+                    id,
+                    port,
+                    Place::TestHome(test_home.clone()),
+                )?;
+                "a copy of the storage"
+            }
+            None => "an empty home",
+        };
 
         self.say(
             out,
             id,
-            format!("starting {id} on spare port {port} with a copy of the storage"),
+            format!("starting {id} on spare port {port} with {with}"),
         );
         let started = Instant::now();
         let vars = self.vars(port, &test_home, &g.dir, id);
@@ -569,10 +641,12 @@ impl Daemon {
             }
         };
 
-        self.say(out, id, "snapshotting storage");
-        if let Err(e) = storage::snapshot(&m.home, &m.storage, &self.paths.snapshot(id)) {
-            resume(self);
-            return Err(err(ErrorCode::StorageFailed, e).with_hint(&unchanged));
+        if let Some(snapshot) = &m.hooks.snapshot {
+            self.say(out, id, "snapshotting storage");
+            if let Err(e) = self.snapshot(&m, id, snapshot) {
+                resume(self);
+                return Err(e.with_hint(&unchanged));
+            }
         }
 
         // The request and the manifest both bound the deadline by MAX_DEADLINE, so this never saturates; saturating
@@ -771,7 +845,15 @@ impl Daemon {
         if let Some(app) = app {
             self.stop_app(app);
         }
-        let restored = storage::restore(&m.home, &self.paths.snapshot(&id));
+        // Every time: whether the storage goes back is not the hook's to decide (only `--keep-storage` gives it up).
+        let restored = match &m.hooks.restore {
+            Some(restore) => {
+                self.say(out, &id, "restoring storage");
+                let snapshot = Place::Snapshot(self.paths.snapshot(&id));
+                self.run_hook(&m, "restore", restore, &id, m.port, snapshot)
+            }
+            None => Ok(()),
+        };
 
         let mut inner = self.inner();
         let permanent = inner.store.state().permanent.clone();
@@ -789,7 +871,8 @@ impl Daemon {
             return Err(err(
                 ErrorCode::StorageFailed,
                 format!(
-                    "{id} was rolled back but its storage could not be restored: {e}; the app stays stopped; {}",
+                    "{id} was rolled back but its storage could not be restored: {}; the app stays stopped; {}",
+                    e.message,
                     restore_way_out(permanent.as_deref())
                 ),
             ));
@@ -1035,47 +1118,16 @@ fn clone_directory(from: &Path, to: &Path, timeout: Duration) -> Result<(), Stri
         &["-R", "--reflink=auto"]
     };
     let mut command = Command::new("cp");
-    command.args(flags).arg(from).arg(to);
-    let (status, _, _) = run_bounded(command, timeout, "cp")?;
-    if status.success() {
+    command
+        .args(flags)
+        .arg(from)
+        .arg(to)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let finished = process::run_bounded(&mut command, timeout, 0.0, "cp", |_| {})?;
+    if finished.status.success() {
         Ok(())
     } else {
-        Err(format!("cp {status}"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_hanging_command_is_ended_with_everything_it_left_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("leader.pid");
-        // The shell starts a member in the background, then records its pid (its group's id) and waits: a written
-        // file means the group has the member to end. A second leaves the shell ample time to get there under load.
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(r#"sleep 30 & echo $$ > "$0"; wait"#)
-            .arg(&pid_file);
-
-        let started = Instant::now();
-        let result = run_bounded(command, Duration::from_secs(1), "sleeper");
-        let waited = started.elapsed();
-
-        let message = result.expect_err("a command that outlives its timeout");
-        assert!(message.contains("timed out"), "{message}");
-        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
-        // The shell leads its group and the background member joined it.
-        let pgid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(
-            !process::group_alive(pgid),
-            "a member of the group survived"
-        );
+        Err(format!("cp {}", finished.status))
     }
 }

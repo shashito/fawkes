@@ -6,7 +6,6 @@
 name = "ultimate"
 repo = "/path/to/ultimate"
 home = "/path/to/.ultimate/projects/my-app-<hash>"
-storage = ["state.sqlite", "trace.sqlite"]
 port = 4747
 spare_ports = [4790, 4799]
 install = "pnpm install --frozen-lockfile"
@@ -21,6 +20,12 @@ stop_timeout = 30               # a test run cleans up its preview branch after 
 # goes live.
 command = "node /path/to/fawkes/ultimate/fawkes/health.ts"
 timeout = 120
+
+[hooks]
+# The extension's storage hooks (ultimate/fawkes/storage.ts) copy state.sqlite and trace.sqlite with `VACUUM INTO`.
+snapshot = "node /path/to/fawkes/ultimate/fawkes/storage.ts snapshot {home} {snapshot}"
+restore = "node /path/to/fawkes/ultimate/fawkes/storage.ts restore {snapshot} {home}"
+test_copy = "node /path/to/fawkes/ultimate/fawkes/storage.ts test-copy {home} {test_home}"
 
 [env]
 ULTIMATE_HOME = "{home}"

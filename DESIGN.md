@@ -43,18 +43,19 @@ Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live ap
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
 `daemon` event naming the changed fields, or an `error` event saying why it was refused:
 
-- `name`, `repo`, `state_dir`, `home` and `storage` never change by reload; they need a daemon restart. (A changed
-  `home` would restore a snapshot into another directory than the one it was taken from.)
+- `name`, `repo`, `state_dir` and `home` never change by reload; they need a daemon restart. (A changed `home` would
+  restore a snapshot into another directory than the one it was taken from.)
 - `port` does not change while the app runs (`stop` it first), nor while a step holds the live process (a switch,
   restart, rollback or the supervisor's own restart: between stopping the old process and starting the new one no app
   runs, yet the step announces the port it starts on). The reload is refused whole; send `SIGHUP` again once the step
   has finished.
-- Everything else (`start`, `env`, `health`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`, `spare_ports`,
-  `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch or start on. An invalid
-  manifest is not reloaded.
+- Everything else (`start`, `env`, `health`, `hooks`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`,
+  `spare_ports`, `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch, rollback
+  or start on. An invalid manifest is not reloaded.
 
-Change `home` or `storage` only while no switch is pending: a daemon start rolls a pending switch back into the
-`home` of the manifest it reads.
+Change `home` only while no switch is pending: a daemon start rolls a pending switch back into the `home` of the
+manifest it reads. The same goes for a `restore` hook that cannot read what the `snapshot` hook before it wrote, since
+the rollback of a pending switch runs the `restore` the daemon has then.
 
 **Panics** abort the daemon (`panic = "abort"`) after an `error` event with the message. The init system restarts
 it, and the daemon start below recovers whatever was in flight; no thread carries on past a broken invariant.
@@ -75,13 +76,12 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   exists. A stage that fails later removes the generation again (record, directory, worktree); one that a daemon's end
   cut short is removed at the next daemon start. Ids are never reused.
 - **staged:** worktree created and install succeeded. **test_failed:** the last test failed; `test` may run again.
-- **tested:** started on a spare port with a copy of the storage and passed the health check. The spare port is
-  the first in `spare_ports` that is free on both `127.0.0.1` and `0.0.0.0`; a test that fails while another
-  process holds its port afterwards is `port_in_use` and leaves the generation as it was. Only a tested
-  generation can be switched to.
-  The copy of each database is one read, so it is consistent (and, in WAL mode, does not hold up the app's
-  writes); one that stays locked for 10 s fails the test with `storage_failed`. The same bound holds for a switch's
-  snapshot (`storage_failed`, and the switch does not happen) and a rollback's restore (a failed restore, below).
+- **tested:** started on a spare port with a test home of its own and passed the health check. The test home is
+  created empty, and the `test_copy` hook (see Hooks) fills it with a copy of the storage before the app starts; a
+  hook that fails fails the test with `storage_failed` and leaves the generation as it was. Without hooks the app
+  starts on the empty home, never on the live one. The spare port is the first in `spare_ports` that is free on both
+  `127.0.0.1` and `0.0.0.0`; a test that fails while another process holds its port afterwards is `port_in_use` and
+  leaves the generation as it was. Only a tested generation can be switched to.
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
 - **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
   start of the daemon always runs the permanent generation (Erlang/OTP release handler).
@@ -95,8 +95,9 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
 1. Refuse unless the target is `tested` and no other switch is pending.
 2. Save the step `switching` to `state.json`, then stop the running generation (SIGTERM to its process group,
    SIGKILL after `stop_timeout`).
-3. Snapshot every storage file into the target's `snapshot/` (SQLite online backup API). Stopping first means no
-   write of the old generation lands after the snapshot, so a rollback loses nothing the old generation wrote.
+3. Run the `snapshot` hook into the target's `snapshot/`, made afresh (see Hooks; without hooks there is no
+   snapshot). Stopping first means no write of the old generation lands after the snapshot, so a rollback loses
+   nothing the old generation wrote.
 4. Mark the target `current` and write the step `pending` with its deadline (absolute time) to `state.json`, then
    start the target on the live port. The deadline is wall-clock time, so it survives a daemon restart, and it also
    runs on while the machine sleeps: a switch whose deadline passes during a sleep rolls back on wake (within a
@@ -109,7 +110,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    rollback is decided before the `unhealthy` event is logged. It is off by default, for apps that are slow to warm
    up.
 
-A switch that fails before step 4 (its snapshot or its `state.json` cannot be written) ends with no step in flight
+A switch that fails before step 4 (its `snapshot` hook fails, `storage_failed`, or its `state.json` cannot be
+written) ends with no step in flight
 and starts the previous generation again, or, when that one was waiting out a crash backoff, leaves its restart
 scheduled as it was; a confirm that cannot be written fails and stays pending. A `SIGTERM` that arrives while the old
 generation is stopping ends the switch the same way, just before step 4: the answer is `busy` (the daemon is shutting
@@ -145,14 +147,12 @@ Code and storage roll back together:
    effort: rolling back is the safe direction, and a `state.json` that still says `pending` rolls back at the next
    start anyway.
 2. Stop the pending generation.
-3. Restore every storage file from the pending generation's `snapshot/` (backup API into the live path, with the
-   mode the live file had at snapshot time, which SQLite gives its `-wal` and `-shm` too; a file that did not exist
-   at snapshot time is deleted together with its `-wal`, `-shm` and `-journal`). An `index.json` naming a path that
-   `storage` validation would refuse, or a file that is not `<n>.sqlite`, fails the restore before any file is
-   touched.
+3. Run the `restore` hook from the pending generation's `snapshot/` into `home` (see Hooks), every time: no hook
+   decides to keep the storage, and only `rollback --keep-storage` (below) gives a restore up. Without hooks the
+   rollback is code-only.
 4. Clear the step, then start the permanent generation again (none on a first-ever switch).
 
-If the restore fails, the generation is still `rolled_back` (its code never runs again), but the step stays in
+If the restore fails (the hook exits non-zero or times out, `storage_failed`), the generation is still `rolled_back` (its code never runs again), but the step stays in
 `state.json` as `rolling_back` with `restore_failed` set, and nothing is started on storage in an unknown state: `status` shows `failed`, and
 `fawkes rollback` or the next daemon start retries the restore, and the error says so, with the other way out:
 "`fawkes rollback` retries the restore, or `fawkes rollback --keep-storage` starts g1 on the storage as it is (it may
@@ -167,8 +167,8 @@ finish, but a daemon on its way out does not start the permanent generation: it 
 Rollback happens at most once per generation and only ever goes to the permanent generation. If that one then fails
 too, Fawkes does not roll further back; the restart policy below applies and the failure is reported in `status`.
 
-A restore that can never succeed (a deleted or corrupt `snapshot/`) would keep the app down for good, so the
-operator can give it up: `fawkes rollback --keep-storage`. It is allowed only while the step is `rolling_back` with
+A restore that can never succeed (a deleted or corrupt `snapshot/`, a hook that is broken for good) would keep the
+app down for good, so the operator can give it up and stop retrying the hook: `fawkes rollback --keep-storage`. It is allowed only while the step is `rolling_back` with
 `restore_failed` (else `invalid_state`). It clears the step, leaves the generation `rolled_back` and records
 `restore_abandoned_at` on it, logs a `rolled_back` event saying the storage was kept as it was, and starts the
 permanent generation. **The risk:** the permanent generation then runs on storage that the failed generation may
@@ -246,8 +246,9 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    file was written counts: a pid reused since, after a reboot too, belongs to a later process and is left alone.
    When that leader is gone but its group still has members (`start = "npm start"`), the group counts if the file
    was written after the machine booted.
-   The install or test that daemon was running is found and stopped the same way, through `step.pid`, before the
-   next step removes the directory it runs in.
+   The install, test or `test_copy` hook that daemon was running is found and stopped the same way, through
+   `step.pid`, before the next step removes the directory it runs in, and a `snapshot` or `restore` hook through
+   `hook.pid`, before the rollback below runs the restore again.
 6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
    owns, and the worktrees git still lists for them (`git worktree prune`).
 7. Act on the step `state.json` says was in flight (`txn`):
@@ -256,8 +257,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
      the old generation). Log that the switch to it was cut short (it stays `tested`), clear the step and start the
      permanent generation;
    - `pending`: roll the switch back (reason `daemon_restart`); a pending switch is never resumed;
-   - `rolling_back`: retry the rollback with its recorded reason (restoring the same snapshot twice is harmless),
-     then start the permanent generation.
+   - `rolling_back`: retry the rollback with its recorded reason (a `restore` hook is safe to run again, see
+     Hooks), then start the permanent generation.
 
 ## Manifest
 
@@ -269,18 +270,20 @@ another user than the one running it, root excepted, or one that other users can
 under a umask of `002` with a group of one's own. The error says which, and to `chmod o-w` it.
 
 TOML, one file per app. Relative paths resolve against the manifest's directory. Strings in `install`, `start`,
-`health.command`, `health.url` and `env` values expand these templates:
+`health.command`, `health.url`, the hooks and `env` values expand these templates:
 
 | Template | Value |
 |---|---|
 | `{port}` | the live `port`, or the spare port during `test` |
-| `{home}` | the app's state directory, or the test copy of it during `test` |
-| `{code}` | the generation's worktree |
+| `{home}` | the app's state directory, or the test home during `test`; in a hook always the live one |
+| `{code}` | the generation's worktree; in a hook the directory it runs in (see Hooks) |
 | `{generation}` | the generation id, `g3` |
 | `{state}` | Fawkes's state directory |
+| `{snapshot}` | `snapshot` and `restore` hooks only: the generation's `snapshot/` |
+| `{test_home}` | `test_copy` hook only: the test's empty home |
 
 Expansion is one pass: a substituted value is never scanned again, and an unknown `{...}` stays as written. In
-`install`, `start` and `health.command` each value is shell-quoted (bare when it only has
+`install`, `start`, `health.command` and the hooks each value is shell-quoted (bare when it only has
 `A-Z a-z 0-9 _ - . / : , + = @ %`, otherwise in single quotes with `'\''` for a single quote), so a path with a space or a `'` stays one word. In `[env]`
 values and `health.url` values are substituted as is. A manifest that quotes a template itself (`'{home}'`) only keeps
 working for paths without special characters, so commands use the bare template, or the `[env]` variable
@@ -291,7 +294,6 @@ name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
 # state_dir = "state"         # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes (absolute)
 home = "sample-home"           # the app's own state directory
-storage = ["app.sqlite"]       # SQLite files relative to home, snapshotted at switch
 port = 4790                    # live port
 spare_ports = [4791, 4799]     # inclusive range for `test`
 install = "npm ci"             # run in the worktree after checkout; optional
@@ -311,7 +313,13 @@ url = "http://127.0.0.1:{port}/"   # healthy on a 2xx or 3xx answer
 interval = 0.5                 # seconds between attempts
 timeout = 60                   # seconds until `test` gives up
 
-[env]                          # environment of start and health.command, not of install
+[hooks]                        # optional; see Hooks
+snapshot = "node hooks.js snapshot {home} {snapshot}"   # at a switch: copy the storage into {snapshot}
+restore = "node hooks.js restore {snapshot} {home}"     # at every rollback: put it back
+test_copy = "node hooks.js copy {home} {test_home}"     # before a test: copy it into the test home
+timeout = 600                  # seconds each hook may take
+
+[env]                          # environment of start, health.command and the hooks, not of install
 APP_PORT = "{port}"
 APP_HOME = "{home}"
 ```
@@ -323,12 +331,16 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
 **Validation:** the daemon refuses to start with (and does not reload) a manifest where:
 
 - `name` is not made of letters, digits, `_` and `-` (it becomes a file name);
-- a `storage` or `reuse` entry is empty, absolute or contains `..` (they are joined onto `home` and the worktree,
-  and a restore deletes files at those paths);
+- a `reuse` entry is empty, absolute or contains `..` (it is joined onto the worktree);
+- it has `storage`, which `[hooks]` replaced: the error says so;
+- `hooks.snapshot` comes without `hooks.restore` or `hooks.test_copy`, or `hooks.restore` without `hooks.snapshot`
+  (the error names the hook that is missing);
+- `{snapshot}` appears anywhere but in `hooks.snapshot` and `hooks.restore`, or `{test_home}` anywhere but in
+  `hooks.test_copy` (elsewhere they would stay as written);
 - `port` lies inside `spare_ports`, or `spare_ports` is not `[low, high]`;
 - `deadline` is not between 1 and 604800 seconds (a week);
-- `install_timeout`, `stop_timeout`, `min_uptime`, `health.interval` or `health.timeout` is not a number of seconds
-  above 0 and at most 86400;
+- `install_timeout`, `stop_timeout`, `min_uptime`, `health.interval`, `health.timeout` or `hooks.timeout` is not a
+  number of seconds above 0 and at most 86400;
 - `max_failed_starts` or `keep` is 0;
 - `[health]` does not have exactly one of `url` and `command`, or `url` is not `http://` with an explicit port
   after the host (`:{port}`, or a number from 1 to 65535);
@@ -337,8 +349,11 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
 
 The error names every problem at once.
 
-`git` and `cp` run in their own process group with a bound: `git worktree add` and the `reuse` copies get
-`install_timeout` seconds, the other git calls 60. Past it the group is killed and the step fails with "timed out".
+Every child that must end by itself (`install`, the hooks, `git`, `cp` and a health command) goes through one
+runner: its own process group, stdin closed, a bound, and the whole group ended on every way out (SIGTERM, then
+SIGKILL after a grace of `stop_timeout` for the install and the hooks, at once for the rest), so neither a child
+that hangs nor what a finished one left running outlives it. `git worktree add` and the `reuse` copies get
+`install_timeout` seconds, the other git calls 60. Past it the step fails with "timed out".
 `git worktree add` skips the repository's hooks (`core.hooksPath=/dev/null`); the install is the place for setup.
 
 A health attempt is bounded too. A `url` attempt must connect, send and read the status line (at most 1 KiB of it)
@@ -350,9 +365,9 @@ comes at `timeout` and not up to an `interval` after it (one attempt may still r
 `install` runs with Fawkes's own environment so package managers find their real caches, in its own process group.
 After `install_timeout` seconds it is stopped like the app (SIGTERM, SIGKILL after `stop_timeout`) and the stage
 fails; whatever it left running in its group is ended when it finishes; a stopping daemon kills it. A failed
-install's output is kept in `<state_dir>/install-failed.log` (the latest one only). `start` and
-`health.command` get the inherited environment plus `[env]` plus `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION`
-and `FAWKES_PHASE` (`test` or `live`).
+install's output is kept in `<state_dir>/install-failed.log` (the latest one only). `start`, `health.command` and
+the hooks get the inherited environment plus `[env]` plus `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and
+`FAWKES_PHASE` (`test` or `live`; `live` for `snapshot` and `restore`, `test` for `test_copy`).
 
 **Copy-on-write reuse:** before `install`, every `reuse` directory is cloned from the permanent generation's worktree
 (or the repository's working tree when there is none): `cp -cR` on macOS (APFS `clonefile`, near-instant and no extra
@@ -362,7 +377,8 @@ starts without it. The stage does not fail for it.
 
 The Ultimate manifest (first user; see `examples/ultimate.toml`). Its `start` is the wrapper of the Ultimate extension
 in `ultimate/fawkes/`, which runs Ultimate for `<project>` from the generation and isolates a test run like an
-Ultimate preview (README there). Fawkes restores storage on a rollback, but not what the app did outside it, so the
+Ultimate preview (README there), and its `storage.ts` is the three hooks for Ultimate's `state.sqlite` and
+`trace.sqlite`. Fawkes restores storage on a rollback, but not what the app did outside it, so the
 extension holds Ultimate's task scheduler in a test run and in a new live generation until that generation has
 confirmed itself: no agent work runs on code that may still roll back. Its `health.command` passes a test run only
 once that hold is in place.
@@ -371,7 +387,6 @@ once that hold is in place.
 name = "ultimate"
 repo = "/path/to/ultimate"
 home = "/path/to/.ultimate/projects/my-app-<hash>"
-storage = ["state.sqlite", "trace.sqlite"]
 port = 4747
 spare_ports = [4790, 4799]
 install = "pnpm install --frozen-lockfile"
@@ -385,10 +400,54 @@ stop_timeout = 30
 command = "node /path/to/fawkes/ultimate/fawkes/health.ts"
 timeout = 120
 
+[hooks]
+snapshot = "node /path/to/fawkes/ultimate/fawkes/storage.ts snapshot {home} {snapshot}"
+restore = "node /path/to/fawkes/ultimate/fawkes/storage.ts restore {snapshot} {home}"
+test_copy = "node /path/to/fawkes/ultimate/fawkes/storage.ts test-copy {home} {test_home}"
+
 [env]
 ULTIMATE_HOME = "{home}"
 ULTIMATE_PORT = "{port}"
 ```
+
+### Hooks
+
+Fawkes does not understand storage. It keeps the two moments a transaction needs, a snapshot at the switch and a
+restore at the rollback, plus a copy for each test, and runs the app's own commands for them, `[hooks]`. Each is a
+shell command run via `/bin/sh -c`, with `{home}` the live home:
+
+- `snapshot`: at a switch, after the old generation has stopped and before the target is marked `current`. It
+  copies the storage into `{snapshot}`, `generations/<target>/snapshot/`, which Fawkes makes afresh just before
+  and keeps until the generation is pruned.
+- `restore`: at every rollback, after the pending generation has stopped and before the permanent one starts. It
+  puts back the storage from `{snapshot}`. It must be **safe to run again after it failed** (`fawkes rollback` and
+  the next daemon start retry it), and leave every file either as it was or wholly restored (write beside it, then
+  rename), since Fawkes trusts its exit code alone. A hook never decides to keep the storage: if there is nothing to
+  restore it fails, and only `rollback --keep-storage` gives a restore up.
+- `test_copy`: at a test, before the app starts, into `{test_home}`, which is empty and is the `{home}` the test run
+  gets. The live app may be running and writing meanwhile.
+
+A hook runs in the **permanent generation's worktree** (`{code}`), or in `repo` before the first confirm; never in
+the generation being tested, switched to or rolled back, so code under suspicion never decides how storage is
+copied or restored. A hook that names an absolute path (as Ultimate's do) runs the same code from any of them. Each
+runs in its own process group through the bounded runner above, for at most `hooks.timeout` seconds (default 600),
+and its output goes to `generations/<id>/logs/hooks.log`. A hook that exits non-zero or times out fails its step
+with `storage_failed`, which means "a storage hook failed": the test fails and the generation stays as it was, the
+switch does not happen (Switch), or the restore fails and the app stays stopped (Rollback). `snapshot` and `restore`
+are tracked in `hook.pid`, `test_copy` in `step.pid`, so a stopping daemon kills them and the next one stops a hook
+the last one left.
+
+**An app without hooks gets a code-only rollback.** The old generation then starts on whatever storage the failed one
+left, migrations included, and every test starts on an empty home, never the live one. This is a change from the
+first design, where Fawkes copied the SQLite files listed in `storage` itself: that is now the app's hook (the
+sample's `examples/sample/hooks.js` and the Ultimate extension's `ultimate/fawkes/storage.ts` copy with `VACUUM
+INTO` a file beside the target and a rename, which a plain `cp` of a live WAL database is not). `snapshot` and
+`restore` come together, and `snapshot` requires `test_copy`, so an app whose storage is worth a snapshot is never
+tested on an empty home.
+
+**Upgrading to this contract:** a manifest with `storage` no longer loads, and a `snapshot/` written before
+(`index.json` and `<n>.sqlite`) is not what the new hooks read. Install this build only with no switch pending, and
+add `[hooks]` to the manifest.
 
 ## CLI
 
@@ -626,7 +685,9 @@ event log started over`. Until the first `status` line names the app, a note nam
                          writes (temp file, fsync, rename, fsync of the directory). A file with the older
                          `pending` field instead of `txn` still loads
   app.pid                pid (= process group) of the live app, written by its start wrapper
-  step.pid               the same for the install or test in progress
+  step.pid               the same for the install, test or `test_copy` hook in progress
+  hook.pid               the same for the `snapshot` or `restore` hook in progress (an automatic rollback restores
+                         beside a stage or test)
   state.json.bak         the same content, written after state.json; read when state.json is unreadable
   events.jsonl           append-only event log, one JSON object per line, each with its `seq`; at 10 MiB it
                          becomes events.1.jsonl
@@ -635,12 +696,12 @@ event log started over`. Until the first `status` line names the app, a note nam
   current -> generations/g3/code    symlink to the live worktree, for people (replaced atomically)
   generations/<id>/
     code/                git worktree at the ref (`git worktree add --detach`)
-    snapshot/            storage of the previous generation, taken when switching to <id>
-      index.json         [{"path": "state.sqlite", "file": "0.sqlite", "present": true}], written last and durably
-      0.sqlite
-    test-home/           storage copy the test run used (removed after the test, whether it passed, failed or never
-                         got as far as starting the app)
+    snapshot/            what the `snapshot` hook wrote of the previous generation's storage when switching to <id>,
+                         read by its `restore`; its contents are the hooks' own
+    test-home/           the test run's home, filled by `test_copy` (removed after the test, whether it passed,
+                         failed or never got as far as starting the app)
     logs/install.log     install output
+    logs/hooks.log       output of every hook run for <id>, with a header line per run
     logs/app.log         stdout and stderr of every run, live and test, with a header line per start; past
                          10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines
                          written during the copy are lost)
@@ -660,8 +721,6 @@ For the daemon and CLI, each replacing something not worth hand-writing:
   to spell out in a usage string kept in step by hand.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
-- **rusqlite** (features `bundled`, `backup`): the SQLite online backup API for consistent snapshots of live
-  databases, including WAL contents. `bundled` builds a known SQLite instead of depending on the system one.
 - **rustix** (features `event`, `fs`, `net`, `param`, `process`): safe wrappers for the system calls std lacks:
   `flock` for the state lock, signalling a process group (std only sends SIGKILL to one pid), `umask` around binding
   the socket, a peeking `recv` to notice a closed client, the clock tick on Linux, `poll` for the accept loop, and
@@ -691,5 +750,4 @@ message. anyhow's context chains would have to be flattened into every one of th
 ## Later
 
 - `confirm = "health"` for apps that cannot call `confirm` themselves.
-- Storage that is not SQLite.
 - Falling back past the permanent generation when it crash-loops.

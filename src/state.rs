@@ -58,9 +58,14 @@ impl Paths {
     pub fn app_pid(&self) -> PathBuf {
         self.root.join("app.pid")
     }
-    /// The same for the install or test in progress (one step runs at a time).
+    /// The same for the install, test or `test_copy` hook in progress (one step runs at a time).
     pub fn step_pid(&self) -> PathBuf {
         self.root.join("step.pid")
+    }
+    /// The same for the `snapshot` or `restore` hook in progress. A file of its own, because an automatic rollback
+    /// restores beside a stage or test, which holds `step.pid`.
+    pub fn hook_pid(&self) -> PathBuf {
+        self.root.join("hook.pid")
     }
     pub fn state_json(&self) -> PathBuf {
         self.root.join("state.json")
@@ -89,6 +94,11 @@ impl Paths {
     pub fn app_log(&self, id: &str) -> PathBuf {
         self.generation(id).join("logs").join("app.log")
     }
+    /// Output of the storage hooks run for generation `id`: the snapshot of its switch, the restore of its
+    /// rollback, the copy of its tests.
+    pub fn hook_log(&self, id: &str) -> PathBuf {
+        self.generation(id).join("logs").join("hooks.log")
+    }
     /// The install log of the latest stage that failed; its generation is gone.
     pub fn failed_install_log(&self) -> PathBuf {
         self.root.join("install-failed.log")
@@ -102,7 +112,7 @@ impl Paths {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum Txn {
-    /// The live app is being stopped and the storage snapshotted for a switch to `generation`; no process of it has
+    /// The live app is being stopped and its storage snapshotted for a switch to `generation`; no process of it has
     /// run yet. Written before the old app is stopped.
     Switching {
         generation: String,
@@ -287,8 +297,8 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 }
 
 /// `write_in_place`, then `sync_directory`. A failure of the second step is an error too: this is for files whose
-/// only meaning is being durable (storage's `index.json`), where the caller has no earlier state to agree with.
-pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// only meaning is being durable (`state.json.bak`), where the caller has no earlier state to agree with.
+fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_in_place(path, bytes)?;
     sync_directory(path)
 }

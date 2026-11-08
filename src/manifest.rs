@@ -2,6 +2,7 @@
 
 use crate::state::Paths;
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
@@ -49,7 +50,7 @@ pub struct Manifest {
     pub repo: PathBuf,
     state_dir: PathBuf,
     pub home: PathBuf,
-    pub storage: Vec<String>,
+    pub hooks: Hooks,
     pub port: u16,
     pub spare_ports: [u16; 2],
     pub install: Option<String>,
@@ -75,6 +76,29 @@ pub struct Health {
     pub timeout: f64,
 }
 
+/// The commands that carry the app's storage through a switch, a rollback and a test (DESIGN.md → Hooks). Without
+/// them a rollback is code-only and a test starts on an empty home.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hooks {
+    pub snapshot: Option<String>,
+    pub restore: Option<String>,
+    pub test_copy: Option<String>,
+    #[serde(default = "default_hook_timeout")]
+    pub timeout: f64,
+}
+
+impl Default for Hooks {
+    fn default() -> Hooks {
+        Hooks {
+            snapshot: None,
+            restore: None,
+            test_copy: None,
+            timeout: default_hook_timeout(),
+        }
+    }
+}
+
 /// The manifest as written in the TOML file, before `load` has validated and resolved it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,8 +107,10 @@ struct Written {
     repo: PathBuf,
     state_dir: Option<PathBuf>,
     home: PathBuf,
+    /// Read only to refuse it with a pointer to `[hooks]`, which replaced it.
+    storage: Option<IgnoredAny>,
     #[serde(default)]
-    storage: Vec<String>,
+    hooks: Hooks,
     port: u16,
     spare_ports: [u16; 2],
     install: Option<String>,
@@ -149,6 +175,9 @@ fn default_interval() -> f64 {
 fn default_health_timeout() -> f64 {
     60.0
 }
+fn default_hook_timeout() -> f64 {
+    600.0
+}
 
 /// What a health check does: the URL to fetch or the command to run, as written in the manifest (templates are
 /// expanded by `health_check`).
@@ -158,13 +187,16 @@ pub enum Check {
     Command(String),
 }
 
-/// Values for the `{port}`, `{home}`, `{code}`, `{generation}` and `{state}` templates.
+/// Values for the `{port}`, `{home}`, `{code}`, `{generation}` and `{state}` templates, and for the hooks'
+/// `{snapshot}` and `{test_home}`, which stay as written where they are None.
 pub struct Vars {
     pub port: u16,
     pub home: PathBuf,
     pub code: PathBuf,
     pub generation: String,
     pub state: PathBuf,
+    pub snapshot: Option<PathBuf>,
+    pub test_home: Option<PathBuf>,
 }
 
 impl Vars {
@@ -193,6 +225,8 @@ impl Vars {
                     "code" => self.code.to_string_lossy().into_owned(),
                     "generation" => self.generation.clone(),
                     "state" => self.state.to_string_lossy().into_owned(),
+                    "snapshot" => self.snapshot.as_ref()?.to_string_lossy().into_owned(),
+                    "test_home" => self.test_home.as_ref()?.to_string_lossy().into_owned(),
                     _ => return None,
                 };
                 Some((close, value))
@@ -220,8 +254,8 @@ fn shell_quote(value: String) -> String {
     }
 }
 
-/// Whether a `storage` or `reuse` entry stays inside the directory it is joined onto.
-pub(crate) fn is_inside(entry: &str) -> bool {
+/// Whether a `reuse` entry stays inside the directory it is joined onto.
+fn is_inside(entry: &str) -> bool {
     !entry.is_empty()
         && Path::new(entry)
             .components()
@@ -312,7 +346,7 @@ impl Manifest {
             repo: base.join(&written.repo),
             state_dir,
             home: base.join(&written.home),
-            storage: written.storage,
+            hooks: written.hooks,
             port: written.port,
             spare_ports: written.spare_ports,
             install: written.install,
@@ -342,14 +376,13 @@ impl Manifest {
         reason = "the timeouts are copied from the manifest text, never computed: any difference is a change the user wrote"
     )]
     pub fn reload(&self, new: &Manifest, app_running: bool) -> Result<Vec<&'static str>, String> {
-        // The daemon's identity, its state and the files a restore overwrites are fixed for its lifetime: a changed
+        // The daemon's identity, its state and the home a restore writes to are fixed for its lifetime: a changed
         // `home` would restore a snapshot into a different directory than the one it was taken from.
         let fixed = [
             ("name", self.name != new.name),
             ("repo", self.repo != new.repo),
             ("state_dir", self.state_dir != new.state_dir),
             ("home", self.home != new.home),
-            ("storage", self.storage != new.storage),
         ];
         let refused = differing(&fixed);
         let mut problems = Vec::new();
@@ -390,6 +423,7 @@ impl Manifest {
                 self.rollback_on_unhealthy != new.rollback_on_unhealthy,
             ),
             ("health", self.health != new.health),
+            ("hooks", self.hooks != new.hooks),
             ("env", self.env != new.env),
         ];
         Ok(differing(&reloadable))
@@ -469,6 +503,7 @@ impl Written {
             ("min_uptime", self.min_uptime),
             ("health.interval", self.health.interval),
             ("health.timeout", self.health.timeout),
+            ("hooks.timeout", self.hooks.timeout),
         ] {
             if !(seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS) {
                 problems.push(format!(
@@ -476,21 +511,87 @@ impl Written {
                 ));
             }
         }
-        for (field, entries) in [("storage", &self.storage), ("reuse", &self.reuse)] {
-            for entry in entries {
-                if !is_inside(entry) {
-                    problems.push(format!(
-                        "{field} entry {entry:?} must be a non-empty relative path without '..' (it is joined onto a directory that a restore may delete from)"
-                    ));
-                }
+        for entry in &self.reuse {
+            if !is_inside(entry) {
+                problems.push(format!(
+                    "reuse entry {entry:?} must be a non-empty relative path without '..' (it is joined onto the worktree)"
+                ));
             }
         }
+        problems.extend(self.hook_problems());
         if let Some(url) = &self.health.url
             && !has_port(url)
         {
             problems.push(format!(
                 "health.url {url:?} must start with http:// and end its host with :<port> (1 to 65535) or :{{port}}, for example http://127.0.0.1:{{port}}/"
             ));
+        }
+        problems
+    }
+
+    /// What is wrong with `[hooks]`, and with `storage`, which it replaced.
+    fn hook_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.storage.is_some() {
+            problems.push(
+                "storage is no longer read: Fawkes runs the app's own commands instead, `snapshot`, `restore` and `test_copy` in [hooks] (DESIGN.md → Hooks)"
+                    .into(),
+            );
+        }
+        let hooks = &self.hooks;
+        // A snapshot nothing restores is useless, a restore without a snapshot has nothing to read, and an app whose
+        // storage is worth a snapshot must not be tested on an empty home.
+        for (hook, given, needs, needed) in [
+            ("snapshot", &hooks.snapshot, "restore", &hooks.restore),
+            ("restore", &hooks.restore, "snapshot", &hooks.snapshot),
+            ("snapshot", &hooks.snapshot, "test_copy", &hooks.test_copy),
+        ] {
+            if given.is_some() && needed.is_none() {
+                problems.push(format!("hooks.{hook} needs hooks.{needs} too"));
+            }
+        }
+        // A template only the hooks get would stay as written anywhere else, and name a path that does not exist.
+        let mut fields: Vec<(String, &str, &[&str])> = vec![
+            ("start".into(), &self.start, &[]),
+            (
+                "hooks.snapshot".into(),
+                hooks.snapshot.as_deref().unwrap_or(""),
+                &["{snapshot}"],
+            ),
+            (
+                "hooks.restore".into(),
+                hooks.restore.as_deref().unwrap_or(""),
+                &["{snapshot}"],
+            ),
+            (
+                "hooks.test_copy".into(),
+                hooks.test_copy.as_deref().unwrap_or(""),
+                &["{test_home}"],
+            ),
+        ];
+        for (field, text) in [
+            ("install", &self.install),
+            ("health.url", &self.health.url),
+            ("health.command", &self.health.command),
+        ] {
+            fields.push((field.into(), text.as_deref().unwrap_or(""), &[]));
+        }
+        for (name, value) in &self.env {
+            fields.push((format!("env.{name}"), value, &[]));
+        }
+        for (field, text, allowed) in fields {
+            for template in ["{snapshot}", "{test_home}"] {
+                if text.contains(template) && !allowed.contains(&template) {
+                    problems.push(format!(
+                        "{field} uses {template}, which only {} gets",
+                        if template == "{snapshot}" {
+                            "hooks.snapshot and hooks.restore"
+                        } else {
+                            "hooks.test_copy"
+                        }
+                    ));
+                }
+            }
         }
         problems
     }
@@ -507,16 +608,22 @@ mod tests {
             code: PathBuf::from("/srv/code"),
             generation: "g3".to_string(),
             state: PathBuf::from("/srv/state"),
+            snapshot: None,
+            test_home: None,
         }
     }
 
     #[test]
     fn templates_expand_in_one_pass() {
-        let v = vars("/tmp/{port}");
+        let mut v = vars("/tmp/{port}");
         assert_eq!(
             v.expand("{home}:{port}:{nope}:{"),
             "/tmp/{port}:4790:{nope}:{"
         );
+        // A hook's own template stays as written without its value.
+        assert_eq!(v.expand("{snapshot}"), "{snapshot}");
+        v.snapshot = Some(PathBuf::from("/s/g3/snapshot"));
+        assert_eq!(v.expand("{snapshot}"), "/s/g3/snapshot");
         assert_eq!(v.expand_command("{home} {port}"), "'/tmp/{port}' 4790");
     }
 
@@ -539,13 +646,16 @@ name = "app"
 repo = "repo"
 state_dir = "state"
 home = "home"
-storage = ["data/app.db"]
 port = 4790
 spare_ports = [4791, 4795]
 reuse = ["node_modules"]
 start = "node app.js"
 [health]
 url = "http://127.0.0.1:{port}/"
+[hooks]
+snapshot = "store save {home} {snapshot}"
+restore = "store load {snapshot} {home}"
+test_copy = "store save {home} {test_home}"
 "#;
 
     /// A temporary directory for manifests, removed on drop. Manifests loaded from one scratch resolve their paths
@@ -644,10 +754,36 @@ url = "http://127.0.0.1:{port}/"
             ("name", with("\"app\"", "\"../x\"")),
             ("name", with("\"app\"", "\"\"")),
             ("name", with("\"app\"", "\"a b\"")),
-            ("storage", with("data/app.db", "/abs")),
-            ("storage", with("data/app.db", "../escape")),
-            ("storage", with("data/app.db", "a/../../b")),
-            ("storage", with("[\"data/app.db\"]", "[\"\"]")),
+            (
+                "storage is no longer read",
+                with("port = 4790", "storage = [\"app.db\"]\nport = 4790"),
+            ),
+            (
+                "hooks.snapshot needs hooks.restore too",
+                with("restore = \"store load {snapshot} {home}\"\n", ""),
+            ),
+            (
+                "hooks.restore needs hooks.snapshot too",
+                with("snapshot = \"store save {home} {snapshot}\"\n", ""),
+            ),
+            (
+                "hooks.snapshot needs hooks.test_copy too",
+                with("test_copy = \"store save {home} {test_home}\"\n", ""),
+            ),
+            ("hooks.timeout", with("[hooks]", "[hooks]\ntimeout = 0.0")),
+            ("snapshoot", with("[hooks]", "[hooks]\nsnapshoot = \"x\"")),
+            (
+                "start uses {snapshot}",
+                with("node app.js", "node app.js {snapshot}"),
+            ),
+            (
+                "hooks.test_copy uses {snapshot}",
+                with("{home} {test_home}", "{home} {snapshot}"),
+            ),
+            (
+                "hooks.restore uses {test_home}",
+                with("{snapshot} {home}", "{test_home} {home}"),
+            ),
             ("reuse", with("node_modules", "/abs")),
             ("reuse", with("node_modules", "..")),
             ("port", with("port = 4790", "port = 4793")),

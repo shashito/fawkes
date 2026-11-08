@@ -22,7 +22,8 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
 ## Tests
 
 - Integration tests (`tests/core.rs`) run the real binary against a throwaway world built by `tests/common/mod.rs`.
-  They need `git` and `node` on `PATH`, and the sample app is `examples/sample/app.js`.
+  They need `git` and `node` on `PATH`, and the sample app is `examples/sample/app.js`, with its storage hooks in
+  `examples/sample/hooks.js`.
 - `Harness::new(extra)` claims a free block of ten ports between 20000 and 29999 through a `flock` on
   `/tmp/fawkes-test-ports/<port>`, and the directory `/tmp/fk<port>`, kept short because socket paths have a length
   limit. Tests, and suites in other worktrees, run in parallel without colliding, so never hard-code a port or a
@@ -31,7 +32,7 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
 - Tests never build the binary's command themselves (`Command::new` of it): use `common::fawkes()`, `Harness::cli`
   or `Harness::fk`. They drop the `FAWKES_*` variables a suite inherits when it runs inside an app Fawkes supervises,
   which would otherwise send the test's requests to that app's live daemon.
-- Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `storage.rs`, `manifest.rs`,
+- Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `manifest.rs`,
   `process.rs`, `protocol.rs`, `main.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`, `daemon/transactions.rs`,
   `watch.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is the pure
   `after_exit` in `daemon/supervisor.rs`: test a change to it there, in milliseconds, and keep the integration tests
@@ -57,9 +58,11 @@ not built yet. Don't start one unless asked.
   alone), and no thread waits on another while holding one. Nothing that may hold a lock writes stderr: event lines
   go to it through `Echo`'s thread.
 - **Processes:** the app runs in its own process group, and stopping or crash handling signals the whole group
-  (`process::kill_group`, rustix's `kill_process_group`), never just the child pid.
-- **Storage snapshots** use the SQLite online backup API (`storage.rs`), never a file copy, because a copy can miss
-  WAL contents.
+  (`process::kill_group`, rustix's `kill_process_group`), never just the child pid. Every child that must end by
+  itself (install, hooks, git, cp, health commands) goes through `process::run_bounded`.
+- **Storage hooks** run from the permanent generation's worktree (`repo` before the first), never from the
+  generation being tested, switched to or rolled back. A rollback runs `restore` every time; only `rollback
+  --keep-storage` gives it up.
 - **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (the `ErrorCode` enum) and a
   readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon and the
   CLI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
@@ -68,7 +71,7 @@ not built yet. Don't start one unless asked.
 
 ## Dependencies
 
-The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rusqlite, rustix, signal-hook,
+The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rustix, signal-hook,
 jiff and libc, and tempfile for the tests. The HTTP health check and the thread-based concurrency are
 hand-written on purpose, and errors stay `protocol::Error` and `String`, without anyhow or thiserror.
 

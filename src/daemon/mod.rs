@@ -459,12 +459,17 @@ impl Daemon {
             daemon.event(EventKind::Error, None, warning);
         }
 
-        // A crashed daemon leaves its app, and the install or test it was running, behind. The state lock proves that
-        // daemon is gone, so what it started has no other supervisor; `leftover` makes sure the pid still names it.
-        // The step goes before the sweep removes the directory it runs in.
+        // A crashed daemon leaves its app, and the install, test or hook it was running, behind. The state lock proves
+        // that daemon is gone, so what it started has no other supervisor; `leftover` makes sure the pid still names
+        // it. The steps go before the sweep removes the directory they run in, and a hook before the rollback below
+        // runs the restore again.
         for (what, pid_file) in [
             ("the app", daemon.paths.app_pid()),
-            ("the install or test", daemon.paths.step_pid()),
+            (
+                "the install, test or test_copy hook",
+                daemon.paths.step_pid(),
+            ),
+            ("the snapshot or restore hook", daemon.paths.hook_pid()),
         ] {
             if let Some(pid) = process::leftover(&pid_file) {
                 process::stop_group(pid, daemon.manifest().stop_timeout, None);
@@ -476,6 +481,8 @@ impl Daemon {
             }
         }
         daemon.forget_step_pid_file();
+        // Best effort, as for `step.pid`: `leftover` never mistakes a stale file for a live hook.
+        let _ = std::fs::remove_file(daemon.paths.hook_pid());
         daemon.update(&mut daemon.inner().store, |state| {
             state.daemon_pid = Some(std::process::id());
         });
@@ -933,6 +940,8 @@ impl Daemon {
             code: code.to_path_buf(),
             generation: id.into(),
             state: self.paths.root.clone(),
+            snapshot: None,
+            test_home: None,
         }
     }
 

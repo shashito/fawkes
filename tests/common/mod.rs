@@ -1,6 +1,5 @@
 //! A throwaway Fawkes world for integration tests: a git repo of the sample app, a manifest, a daemon.
 
-use rusqlite::{Connection, OpenFlags};
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use serde_json::Value;
@@ -16,6 +15,18 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 const APP_JS: &str = include_str!("../../examples/sample/app.js");
+const HOOKS_JS: &str = include_str!("../../examples/sample/hooks.js");
+
+/// The manifest's `[hooks]`: the sample's own (`examples/sample/hooks.js`), run from the permanent generation's
+/// worktree. A test removes the table with `edit_manifest(HOOKS, "")`, and makes every hook fail while
+/// `<dir>/s/hooks-fail` exists.
+pub const HOOKS: &str = r#"
+[hooks]
+snapshot = "node hooks.js snapshot {home} {snapshot}"
+restore = "node hooks.js restore {snapshot} {home}"
+test_copy = "node hooks.js copy {home} {test_home}"
+timeout = 20
+"#;
 const BIN: &str = env!("CARGO_BIN_EXE_fawkes");
 
 /// The variables Fawkes gives the processes it starts. A suite run under a supervised app (a lander's `cargo test`
@@ -187,7 +198,6 @@ impl Harness {
 repo = "{d}/repo"
 state_dir = "{d}/s"
 home = "{d}/home"
-storage = ["app.sqlite"]
 port = {port}
 spare_ports = [{}, {}]
 start = "node app.js"
@@ -199,10 +209,11 @@ min_uptime = 1
 url = "http://127.0.0.1:{{port}}/"
 interval = 0.1
 timeout = 20
-
+{HOOKS}
 [env]
 APP_PORT = "{{port}}"
 APP_HOME = "{{home}}"
+HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
 "#,
                 port + 1,
                 port + 9
@@ -233,6 +244,7 @@ APP_HOME = "{{home}}"
     pub fn commit(&self, version: &str, mode: &str) {
         let repo = self.dir.join("repo");
         std::fs::write(repo.join("app.js"), APP_JS).unwrap();
+        std::fs::write(repo.join("hooks.js"), HOOKS_JS).unwrap();
         std::fs::write(repo.join("VERSION"), version).unwrap();
         std::fs::write(repo.join("MODE"), mode).unwrap();
         self.git(&["add", "."]);
@@ -436,19 +448,33 @@ APP_HOME = "{{home}}"
             .map(|(_, body)| body.to_string())
     }
 
-    /// The versions the app has recorded in its storage, one per start.
+    /// The versions the app has recorded in its storage, one per start, read with `node:sqlite` as the app writes
+    /// them; none without a database.
     pub fn versions(&self) -> Vec<String> {
-        let path: &Path = &self.dir.join("home/app.sqlite");
-        let Ok(db) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        let path = self.dir.join("home/app.sqlite");
+        if !path.exists() {
             return vec![];
-        };
-        let Ok(mut query) = db.prepare("SELECT version FROM starts") else {
-            return vec![];
-        };
-        query
-            .query_map([], |row| row.get(0))
-            .map(|rows| rows.flatten().collect())
-            .unwrap_or_default()
+        }
+        let read = r"
+            const { DatabaseSync } = require('node:sqlite');
+            const db = new DatabaseSync(process.argv[1], { readOnly: true });
+            for (const row of db.prepare('SELECT version FROM starts').all()) console.log(row.version);
+        ";
+        let output = Command::new("node")
+            .args(["-e", read])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cannot read {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -526,9 +552,9 @@ impl Drop for Harness {
             let _ = daemon.kill();
             let _ = daemon.wait();
         }
-        // The daemon stops its app and any install or test; if it died abnormally, a leftover must not keep the port
+        // The daemon stops its app and any install, test or hook; if it died abnormally, a leftover must not keep the port
         // or run on.
-        for file in ["s/app.pid", "s/step.pid"] {
+        for file in ["s/app.pid", "s/step.pid", "s/hook.pid"] {
             if let Ok(text) = std::fs::read_to_string(self.dir.join(file))
                 && let Ok(pid) = text.trim().parse::<i32>()
                 && pid > 1

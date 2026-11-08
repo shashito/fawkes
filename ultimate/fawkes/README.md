@@ -28,7 +28,7 @@ but run with a home of their own, so they never confirm, upgrade or roll back th
 
 - **Live** (`FAWKES_PHASE=live`): it runs `bin/ultimate.ts <project> --no-open` from the generation, Ultimate's own
   supervisor, unchanged.
-- **Test** (`FAWKES_PHASE=test`): Fawkes gives the test run a copy of the storage, but `~`, `~/.ultimate` and the
+- **Test** (`FAWKES_PHASE=test`): the test run gets a copy of the storage (the `test_copy` hook, below), but `~`, `~/.ultimate` and the
   project are the real ones. So the run is set up like an Ultimate preview, with the helpers of the generation under
   test (`extensions/instance/server.ts`): a private user home inside the copy (`~/.ultimate` copied, the rest linked
   back), a git guard that never pushes and moves only the preview's own branches, and `ULTIMATE_INSTANCE_OWNER`,
@@ -120,6 +120,6 @@ test_copy = "node /path/to/fawkes/ultimate/fawkes/storage.ts test-copy {home} {t
 - **test-copy** (while the app runs and writes) copies each database present into the test home, rows that are still
   only in the `-wal` included.
 
-A database is copied with `VACUUM INTO` (one read transaction, waiting up to 10 s for a lock), never with a file copy,
-which loses the `-wal`. Each copy keeps the mode of its source, a read-only file included. Exit 0 is success, 1 a failed
+A database is copied with `VACUUM INTO` (one read transaction, waiting up to 10 s for a lock), never with a file copy
+of a live database, which loses the `-wal`; only a restore copies the snapshot's finished file as it is. Each copy keeps the mode of its source, a read-only file included. Exit 0 is success, 1 a failed
 step with the file and the reason on stderr, 2 a usage error. It needs `node:sqlite` (Node 22.13 or newer).

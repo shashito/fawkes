@@ -761,18 +761,14 @@ fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
 fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
     let mut h = Harness::new("max_failed_starts = 5");
     h.edit_manifest("min_uptime = 1", "min_uptime = 60");
-    h.edit_manifest(
-        r#"storage = ["app.sqlite"]"#,
-        r#"storage = ["app.sqlite", "other.sqlite"]"#,
-    );
     h.commit("v1", "confirm");
     h.commit("v2", "confirm");
     h.start_daemon();
     make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
     h.ok(&["test", "g2"]);
-    // A storage file that is not a database: the next switch cannot snapshot it.
-    std::fs::write(h.dir.join("home/other.sqlite"), "not a database").unwrap();
+    // The next switch cannot snapshot the storage: its hook fails.
+    std::fs::write(h.dir.join("s/hooks-fail"), "").unwrap();
 
     // Three crashes within min_uptime: the third restart waits 4 s (after 1 s and 2 s), the window the switch lands in.
     for _ in 0..2 {
@@ -793,6 +789,13 @@ fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
         (1, Some("storage_failed")),
         "{error}"
     );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("the snapshot hook failed"),
+        "{error}"
+    );
     let backoff = h.status()["process"].clone();
     assert!(
         backoff["restart_at"].is_string(),
@@ -806,19 +809,106 @@ fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
 }
 
 /// A test works on a copy of the storage, which does not outlive the test: not when the test fails before the app
-/// starts either (here the copy itself fails).
+/// starts either. Here the copy hangs: its hook's whole group is ended at its timeout and the test fails.
 #[test]
-fn a_test_that_fails_before_its_app_starts_leaves_no_copy_of_the_storage() {
+fn a_test_copy_hook_that_hangs_is_ended_with_its_group_and_leaves_no_copy() {
     let mut h = Harness::new("");
+    h.edit_manifest(
+        "test_copy = \"node hooks.js copy {home} {test_home}\"\ntimeout = 20",
+        "test_copy = '''echo $$ > {state}/hook.pgid; sleep 600 & exec sleep 600'''\ntimeout = 1",
+    );
     h.commit("v1", "confirm");
     h.start_daemon();
     h.ok(&["stage", "v1"]);
-    std::fs::create_dir_all(h.dir.join("home")).unwrap();
-    std::fs::write(h.dir.join("home/app.sqlite"), "not a database").unwrap();
 
-    refused(&h, &["test", "g1"], "storage_failed", "app.sqlite");
+    let started = Instant::now();
+    refused(
+        &h,
+        &["test", "g1"],
+        "storage_failed",
+        "the test_copy hook timed out after 1s",
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "waited {:?}",
+        started.elapsed()
+    );
+    let pid = read_pid(h.dir.join("s/hook.pgid"));
+    assert!(
+        test_kill_process_group(pid).is_err(),
+        "the hanging hook's process group outlived its timeout"
+    );
     assert!(!h.dir.join("s/generations/g1/test-home").exists());
+    assert!(!h.dir.join("s/step.pid").exists());
     assert_eq!(h.generation("g1")["state"], "staged");
+}
+
+/// The storage hooks run from the permanent generation's worktree (the repository before the first confirm), never
+/// from the generation being switched to or rolled back.
+#[test]
+fn the_storage_hooks_run_from_the_permanent_generation() {
+    let mut h = Harness::new("");
+    for hook in ["snapshot", "restore"] {
+        h.edit_manifest(
+            &format!("{hook} = \"node"),
+            &format!("{hook} = \"pwd -P >> {{state}}/{hook}-dirs && node"),
+        );
+    }
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+    h.ok(&["rollback"]);
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+
+    let dirs = |hook: &str| std::fs::read_to_string(h.dir.join(format!("s/{hook}-dirs"))).unwrap();
+    let repo = std::fs::canonicalize(h.dir.join("repo")).unwrap();
+    let g1 = h.generation("g1")["dir"].as_str().unwrap().to_string();
+    assert_eq!(
+        dirs("snapshot"),
+        format!("{}\n{g1}\n", repo.display()),
+        "the first switch has no permanent generation, the second has g1"
+    );
+    assert_eq!(dirs("restore"), format!("{g1}\n"));
+    // v2's row is gone: the restore went through, and g1 started again.
+    assert_eq!(h.versions(), ["v1", "v1"]);
+}
+
+/// A manifest without hooks gets a code-only rollback: the old generation starts on the storage the rolled-back one
+/// left. Its tests start on an empty home, never the live one.
+#[test]
+fn without_hooks_a_rollback_is_code_only_and_a_test_starts_on_an_empty_home() {
+    let mut h = Harness::new("");
+    h.edit_manifest(common::HOOKS, "");
+    h.edit_manifest(
+        r#"start = "node app.js""#,
+        r#"start = '''[ "$FAWKES_PHASE" = test ] && ls -A {home} > {state}/test-home; exec node app.js'''"#,
+    );
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    assert_eq!(h.versions(), ["v1"]);
+
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    assert_eq!(
+        std::fs::read_to_string(h.dir.join("s/test-home")).unwrap(),
+        "",
+        "the test home was not empty"
+    );
+    assert_eq!(h.versions(), ["v1"], "the test wrote to the live storage");
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.wait("v2 to serve", 10, || h.get().as_deref() == Some("v2"));
+    h.ok(&["rollback"]);
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+
+    assert_eq!(h.versions(), ["v1", "v2", "v1"], "v2's row stays");
+    assert!(!h.dir.join("s/generations/g2/snapshot").exists());
 }
 
 /// The messages of the events of `kind`, oldest first.
@@ -1586,10 +1676,7 @@ fn sighup_reloads_hot_fields_and_refuses_a_manifest_that_changes_a_fixed_one() {
 
     // A refused field refuses the whole manifest: `MARK` stays what it was.
     h.edit_manifest(r#"MARK = "two""#, r#"MARK = "three""#);
-    h.edit_manifest(
-        r#"storage = ["app.sqlite"]"#,
-        r#"storage = ["app.sqlite", "other.sqlite"]"#,
-    );
+    h.edit_manifest("/home\"", "/elsewhere\"");
     h.signal_daemon(Signal::HUP);
     h.wait("the refusal to be logged", 10, || {
         !messages_starting(&h, "error", "manifest not reloaded").is_empty()
@@ -1597,7 +1684,7 @@ fn sighup_reloads_hot_fields_and_refuses_a_manifest_that_changes_a_fixed_one() {
     let refused = messages_starting(&h, "error", "manifest not reloaded");
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert!(
-        refused[0].contains("storage can only change with a daemon restart"),
+        refused[0].contains("home can only change with a daemon restart"),
         "{refused:?}"
     );
     h.ok(&["restart"]);

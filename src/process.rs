@@ -1,5 +1,5 @@
-//! Child processes: spawning in their own process group, waiting for them to exit, stopping the group, and health
-//! checks.
+//! Child processes: spawning in their own process group, waiting for them to exit, running a bounded one, stopping
+//! the group, and health checks.
 
 use crate::manifest::Check;
 use crate::state;
@@ -30,6 +30,21 @@ pub fn spawn(
     header: &str,
     pid_file: Option<&Path>,
 ) -> std::io::Result<Child> {
+    shell(command, cwd, env, log, header, pid_file)?
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+}
+
+/// The `/bin/sh -c` of `spawn`, not started yet, for `run_bounded`: the header is in `log` already.
+pub fn shell(
+    command: &str,
+    cwd: &Path,
+    env: &Env,
+    log: &Path,
+    header: &str,
+    pid_file: Option<&Path>,
+) -> std::io::Result<Command> {
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -47,11 +62,68 @@ pub fn spawn(
     shell
         .current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
         .stdout(file.try_clone()?)
-        .stderr(file)
+        .stderr(file);
+    Ok(shell)
+}
+
+/// How a bounded child ended: its exit status, and its stdout and stderr when they were piped (empty otherwise).
+pub struct Finished {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run `command` in its own process group with stdin closed, for at most `timeout`: the one runner for every child
+/// that must end by itself (install, the storage hooks, git, cp and health commands). On every way out its whole
+/// group is ended (SIGTERM, SIGKILL after `grace` seconds), so neither a child that hangs nor what a finished one left
+/// running outlives it. `spawned` gets the group's id as soon as it exists, for a caller that must be able to kill it
+/// from elsewhere (a daemon shutting down). `what` names the child in the errors.
+pub fn run_bounded(
+    command: &mut Command,
+    timeout: Duration,
+    grace: f64,
+    what: &str,
+    spawned: impl FnOnce(u32),
+) -> Result<Finished, String> {
+    let mut child = command
+        .stdin(Stdio::null())
         .process_group(0)
         .spawn()
+        .map_err(|e| format!("cannot run {what}: {e}"))?;
+    let pgid = child.id();
+    spawned(pgid);
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let waited = wait_until(&mut child, Instant::now() + timeout);
+    stop_group(pgid, grace, Some(&mut child));
+    let status = match waited {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            // The readers are left to finish on their own: a group stuck in the kernel keeps its pipes open.
+            return Err(format!("{what} timed out after {}s", timeout.as_secs_f64()));
+        }
+        Err(e) => return Err(format!("{what}: {e}")),
+    };
+    let output = |reader: thread::JoinHandle<String>| reader.join().unwrap_or_default();
+    Ok(Finished {
+        status,
+        stdout: output(stdout),
+        stderr: output(stderr),
+    })
+}
+
+/// Read `pipe` to its end on a thread: a child that writes more than a pipe holds would otherwise wait for a reader
+/// that only reads once it has exited.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(mut pipe) = pipe {
+            // A read error ends the capture; what came before is still the useful part.
+            let _ = pipe.read_to_end(&mut text);
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    })
 }
 
 /// Run `then` once `child` has exited. A thread blocks in `waitid` with `WNOWAIT`, which leaves the exit unreaped:
@@ -314,25 +386,22 @@ pub fn wait_healthy(
 /// A health command gets this long before it counts as failed.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One try of a health command. Whatever the check left in its group ends with it, passed or not, at once, and the
+/// wait for the group is bounded: a command stuck in the kernel outlives SIGKILL, and must not hold the thread that
+/// runs the check.
 fn run_check(command: &str, cwd: &Path, env: &Env, timeout: Duration) -> Result<(), String> {
-    let mut child = Command::new("/bin/sh")
+    let mut shell = Command::new("/bin/sh");
+    shell
         .args(["-c", command])
         .current_dir(cwd)
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("cannot run health command: {e}"))?;
-    let waited = wait_until(&mut child, Instant::now() + timeout);
-    // Whatever the check left in its group ends with it, passed or not, and the wait for the group is bounded: a
-    // command stuck in the kernel outlives SIGKILL, and must not hold the thread that runs the check.
-    stop_group(child.id(), 0.0, Some(&mut child));
-    match waited.map_err(|e| e.to_string())? {
-        Some(status) if status.success() => Ok(()),
-        Some(status) => Err(format!("health command failed ({status})")),
-        None => Err("health command timed out".into()),
+        .stderr(Stdio::null());
+    let finished = run_bounded(&mut shell, timeout, 0.0, "health command", |_| {})?;
+    if finished.status.success() {
+        Ok(())
+    } else {
+        Err(format!("health command failed ({})", finished.status))
     }
 }
 
@@ -517,6 +586,46 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_command_that_hangs_is_ended_with_everything_it_left_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("leader.pid");
+        // The shell starts a member in the background, then records its pid (its group's id) and waits: a written
+        // file means the group has the member to end. A second leaves the shell ample time to get there under load.
+        // The member holds the piped stdout open, which must not hold up the timeout either.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(r#"sleep 30 & echo $$ > "$0"; wait"#)
+            .arg(&pid_file)
+            .stdout(Stdio::piped());
+
+        let started = Instant::now();
+        let mut spawned = None;
+        let result = run_bounded(
+            &mut command,
+            Duration::from_secs(1),
+            0.5,
+            "sleeper",
+            |pgid| {
+                spawned = Some(pgid);
+            },
+        );
+        let waited = started.elapsed();
+
+        let message = result.err().expect("a command that outlives its timeout");
+        assert_eq!(message, "sleeper timed out after 1s");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        // The shell leads its group and the background member joined it.
+        let pgid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(spawned, Some(pgid));
+        assert!(!group_alive(pgid), "a member of the group survived");
+    }
+
+    #[test]
     fn a_health_url_is_judged_by_its_status_line_alone() {
         for host in ["127.0.0.1", "[::1]"] {
             // Each answer promises a body it never sends, and its connection stays open until the checks are over:
@@ -694,7 +803,7 @@ mod tests {
             .parse()
             .unwrap();
         let _cleanup = KillGroup(pgid);
-        assert_eq!(result, Err("health command timed out".into()));
+        assert_eq!(result, Err("health command timed out after 1s".into()));
         assert!(waited < Duration::from_secs(5), "waited {waited:?}");
         // The killed `sleep`s are gone once whoever inherited them has reaped them.
         let give_up = Instant::now() + Duration::from_secs(5);

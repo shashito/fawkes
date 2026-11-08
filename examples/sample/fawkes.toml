@@ -1,11 +1,10 @@
-# Try it: put app.js, a VERSION file and optionally a MODE file in a git repo at ../sample-repo, then
+# Try it: put app.js, hooks.js, a VERSION file and optionally a MODE file in a git repo at ../sample-repo, then
 #   fawkes daemon --manifest fawkes.toml &
 #   fawkes stage HEAD && fawkes test g1 && fawkes switch g1
 name = "sample"
 repo = "../sample-repo"            # git repository generations are cut from
 # state_dir defaults to ~/.fawkes/sample; keep a custom one short, since the socket path is limited to about 100 bytes
 home = "sample-home"               # the app's own state directory, next to this file
-storage = ["app.sqlite"]           # SQLite files relative to home, snapshotted at every switch
 port = 4790                        # live port
 spare_ports = [4791, 4799]         # inclusive range for `test`
 start = "node app.js"
@@ -18,6 +17,11 @@ max_failed_starts = 3
 url = "http://127.0.0.1:{port}/"
 interval = 0.5
 timeout = 20
+
+[hooks]                            # run from the permanent generation's worktree (the repo before the first)
+snapshot = "node hooks.js snapshot {home} {snapshot}"    # at a switch, once the old generation has stopped
+restore = "node hooks.js restore {snapshot} {home}"      # at every rollback, before the old generation starts
+test_copy = "node hooks.js copy {home} {test_home}"      # before a test, into its empty home
 
 [env]
 APP_PORT = "{port}"

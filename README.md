@@ -28,10 +28,13 @@ versions.
 - **Stage:** a git worktree at a ref, with its dependencies installed (copy-on-write clones on APFS keep it cheap).
 - **Test:** the staged generation boots on a spare port with a copy of the app's storage and must pass its health
   check.
-- **Switch:** the storage is snapshotted with SQLite's backup API, the new generation goes live, and a confirm deadline
-  starts.
+- **Switch:** the storage is snapshotted, the new generation goes live, and a confirm deadline starts.
 - **Confirm:** the new generation vouches for itself once it is healthy. If it crashes, or the deadline passes, Fawkes
   rolls back code and storage together.
+
+Fawkes does not read the storage itself: the app's own `[hooks]` in the manifest copy, snapshot and restore it, run
+from the last confirmed generation so code under test never decides how. An app without hooks gets a code-only
+rollback and tests on an empty home.
 
 The semantics are borrowed, not invented:
 
@@ -51,14 +54,18 @@ not tested yet. From a checkout of this repository:
 cargo install --path . --locked
 ```
 
-This builds a release binary (about half a minute, SQLite included) and puts `fawkes` in `~/.cargo/bin`, which rustup
+This builds a release binary and puts `fawkes` in `~/.cargo/bin`, which rustup
 adds to your `PATH`. Run that installed copy rather than `target/`: a supervisor should not run from a build directory
 that the next `cargo build` replaces. To update, pull and run the same command again.
+
+**Upgrading from a build with `storage = [...]`:** that field is gone and such a manifest no longer loads; name the
+app's storage hooks in `[hooks]` instead (DESIGN.md → Hooks). A snapshot the old build took is not one the hooks can
+restore, so install the new build only while no switch is pending (`fawkes status` shows no `pending`).
 
 ## Using it
 
 Each app gets a small TOML manifest: its repository, start and install commands, a health check (URL or command), the
-storage to snapshot, its live port and a range of spare ports for tests. See
+hooks that snapshot and restore its storage, its live port and a range of spare ports for tests. See
 [`examples/sample/fawkes.toml`](examples/sample/fawkes.toml) and [`examples/ultimate.toml`](examples/ultimate.toml).
 
 ```sh

@@ -5,7 +5,6 @@ mod manifest;
 mod process;
 mod protocol;
 mod state;
-mod storage;
 mod watch;
 
 use clap::{Parser, Subcommand};
@@ -70,7 +69,7 @@ enum Command {
         #[arg(value_name = "REF")]
         git_ref: String,
     },
-    /// Start a generation on a spare port with a copy of the storage
+    /// Start a generation on a spare port with a copy of the storage (the `test_copy` hook), or an empty home
     Test {
         #[arg(value_name = "GEN")]
         generation: String,
