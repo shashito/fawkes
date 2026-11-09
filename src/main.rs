@@ -131,10 +131,10 @@ enum Command {
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon`, `watch` and `up` (three requests) send none. `own_generation` is
-    /// `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from it names that
-    /// generation, so an app's test run (or anything it left behind) cannot confirm another generation that happens to
-    /// be pending.
+    /// The request this command sends to the daemon; `daemon`, `watch` and `up` (three requests) send none.
+    /// `own_generation` is `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from
+    /// it names that generation, so an app's test run (or anything it left behind) cannot confirm another generation
+    /// that happens to be pending.
     fn request(&self, own_generation: Option<&str>) -> Option<Request> {
         Some(match self {
             Command::Daemon | Command::Watch { .. } | Command::Up { .. } => return None,

@@ -15,7 +15,6 @@
 //   unhealthy-live     when live, answers every request with 500 and never confirms (it passes its test)
 //   slow-stop          like confirm, but takes 1.5 s to exit on SIGTERM
 //   slow-stop-never    like never, but takes 1.5 s to exit on SIGTERM
-//   slow-test          during a test, starts listening only after 6 s; live it confirms
 const { DatabaseSync } = require('node:sqlite');
 const http = require('node:http');
 const fs = require('node:fs');
@@ -51,9 +50,9 @@ const server = http.createServer((req, res) => {
   if (mode === 'unhealthy-live' && phase === 'live') res.statusCode = 500;
   res.end(version);
 });
-const listen = () => server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
+server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
   console.log(`${version} listening on ${process.env.APP_PORT} (${phase})`);
-  if (['confirm', 'slow-stop', 'slow-test'].includes(mode) && phase === 'live') {
+  if (['confirm', 'slow-stop'].includes(mode) && phase === 'live') {
     // FAWKES_BIN, FAWKES_SOCKET and FAWKES_GENERATION are in our environment. Nothing is pending when this
     // generation is merely restarted; it is already permanent then, and the confirm is answered ok and changes nothing.
     spawnSync(process.env.FAWKES_BIN, ['confirm', process.env.FAWKES_GENERATION], { stdio: 'inherit' });
@@ -62,8 +61,6 @@ const listen = () => server.listen(Number(process.env.APP_PORT), '127.0.0.1', ()
     spawnSync('/bin/sh', ['-c', '"$FAWKES_BIN" --json confirm > confirm.json'], { cwd: __dirname, stdio: 'inherit' });
   }
 });
-if (mode === 'slow-test' && phase === 'test') setTimeout(listen, 6000);
-else listen();
 
 process.on('SIGTERM', () => {
   setTimeout(() => {

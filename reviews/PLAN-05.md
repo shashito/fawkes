@@ -91,6 +91,18 @@ of its own (the review of `1007cf5..63f249b`). The unit and integration suites w
 
 ## Phase 11: the agent surface
 
+**Done:** 11.1 to 11.6. Where the build differs from the rows: `actions` lists every command the daemon would accept
+at the moment of the `status`, by the same check functions the commands call, so it is a superset of the row's
+examples (with a switch pending it also holds `stop`, `restart`, `stage` and the `test` entries), and a command whose
+slot is taken is left out while `busy` names the step; `confirm` names the pending generation (`confirm g4`), like
+`test g4`, and a confirm of the permanent generation is not listed. `up` is client-side: it sends the three requests
+in turn, so each step keeps its slots, refusals and progress, the daemon's transaction code is unchanged, and a client
+that dies midway leaves a generation that `up` again picks up through the idempotent `stage`. Its result is the
+`switch` result. `confirm` of the permanent generation answers ok before any refusal and changes nothing. `log_tail`
+is one string (the last 50 lines within the last 8 KiB) or null; the failed stage's install log is `history`'s
+top-level `failed_install_tail`, since that generation's record is gone. The sample app's `slow-test` mode went: the
+busy-steps test holds its test run on a marker file instead of a 6 s timer, which flaked under load.
+
 | # | Change |
 |---|---|
 | 11.1 | `status` result gains `actions`: the commands legal from this state (`["stage"]` idle; `["confirm","rollback"]` pending; `["test g4","switch g3"]` with their generations; `["rollback --keep-storage"]` on `restore_failed`; `["start"]` when stopped). Computed from the same checks the daemon applies, so an agent never encodes the state machine. Protocol addition, `DESIGN.md` → `status`. |

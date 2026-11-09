@@ -605,15 +605,17 @@ fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
 fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
     let mut h = Harness::new("");
     // Live g1 leaves a process that ignores SIGTERM in its group until `{state}/release` exists, so the switch that
-    // stops g1 stays busy until the test lets it go on, however slowly the `stop` below arrives.
+    // stops g1 stays busy until the test lets it go on, however slowly the `stop` below arrives. The test run of g3
+    // starts its app only once `{state}/release-test` exists, so the test stays in progress until the rollback has
+    // been seen, however loaded the machine is.
     h.edit_manifest("stop_timeout = 5", "stop_timeout = 60");
     h.edit_manifest(
         r#"start = "node app.js""#,
-        r#"start = "if [ $FAWKES_GENERATION = g1 ] && [ $FAWKES_PHASE = live ]; then (trap '' TERM; while [ ! -e {state}/release ]; do sleep 0.05; done) & fi; exec node app.js""#,
+        r#"start = "if [ $FAWKES_GENERATION = g1 ] && [ $FAWKES_PHASE = live ]; then (trap '' TERM; while [ ! -e {state}/release ]; do sleep 0.05; done) & fi; if [ $FAWKES_GENERATION = g3 ] && [ $FAWKES_PHASE = test ]; then while [ ! -e {state}/release-test ]; do sleep 0.05; done; fi; exec node app.js""#,
     );
     h.commit("v1", "confirm");
     h.commit("v2", "never");
-    h.commit("v3", "slow-test");
+    h.commit("v3", "confirm");
     h.start_daemon();
     make_permanent(&h, "v1", "g1");
     h.ok(&["stage", "v2"]);
@@ -643,11 +645,9 @@ fn busy_steps_refuse_others_but_never_delay_an_automatic_rollback() {
         h.wait("g2's deadline to roll it back", 10, || {
             h.generation("g2")["state"] == "rolled_back"
         });
-        assert_eq!(
-            h.status()["busy"],
-            "test g3",
-            "the rollback ran while the test went on"
-        );
+        let busy = h.status()["busy"].clone();
+        std::fs::write(h.dir.join("s/release-test"), "").unwrap();
+        assert_eq!(busy, "test g3", "the rollback ran while the test went on");
         assert_eq!(test.join().unwrap().0, 0);
     });
     assert_eq!(

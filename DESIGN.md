@@ -670,7 +670,7 @@ picks from it instead of encoding the state machine. The order is fixed: `start`
 one), `rollback`, `rollback --keep-storage`, `prune`. An entry is there exactly when both checks the command itself
 makes pass at the moment of the `status`: its slot is free, and the state allows it. The daemon computes the list from
 the very functions the commands call, so it cannot say what a command would refuse. A command whose slot is taken is
-left out, which means that while `busy` names a step, the commands that would wait for it (`busy`) are not listed. The
+left out, which means that while `busy` names a step, the commands it would refuse with `busy` are not listed. The
 state checks, in short: `start` needs a current generation and no app running; `stop` an app running that has not
 exited, or a scheduled crash restart to cancel; `restart` a current generation whose app, if any, has not exited;
 `stage` nothing; `test <gen>` a generation that may be tested (`staged`, `test_failed`, `tested`, `retired`);
