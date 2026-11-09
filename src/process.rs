@@ -629,7 +629,9 @@ mod tests {
     fn a_health_url_is_judged_by_its_status_line_alone() {
         for host in ["127.0.0.1", "[::1]"] {
             // Each answer promises a body it never sends, and its connection stays open until the checks are over:
-            // only a check that stops at the status line returns before its timeout.
+            // only a check that stops at the status line returns before its attempt's bound, `HTTP_TIMEOUT`, which
+            // one that read on would wait out at least. Each check is held to that bound alone, so a loaded
+            // machine that slows the three of them down does not fail the test.
             let listener = match std::net::TcpListener::bind(format!("{host}:0")) {
                 Ok(listener) => listener,
                 // A machine without IPv6 loopback has nothing to test there.
@@ -655,9 +657,13 @@ mod tests {
                 open
             });
 
-            let started = Instant::now();
-            let results = [http_get(&url), http_get(&url), http_get(&url)];
-            let waited = started.elapsed();
+            let results = [(); 3].map(|()| {
+                let started = Instant::now();
+                let result = http_get(&url);
+                let waited = started.elapsed();
+                assert!(waited < HTTP_TIMEOUT, "{url} waited {waited:?}");
+                result
+            });
 
             drop(server.join().unwrap());
             assert_eq!(results[0], Ok(()), "{url}");
@@ -672,7 +678,6 @@ mod tests {
                     "{url} answered \"HTTP/1.1 503 Service Unavailable\""
                 ))
             );
-            assert!(waited < Duration::from_secs(2), "{url} waited {waited:?}");
         }
     }
 
