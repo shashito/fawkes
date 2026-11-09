@@ -11,7 +11,8 @@ use clap::{Parser, Subcommand};
 use manifest::Manifest;
 use protocol::{
     ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
-    REQUEST_TIMEOUT, Request, RollbackResult, Status, Step, SwitchResult, err, timed_out,
+    REQUEST_TIMEOUT, Request, RollbackResult, StageResult, Status, Step, SwitchResult, err,
+    timed_out,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -537,8 +538,18 @@ fn render_result(request: &Request, result: &Value) -> String {
         T::deserialize(result).map_or_else(|_| result.to_string(), render)
     }
     match request {
-        Request::Stage { .. } => typed(result, |g: Generation| {
-            format!("staged {} ({} @ {})", g.id, g.git_ref, g.short_commit())
+        Request::Stage { .. } => typed(result, |r: StageResult| {
+            let g = &r.generation;
+            if r.existing {
+                format!(
+                    "{} is already staged as {} ({}); nothing was built",
+                    g.short_commit(),
+                    g.id,
+                    g.git_ref
+                )
+            } else {
+                format!("staged {} ({} @ {})", g.id, g.git_ref, g.short_commit())
+            }
         }),
         Request::Test { .. } => typed(result, |g: Generation| {
             format!(
@@ -591,6 +602,7 @@ fn render_result(request: &Request, result: &Value) -> String {
         Request::History => typed(result, |h: History| {
             h.generations
                 .iter()
+                .map(|entry| &entry.generation)
                 .map(|g| {
                     let reason = g
                         .rollback_reason
@@ -924,6 +936,19 @@ mod tests {
 
     #[test]
     fn the_variable_parts_of_a_rendered_result_follow_the_result() {
+        let mut existing = generation("g3", "tested", None);
+        existing["existing"] = serde_json::json!(true);
+        let text = render_result(
+            &Request::Stage {
+                git_ref: "main".into(),
+            },
+            &existing,
+        );
+        assert!(
+            text.contains("01234567 is already staged as g3") && text.contains("nothing was built"),
+            "{text}"
+        );
+
         let rolled_back = serde_json::json!({"from": "g3", "to": null, "reason": "no previous"});
         let text = render_result(
             &Request::Rollback {

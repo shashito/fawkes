@@ -54,8 +54,8 @@ const server = http.createServer((req, res) => {
 const listen = () => server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
   console.log(`${version} listening on ${process.env.APP_PORT} (${phase})`);
   if (['confirm', 'slow-stop', 'slow-test'].includes(mode) && phase === 'live') {
-    // FAWKES_BIN, FAWKES_SOCKET and FAWKES_GENERATION are in our environment. Nothing is pending (and the
-    // confirm is refused) when this generation is merely restarted; that is fine.
+    // FAWKES_BIN, FAWKES_SOCKET and FAWKES_GENERATION are in our environment. Nothing is pending when this
+    // generation is merely restarted; it is already permanent then, and the confirm is answered ok and changes nothing.
     spawnSync(process.env.FAWKES_BIN, ['confirm', process.env.FAWKES_GENERATION], { stdio: 'inherit' });
   }
   if (mode === 'confirm-always') {

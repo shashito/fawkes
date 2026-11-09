@@ -76,6 +76,12 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   exists. A stage that fails later removes the generation again (record, directory, worktree); one that a daemon's end
   cut short is removed at the next daemon start. Ids are never reused.
 - **staged:** worktree created and install succeeded. **test_failed:** the last test failed; `test` may run again.
+  `stage <ref>` is safe to retry: when the commit it resolves to already has a `staged`, `tested`, `test_failed` or
+  `retired` generation, `stage` builds nothing and answers with the newest such record and `"existing": true`
+  (one `progress` line says so, no `staged` event is logged, since nothing changed); a new build answers
+  `"existing": false`. A `staging`, `current`, `permanent` or `rolled_back` generation is never reused. The catch:
+  staging the same commit again to pick up a changed install environment (a new toolchain, a changed `install`
+  command or `[env]`) returns the old build; `prune` it (or stage another commit) to build anew.
 - **tested:** started on a spare port with a test home of its own and passed the health check. The test home is
   created empty, and the `test_copy` hook (see Hooks) fills it with a copy of the storage before the app starts; a
   hook that fails fails the test with `storage_failed` and leaves the generation as it was. Without hooks the app
@@ -87,8 +93,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   start of the daemon always runs the permanent generation (Erlang/OTP release handler).
 - **retired:** was permanent, superseded by a newer confirm. Its worktree stays until `prune` removes it; `switch` to it
   again is allowed (after a new `test`), which is how an agent goes back to an older version on purpose.
-- **rolled_back:** final. A rolled-back generation is never started again, so a broken rollback cannot loop; stage
-  the same ref again to get a fresh generation.
+- **rolled_back:** final. A rolled-back generation is never started again, so a broken rollback cannot loop, and
+  `stage` never reuses it; stage the same ref again to get a fresh generation.
 
 ### Switch
 
@@ -127,8 +133,11 @@ daemon start runs the permanent generation.
 when it is set (and no `--socket` points it at another daemon), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
 an app, a bare `confirm` confirms whichever generation is pending. The `confirmed` event says whether the confirm
 named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
-deadline is cleared. Confirming a generation that is not pending is `invalid_state`,
-and so is confirming the pending generation while its process is not running (stopped, or exited and about to be
+deadline is cleared. Confirming a generation that is not pending is `invalid_state`, except the permanent one:
+`confirm <gen>` naming the permanent generation is ok with its record and changes nothing (no event, no write),
+whatever else is going on, so an app whose confirm answer was lost can retry it. A bare `confirm` with nothing pending
+stays `invalid_state`. Confirming the pending generation is also `invalid_state`
+when confirming the pending generation while its process is not running (stopped, or exited and about to be
 rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The supervisor
 records a rollback (crash, missed deadline, failed health check) in the same step that learns of it, so a confirm
 never slips in between.
@@ -478,6 +487,11 @@ and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `hel
 `--keep-storage` belongs to `rollback` (a usage error elsewhere): it gives up a restore that failed, and the permanent
 generation then runs on storage that the failed generation may already have migrated.
 
+Commands that agents retry are idempotent: `stage <ref>` of a commit that already has a `staged`, `tested`,
+`test_failed` or `retired` generation answers with it (`existing: true`; the text form says "already staged") instead
+of building another, so to rebuild the same commit after the install environment changed, `prune` it first. `confirm
+<gen>` of the permanent generation is ok. `test <gen>` of a `tested` generation tests it again.
+
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
 That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (arguments it cannot
@@ -551,15 +565,15 @@ Results per command:
 | `start` | — | the `process` object of `status` |
 | `stop` | — | the `process` object, with `last_exit` of the stop; during a crash backoff, with `restart_at` null |
 | `restart` | — | the `process` object |
-| `stage` | `ref` | the generation record |
+| `stage` | `ref` | the generation record plus `existing`: `true` when the commit already had a `staged`, `tested`, `test_failed` or `retired` generation and nothing was built (see Generations), else `false` |
 | `test` | `generation` | the generation record (its `test` field holds port, outcome, duration) |
 | `switch` | `generation`, `deadline?` (seconds, `1..=604800`, else `usage`) | `generation`, `previous`, `deadline` |
-| `confirm` | `generation?` | the generation record, now permanent |
+| `confirm` | `generation?` | the generation record, now permanent (naming the generation that already is permanent answers ok with its record and changes nothing) |
 | `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason` |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
 | `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
-| `history` | — | `generations`, oldest first |
+| `history` | — | `generations`, oldest first, each the generation record plus `log_tail`; `failed_install_tail` |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
 
 `subscribe` is the stream for live clients such as `watch`. With `limit` it first replays that many recent events as
@@ -607,6 +621,13 @@ A generation record:
 ```
 
 `restore_abandoned_at` is set on a rolled-back generation whose failed restore `rollback --keep-storage` gave up.
+
+`history` adds, to each generation's record, `log_tail`: the last 50 lines of its `logs/app.log`, read from the last
+8 KiB of the file (a line cut by that bound is dropped; bytes that are not UTF-8 are replaced), as one string, or null
+when the file does not exist or is empty. The result also has `failed_install_tail`, the same tail of
+`install-failed.log`, the install output of the latest stage that failed (its generation is removed, so it cannot carry
+it), null when none. Both are read when `history` is asked and are not part of `state.json`; a successor process can
+explain its predecessor's rollback with one call. A client reads a missing field as null (an older daemon's history).
 
 `status`:
 

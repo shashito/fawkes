@@ -5,7 +5,7 @@ use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
     Error, ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
-    RollbackResult, SwitchResult, TestInfo, err, invalid_state, not_found,
+    RollbackResult, StageResult, SwitchResult, TestInfo, err, invalid_state, not_found,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, refusal};
 use std::net::TcpListener;
@@ -85,7 +85,7 @@ fn git_within(repo: &Path, args: &[&str], timeout: Duration) -> Result<String, S
 }
 
 impl Daemon {
-    pub(super) fn stage(self: &Arc<Self>, out: &mut Out, git_ref: &str) -> R<Generation> {
+    pub(super) fn stage(self: &Arc<Self>, out: &mut Out, git_ref: &str) -> R<StageResult> {
         let _busy = self.begin("stage", Slot::Step)?;
         let m = self.manifest();
         let commit = git(
@@ -113,6 +113,41 @@ impl Daemon {
                 ),
             )
         })?;
+        // An agent that retries a stage must not build twice: the newest generation of this commit that was staged and
+        // is not live or rolled back stands for it. The step slot is held, so no other stage adds one meanwhile.
+        let existing = self
+            .inner()
+            .store
+            .state()
+            .generations
+            .iter()
+            .rev()
+            .find(|g| {
+                g.commit == commit
+                    && matches!(
+                        g.state,
+                        GenState::Staged
+                            | GenState::Tested
+                            | GenState::TestFailed
+                            | GenState::Retired
+                    )
+            })
+            .cloned();
+        if let Some(generation) = existing {
+            self.say(
+                out,
+                &generation.id,
+                format!(
+                    "{} is already staged as {}; nothing to build",
+                    generation.short_commit(),
+                    generation.id
+                ),
+            );
+            return Ok(StageResult {
+                generation,
+                existing: true,
+            });
+        }
         // Recorded before the slow work, so a stage cut short by a daemon restart shows in history and the next
         // daemon start cleans it up. An intent: the id it spends must be on disk before any worktree carries it, or
         // a daemon that dies now would hand the same id out again.
@@ -168,7 +203,10 @@ impl Daemon {
             Some(&id),
             format!("{git_ref} staged as {id}"),
         );
-        Ok(record)
+        Ok(StageResult {
+            generation: record,
+            existing: false,
+        })
     }
 
     /// The slow part of `stage`: the worktree, the reused directories and the install.
@@ -721,6 +759,14 @@ impl Daemon {
 
     pub(super) fn confirm(&self, id: Option<&str>) -> R<Generation> {
         let mut inner = self.inner();
+        // An app confirms itself by name. If the answer was lost and it asks again, the generation is already
+        // permanent: that is a true answer whatever else is going on, so it comes before every refusal.
+        if let Some(id) = id
+            && inner.store.state().permanent.as_deref() == Some(id)
+            && let Some(record) = inner.store.state().find(id)
+        {
+            return Ok(record.clone());
+        }
         refuse_failed_restore(inner.store.state())?;
         match &inner.store.state().txn {
             Some(Txn::RollingBack {

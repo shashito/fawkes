@@ -7,10 +7,12 @@
 use super::{APP_LOG_BYTES, App, Daemon, Inner, Live, Slot, Why, tenths};
 use crate::process;
 use crate::protocol::{
-    ErrorCode, EventKind, History, LastExit, Out, Process, ProcessState, R, Status, err, not_found,
+    ErrorCode, EventKind, History, HistoryEntry, LastExit, Out, Process, ProcessState, R, Status,
+    err, not_found,
 };
 use crate::state::{Txn, format_time, now_secs, parse_time, with_suffix};
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
@@ -577,11 +579,45 @@ impl Daemon {
         }
     }
 
+    /// The generations with the end of their app logs. The files are read once `inner` is released: `history` is
+    /// also in every `subscribe` snapshot, and a disk read must not hold up a transaction.
     pub(super) fn history(&self) -> History {
+        let generations = self.inner().store.state().generations.clone();
         History {
-            generations: self.inner().store.state().generations.clone(),
+            generations: generations
+                .into_iter()
+                .map(|generation| HistoryEntry {
+                    log_tail: log_tail(&self.paths.app_log(&generation.id)),
+                    generation,
+                })
+                .collect(),
+            failed_install_tail: log_tail(&self.paths.failed_install_log()),
         }
     }
+}
+
+/// The most lines `history` shows of a log.
+const TAIL_LINES: usize = 50;
+/// The most bytes `history` reads of a log; only the end of the file is read.
+const TAIL_BYTES: u64 = 8192;
+
+/// The last lines of a log (at most `TAIL_LINES`, from the last `TAIL_BYTES`), or None when the file is missing,
+/// unreadable or empty. A cut in the middle of a line drops that partial line.
+fn log_tail(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let from = lines.len().saturating_sub(TAIL_LINES);
+    let tail = lines[from..].join("\n");
+    (!tail.is_empty()).then_some(tail)
 }
 
 #[cfg(test)]
@@ -884,12 +920,13 @@ mod tests {
         set_txn(Some(120));
         let (code, _) = refusal(Some("g9"));
         assert_eq!(code, ErrorCode::NotFound);
-        let (code, message) = refusal(Some("g1"));
-        assert_eq!(code, ErrorCode::InvalidState);
-        assert!(
-            message.contains("g1 is permanent, not pending"),
-            "{message}"
+        // The permanent generation is already confirmed: a retried confirm gets its record and changes nothing.
+        let record = daemon.confirm(Some("g1")).unwrap();
+        assert_eq!(
+            (record.id.as_str(), record.state),
+            ("g1", GenState::Permanent)
         );
+        assert_pending();
 
         // Nothing runs (`Live::Stopped`): only a generation that runs can vouch for itself.
         for id in [None, Some("g2")] {
@@ -939,5 +976,53 @@ mod tests {
             std::fs::read_to_string(with_suffix(&log, ".1")).unwrap(),
             format!("{full}y")
         );
+    }
+
+    #[test]
+    fn a_log_tail_is_the_last_lines_within_the_byte_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("app.log");
+        assert_eq!(log_tail(&path), None, "missing file");
+
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(log_tail(&path), None, "empty file");
+
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(log_tail(&path).as_deref(), Some("one\ntwo"));
+
+        let many = "line\n".repeat(120).replacen("line", "first", 1) + "last\n";
+        let tail = log_tail(&path_with(&path, &many)).unwrap();
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), TAIL_LINES);
+        assert_eq!(lines[0], "line");
+        assert_eq!(lines[TAIL_LINES - 1], "last");
+
+        // Longer than the byte bound: only the end is read, and the line it cuts through is dropped.
+        let long = "row\n".repeat(5000) + "end\n";
+        assert!(long.len() as u64 > TAIL_BYTES * 2);
+        let tail = log_tail(&path_with(&path, &long)).unwrap();
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), TAIL_LINES);
+        assert_eq!(lines[TAIL_LINES - 1], "end");
+
+        let partial = format!(
+            "{}\nwhole\nlast\n",
+            "x".repeat(usize::try_from(TAIL_BYTES).unwrap())
+        );
+        assert_eq!(
+            log_tail(&path_with(&path, &partial)).as_deref(),
+            Some("whole\nlast")
+        );
+
+        std::fs::write(&path, b"ok \xff\xfe bytes\n").unwrap();
+        assert_eq!(
+            log_tail(&path).as_deref(),
+            Some("ok \u{fffd}\u{fffd} bytes")
+        );
+    }
+
+    fn path_with(path: &Path, content: &str) -> std::path::PathBuf {
+        std::fs::write(path, content).unwrap();
+        path.to_path_buf()
     }
 }

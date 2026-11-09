@@ -57,6 +57,11 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     });
     assert_eq!(h.generation("g1")["state"], "permanent");
     assert!(h.generation("g1")["confirmed_at"].is_string());
+    let tail = h.generation("g1")["log_tail"].clone();
+    assert!(
+        tail.as_str().is_some_and(|t| t.contains("v1 listening on")),
+        "a generation that ran carries the end of its app log: {tail}"
+    );
     assert_eq!(h.status()["pending"], Value::Null);
     assert_eq!(h.status()["process"]["state"], "running");
     assert_eq!(h.get().as_deref(), Some("v1"));
@@ -411,7 +416,7 @@ fn worktrees(h: &Harness) -> usize {
 #[test]
 fn a_failing_or_hanging_install_leaves_nothing_behind() {
     let mut h = Harness::new(
-        r#"install = '''case "$(cat MODE)" in fails) exit 1;; hangs) echo $$ > {state}/install.pid; exec sleep 600;; esac'''
+        r#"install = '''case "$(cat MODE)" in fails) echo install broke; exit 1;; hangs) echo $$ > {state}/install.pid; exec sleep 600;; esac'''
 install_timeout = 1"#,
     );
     h.commit("v1", "fails");
@@ -431,6 +436,11 @@ install_timeout = 1"#,
             .unwrap()
             .starts_with("install for g1 failed (exit status: 1); see "),
         "{error}"
+    );
+    let failed = h.ok(&["history"])["failed_install_tail"].clone();
+    assert!(
+        failed.as_str().is_some_and(|t| t.contains("install broke")),
+        "the failed stage's generation is gone, its install log is in history: {failed}"
     );
     let (code, error) = h.fk(&["stage", "v2"]);
     assert_eq!(
@@ -460,6 +470,67 @@ install_timeout = 1"#,
     assert_eq!(worktrees(&h), 2);
 }
 
+/// A retried `stage` of a commit that already has a usable generation builds nothing and answers with it; a rolled
+/// back, a live or a permanent generation is never reused. A retried `confirm` of the permanent generation is ok.
+#[test]
+fn staging_a_commit_twice_returns_the_first_build_until_it_is_rolled_back() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+
+    let first = h.ok(&["stage", "v2"]);
+    let again = h.ok(&["stage", "v2"]);
+    assert_eq!(
+        (first["id"].as_str(), first["existing"].as_bool()),
+        (Some("g2"), Some(false))
+    );
+    assert_eq!(
+        (again["id"].as_str(), again["existing"].as_bool()),
+        (Some("g2"), Some(true))
+    );
+    assert_eq!(
+        h.ok(&["history"])["generations"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        h.ok(&["stage", "v2"])["id"],
+        "g2",
+        "a tested one is reused too"
+    );
+
+    // The permanent generation is never reused, and confirming it again is a true answer that changes nothing.
+    let events = h.ok(&["log", "-n", "1000"]);
+    let confirmed = h.ok(&["confirm", "g1"]);
+    assert_eq!(
+        (confirmed["id"].as_str(), confirmed["state"].as_str()),
+        (Some("g1"), Some("permanent"))
+    );
+    refused(&h, &["confirm"], "invalid_state", "no switch is pending");
+    assert_eq!(
+        h.ok(&["log", "-n", "1000"]),
+        events,
+        "the retried confirm logged nothing"
+    );
+    let permanent = h.ok(&["stage", "v1"]);
+    assert_eq!(
+        (permanent["id"].as_str(), permanent["existing"].as_bool()),
+        (Some("g3"), Some(false))
+    );
+
+    // v2 never confirms: rolled back, it is not offered again.
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+    h.ok(&["rollback"]);
+    assert_eq!(h.generation("g2")["state"], "rolled_back");
+    let fresh = h.ok(&["stage", "v2"]);
+    assert_eq!(
+        (fresh["id"].as_str(), fresh["existing"].as_bool()),
+        (Some("g4"), Some(false))
+    );
+}
+
 /// `keep = 2`: `prune` removes the oldest generations beyond two, never the permanent one, the pending one or the
 /// one it rolls back to, and a confirm prunes by itself.
 #[test]
@@ -483,7 +554,9 @@ fn prune_keeps_the_newest_generations_and_never_the_ones_a_rollback_needs() {
     h.ok(&["stage", "v3"]);
     h.ok(&["test", "g3"]);
     h.ok(&["switch", "g3", "--deadline", "120"]);
-    h.ok(&["stage", "v1"]);
+    // A fourth generation of a commit of its own: staging v1 again would answer with the retired g1.
+    h.commit("v4", "never");
+    h.ok(&["stage", "v4"]);
     assert_eq!(ids(&h), ["g1", "g2", "g3", "g4"]);
 
     let pruned = h.ok(&["prune"]);
@@ -1337,7 +1410,9 @@ fn watch_follows_every_daemon_of_a_fawkes_home_across_a_daemon_restart() {
 
     u.kill_daemon();
     u.start_daemon();
-    u.ok(&["stage", "v1"]);
+    // Another commit: staging v1 again would answer with g1.
+    u.commit("v2", "confirm");
+    u.ok(&["stage", "v2"]);
     until_staged("u", "g2");
 
     let watched = |app: &str| -> Vec<Value> {
@@ -2156,7 +2231,8 @@ if (process.argv[2] === 'listen') {
     );
     h.commit("v1", "confirm");
     h.start_daemon();
-    let staged = h.ok(&["stage", "v1"]);
+    let mut staged = h.ok(&["stage", "v1"]);
+    staged.as_object_mut().unwrap().remove("existing");
     let listener = EndListener(h.dir.join("s/squat.pid"));
     std::fs::write(h.dir.join("s/squat"), "").unwrap();
 
@@ -2166,7 +2242,13 @@ if (process.argv[2] === 'listen') {
         "port_in_use",
         "was taken by another process",
     );
-    assert_eq!(h.generation("g1"), staged, "the stolen port blamed g1");
+    // The record without the log tail `history` adds, which changes as the test runs the app.
+    let record = |h: &Harness| {
+        let mut record = h.generation("g1");
+        record.as_object_mut().unwrap().remove("log_tail");
+        record
+    };
+    assert_eq!(record(&h), staged, "the stolen port blamed g1");
     assert!(
         messages(&h, "error")
             .iter()
@@ -2184,7 +2266,7 @@ if (process.argv[2] === 'listen') {
         .map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap())
         .collect();
     refused(&h, &["test", "g1"], "start_failed", "no free spare port");
-    assert_eq!(h.generation("g1"), staged);
+    assert_eq!(record(&h), staged);
     drop(held);
     assert_eq!(h.ok(&["test", "g1"])["state"], "tested");
 }

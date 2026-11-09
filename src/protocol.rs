@@ -592,10 +592,35 @@ impl Status {
     }
 }
 
+/// The result of `stage`: the generation record, and whether it was already there. `existing` is not part of
+/// `Generation`, which `state.json` persists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageResult {
+    #[serde(flatten)]
+    pub generation: Generation,
+    /// True when the commit already had a usable generation and nothing was built.
+    #[serde(default)]
+    pub existing: bool,
+}
+
+/// One generation of `history`: its record plus the end of its app log. `log_tail` is read when `history` is
+/// asked and never persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    #[serde(flatten)]
+    pub generation: Generation,
+    /// The last lines (at most 50, 8 KiB) of the generation's `logs/app.log`; null when it has none or it is empty.
+    #[serde(default)]
+    pub log_tail: Option<String>,
+}
+
 /// The result of `history`, and the `history` line of a `subscribe` stream. Oldest first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct History {
-    pub generations: Vec<Generation>,
+    pub generations: Vec<HistoryEntry>,
+    /// The same tail of the install log of the latest stage that failed, whose generation is gone; null when none.
+    #[serde(default)]
+    pub failed_install_tail: Option<String>,
 }
 
 /// The result of `log`. Oldest first.
@@ -633,6 +658,7 @@ pub struct PruneResult {
 pub enum Reply {
     Process(Process),
     Generation(Generation),
+    Stage(StageResult),
     Switch(SwitchResult),
     Rollback(RollbackResult),
     Prune(PruneResult),
@@ -656,6 +682,7 @@ macro_rules! reply_from {
 reply_from!(
     Process(Process),
     Generation(Generation),
+    Stage(StageResult),
     Switch(SwitchResult),
     Rollback(RollbackResult),
     Prune(PruneResult),
@@ -1124,7 +1151,8 @@ mod tests {
         let Line::History { history } = serde_json::from_str::<Line>(history).unwrap() else {
             panic!("a history line reads as one");
         };
-        assert_eq!(history.generations[0].state, GenState::Unknown);
+        assert_eq!(history.generations[0].generation.state, GenState::Unknown);
+        assert_eq!(history.failed_install_tail, None);
 
         let event = r#"{"event":{"seq":7,"at":"t","kind":"from_the_future","generation":null,"message":"m"}}"#;
         let Line::Event { event } = serde_json::from_str::<Line>(event).unwrap() else {
