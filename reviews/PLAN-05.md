@@ -114,6 +114,20 @@ busy-steps test holds its test run on a marker file instead of a 6 s timer, whic
 
 ## Phase 12: server, as an option
 
+**Done:** 12.1 to 12.3. Where the build differs from the rows: `install` refuses a binary with a `CACHEDIR.TAG` in an
+ancestor (cargo's `target/`), and with no plist yet a daemon that already answers on the socket; an existing plist is
+replaced and reloaded, so `install` again after an update is how a new binary or `PATH` is picked up. `--json` applies
+to all three, and a failing `launchctl` is a new client-only code, `service_failed`. `uninstall` is idempotent;
+`restart` is a bootout and a bootstrap (a graceful SIGTERM, and the plist read afresh), `not_found` without a plist.
+The plist also carries `ExitTimeOut` (`stop_timeout` rounded up plus 10 s, since launchd's 20 s would SIGKILL a daemon
+still stopping a slower app) and `FAWKES_HOME` when set; `install` creates `state_dir`, which launchd needs for
+`daemon.log`. A bootout waits until `launchctl print` no longer finds the agent: checked by hand against launchd (a
+throwaway label, `HOME` in `/tmp`), a bootstrap right after a bootout fails with `5: Input/output error`. The same
+check saw `RunAtLoad`, a restart after `kill -9` and a clean SIGTERM on restart and uninstall. Tests reach a fake
+`launchctl` on `PATH` with `HOME` in the harness's directory, which are the only seams. `daemon.log` is capped by the
+thread that writes stderr, only when stderr is that file (same inode), so no line is lost and the daemon has no launchd
+code.
+
 | # | Change |
 |---|---|
 | 12.1 | `fawkes service install [--manifest FILE]`, `uninstall`, `restart` (macOS only; Linux **Later** with systemd user units). Writes `~/Library/LaunchAgents/dev.fawkes.<name>.plist`: `ProgramArguments` = the installed `fawkes` binary (`std::env::current_exe`), `daemon --manifest <absolute path>`; `KeepAlive = { SuccessfulExit = false }`; `RunAtLoad`; `EnvironmentVariables.PATH` captured from the installing shell; stderr to `<state_dir>/daemon.log`. `bootstrap gui/$UID` to load. A desktop user never runs it; the daemon does not know it was started this way. |
