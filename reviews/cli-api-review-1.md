@@ -28,7 +28,7 @@ grouped command help and the "only one daemon is running" fallback.
 | 7 | Ambiguity refuses (R9) | **Does not apply yet** | No discovery. `watch` without a target follows every daemon, which is not a guess |
 | 8 | No abbreviations; aliases explicit (R10) | **Yes** | clap's inference is off; `statsu` fails with `error: unrecognized subcommand 'statsu'` |
 | 9 | One prefix, variables shown with their options (R11) | **Partly** | `FAWKES_SOCKET` and `FAWKES_GENERATION` are named in help text; `FAWKES_HOME` only in `DESIGN.md:303,335` |
-| 10 | One-sentence abouts, details in long help (R13) | **No** | `--json`'s help is three lines, repeated under all 15 commands, `daemon` included, where it ends in "Not for `daemon`". The `test`, `up` and `watch` abouts are clauses joined by semicolons (`src/main.rs:39-42,72,86,124`) |
+| 10 | One-sentence abouts, details in long help (R13) | **No** | `--json`'s help is a 240-character line, repeated under all 15 commands, `daemon` included, where it ends in "Not for `daemon`". The `up` and `watch` abouts are clauses joined by semicolons, and `test`'s carries a parenthesis about hooks (`src/main.rs:39-42,73,86,124`) |
 | 11 | Options under headings once there are many (R13) | **Does not apply** | Eight options in all |
 | 12 | Runnable examples in help (R14) | **No** | None; they live in `README.md` and `skills/fawkes/SKILL.md` |
 | 13 | `--help` works with a broken project (R15) | **Yes** | clap answers `--help` before any manifest is read (`DESIGN.md:483-484`) |
@@ -39,7 +39,7 @@ grouped command help and the "only one daemon is running" fallback.
 | 18 | Starting twice fails clearly (R20) | **Yes** | A second daemon is refused by the `flock` on `<state_dir>/lock` and by a socket that answers (`DESIGN.md:232-246`) |
 | 19 | stdout is only the result (R21) | **Yes** | Progress lines go to stderr (`DESIGN.md:511`) |
 | 20 | One machine format, additive promise written down (R22) | **Partly** | Every command but `daemon` has `--json`, and readers tolerate unknown enum values (`DESIGN.md:567-575`). No sentence promises that result fields are only ever added |
-| 21 | Human output ends with the next command (R23) | **Yes** | `status` prints `actions: …`, the commands the daemon accepts now (`DESIGN.md:666-668`) |
+| 21 | Human output ends with the next command (R23) | **Partly** | `status` prints `actions: …`, the commands the daemon accepts now, though before the process line rather than at the end (`DESIGN.md:666-668`); other commands' text output does not name a next step |
 | 22 | Colour and progress only on a terminal (R25) | **Does not apply** | No colour, no progress bars; progress is plain lines |
 | 23 | No prompt without a flag (R26) | **Yes** | No prompts at all |
 | 24 | First use sets itself up (R27) | **No** | A first run needs a hand-written manifest of about seven fields, a daemon in its own terminal, and a confirm the app must make |
@@ -111,7 +111,8 @@ Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers.
 ```
 
 The full `--json` paragraph (streams, `log --follow`, `watch`), the "confirming stays the new generation's own step"
-note on `up`, and these examples go into the long help (`--help`, not `-h`), as in minijinja-cli and rye (R13, R14):
+note on `up`, and these examples go into the long help (`--help`, not `-h`), as minijinja-cli's `--long-help` does
+(R13, R14):
 
 ```
 Examples:
@@ -130,15 +131,24 @@ Examples:
 
 **Fits his style, with one change.** Walking up from the current directory to a project marker is what rye
 (`pyproject.toml`), sentry-cli (`.sentryclirc`), platter (`setup.py`) and gh-issue-sync (`.issues/`, stopping at
-`.git`) do (R8). The side chat's order was `--socket`, `--manifest`, `FAWKES_SOCKET`, the current directory,
-`./fawkes.toml`, then "the only daemon running". In his terms:
+`.git`) do (R8). rye, sentry-cli and platter walk all the way to `/`; only gh-issue-sync stops at the repository
+root. The side chat's order was `--socket`, `--manifest`, `FAWKES_SOCKET`, the current directory, `./fawkes.toml`,
+then "the only daemon running". In his terms:
 
-1. `--socket`, then `--manifest` (a name or a path), as today: the flag wins.
+1. `--socket`, then `--manifest` (a name or a path): the flag wins.
 2. `FAWKES_SOCKET`, then `FAWKES_MANIFEST` (C2): the environment comes next, and an app Fawkes runs keeps reaching
    its own daemon.
 3. **Walk up** from the current directory to the first `fawkes.toml`, stopping at the repository root (the `.git`).
-   This is his pattern exactly: the project carries its manifest. It replaces today's `./fawkes.toml`, which is the
-   first step of that walk.
+   The walk is his pattern, and the project carries its manifest. The stop at `.git` is gh-issue-sync's (and
+   just's `--ceiling`, P12, other), chosen so that a project nested in another never picks up the outer one's
+   manifest. It replaces today's `./fawkes.toml`, which is the first step of that walk.
+
+**Steps 1 and 2 change today's contract.** Today `FAWKES_SOCKET` beats `--manifest` (`DESIGN.md:482-483`,
+`socket_path` in `src/main.rs:293-304`), so an inherited `FAWKES_SOCKET` silently overrides an explicit
+`--manifest`. Flag over environment is his rule (R8), and it fits Fawkes better: an app running under Fawkes that
+names another app's manifest means that app. It needs a `DESIGN.md` change. A bare `confirm` must then use
+`FAWKES_GENERATION` only when the daemon it reaches is the caller's own, as `src/main.rs:228-232` already does for
+`--socket`.
 4. **Then the registry:** match the current directory against the `project`, else the `repo`, of each
    `<fawkes_home>/*.toml`. He never does this reverse lookup, because his tools' configuration always lives in the
    tree. Fawkes needs it for Ultimate hosts, whose manifests live in `~/.fawkes` and whose `repo` is the shared
@@ -241,8 +251,11 @@ Each item is marked with its source.
 
 ## Open decisions
 
-1. **Discovery order (C1):** (a) walk up to `fawkes.toml` then the registry match, ambiguity refused, no
-   single-daemon fallback; (b) the side chat's order including the single-daemon fallback. Recommended: (a).
+1. **Discovery order (C1):** (a) `--socket`, `--manifest`, `FAWKES_SOCKET`, `FAWKES_MANIFEST`, walk up to
+   `fawkes.toml` (stopping at `.git`), then the registry match; ambiguity refused, no single-daemon fallback; an
+   explicit `--manifest` then beats an inherited `FAWKES_SOCKET`, a `DESIGN.md` change; (b) the same, but keep
+   today's `FAWKES_SOCKET` over `--manifest`; (c) the side chat's order including the single-daemon fallback.
+   Recommended: (a).
 2. **Skill command (C7):** (a) `fawkes install-skill [DIR] [--force]`, absurdctl's shape; (b) `fawkes skill` printing
    it to stdout for the extension or the agent to place; (c) neither. Recommended: (b), the smaller change, since the
    Ultimate extension does the setup.
