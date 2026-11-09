@@ -17,7 +17,7 @@ its confirm deadline, Fawkes rolls back to the permanent generation, code and st
 back at most once and is never started again. `DESIGN.md` in the Fawkes repository is the full contract; this file
 is what you need to act.
 
-Every command takes `--json`. Then stdout is exactly one JSON document, the result or an error object
+Every command but `daemon` takes `--json`. Then stdout is exactly one JSON document, the result or an error object
 `{"code": "...", "message": "..."}`, and progress lines go to stderr. Read the `code`, never parse the message.
 Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers.
 
@@ -46,7 +46,8 @@ Only in the `live` phase, and only once you know you work (your own checks pass,
 "$FAWKES_BIN" confirm "$FAWKES_GENERATION"
 ```
 
-Always name yourself. A bare `confirm` confirms whatever is pending, which may not be you. Confirm before the
+Always name yourself. A bare `confirm` sends your `FAWKES_GENERATION` only while no `--socket` is given; with one, or
+from anywhere outside an app, it confirms whatever is pending, which may not be you. Confirm before the
 deadline the switch set (`status` → `pending.deadline`); after it you are rolled back. A confirm is safe to retry: once
 you are permanent, confirming yourself again answers ok with your record. Being restarted (a crash restart, `fawkes
 restart`) as the permanent generation needs no confirm.
@@ -68,6 +69,10 @@ switched. `up` never confirms: the new generation confirms itself.
 If you run `up` on yourself (you are the live app upgrading your own code), the switch stops you, and your `up`
 client with you. That is expected: the daemon finishes the switch without you, and the new generation reads the
 outcome. A failed stage or test still reaches you, since you are only stopped once the switch begins.
+
+Before retrying an `up` whose answer you never got, read `status`: if a switch is pending (`step` is `pending`), the
+last `up` got as far as the switch, and another one would only be refused at its switch. Otherwise `up` again is safe:
+it picks up the generation the last one staged.
 
 The steps one by one, when you need to look in between:
 

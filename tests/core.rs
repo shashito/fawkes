@@ -482,10 +482,11 @@ install_timeout = 1"#,
 }
 
 /// A retried `stage` of a commit that already has a usable generation builds nothing and answers with it; a rolled
-/// back, a live or a permanent generation is never reused. A retried `confirm` of the permanent generation is ok.
+/// back, a live or a permanent generation is never reused. A retried `confirm` of the permanent generation is ok and
+/// changes nothing: with `keep = 1` a real confirm would prune g2 right away.
 #[test]
 fn staging_a_commit_twice_returns_the_first_build_until_it_is_rolled_back() {
-    let mut h = Harness::new("");
+    let mut h = Harness::new("keep = 1");
     h.commit("v1", "confirm");
     h.commit("v2", "never");
     h.start_daemon();

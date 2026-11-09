@@ -7,7 +7,7 @@ use crate::protocol::{
     Error, ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
     RollbackResult, StageResult, SwitchResult, TestInfo, err, invalid_state, not_found,
 };
-use crate::state::{self, State, Txn, allowed, now, now_secs, refusal};
+use crate::state::{self, State, Txn, allowed, now, now_secs, parse_time, refusal};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -805,7 +805,9 @@ impl Daemon {
 
     /// What `confirm` needs of the state, once the generation is not permanent already: a pending switch that is
     /// `id` (any when none is named), within its deadline, whose process runs and has not exited. Gives the switch.
-    pub(super) fn check_confirm(&self, inner: &mut Inner, id: Option<&str>) -> R<Pending> {
+    /// It logs nothing, since `status` runs it for every subscriber's snapshot: an unreadable deadline counts as
+    /// passed here, and the supervisor, which rolls that switch back, reports it.
+    pub(super) fn check_confirm(inner: &mut Inner, id: Option<&str>) -> R<Pending> {
         refuse_failed_restore(inner.store.state())?;
         match &inner.store.state().txn {
             Some(Txn::RollingBack {
@@ -816,7 +818,9 @@ impl Daemon {
                     pending.generation
                 )));
             }
-            Some(Txn::Pending(pending)) if now_secs() >= self.deadline_secs(pending) => {
+            Some(Txn::Pending(pending))
+                if parse_time(&pending.deadline).is_none_or(|deadline| now_secs() >= deadline) =>
+            {
                 return Err(invalid_state(format!(
                     "{} missed its confirm deadline ({}) and is being rolled back",
                     pending.generation, pending.deadline
@@ -869,7 +873,9 @@ impl Daemon {
         Ok(pending)
     }
 
-    pub(super) fn confirm(&self, id: Option<&str>) -> R<Generation> {
+    /// Confirm the pending generation, or answer for the permanent one; the flag says whether a generation became
+    /// permanent, which is what a prune follows.
+    pub(super) fn confirm(&self, id: Option<&str>) -> R<(Generation, bool)> {
         let mut inner = self.inner();
         // An app confirms itself by name. If the answer was lost and it asks again, the generation is already
         // permanent: that is a true answer whatever else is going on, so it comes before every refusal.
@@ -877,9 +883,9 @@ impl Daemon {
             && inner.store.state().permanent.as_deref() == Some(id)
             && let Some(record) = inner.store.state().find(id)
         {
-            return Ok(record.clone());
+            return Ok((record.clone(), false));
         }
-        let pending = self.check_confirm(&mut inner, id)?;
+        let pending = Self::check_confirm(&mut inner, id)?;
         // Applied to a copy and kept only once it is on disk: a confirm the daemon could not write is not one, and
         // the switch stays pending (a daemon restart would roll it back).
         let record = self
@@ -912,7 +918,7 @@ impl Daemon {
             Some(&pending.generation),
             format!("{} is permanent ({by})", pending.generation),
         );
-        Ok(record)
+        Ok((record, true))
     }
 
     /// Roll the pending generation back (the caller holds the rollback slots). A rollback already decided, or

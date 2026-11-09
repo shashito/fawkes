@@ -623,7 +623,7 @@ impl Daemon {
         }
         // Confirm of the permanent generation answers ok and changes nothing: not an action.
         if let Some(Txn::Pending(pending)) = inner.store.state().txn.clone()
-            && self.check_confirm(inner, None).is_ok()
+            && Self::check_confirm(inner, None).is_ok()
         {
             actions.push(format!("confirm {}", pending.generation));
         }
@@ -669,15 +669,21 @@ const TAIL_BYTES: u64 = 8192;
 fn log_tail(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
+    // One byte before the window too, to tell whether the window starts at a line's start or inside a line.
+    let start = len.saturating_sub(TAIL_BYTES + 1);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
-    file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines: Vec<&str> = text.lines().collect();
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0);
-    }
+    file.take(TAIL_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    let whole = if start > 0 {
+        bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(&[][..], |at| &bytes[at + 1..])
+    } else {
+        &bytes[..]
+    };
+    let text = String::from_utf8_lossy(whole);
+    let lines: Vec<&str> = text.lines().collect();
     let from = lines.len().saturating_sub(TAIL_LINES);
     let tail = lines[from..].join("\n");
     (!tail.is_empty()).then_some(tail)
@@ -984,10 +990,10 @@ mod tests {
         let (code, _) = refusal(Some("g9"));
         assert_eq!(code, ErrorCode::NotFound);
         // The permanent generation is already confirmed: a retried confirm gets its record and changes nothing.
-        let record = daemon.confirm(Some("g1")).unwrap();
+        let (record, confirmed) = daemon.confirm(Some("g1")).unwrap();
         assert_eq!(
-            (record.id.as_str(), record.state),
-            ("g1", GenState::Permanent)
+            (record.id.as_str(), record.state, confirmed),
+            ("g1", GenState::Permanent, false)
         );
         assert_pending();
 
@@ -1076,6 +1082,14 @@ mod tests {
             log_tail(&path_with(&path, &partial)).as_deref(),
             Some("whole\nlast")
         );
+
+        // A window that starts just after a newline keeps its first line whole.
+        let first = format!(
+            "keep{}",
+            "y".repeat(usize::try_from(TAIL_BYTES).unwrap() - 7)
+        );
+        let tail = log_tail(&path_with(&path, &format!("drop\n{first}\nz\n"))).unwrap();
+        assert_eq!(tail, format!("{first}\nz"));
 
         std::fs::write(&path, b"ok \xff\xfe bytes\n").unwrap();
         assert_eq!(

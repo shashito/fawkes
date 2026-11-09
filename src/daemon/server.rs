@@ -216,8 +216,10 @@ impl Daemon {
                 deadline,
             } => self.switch(out, &generation, deadline).map(Reply::from),
             Request::Confirm { generation } => {
-                let record = self.confirm(generation.as_deref())?;
-                self.prune_soon();
+                let (record, confirmed) = self.confirm(generation.as_deref())?;
+                if confirmed {
+                    self.prune_soon();
+                }
                 Ok(record.into())
             }
             Request::Prune => self.prune(out).map(Reply::from),

@@ -135,10 +135,9 @@ an app, a bare `confirm` confirms whichever generation is pending. The `confirme
 named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
 deadline is cleared. Confirming a generation that is not pending is `invalid_state`, except the permanent one:
 `confirm <gen>` naming the permanent generation is ok with its record and changes nothing (no event, no write),
-whatever else is going on, so an app whose confirm answer was lost can retry it. A bare `confirm` with nothing pending
-stays `invalid_state`. Confirming the pending generation is also `invalid_state`
-when confirming the pending generation while its process is not running (stopped, or exited and about to be
-rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The supervisor
+whatever else is going on, so an app whose confirm answer was lost can retry it (it starts no prune either). A bare
+`confirm` with nothing pending stays `invalid_state`. Confirming the pending generation is also `invalid_state` while
+its process is not running (stopped, or exited and about to be rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The supervisor
 records a rollback (crash, missed deadline, failed health check) in the same step that learns of it, so a confirm
 never slips in between.
 
@@ -503,7 +502,9 @@ command with that step's error and exit code, printed as that command prints it,
 too: a stage, test or switch in progress is the same refusal as for the single command). `up` never confirms: the new
 generation does, as after `switch`, and the deadline still rolls it back. A client that dies midway leaves a `staged`
 or `tested` generation, which running `up` again picks up, because `stage` of the same commit answers with the
-existing generation. Run from inside the app it upgrades, the switch stops the old generation's process group, the
+existing generation. A client that dies once the switch has begun leaves a pending generation instead: `up` again
+then stages a new generation and its switch is refused (`invalid_state`) until that one is confirmed or rolled back,
+so a retry reads `status` first. Run from inside the app it upgrades, the switch stops the old generation's process group, the
 client's included, so it gets no answer; that is expected, the daemon finishes the switch anyway and the new
 generation reads the outcome from `status` or `history`.
 
@@ -662,7 +663,7 @@ the app stays stopped until `rollback` retries it or `rollback --keep-storage` g
 reads `step`, not the presence of `pending`, to know whether a confirm can still happen. A status without `step` is an
 older daemon's; its `pending` awaits a confirm. The text form of `fawkes status` says `waiting for confirm until …`
 only for `pending`, `rolling back gN to gM` for `rolling_back`, and for `restore_failed` that the storage could not be
-restored and which command retries or gives it up.
+restored and which command retries or gives it up. A line `actions: …` (or `actions: none`) comes before the process.
 
 `actions` lists the commands the daemon would accept right now, each as the command line without `fawkes`, so an agent
 picks from it instead of encoding the state machine. The order is fixed: `start`, `stop`, `restart`, `stage`,
