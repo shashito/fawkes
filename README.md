@@ -73,6 +73,7 @@ fawkes daemon --manifest fawkes.toml      # one daemon per app, in the foregroun
 fawkes stage main                         # → g1
 fawkes test g1
 fawkes switch g1                          # the new generation then runs `fawkes confirm`
+fawkes up main                            # or all three in one call: stage, test and switch
 fawkes status
 fawkes watch                              # every supervised app's events, one line each
 ```

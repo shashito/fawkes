@@ -297,19 +297,29 @@ fn optional_bool(args: &Value, key: &str) -> R<bool> {
 fn deadline_arg(args: &Value) -> R<Option<u64>> {
     match args.get("deadline") {
         None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .filter(|seconds| (1..=MAX_DEADLINE).contains(seconds))
-            .map(Some)
-            .ok_or_else(|| {
-                err(
-                    ErrorCode::Usage,
-                    format!(
-                        "the deadline must be whole seconds from 1 to {MAX_DEADLINE} (a week), not {value}"
-                    ),
-                )
-            }),
+        Some(value) => match value.as_u64() {
+            Some(seconds) => check_deadline(seconds).map(Some),
+            None => Err(bad_deadline(value)),
+        },
     }
+}
+
+/// A deadline in `1..=MAX_DEADLINE`; the client checks it too, before `up` stages anything.
+pub fn check_deadline(seconds: u64) -> R<u64> {
+    if (1..=MAX_DEADLINE).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err(bad_deadline(seconds))
+    }
+}
+
+fn bad_deadline(value: impl std::fmt::Display) -> Error {
+    err(
+        ErrorCode::Usage,
+        format!(
+            "the deadline must be whole seconds from 1 to {MAX_DEADLINE} (a week), not {value}"
+        ),
+    )
 }
 
 // ------------------------------------------------------------ records

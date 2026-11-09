@@ -83,6 +83,14 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         deadline: Option<u64>,
     },
+    /// Stage a git ref, test it and switch to it in one call; confirming stays the new generation's own step
+    Up {
+        #[arg(value_name = "REF")]
+        git_ref: String,
+        /// Seconds to confirm in, 1 to 604800 [default: the manifest's `deadline`]
+        #[arg(long, value_name = "SECS")]
+        deadline: Option<u64>,
+    },
     /// Make the pending generation permanent
     Confirm {
         #[arg(
@@ -123,13 +131,13 @@ enum Command {
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon` and `watch` send none. `own_generation` is
+    /// The request this command sends to the daemon; `daemon`, `watch` and `up` (three requests) send none. `own_generation` is
     /// `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from it names that
     /// generation, so an app's test run (or anything it left behind) cannot confirm another generation that happens to
     /// be pending.
     fn request(&self, own_generation: Option<&str>) -> Option<Request> {
         Some(match self {
-            Command::Daemon | Command::Watch { .. } => return None,
+            Command::Daemon | Command::Watch { .. } | Command::Up { .. } => return None,
             Command::Start => Request::Start,
             Command::Stop => Request::Stop,
             Command::Restart => Request::Restart,
@@ -222,7 +230,17 @@ fn main() -> ExitCode {
     let own_generation = std::env::var("FAWKES_GENERATION")
         .ok()
         .filter(|_| cli.socket.is_none());
-    // `daemon` and `watch` returned above, so every command left sends a request.
+    if let Command::Up { git_ref, deadline } = &cli.command {
+        return ExitCode::from(run_up(
+            &cli,
+            git_ref,
+            *deadline,
+            &socket,
+            &manifest_path,
+            &mut stdout,
+        ));
+    }
+    // `daemon`, `watch` and `up` returned above, so every command left sends a request.
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
         let message = "this command sends no request to a daemon".to_string();
         return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
@@ -306,19 +324,40 @@ fn exit_code(code: ErrorCode) -> u8 {
     }
 }
 
-/// Report a failure of the client itself, the one way every such failure goes out: the `{"code", "message"}` error
-/// object on `out` under `--json` (the document an agent parses), `error: …` on stderr otherwise. Returns the exit
-/// code.
-fn fail(json: bool, out: &mut dyn Write, code: ErrorCode, message: String) -> u8 {
-    if json {
-        say(
-            out,
-            serde_json::to_string(&err(code, message)).unwrap_or_default(),
-        );
-    } else {
-        warn(format!("error: {message}"));
+/// Why a command failed: the `{"code", "message"}` object as it goes out under `--json` (the daemon's own, as it
+/// sent it), and the exit code.
+struct Failure {
+    raw: Value,
+    error: protocol::Error,
+    exit: u8,
+}
+
+impl Failure {
+    /// A failure of the client itself.
+    fn new(code: ErrorCode, message: String) -> Failure {
+        let error = err(code, message);
+        Failure {
+            raw: serde_json::to_value(&error).unwrap_or_default(),
+            error,
+            exit: exit_code(code),
+        }
     }
-    exit_code(code)
+
+    /// Print it, the one way every failure goes out: the error object on `out` under `--json` (the document an agent
+    /// parses), `error: …` on stderr otherwise. Returns the exit code.
+    fn report(&self, json: bool, out: &mut dyn Write) -> u8 {
+        if json {
+            say(out, &self.raw);
+        } else {
+            warn(format!("error: {}", self.error.message));
+        }
+        self.exit
+    }
+}
+
+/// Report a failure of the client itself. Returns the exit code.
+fn fail(json: bool, out: &mut dyn Write, code: ErrorCode, message: String) -> u8 {
+    Failure::new(code, message).report(json, out)
 }
 
 /// Send one request, show progress, render the answer on `out`. Returns the exit code. A quick command waits
@@ -331,13 +370,95 @@ fn client(
     timeout: Duration,
     out: &mut dyn Write,
 ) -> u8 {
+    match exchange(cli, request, socket, manifest_path, timeout, out) {
+        // A followed log printed its events as they came; there is no result to show.
+        Ok(_) if matches!(request, Request::Log { follow: true, .. }) => 0,
+        Ok(result) => {
+            if cli.json {
+                say(out, result);
+            } else {
+                say(out, render_result(request, &result));
+            }
+            0
+        }
+        Err(failure) => failure.report(cli.json, out),
+    }
+}
+
+/// `fawkes up`: `stage`, `test` and `switch` in turn, each as its own request, and the first failure is the
+/// command's. The result is the switch's. Returns the exit code.
+fn run_up(
+    cli: &Cli,
+    git_ref: &str,
+    deadline: Option<u64>,
+    socket: &Path,
+    manifest_path: &Path,
+    out: &mut dyn Write,
+) -> u8 {
+    // Refused before anything is staged, as `switch --deadline` is before anything is stopped.
+    if let Some(seconds) = deadline
+        && let Err(error) = protocol::check_deadline(seconds)
+    {
+        return fail(cli.json, out, error.code, error.message);
+    }
+    let mut step =
+        |request: &Request| exchange(cli, request, socket, manifest_path, REQUEST_TIMEOUT, out);
+    let stage = Request::Stage {
+        git_ref: git_ref.into(),
+    };
+    let staged = match step(&stage).and_then(|result| {
+        StageResult::deserialize(&result).map_err(|e| {
+            Failure::new(
+                ErrorCode::Internal,
+                format!("the daemon's stage result could not be read: {e}"),
+            )
+        })
+    }) {
+        Ok(staged) => staged,
+        Err(failure) => return failure.report(cli.json, out),
+    };
+    let id = staged.generation.id;
+    if !cli.json {
+        warn(if staged.existing {
+            format!("{id} was already staged")
+        } else {
+            format!("staged {id}")
+        });
+    }
+    let switch = Request::Switch {
+        generation: id.clone(),
+        deadline,
+    };
+    match step(&Request::Test { generation: id }).and_then(|_| step(&switch)) {
+        Ok(result) => {
+            if cli.json {
+                say(out, result);
+            } else {
+                say(out, render_result(&switch, &result));
+            }
+            0
+        }
+        Err(failure) => failure.report(cli.json, out),
+    }
+}
+
+/// Send one request and stream its progress to stderr; the daemon's final result, or why there is none. A followed
+/// log's events go to `out` as they come and its result is null.
+fn exchange(
+    cli: &Cli,
+    request: &Request,
+    socket: &Path,
+    manifest_path: &Path,
+    timeout: Duration,
+    out: &mut dyn Write,
+) -> Result<Value, Failure> {
     let Ok(mut stream) = UnixStream::connect(socket) else {
         let message = format!(
             "no daemon answers on {}; start one with `fawkes daemon --manifest {}`",
             socket.display(),
             manifest_path.display()
         );
-        return fail(cli.json, out, ErrorCode::DaemonUnreachable, message);
+        return Err(Failure::new(ErrorCode::DaemonUnreachable, message));
     };
     // A daemon with no place for another connection answers `busy` and closes without reading, which can fail the
     // write: its answer is still there to be read.
@@ -357,7 +478,7 @@ fn client(
                     "the daemon on {} did not answer in time; check that it is healthy with `fawkes status`",
                     socket.display()
                 );
-                return fail(cli.json, out, ErrorCode::NoAnswer, message);
+                return Err(Failure::new(ErrorCode::NoAnswer, message));
             }
             Err(_) => break,
         };
@@ -383,38 +504,31 @@ fn client(
                     }
                 };
                 if !shown {
-                    return 0;
+                    return Ok(Value::Null);
                 }
             }
             // Only `subscribe` sends these.
             Line::Status { .. } | Line::History { .. } => {}
             // A followed log ends with a null result when the daemon ends the stream; the events were the output.
-            Line::Done { .. } if follow => return 0,
-            Line::Done { result, .. } => {
-                if cli.json {
-                    say(out, result);
-                } else {
-                    say(out, render_result(request, &result));
-                }
-                return 0;
-            }
+            Line::Done { .. } if follow => return Ok(Value::Null),
+            Line::Done { result, .. } => return Ok(result),
             Line::Failed { error, .. } => {
-                if cli.json {
-                    say(out, &raw["error"]);
-                } else {
-                    warn(format!("error: {}", error.message));
-                }
                 // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
-                return if error.code == ErrorCode::Usage {
+                let exit = if error.code == ErrorCode::Usage {
                     EXIT_USAGE
                 } else {
                     EXIT_FAILED
                 };
+                return Err(Failure {
+                    raw: raw["error"].clone(),
+                    error,
+                    exit,
+                });
             }
         }
     }
     if follow {
-        return 0;
+        return Ok(Value::Null);
     }
     let message = if sent {
         format!(
@@ -427,7 +541,7 @@ fn client(
             socket.display()
         )
     };
-    fail(cli.json, out, ErrorCode::DaemonUnreachable, message)
+    Err(Failure::new(ErrorCode::DaemonUnreachable, message))
 }
 
 // ----------------------------------------------------------- rendering
@@ -653,6 +767,12 @@ mod tests {
         let daemon = parse("daemon --manifest f.toml");
         assert!(matches!(daemon.command, Command::Daemon));
         assert_eq!(daemon.manifest, Some("f.toml".into()));
+        // `up` sends three requests, none of them its own.
+        let up = parse("up main --deadline 60");
+        assert!(
+            matches!(&up.command, Command::Up { git_ref, deadline: Some(60) } if git_ref == "main")
+        );
+        assert_eq!(up.command.request(None), None);
     }
 
     #[test]

@@ -13,7 +13,7 @@ implements all of it except where a section says **later**.
 
 `fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive). It is the parent of the
 app's live process and the only writer of the state directory. Every other command (`start`, `stop`, `restart`,
-`stage`, `test`, `switch`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `watch`) is a thin client that
+`stage`, `test`, `switch`, `up`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `watch`) is a thin client that
 sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
 manifest.
 
@@ -469,6 +469,7 @@ fawkes restart
 fawkes stage    <ref>
 fawkes test     <gen>
 fawkes switch   <gen> [--deadline SECS]
+fawkes up       <ref> [--deadline SECS]
 fawkes confirm  [<gen>]
 fawkes rollback [--keep-storage]
 fawkes prune
@@ -483,7 +484,8 @@ A command's own options come after it. A client finds the daemon by `--socket`, 
 `<state_dir>/fawkes.sock` from the manifest. `--help` (or `-h`), after `fawkes` or after a command, prints its usage
 and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`.
 
-`--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped.
+`--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped (for
+`up`, nothing is staged either).
 `--keep-storage` belongs to `rollback` (a usage error elsewhere): it gives up a restore that failed, and the permanent
 generation then runs on storage that the failed generation may already have migrated.
 
@@ -491,6 +493,19 @@ Commands that agents retry are idempotent: `stage <ref>` of a commit that alread
 `test_failed` or `retired` generation answers with it (`existing: true`; the text form says "already staged") instead
 of building another, so to rebuild the same commit after the install environment changed, `prune` it first. `confirm
 <gen>` of the permanent generation is ok. `test <gen>` of a `tested` generation tests it again.
+
+`up <ref>` is `stage`, `test` and `switch` in one call, so an agent upgrades with one command. It is client-side, with
+no request of its own: it sends the three requests in turn (the generation `stage` answers with is the one it tests
+and switches to), so each step keeps its own slots, refusals and progress lines and the daemon's transaction code is
+unchanged. Their progress goes to stderr as for the single commands (in text mode, plus a line saying `g4` was staged or
+was already staged), and the output is the `switch` result alone, in text or `--json`. A step that fails ends the
+command with that step's error and exit code, printed as that command prints it, and nothing after it runs (`busy`
+too: a stage, test or switch in progress is the same refusal as for the single command). `up` never confirms: the new
+generation does, as after `switch`, and the deadline still rolls it back. A client that dies midway leaves a `staged`
+or `tested` generation, which running `up` again picks up, because `stage` of the same commit answers with the
+existing generation. Run from inside the app it upgrades, the switch stops the old generation's process group, the
+client's included, so it gets no answer; that is expected, the daemon finishes the switch anyway and the new
+generation reads the outcome from `status` or `history`.
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.

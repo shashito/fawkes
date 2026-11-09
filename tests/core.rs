@@ -2529,3 +2529,94 @@ fn json_output_is_one_document_on_stdout_and_progress_lines_on_stderr() {
         assert!(text.contains(word), "{word:?} is not in:\n{text}");
     }
 }
+
+/// `fawkes up` stages, tests and switches in one call: stdout is the switch result alone, the progress of all three
+/// steps is on stderr, and it does not confirm (the app does). A commit already staged is reused, not built again.
+#[test]
+fn up_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+
+    let output = h.cli().args(["up", "v1"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let result: Value = serde_json::from_str(&stdout).expect(&stdout);
+    assert_eq!(result["generation"], "g1");
+    assert_eq!(result["previous"], Value::Null);
+    assert!(result["deadline"].is_string(), "{result}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let progress: Vec<Value> = stderr
+        .lines()
+        .map(|line| serde_json::from_str(line).expect(line))
+        .collect();
+    for (step, says) in [
+        ("stage", "checking out"),
+        ("test", "on spare port"),
+        ("switch", "confirm before"),
+    ] {
+        assert!(
+            progress
+                .iter()
+                .any(|p| p["kind"] == "progress" && p["message"].as_str().unwrap().contains(says)),
+            "no progress line of the {step} in:\n{stderr}"
+        );
+    }
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    h.wait("v1 to serve", 5, || h.get().as_deref() == Some("v1"));
+
+    // A staged commit is picked up by `up`, which then switches to the same generation.
+    h.commit("v2", "confirm");
+    assert_eq!(h.ok(&["stage", "v2"])["id"], "g2");
+    let (exit, result) = h.fk(&["up", "v2"]);
+    assert_eq!((exit, result["generation"].as_str()), (0, Some("g2")));
+    assert_eq!(result["previous"], "g1");
+    h.wait("g2 to confirm itself", 15, || {
+        h.status()["permanent"] == "g2"
+    });
+    h.wait("v2 to serve", 5, || h.get().as_deref() == Some("v2"));
+    assert_eq!(
+        h.ok(&["history"])["generations"].as_array().unwrap().len(),
+        2
+    );
+}
+
+/// A step that fails is the whole command's failure, as its own command prints it, and nothing after it runs: a
+/// generation whose test fails is not switched to.
+#[test]
+fn up_stops_at_a_failing_test_and_switches_nothing() {
+    let mut h = Harness::new("");
+    crash_while_marked(&h);
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["up", "v1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+
+    h.commit("v2", "crash");
+    let output = h.cli().args(["up", "v2"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let error: Value = serde_json::from_str(&stdout).expect(&stdout);
+    assert_eq!(error["code"], "health_failed", "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("g2 failed its test"),
+        "{error}"
+    );
+    assert_eq!(h.generation("g2")["state"], "test_failed");
+    let status = h.status();
+    assert_eq!(status["permanent"], "g1");
+    assert_eq!(status["current"], "g1");
+    assert_eq!(status["pending"], Value::Null);
+    assert_eq!(h.get().as_deref(), Some("v1"));
+
+    // The deadline is checked before anything is staged.
+    let (exit, error) = h.fk(&["up", "v1", "--deadline", "0"]);
+    assert_eq!((exit, error["code"].as_str()), (2, Some("usage")));
+}
