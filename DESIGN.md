@@ -649,6 +649,7 @@ explain its predecessor's rollback with one call. A client reads a missing field
 ```json
 {"name": "sample", "daemon_pid": 812, "permanent": "g2", "current": "g3", "pending": {"generation": "g3",
  "previous": "g2", "deadline": "…"}, "step": "pending", "busy": null,
+ "actions": ["stop", "restart", "stage", "confirm g3", "rollback"],
  "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
              "uptime": 42.5, "restarts": 1,
              "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}, "restart_at": null}}
@@ -662,6 +663,38 @@ reads `step`, not the presence of `pending`, to know whether a confirm can still
 older daemon's; its `pending` awaits a confirm. The text form of `fawkes status` says `waiting for confirm until …`
 only for `pending`, `rolling back gN to gM` for `rolling_back`, and for `restore_failed` that the storage could not be
 restored and which command retries or gives it up.
+
+`actions` lists the commands the daemon would accept right now, each as the command line without `fawkes`, so an agent
+picks from it instead of encoding the state machine. The order is fixed: `start`, `stop`, `restart`, `stage`,
+`test <gen>` (one per generation, oldest first), `switch <gen>` (one per generation), `confirm <gen>` (the pending
+one), `rollback`, `rollback --keep-storage`, `prune`. An entry is there exactly when both checks the command itself
+makes pass at the moment of the `status`: its slot is free, and the state allows it. The daemon computes the list from
+the very functions the commands call, so it cannot say what a command would refuse. A command whose slot is taken is
+left out, which means that while `busy` names a step, the commands that would wait for it (`busy`) are not listed. The
+state checks, in short: `start` needs a current generation and no app running; `stop` an app running that has not
+exited, or a scheduled crash restart to cancel; `restart` a current generation whose app, if any, has not exited;
+`stage` nothing; `test <gen>` a generation that may be tested (`staged`, `test_failed`, `tested`, `retired`);
+`switch <gen>` a `tested` one, no switch in flight and no failed restore; `confirm <gen>` a pending switch within its
+deadline whose process runs and has not exited (the permanent generation is never listed: confirming it is answered ok
+and changes nothing); `rollback` a pending switch or a rollback that did not finish; `rollback --keep-storage` a
+restore that failed; `prune` a `keep` in the manifest. A status without `actions` is an older daemon's.
+
+| Situation | `actions` |
+|---|---|
+| idle, no generation yet | `stage` |
+| permanent runs | `stop`, `restart`, `stage`, then `test` and `switch` entries for the generations that allow them |
+| permanent stopped | `start`, `restart`, `stage`, … |
+| crash restart scheduled (`restart_at` set) | `start`, `stop`, `restart`, `stage`, … |
+| given up (`failed`) | `start`, `restart`, `stage`, … |
+| switching (holds both slots) | none |
+| pending, its app runs, within the deadline | `stop`, `restart`, `stage`, `test` entries, `confirm gN`, `rollback` (no `switch`) |
+| pending, deadline passed | as above without `confirm` (the supervisor rolls it back next) |
+| pending, its app exited and is not reaped yet | `stage`, `test` entries, `rollback` |
+| pending, its app stopped | `start`, `restart`, `stage`, …, `rollback` |
+| `rolling_back` (the supervisor holds the live slot) | `stage`, `test` entries |
+| `restore_failed` | `stage`, `test` entries, `rollback`, `rollback --keep-storage` |
+| a `stage` or `test` in progress (`busy` names it) | only what does not take the step slot: the lifecycle commands the state allows, and `confirm gN` |
+| `keep` set, step slot free | the list above and `prune` last |
 
 `process.state` is `running`, `stopped` or `failed`; `uptime` is seconds, null when not running; `restarts` counts
 starts of the current generation after its first (crash restarts and `restart`) since it became current or the daemon

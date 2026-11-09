@@ -588,6 +588,10 @@ pub struct Status {
     pub step: Option<Step>,
     /// The step in progress: a transaction step, else one that moves the live process (see DESIGN.md).
     pub busy: Option<String>,
+    /// The commands the daemon would accept right now, as command lines without `fawkes`. Absent from an older
+    /// daemon's status.
+    #[serde(default)]
+    pub actions: Vec<String>,
     pub process: Process,
 }
 
@@ -1208,6 +1212,7 @@ mod tests {
             }),
             step: Some(Step::Pending),
             busy: None,
+            actions: vec!["confirm g3".into(), "rollback".into()],
             process: Process {
                 state: ProcessState::Running,
                 generation: Some("g3".into()),
@@ -1231,7 +1236,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
+            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
         );
         let Line::Status { status } = serde_json::from_str::<Line>(&text).unwrap() else {
             panic!("a status line reads as one");
@@ -1244,6 +1249,12 @@ mod tests {
             panic!("a status line reads as one");
         };
         assert!(status.step.is_none() && status.pending.is_some());
+        // ... and no `actions`.
+        let older = text.replace(r#""actions":["confirm g3","rollback"],"#, "");
+        let Line::Status { status } = serde_json::from_str::<Line>(&older).unwrap() else {
+            panic!("a status line reads as one");
+        };
+        assert_eq!(status.actions, Vec::<String>::new());
         // Final lines: a stream ends with a null result, a failure carries its error.
         assert_eq!(
             serde_json::to_string(&Line::done(Reply::Streamed)).unwrap(),

@@ -65,6 +65,12 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     assert_eq!(h.status()["pending"], Value::Null);
     assert_eq!(h.status()["process"]["state"], "running");
     assert_eq!(h.get().as_deref(), Some("v1"));
+    let actions = h.status()["actions"].clone();
+    assert!(
+        actions.as_array().unwrap().contains(&"stop".into())
+            && !actions.to_string().contains("confirm"),
+        "nothing waits for confirm: {actions}"
+    );
 
     // Lifecycle: stop stays stopped and is not a crash; start and restart run the same generation.
     let stopped = h.ok(&["stop"]);
@@ -106,6 +112,11 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     assert!(h.versions().contains(&"v2".to_string()));
     assert_eq!(h.status()["pending"]["generation"], "g2");
     assert_eq!(h.status()["step"], "pending");
+    let actions = h.status()["actions"].clone();
+    assert!(
+        actions.as_array().unwrap().contains(&"confirm g2".into()),
+        "a pending switch can be confirmed: {actions}"
+    );
 
     h.wait("the deadline to roll g2 back", 20, || {
         h.generation("g2")["state"] == "rolled_back"

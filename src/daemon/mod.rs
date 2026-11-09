@@ -153,10 +153,10 @@ impl Inner {
         }
     }
 
-    /// `take_running` for `stop` and `restart`, which act on what is running. An app that has already exited stays
-    /// in place and the request is `busy`: the exit is a crash for the supervisor's `reap` to decide (a pending
-    /// generation gets no retries), not a stop that was asked for.
-    fn take_running_alive(&mut self) -> R<Option<App>> {
+    /// `stop` and `restart` act on what is running. An app that has already exited stays in place and the request is
+    /// `busy`: the exit is a crash for the supervisor's `reap` to decide (a pending generation gets no retries), not a
+    /// stop that was asked for.
+    fn refuse_exited(&mut self) -> R<()> {
         if let Some(app) = self.running_mut()
             && matches!(app.child.try_wait(), Ok(Some(_)))
         {
@@ -168,7 +168,24 @@ impl Inner {
                 ),
             ));
         }
-        Ok(self.take_running())
+        Ok(())
+    }
+
+    /// The slots a step of kind `slot` needs, free or not: the check `begin` makes before it takes them, and the one
+    /// `status` makes to leave out the commands that would wait.
+    fn check_slot(&self, slot: Slot) -> R<()> {
+        let taken = self
+            .busy
+            .as_ref()
+            .filter(|_| slot.step())
+            .or_else(|| self.moving.as_ref().filter(|_| slot.live()));
+        match taken {
+            Some(other) => Err(err(
+                ErrorCode::Busy,
+                format!("{other} is in progress; try again when it has finished"),
+            )),
+            None => Ok(()),
+        }
     }
 }
 
@@ -909,17 +926,7 @@ impl Daemon {
 
     fn begin(&self, step: &str, slot: Slot) -> R<Busy<'_>> {
         let mut inner = self.inner();
-        let taken = inner
-            .busy
-            .as_ref()
-            .filter(|_| slot.step())
-            .or_else(|| inner.moving.as_ref().filter(|_| slot.live()));
-        if let Some(other) = taken {
-            return Err(err(
-                ErrorCode::Busy,
-                format!("{other} is in progress; try again when it has finished"),
-            ));
-        }
+        inner.check_slot(slot)?;
         if slot.step() {
             inner.busy = Some(step.into());
         }
@@ -963,6 +970,7 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{GenState, Generation};
     use rustix::process::{Signal, WaitOptions, kill_process, waitpid};
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -984,11 +992,19 @@ mod tests {
 
     /// A daemon over a scratch state directory, with no socket and no supervision thread.
     pub(super) fn scratch_daemon(dir: &Path) -> Daemon {
+        scratch_daemon_keeping(dir, None)
+    }
+
+    /// `scratch_daemon` whose manifest has `keep = N` (without it `prune` has nothing to do).
+    fn scratch_daemon_keeping(dir: &Path, keep: Option<u32>) -> Daemon {
         let manifest_path = dir.join("fawkes.toml");
+        let keep = keep.map_or_else(String::new, |keep| format!("keep = {keep}\n"));
         std::fs::write(
             &manifest_path,
-            "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\n\
-             spare_ports = [4791, 4795]\nstart = \"node app.js\"\n[health]\nurl = \"http://127.0.0.1:{port}/\"\n",
+            format!(
+                "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\n\
+                 spare_ports = [4791, 4795]\nstart = \"node app.js\"\n{keep}[health]\nurl = \"http://127.0.0.1:{{port}}/\"\n"
+            ),
         )
         .unwrap();
         let manifest = Manifest::load(&manifest_path).unwrap();
@@ -1048,7 +1064,7 @@ mod tests {
             sleep(Duration::from_millis(10));
         }
         inner.live = Live::Running(App::new(crashed, "g1"));
-        let refused = inner.take_running_alive().err().expect("an exited app");
+        let refused = inner.refuse_exited().expect_err("an exited app");
         assert_eq!(refused.code, ErrorCode::Busy);
         assert!(
             inner.running().is_some_and(|app| app.generation == "g1"),
@@ -1061,9 +1077,341 @@ mod tests {
             .unwrap();
         let _reaper = KillOnDrop(alive.id());
         inner.live = Live::Running(App::new(alive, "g2"));
-        let taken = inner.take_running_alive().unwrap().expect("a running app");
+        inner.refuse_exited().unwrap();
+        let taken = inner.take_running().expect("a running app");
         assert_eq!(taken.generation, "g2");
         assert!(matches!(inner.live, Live::Stopped));
+    }
+
+    enum Process {
+        Stopped,
+        Running(&'static str),
+        /// The app of this generation has exited and the supervisor has not reaped it yet.
+        Exited(&'static str),
+        Backoff,
+        Failed,
+    }
+    enum Step {
+        None,
+        Switching,
+        /// Seconds from now to the confirm deadline (negative: passed).
+        Pending(i64),
+        RollingBack {
+            restore_failed: bool,
+        },
+    }
+    struct Row {
+        name: &'static str,
+        generations: &'static [(&'static str, GenState)],
+        process: Process,
+        step: Step,
+        busy: Option<&'static str>,
+        moving: Option<&'static str>,
+        keep: Option<u32>,
+        actions: &'static [&'static str],
+    }
+    use GenState::{Current, Permanent, Retired, RolledBack, Staged, TestFailed, Tested};
+    const IDLE: &[(&str, GenState)] = &[
+        ("g1", Permanent),
+        ("g2", Staged),
+        ("g3", Tested),
+        ("g4", TestFailed),
+        ("g5", Retired),
+        ("g6", RolledBack),
+    ];
+    const ONE: &[(&str, GenState)] = &[("g1", Permanent)];
+    const PENDING: &[(&str, GenState)] = &[("g1", Permanent), ("g2", Current)];
+    const PENDING_AND_TESTED: &[(&str, GenState)] =
+        &[("g1", Permanent), ("g2", Current), ("g3", Tested)];
+    const ROLLED_BACK: &[(&str, GenState)] =
+        &[("g1", Permanent), ("g2", RolledBack), ("g3", Tested)];
+
+    fn row(
+        name: &'static str,
+        generations: &'static [(&'static str, GenState)],
+        process: Process,
+        step: Step,
+        actions: &'static [&'static str],
+    ) -> Row {
+        Row {
+            name,
+            generations,
+            process,
+            step,
+            busy: None,
+            moving: None,
+            keep: None,
+            actions,
+        }
+    }
+
+    /// With no switch awaiting confirm, and while one is being made.
+    fn idle_rows() -> Vec<Row> {
+        vec![
+            row(
+                "an empty daemon",
+                &[],
+                Process::Stopped,
+                Step::None,
+                &["stage"],
+            ),
+            row(
+                "permanent runs",
+                IDLE,
+                Process::Running("g1"),
+                Step::None,
+                &[
+                    "stop",
+                    "restart",
+                    "stage",
+                    "test g2",
+                    "test g3",
+                    "test g4",
+                    "test g5",
+                    "switch g3",
+                ],
+            ),
+            row(
+                "permanent stopped",
+                IDLE,
+                Process::Stopped,
+                Step::None,
+                &[
+                    "start",
+                    "restart",
+                    "stage",
+                    "test g2",
+                    "test g3",
+                    "test g4",
+                    "test g5",
+                    "switch g3",
+                ],
+            ),
+            row(
+                "crash restart scheduled",
+                ONE,
+                Process::Backoff,
+                Step::None,
+                &["start", "stop", "restart", "stage"],
+            ),
+            row(
+                "given up (failed)",
+                ONE,
+                Process::Failed,
+                Step::None,
+                &["start", "restart", "stage"],
+            ),
+            Row {
+                busy: Some("switch g2"),
+                moving: Some("switch g2"),
+                ..row(
+                    "switching",
+                    &[("g1", Permanent), ("g2", Tested)],
+                    Process::Stopped,
+                    Step::Switching,
+                    &[],
+                )
+            },
+        ]
+    }
+
+    /// With a switch pending, rolling back or failed to restore, and with other steps in progress.
+    fn switch_rows() -> Vec<Row> {
+        vec![
+            row(
+                "pending, runs, within its deadline",
+                PENDING,
+                Process::Running("g2"),
+                Step::Pending(120),
+                &["stop", "restart", "stage", "confirm g2", "rollback"],
+            ),
+            row(
+                "pending hides the switch of a tested generation",
+                PENDING_AND_TESTED,
+                Process::Running("g2"),
+                Step::Pending(120),
+                &[
+                    "stop",
+                    "restart",
+                    "stage",
+                    "test g3",
+                    "confirm g2",
+                    "rollback",
+                ],
+            ),
+            row(
+                "pending, deadline passed",
+                PENDING,
+                Process::Running("g2"),
+                Step::Pending(-5),
+                &["stop", "restart", "stage", "rollback"],
+            ),
+            row(
+                "pending, stopped",
+                PENDING,
+                Process::Stopped,
+                Step::Pending(120),
+                &["start", "restart", "stage", "rollback"],
+            ),
+            row(
+                "pending, its app exited and is not reaped yet",
+                PENDING,
+                Process::Exited("g2"),
+                Step::Pending(120),
+                &["stage", "rollback"],
+            ),
+            Row {
+                moving: Some("rollback"),
+                ..row(
+                    "rolling back (decided by the supervisor)",
+                    ROLLED_BACK,
+                    Process::Stopped,
+                    Step::RollingBack {
+                        restore_failed: false,
+                    },
+                    &["stage", "test g3"],
+                )
+            },
+            row(
+                "restore failed",
+                ROLLED_BACK,
+                Process::Failed,
+                Step::RollingBack {
+                    restore_failed: true,
+                },
+                &["stage", "test g3", "rollback", "rollback --keep-storage"],
+            ),
+            Row {
+                busy: Some("stage"),
+                ..row(
+                    "a stage in progress, pending runs",
+                    PENDING,
+                    Process::Running("g2"),
+                    Step::Pending(120),
+                    &["stop", "restart", "confirm g2"],
+                )
+            },
+            Row {
+                moving: Some("stop"),
+                ..row(
+                    "a stop in progress",
+                    &[("g1", Permanent), ("g2", Staged), ("g3", Tested)],
+                    Process::Running("g1"),
+                    Step::None,
+                    &["stage", "test g2", "test g3"],
+                )
+            },
+            Row {
+                keep: Some(2),
+                ..row(
+                    "keep is set",
+                    ONE,
+                    Process::Running("g1"),
+                    Step::None,
+                    &["stop", "restart", "stage", "prune"],
+                )
+            },
+            Row {
+                keep: Some(2),
+                busy: Some("test g2"),
+                ..row(
+                    "keep is set, a test in progress",
+                    &[("g1", Permanent), ("g2", Staged)],
+                    Process::Running("g1"),
+                    Step::None,
+                    &["stop", "restart"],
+                )
+            },
+        ]
+    }
+
+    /// What `status.actions` holds in every situation the state machine has. The list is built from the checks the
+    /// commands run, so each row also reads as the table in DESIGN.md → `status`.
+    #[test]
+    fn status_lists_the_commands_the_daemon_accepts_now() {
+        use crate::state::{format_time, now_secs};
+
+        let record = |id: &str, state| Generation {
+            id: id.into(),
+            git_ref: "main".into(),
+            commit: "0".into(),
+            state,
+            dir: PathBuf::new(),
+            staged_at: String::new(),
+            test: None,
+            switched_at: None,
+            confirmed_at: None,
+            rolled_back_at: None,
+            rollback_reason: None,
+            failed_starts: 0,
+            restore_abandoned_at: None,
+        };
+        // Held to the end: a failed assertion must not leave a `sleep` behind.
+        let mut sleepers = Vec::new();
+        for row in idle_rows().into_iter().chain(switch_rows()) {
+            let temp = tempfile::tempdir().unwrap();
+            let daemon = scratch_daemon_keeping(temp.path(), row.keep);
+            let mut inner = daemon.inner();
+            inner
+                .store
+                .modify(|state| {
+                    state.generations = row
+                        .generations
+                        .iter()
+                        .map(|&(id, gen_state)| record(id, gen_state))
+                        .collect();
+                    state.permanent = (!row.generations.is_empty()).then(|| "g1".into());
+                    let pending = |seconds: i64| Pending {
+                        generation: "g2".into(),
+                        previous: Some("g1".into()),
+                        deadline: format_time(now_secs().saturating_add_signed(seconds)),
+                    };
+                    state.txn = match row.step {
+                        Step::None => None,
+                        Step::Switching => Some(Txn::Switching {
+                            generation: "g2".into(),
+                            previous: Some("g1".into()),
+                        }),
+                        Step::Pending(seconds) => Some(Txn::Pending(pending(seconds))),
+                        Step::RollingBack { restore_failed } => Some(Txn::RollingBack {
+                            pending: pending(120),
+                            reason: "unhealthy".into(),
+                            restore_failed,
+                        }),
+                    };
+                    Ok(())
+                })
+                .unwrap();
+            inner.live = match row.process {
+                Process::Stopped => Live::Stopped,
+                Process::Running(generation) => {
+                    let child = std::process::Command::new("sleep")
+                        .arg("30")
+                        .spawn()
+                        .unwrap();
+                    sleepers.push(KillOnDrop(child.id()));
+                    Live::Running(App::new(child, generation))
+                }
+                Process::Exited(generation) => {
+                    let mut child = std::process::Command::new("true").spawn().unwrap();
+                    let give_up = Instant::now() + Duration::from_secs(5);
+                    while child.try_wait().unwrap().is_none() {
+                        assert!(Instant::now() < give_up, "`true` never exited");
+                        sleep(Duration::from_millis(10));
+                    }
+                    Live::Running(App::new(child, generation))
+                }
+                Process::Backoff => Live::Backoff {
+                    until: Instant::now() + Duration::from_secs(60),
+                    at: String::new(),
+                },
+                Process::Failed => Live::Failed,
+            };
+            inner.busy = row.busy.map(String::from);
+            inner.moving = row.moving.map(String::from);
+            drop(inner);
+            assert_eq!(daemon.status().actions, row.actions, "{}", row.name);
+        }
     }
 
     fn mode(path: &Path) -> u32 {

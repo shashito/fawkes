@@ -632,13 +632,18 @@ fn render_status(s: &Status) -> String {
         }
     };
     format!(
-        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nprocess {}",
+        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nactions: {}\nprocess {}",
         s.name,
         s.daemon_pid,
         or_dash(s.busy.as_deref()),
         or_dash(s.permanent.as_deref()),
         or_dash(s.current.as_deref()),
         note,
+        if s.actions.is_empty() {
+            "none".into()
+        } else {
+            s.actions.join(", ")
+        },
         render_process(&s.process)
     )
 }
@@ -845,6 +850,7 @@ mod tests {
             }),
             step,
             busy: None,
+            actions: Vec::new(),
             process: Process {
                 state: ProcessState::Stopped,
                 generation: Some("g2".into()),
@@ -868,6 +874,10 @@ mod tests {
         // An older daemon sends no step.
         assert!(text(None, true).contains(waits));
         assert!(!text(None, false).contains("confirm"));
+        assert!(text(None, false).contains("\nactions: none\n"));
+        let mut status = status_in(Some(Step::Pending), true);
+        status.actions = vec!["stop".into(), "confirm g2".into()];
+        assert!(render_status(&status).contains("\nactions: stop, confirm g2\n"));
 
         let rolling_back = text(Some(Step::RollingBack), true);
         assert!(!rolling_back.contains("confirm"), "{rolling_back}");

@@ -1,6 +1,6 @@
 //! The transactions (stage, test, switch, confirm, rollback) and the pruning of old generations.
 
-use super::{Daemon, Live, Slot, Why, lock, tenths};
+use super::{Daemon, Inner, Live, Slot, Why, lock, tenths};
 use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
@@ -41,6 +41,67 @@ pub(super) fn refuse_failed_restore(state: &State) -> R<()> {
         ))),
         _ => Ok(()),
     }
+}
+
+/// What `test` needs of generation `id`: that it exists and may be tested.
+pub(super) fn check_test<'a>(state: &'a State, id: &str) -> R<&'a Generation> {
+    let g = state.find(id).ok_or_else(|| not_found(id))?;
+    if !allowed(g.state, GenState::Tested) {
+        return Err(refusal(g, GenState::Tested));
+    }
+    Ok(g)
+}
+
+/// What `switch` needs of the state and of generation `id`: no failed restore, no switch in flight, a tested `id`.
+/// Gives the permanent generation the switch leaves.
+pub(super) fn check_switch(state: &State, id: &str) -> R<Option<String>> {
+    refuse_failed_restore(state)?;
+    if let Some(txn) = &state.txn {
+        return Err(invalid_state(format!(
+            "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
+            txn.generation()
+        )));
+    }
+    let g = state.find(id).ok_or_else(|| not_found(id))?;
+    if !allowed(g.state, GenState::Current) {
+        return Err(refusal(g, GenState::Current));
+    }
+    Ok(state.permanent.clone())
+}
+
+/// What `rollback` needs of the state: a switch to roll back, pending or already being rolled back (a retry after a
+/// failed restore). Gives it.
+pub(super) fn check_rollback(state: &State) -> R<&Pending> {
+    match &state.txn {
+        Some(Txn::Pending(pending) | Txn::RollingBack { pending, .. }) => Ok(pending),
+        _ => Err(invalid_state(
+            "no switch is pending, so there is nothing to roll back; to go back past a confirm, `test` and `switch` to a retired generation",
+        )),
+    }
+}
+
+/// What `rollback --keep-storage` needs of the state: a rollback whose restore failed. Gives the switch and the
+/// reason it was rolled back.
+pub(super) fn check_abandon(state: &State) -> R<(Pending, String)> {
+    match &state.txn {
+        Some(Txn::RollingBack {
+            pending,
+            reason,
+            restore_failed: true,
+        }) => Ok((pending.clone(), reason.clone())),
+        _ => Err(invalid_state(
+            "--keep-storage only gives up a restore that failed, and none has; `fawkes rollback` first",
+        )),
+    }
+}
+
+/// What `prune` needs of the manifest: a `keep`. Gives it.
+pub(super) fn check_prune(m: &Manifest) -> R<u32> {
+    m.keep.ok_or_else(|| {
+        invalid_state(
+            "pruning needs `keep = N` in the manifest; without it every generation is kept",
+        )
+    })
 }
 
 /// Removes a directory when dropped, on every way out of the function that made it. Best effort: a directory that
@@ -477,11 +538,7 @@ impl Daemon {
         let m = self.manifest();
         let g = {
             let inner = self.inner();
-            let g = inner.store.state().find(id).ok_or_else(|| not_found(id))?;
-            if !allowed(g.state, GenState::Tested) {
-                return Err(refusal(g, GenState::Tested));
-            }
-            g.clone()
+            check_test(inner.store.state(), id)?.clone()
         };
         let port = (m.spare_ports[0]..=m.spare_ports[1])
             .find(|&p| p != m.port && port_free(p))
@@ -625,18 +682,7 @@ impl Daemon {
         let unchanged = format!("{id} stays tested and nothing changed");
         let previous = {
             let inner = self.inner();
-            refuse_failed_restore(inner.store.state())?;
-            if let Some(txn) = &inner.store.state().txn {
-                return Err(invalid_state(format!(
-                    "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
-                    txn.generation()
-                )));
-            }
-            let g = inner.store.state().find(id).ok_or_else(|| not_found(id))?;
-            if !allowed(g.state, GenState::Current) {
-                return Err(refusal(g, GenState::Current));
-            }
-            inner.store.state().permanent.clone()
+            check_switch(inner.store.state(), id)?
         };
 
         // The intent goes to disk before the old app is stopped: a daemon that dies from here on finds the switch
@@ -757,16 +803,9 @@ impl Daemon {
         })
     }
 
-    pub(super) fn confirm(&self, id: Option<&str>) -> R<Generation> {
-        let mut inner = self.inner();
-        // An app confirms itself by name. If the answer was lost and it asks again, the generation is already
-        // permanent: that is a true answer whatever else is going on, so it comes before every refusal.
-        if let Some(id) = id
-            && inner.store.state().permanent.as_deref() == Some(id)
-            && let Some(record) = inner.store.state().find(id)
-        {
-            return Ok(record.clone());
-        }
+    /// What `confirm` needs of the state, once the generation is not permanent already: a pending switch that is
+    /// `id` (any when none is named), within its deadline, whose process runs and has not exited. Gives the switch.
+    pub(super) fn check_confirm(&self, inner: &mut Inner, id: Option<&str>) -> R<Pending> {
         refuse_failed_restore(inner.store.state())?;
         match &inner.store.state().txn {
             Some(Txn::RollingBack {
@@ -827,6 +866,20 @@ impl Daemon {
                 )));
             }
         }
+        Ok(pending)
+    }
+
+    pub(super) fn confirm(&self, id: Option<&str>) -> R<Generation> {
+        let mut inner = self.inner();
+        // An app confirms itself by name. If the answer was lost and it asks again, the generation is already
+        // permanent: that is a true answer whatever else is going on, so it comes before every refusal.
+        if let Some(id) = id
+            && inner.store.state().permanent.as_deref() == Some(id)
+            && let Some(record) = inner.store.state().find(id)
+        {
+            return Ok(record.clone());
+        }
+        let pending = self.check_confirm(&mut inner, id)?;
         // Applied to a copy and kept only once it is on disk: a confirm the daemon could not write is not one, and
         // the switch stays pending (a daemon restart would roll it back).
         let record = self
@@ -872,6 +925,7 @@ impl Daemon {
         let m = self.manifest();
         let (id, reason, app) = {
             let mut inner = self.inner();
+            check_rollback(inner.store.state())?;
             // Saved with the generation's `rolled_back` state before anything is stopped. Only a best-effort
             // save: rolling back is the safe direction and a disk that still says pending rolls back at the next
             // start, so a full disk must not stop it.
@@ -880,8 +934,9 @@ impl Daemon {
                 pending, reason, ..
             }) = &inner.store.state().txn
             else {
-                return Err(invalid_state(
-                    "no switch is pending, so there is nothing to roll back; to go back past a confirm, `test` and `switch` to a retired generation",
+                return Err(err(
+                    ErrorCode::Internal,
+                    "the rollback was decided but the state does not say so",
                 ));
             };
             let (id, reason) = (pending.generation.clone(), reason.clone());
@@ -971,16 +1026,7 @@ impl Daemon {
     /// the storage may be one the failed generation already migrated.
     pub(super) fn abandon_restore(self: &Arc<Self>) -> R<RollbackResult> {
         let mut inner = self.inner();
-        let Some(Txn::RollingBack {
-            pending,
-            reason,
-            restore_failed: true,
-        }) = inner.store.state().txn.clone()
-        else {
-            return Err(invalid_state(
-                "--keep-storage only gives up a restore that failed, and none has; `fawkes rollback` first",
-            ));
-        };
+        let (pending, reason) = check_abandon(inner.store.state())?;
         let id = pending.generation;
         let permanent = inner.store.state().permanent.clone();
         self.modify(&mut inner.store, |state| {
@@ -1019,11 +1065,7 @@ impl Daemon {
     pub(super) fn prune(&self, out: &mut Out) -> R<PruneResult> {
         let _busy = self.begin("prune", Slot::Step)?;
         let m = self.manifest();
-        let keep = m.keep.ok_or_else(|| {
-            invalid_state(
-                "pruning needs `keep = N` in the manifest; without it every generation is kept",
-            )
-        })?;
+        let keep = check_prune(&m)?;
         let doomed = self
             .inner()
             .store

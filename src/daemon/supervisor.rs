@@ -4,6 +4,7 @@
 //! so does every change subscribers hear of; the timers it keeps (a crash restart's backoff, the confirm deadline,
 //! the app-log cap) bound the sleep. An idle daemon without an app wakes for nothing.
 
+use super::transactions::{check_abandon, check_prune, check_rollback, check_switch, check_test};
 use super::{APP_LOG_BYTES, App, Daemon, Inner, Live, Slot, Why, tenths};
 use crate::process;
 use crate::protocol::{
@@ -566,7 +567,8 @@ impl Daemon {
     }
 
     pub(super) fn status(&self) -> Status {
-        let inner = self.inner();
+        let mut inner = self.inner();
+        let actions = self.actions(&mut inner);
         Status {
             name: self.manifest().name.clone(),
             daemon_pid: std::process::id(),
@@ -575,8 +577,69 @@ impl Daemon {
             pending: inner.store.state().pending().cloned(),
             step: inner.store.state().step(),
             busy: inner.busy.clone().or_else(|| inner.moving.clone()),
+            actions,
             process: self.process(&inner),
         }
+    }
+
+    /// The commands the daemon would accept now, in the order of DESIGN.md → `status`. An entry is there when the two
+    /// checks its command makes both pass: the slot `begin` takes and the state check the command runs (the
+    /// `check_*` functions), so the list cannot say what the command would refuse. The checks only read, but `try_wait`
+    /// on the app needs the guard mutably.
+    fn actions(&self, inner: &mut Inner) -> Vec<String> {
+        let mut actions = Vec::new();
+        let free = |inner: &Inner, slot| inner.check_slot(slot).is_ok();
+        if free(inner, Slot::Live) {
+            if Self::check_start(inner).is_ok() {
+                actions.push("start".into());
+            }
+            if Self::check_stop(inner).is_ok() {
+                actions.push("stop".into());
+            }
+            if Self::check_restart(inner).is_ok() {
+                actions.push("restart".into());
+            }
+        }
+        if free(inner, Slot::Step) {
+            actions.push("stage".into());
+            let state = inner.store.state();
+            actions.extend(
+                state
+                    .generations
+                    .iter()
+                    .filter(|g| check_test(state, &g.id).is_ok())
+                    .map(|g| format!("test {}", g.id)),
+            );
+        }
+        if free(inner, Slot::Both) {
+            let state = inner.store.state();
+            actions.extend(
+                state
+                    .generations
+                    .iter()
+                    .filter(|g| check_switch(state, &g.id).is_ok())
+                    .map(|g| format!("switch {}", g.id)),
+            );
+        }
+        // Confirm of the permanent generation answers ok and changes nothing: not an action.
+        if let Some(Txn::Pending(pending)) = inner.store.state().txn.clone()
+            && self.check_confirm(inner, None).is_ok()
+        {
+            actions.push(format!("confirm {}", pending.generation));
+        }
+        if free(inner, Slot::Both) {
+            let state = inner.store.state();
+            if check_rollback(state).is_ok() {
+                actions.push("rollback".into());
+            }
+            if check_abandon(state).is_ok() {
+                actions.push("rollback --keep-storage".into());
+            }
+        }
+        if free(inner, Slot::Step) && check_prune(&self.manifest()).is_ok() {
+            actions.push("prune".into());
+        }
+        actions
     }
 
     /// The generations with the end of their app logs. The files are read once `inner` is released: `history` is
