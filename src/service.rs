@@ -44,7 +44,7 @@ mod launchd {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Slack on top of the daemon's `ExitTimeOut` for `launchctl`, which `bootout` makes wait until the daemon is gone.
     const LAUNCHCTL_SLACK: u64 = 30;
@@ -128,7 +128,7 @@ mod launchd {
                     ),
                 ));
             }
-            let log = self.manifest.paths().root.join("daemon.log");
+            let log = self.manifest.paths().daemon_log();
             let mut variables = Vec::new();
             for name in ["PATH", "FAWKES_HOME"] {
                 if let Some(value) = std::env::var_os(name) {
@@ -245,11 +245,25 @@ mod launchd {
             stop.as_secs() + u64::from(stop.subsec_nanos() > 0) + EXIT_MARGIN
         }
 
-        /// Unload the agent: whether it was loaded.
+        /// Unload the agent: whether it was loaded. launchd answers a `bootout` before it has let go of the service,
+        /// and a `bootstrap` until then fails with `5: Input/output error`, so it waits until `print` no longer finds
+        /// the service.
         fn bootout(&self) -> R<bool> {
             let target = format!("{}/{}", self.domain, self.label);
             let done = self.launchctl(["bootout", target.as_str()])?;
             if done.status.success() {
+                let until = Instant::now() + Duration::from_secs(self.exit_timeout());
+                while self.launchctl(["print", target.as_str()])?.status.success() {
+                    if Instant::now() >= until {
+                        return Err(err(
+                            ErrorCode::ServiceFailed,
+                            format!(
+                                "launchd still has {target} after its bootout; try again in a moment"
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 return Ok(true);
             }
             if done.status.code() == Some(3) && output_of(&done).contains("No such process") {

@@ -564,7 +564,8 @@ which `launchctl` runs. The plist holds:
 every target directory, and the next `cargo build` replaces the binary under the running daemon. Install a copy
 (`cargo install --path . --locked`) and run `fawkes service install` from it. With no plist yet, it also refuses
 (`invalid_state`) when a daemon already answers on the manifest's socket (started from a terminal): stop it first. With a
-plist, `install` replaces it: it boots the old agent out (waiting for the daemon to stop), writes the new plist beside it
+plist, `install` replaces it: it boots the old agent out and waits until `launchctl print` no longer finds it (launchd
+answers a bootout before it has let go of the service, and a bootstrap until then fails), writes the new plist beside it
 and renames it into place, then bootstraps. A failing `launchctl` is `service_failed` with its message; after a failed
 bootstrap the plist stays, and running `install` again or `uninstall` cleans up. Result:
 `{"label", "plist", "log", "replaced"}` (`replaced`: the plist existed before).

@@ -2634,7 +2634,9 @@ fn up_stops_at_a_failing_test_and_switches_nothing() {
 }
 
 /// A fake `launchctl` in `<dir>/fakebin` that appends its arguments to `<dir>/calls` and keeps `<dir>/loaded` as the
-/// service's loaded state: `bootout` of an unloaded service fails the way launchd does, `bootstrap` loads it.
+/// service's loaded state: `bootout` of an unloaded service fails the way launchd does, `bootstrap` loads it. As
+/// launchd does, a booted-out service lingers until `print` has seen it once more, and a `bootstrap` before it has gone
+/// fails with `5: Input/output error`.
 #[cfg(target_os = "macos")]
 fn fake_launchctl(h: &Harness) -> std::path::PathBuf {
     let bin = h.dir.join("fakebin");
@@ -2648,10 +2650,19 @@ fn fake_launchctl(h: &Harness) -> std::path::PathBuf {
 echo "$*" >> {d}/calls
 case "$1" in
 bootout)
-	if [ -e {d}/loaded ]; then rm {d}/loaded; exit 0; fi
+	if [ -e {d}/loaded ]; then mv {d}/loaded {d}/unloading; exit 0; fi
 	echo "Boot-out failed: 3: No such process" >&2
 	exit 3 ;;
-bootstrap) touch {d}/loaded ;;
+print)
+	if [ -e {d}/unloading ]; then rm {d}/unloading; exit 0; fi
+	if [ -e {d}/loaded ]; then exit 0; fi
+	exit 113 ;;
+bootstrap)
+	if [ -e {d}/loaded ] || [ -e {d}/unloading ]; then
+		echo "Bootstrap failed: 5: Input/output error" >&2
+		exit 5
+	fi
+	touch {d}/loaded ;;
 esac
 "#
         ),
@@ -2771,10 +2782,19 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     );
     assert_eq!(std::fs::read_to_string(&plist).unwrap(), expected);
 
+    // A bootout waits until launchd has let go of the service: the fake keeps it for one `print`.
+    let bootout = [
+        format!("bootout {target}"),
+        format!("print {target}"),
+        format!("print {target}"),
+    ];
     let (exit, reinstalled, calls) = service(&h, &binary, "install");
     assert_eq!(exit, 0, "{reinstalled}");
     assert_eq!(reinstalled["replaced"], true);
-    assert_eq!(calls, [format!("bootout {target}"), bootstrap.clone()]);
+    assert_eq!(
+        calls,
+        [&bootout[..], std::slice::from_ref(&bootstrap)].concat()
+    );
 
     let (exit, restarted, calls) = service(&h, &binary, "restart");
     assert_eq!(exit, 0, "{restarted}");
@@ -2782,12 +2802,12 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
         restarted,
         serde_json::json!({"label": "dev.fawkes.t", "plist": plist})
     );
-    assert_eq!(calls, [format!("bootout {target}"), bootstrap]);
+    assert_eq!(calls, [&bootout[..], &[bootstrap]].concat());
 
     let (exit, removed, calls) = service(&h, &binary, "uninstall");
     assert_eq!(exit, 0, "{removed}");
     assert_eq!(removed["removed"], true);
-    assert_eq!(calls, [format!("bootout {target}")]);
+    assert_eq!(calls, bootout);
     assert!(!std::path::Path::new(&plist).exists());
     assert!(h.dir.join("s").exists());
     let (exit, removed, _) = service(&h, &binary, "uninstall");
