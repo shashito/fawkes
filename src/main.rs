@@ -4,6 +4,7 @@ mod daemon;
 mod manifest;
 mod process;
 mod protocol;
+mod service;
 mod state;
 mod watch;
 
@@ -128,16 +129,24 @@ enum Command {
         #[arg(long, value_name = "N")]
         since: Option<u64>,
     },
+    /// Run the daemon of --manifest as a launchd user agent (macOS only; --socket is not accepted)
+    Service {
+        #[command(subcommand)]
+        action: service::Action,
+    },
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon`, `watch` and `up` (three requests) send none.
+    /// The request this command sends to the daemon; `daemon`, `watch`, `service` and `up` (three requests) send none.
     /// `own_generation` is `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from
     /// it names that generation, so an app's test run (or anything it left behind) cannot confirm another generation
     /// that happens to be pending.
     fn request(&self, own_generation: Option<&str>) -> Option<Request> {
         Some(match self {
-            Command::Daemon | Command::Watch { .. } | Command::Up { .. } => return None,
+            Command::Daemon
+            | Command::Watch { .. }
+            | Command::Service { .. }
+            | Command::Up { .. } => return None,
             Command::Start => Request::Start,
             Command::Stop => Request::Stop,
             Command::Restart => Request::Restart,
@@ -219,6 +228,9 @@ fn main() -> ExitCode {
     if let Command::Watch { since } = cli.command {
         return ExitCode::from(run_watch(&cli, since, &manifest_path, &mut stdout));
     }
+    if let Command::Service { action } = cli.command {
+        return ExitCode::from(run_service(&cli, action, &manifest_path, &mut stdout));
+    }
     let socket = match socket_path(&cli, &manifest_path) {
         Ok(socket) => socket,
         Err(message) => {
@@ -279,6 +291,32 @@ fn run_watch(cli: &Cli, since: Option<u64>, manifest_path: &Path, out: &mut dyn 
             );
             fail(cli.json, out, ErrorCode::DaemonUnreachable, message)
         }
+    }
+}
+
+/// `fawkes service`: the service of the manifest's daemon, which it reaches by its own socket. Returns the exit code.
+fn run_service(
+    cli: &Cli,
+    action: service::Action,
+    manifest_path: &Path,
+    out: &mut dyn Write,
+) -> u8 {
+    if cli.socket.is_some() {
+        let message =
+            "the service runs the daemon on the manifest's own socket, so --socket does not apply"
+                .into();
+        return fail(cli.json, out, ErrorCode::Usage, message);
+    }
+    match service::run(action, manifest_path) {
+        Ok((result, text)) => {
+            if cli.json {
+                say(out, result);
+            } else {
+                say(out, text);
+            }
+            0
+        }
+        Err(error) => fail(cli.json, out, error.code, error.message),
     }
 }
 
