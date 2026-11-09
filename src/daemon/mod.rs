@@ -24,13 +24,14 @@ use server::{Admission, bind, refuse, register};
 use crate::manifest::{Manifest, Vars};
 use crate::process;
 use crate::protocol::{ErrorCode, Event, EventKind, LastExit, Out, Pending, R, err};
-use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time};
+use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time, with_suffix};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{FlockOperation, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -240,12 +241,13 @@ enum Msg {
     Changed,
 }
 
-/// How large a generation's `logs/app.log` grows before the watcher moves it to `app.log.1`. Small under test, so
-/// a test fills it with a few bytes.
+/// How large a generation's `logs/app.log` grows before the watcher moves it to `app.log.1`, and `daemon.log`, when it
+/// is the daemon's stderr, before `Echo` moves it to `daemon.log.1`. Small under test, so a test fills it with a few
+/// bytes.
 #[cfg(not(test))]
-const APP_LOG_BYTES: u64 = 10 << 20;
+const LOG_BYTES: u64 = 10 << 20;
 #[cfg(test)]
-const APP_LOG_BYTES: u64 = 64;
+const LOG_BYTES: u64 = 64;
 
 /// The longest request line a client may send, in bytes.
 const MAX_REQUEST: u64 = 64 * 1024;
@@ -276,12 +278,16 @@ const ECHO_QUEUE: usize = 1024;
 /// event's caller may hold `inner`, and a stderr that blocks (a terminal on hold) must not stall the daemon, nor one
 /// that fails (a closed terminal, a `| tee` that died) end it. Best effort: a line that cannot be written, or finds
 /// the queue full, is dropped, since `events.jsonl` is the record.
+///
+/// When stderr is `<state_dir>/daemon.log` (a launchd service's, or a redirect to it), the thread also keeps that file
+/// under `LOG_BYTES`, as the supervisor does `app.log`. It is the file's only writer, so a line is never lost to the
+/// cap. Whoever started the daemon decides where stderr goes; the daemon only looks at what it is.
 struct Echo(SyncSender<String>);
 
 impl Echo {
-    /// Start the thread that writes to `to`. It ends once the `Echo` is gone and what was queued is written, which
-    /// disconnects the returned receiver.
-    fn start(mut to: impl Write + Send + 'static) -> (Echo, Receiver<()>) {
+    /// Start the thread that writes to `to`, capping it when it is the file `log`. It ends once the `Echo` is gone and
+    /// what was queued is written, which disconnects the returned receiver.
+    fn start(mut to: impl Write + AsFd + Send + 'static, log: PathBuf) -> (Echo, Receiver<()>) {
         let (lines, queued) = mpsc::sync_channel::<String>(ECHO_QUEUE);
         let (finished, ended) = mpsc::channel();
         thread::spawn(move || {
@@ -289,6 +295,9 @@ impl Echo {
             for line in queued {
                 // A failed write is no reason to stop: a terminal on hold takes lines again once it is released.
                 let _ = writeln!(to, "{line}");
+                // Best effort like the line itself: a log that cannot be capped goes on growing, and the next line
+                // tries again.
+                let _ = cap_daemon_log(&to, &log);
             }
         });
         (Echo(lines), ended)
@@ -298,6 +307,25 @@ impl Echo {
         // Full only while stderr is stuck; the line is in `events.jsonl`.
         let _ = self.0.try_send(line);
     }
+}
+
+/// When `to` is the file at `log` and has grown past `LOG_BYTES`, copy it to `daemon.log.1` (replacing the one before)
+/// and empty it. The seek puts the next line at the start whether or not the descriptor appends. A duplicate of the
+/// descriptor shares its offset, so it truncates and seeks `to` itself.
+fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
+    let mut to = File::from(to.as_fd().try_clone_to_owned()?);
+    let open = to.metadata()?;
+    if !open.is_file() || open.len() <= LOG_BYTES {
+        return Ok(());
+    }
+    let named = std::fs::metadata(log)?;
+    if (named.dev(), named.ino()) != (open.dev(), open.ino()) {
+        return Ok(());
+    }
+    std::fs::copy(log, with_suffix(log, ".1"))?;
+    to.set_len(0)?;
+    to.seek(SeekFrom::Start(0))?;
+    Ok(())
 }
 
 /// What the supervisor sleeps on: a count of changes, and a condvar to wait for the next one. Every change
@@ -442,7 +470,7 @@ impl Daemon {
         published.run_link = Some(register(&manifest.name, &socket)?);
         let (store, recovered) = Store::load(paths.state_json())?;
         let bin = std::env::current_exe().map_err(|e| e.to_string())?;
-        let (echo, echo_finished) = Echo::start(std::io::stderr());
+        let (echo, echo_finished) = Echo::start(std::io::stderr(), paths.daemon_log());
 
         let daemon = Arc::new(Daemon {
             shutdown,
@@ -1047,6 +1075,52 @@ mod tests {
         let reading = hub.join();
         hub.send(&Msg::Changed);
         assert!(reading.try_recv().is_ok() && lock(&hub.0).len() == 1);
+    }
+
+    /// Echo `lines` to `to` and wait until the writer has ended.
+    fn echo_into(to: File, log: &Path, lines: &[&str]) {
+        let (echo, finished) = Echo::start(to, log.to_path_buf());
+        for line in lines {
+            echo.line((*line).to_string());
+        }
+        drop(echo);
+        assert!(matches!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    /// `daemon.log` as the daemon's stderr moves to `daemon.log.1` past the cap, whole, and starts over, whether its
+    /// descriptor appends (launchd's) or not (`2> daemon.log`); a stderr that is another file is left alone.
+    #[test]
+    fn a_daemon_log_over_the_cap_moves_to_daemon_log_1_and_starts_over() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = temp.path().join("daemon.log");
+        let old = with_suffix(&log, ".1");
+        let line = "x".repeat(usize::try_from(LOG_BYTES).unwrap() / 3);
+        let full = format!("{line}\n{line}\n{line}\n");
+        for append in [true, false] {
+            let _ = std::fs::remove_file(&log);
+            let to = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(append)
+                .open(&log)
+                .unwrap();
+            echo_into(to, &log, &[&line, &line, &line, "next"]);
+            assert_eq!(std::fs::read_to_string(&old).unwrap(), full, "{append}");
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "next\n", "{append}");
+        }
+
+        std::fs::remove_file(&old).unwrap();
+        let elsewhere = temp.path().join("terminal.log");
+        echo_into(
+            File::create(&elsewhere).unwrap(),
+            &log,
+            &[&line, &line, &line],
+        );
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), full);
+        assert!(!old.exists());
     }
 
     #[test]

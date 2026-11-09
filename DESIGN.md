@@ -37,7 +37,10 @@ its thread look every 500 ms whether the client has gone.
 
 The daemon writes every event to stderr as a line, for whoever watches the terminal. That copy is best effort, from
 a thread of its own: a stderr that blocks or breaks (a closed terminal, a `| tee` that died) never stalls or ends the
-daemon, and lines it cannot take are dropped. `events.jsonl` is the record.
+daemon, and lines it cannot take are dropped. `events.jsonl` is the record. When stderr is `<state_dir>/daemon.log`
+(the same file, as a launchd service's is), the thread that writes it keeps it under 10 MiB: past that it copies the
+file to `daemon.log.1` (replacing the one before) and empties it, between two lines, so none is lost. Whoever starts
+the daemon decides where stderr goes; the daemon only looks at what it is.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
@@ -777,6 +780,8 @@ event log started over`. Until the first `status` line names the app, a note nam
                          10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines
                          written during the copy are lost)
   install-failed.log     install output of the latest stage that failed (its generation is removed)
+  daemon.log             the daemon's stderr under `fawkes service` (launchd writes it); past 10 MiB copied to
+                         daemon.log.1 and emptied by the daemon
 ```
 
 `state.json` is the source of truth; the deadline is an absolute time so it survives a daemon restart.

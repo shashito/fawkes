@@ -73,6 +73,10 @@ impl Paths {
     pub fn events(&self) -> PathBuf {
         self.root.join("events.jsonl")
     }
+    /// The daemon's stderr when `fawkes service install` runs it; capped when it is (`Echo`).
+    pub fn daemon_log(&self) -> PathBuf {
+        self.root.join("daemon.log")
+    }
     pub fn current_link(&self) -> PathBuf {
         self.root.join("current")
     }
