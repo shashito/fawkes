@@ -126,10 +126,18 @@ failed install's log (that stage's generation is removed). `fawkes log -n 50 --j
 | `start_failed` | The process could not be started, or no spare port was free for a test. A switch whose target cannot start is rolled back at once. | Check the `start` command and the spare ports. |
 | `port_in_use` | Another process took the test's spare port. The generation is unchanged. | `test` again. |
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
-| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Start one: `fawkes daemon --manifest FILE`. |
+| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Start one: `fawkes daemon --manifest FILE`, or `fawkes service restart` when it runs as a service. |
 | `no_answer` | The daemon took a quick request and did not answer within 30 s. Produced by the client. | Check `fawkes status`; the daemon may be stuck. |
+| `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; `fawkes service install` again replaces the plist and reloads it. |
 
 A code not in this table comes from a newer Fawkes: treat it as a failed command and read its message.
+
+## On a server: `fawkes service`
+
+On macOS the daemon may run as a launchd agent (`fawkes service install`, plist
+`~/Library/LaunchAgents/dev.fawkes.<name>.plist`, its stderr in `<state_dir>/daemon.log`). Nothing changes for you:
+the same commands reach it over the same socket. Never run `fawkes service restart` or `uninstall` from inside the app
+it supervises: they stop the daemon and the app, and a pending switch rolls back.
 
 ## Storage rolls back only through the app's hooks
 
