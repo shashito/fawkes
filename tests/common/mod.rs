@@ -43,7 +43,12 @@ const INHERITED: [&str; 5] = [
 /// `fawkes`, deaf to the Fawkes variables of the environment the tests run in. Every test builds the binary's
 /// command here (or through `Harness`), never with `Command::new` itself.
 pub fn fawkes() -> Command {
-    let mut command = Command::new(BIN);
+    fawkes_at(Path::new(BIN))
+}
+
+/// `fawkes()` for a copy of the binary somewhere else (`fawkes service install` refuses the one in `target/`).
+pub fn fawkes_at(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
     for name in INHERITED {
         command.env_remove(name);
     }
@@ -376,9 +381,18 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
     /// `fawkes --json --manifest <manifest>`, for a test that runs the client itself (in the background, or with
     /// its output going somewhere of its own).
     pub fn cli(&self) -> Command {
-        let mut command = fawkes();
+        self.cli_with(fawkes())
+    }
+
+    /// `cli` for `command`, the binary's command from `fawkes_at`.
+    pub fn cli_with(&self, mut command: Command) -> Command {
         command.arg("--json").arg("--manifest").arg(&self.manifest);
         command
+    }
+
+    /// The binary under test, to copy.
+    pub fn binary() -> &'static Path {
+        Path::new(BIN)
     }
 
     /// Run `fawkes --json <args>`; the exit code and the single JSON document it printed.

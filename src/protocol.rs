@@ -51,6 +51,9 @@ pub enum ErrorCode {
     DaemonUnreachable,
     /// Produced by the client only: the daemon accepted a quick request and did not answer in time.
     NoAnswer,
+    /// Produced by the client only: `fawkes service` could not run `launchctl` or write the plist, or `launchctl`
+    /// refused.
+    ServiceFailed,
     /// A code a newer daemon sent that this client does not know; the command failed all the same.
     #[serde(other)]
     Unknown,
@@ -858,6 +861,7 @@ mod tests {
         Internal => "internal",
         DaemonUnreachable => "daemon_unreachable",
         NoAnswer => "no_answer",
+        ServiceFailed => "service_failed",
         Unknown => "unknown",
     });
 
