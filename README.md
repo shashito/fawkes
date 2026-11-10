@@ -122,9 +122,14 @@ Ultimate fork, never a live install. The test suite passes on macOS and on Linux
 
 ```sh
 cargo fmt --check
+cargo deny check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+`cargo deny check` ([cargo-deny](https://github.com/EmbarkStudios/cargo-deny), `brew install cargo-deny`) checks the
+dependencies for security advisories, licences outside the list in `deny.toml`, and unknown sources. Every landing
+runs all four.
 
 `rust-toolchain.toml` uses stable Rust with clippy and rustfmt, and `rust-version` in `Cargo.toml` names the release
 it is developed and tested on. The integration tests (`tests/core.rs`) run the real binary against the sample app in

@@ -78,7 +78,9 @@ hand-written on purpose, and errors stay `protocol::Error` and `String`, without
 
 A well-known crate is preferred over hand-written code when it removes a meaningful amount of code or `unsafe`, but
 ask before adding one (and never tokio: the threads are deliberate). Once one is agreed, add it to the Crates section
-with what it replaces. Update a single dependency with `cargo update --precise`, never everything at once.
+with what it replaces. Update a single dependency with `cargo update --precise`, never everything at once. After
+any change to `Cargo.toml` or `Cargo.lock`, run `cargo deny check` (the lander runs it too): a crate under a
+licence `deny.toml` does not allow fails it, so ask before adding that licence.
 
 ## Code style
 

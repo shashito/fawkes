@@ -3,6 +3,8 @@ name = "fawkes"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
+license = "MIT"
+publish = false
 
 [dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }

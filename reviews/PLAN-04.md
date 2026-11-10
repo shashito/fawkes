@@ -132,7 +132,8 @@ entry; the swap file in the user's checkout is left to them).
 
 ## Needs the user
 
-- **Tools (L50):** cargo-deny (advisories, licences) is not installed. L52 is done: `cargo clippy` and `cargo test`
+- **Tools (L50):** done. cargo-deny is installed, `deny.toml` allows the dependencies' licences, and every landing
+  runs `cargo deny check`. L52 is done: `cargo clippy` and `cargo test`
   pass in an Alpine Linux micro-VM, crash recovery's leftover check included (there is still no CI).
 - **Overlap with the extension (#2227):** its code lives in this repository (the user's choice), and its doc fixes
   touch `examples/ultimate.toml` and DESIGN.md's "Later", which 7.1 also changes. Phase 5 touches neither, so it can
