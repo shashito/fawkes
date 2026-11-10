@@ -196,6 +196,11 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
   const canConfirm = !!pending && (old ? true : allows(status, `confirm ${pending.generation}`))
   const canRollback = old ? !!pending || restoreFailed(status) : allows(status, 'rollback')
   const canUpgrade = !!behind?.count && !running(upgrade) && !upgradeRefusal(status)
+  // The ref still points at the commit the latest switch rolled back from (`behind` has short shas, newest first).
+  const last = lastOutcome(state)
+  const head = behind?.commits[0]?.sha
+  const retry =
+    last?.decided.state === 'rolled_back' && head && last.target.commit.startsWith(head) ? last : undefined
   return (
     <>
       <div className="border-b border-border/70 px-3 py-2 text-[11.5px]">
@@ -263,6 +268,11 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
               <>
                 <span className="text-success">Up to date</span> with {behind.ref}
               </>
+            )}
+            {retry && (
+              <div className="text-warning">
+                That is the commit {retry.target.id} rolled back from; an upgrade builds it again.
+              </div>
             )}
             {behind.error && <div className="text-error">Last check failed: {behind.error}</div>}
           </div>
