@@ -4,8 +4,9 @@ use super::{Daemon, Inner, Live, Slot, Why, lock, tenths};
 use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
-    Error, ErrorCode, EventKind, GenState, Generation, LastExit, Out, Pending, PruneResult, R,
-    RollbackResult, StageResult, SwitchResult, TestInfo, err, invalid_state, not_found,
+    DaemonAction, Error, ErrorCode, EventKind, Facts, GenState, Generation, LastExit, Out, Pending,
+    PruneResult, R, RollbackCause, RollbackResult, StageResult, StorageOutcome, SwitchResult,
+    TestInfo, err, invalid_state, not_found,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, parse_time, refusal};
 use std::net::TcpListener;
@@ -38,7 +39,8 @@ pub(super) fn refuse_failed_restore(state: &State) -> R<()> {
             "{} was rolled back but its storage could not be restored; {}",
             pending.generation,
             restore_way_out(state.permanent.as_deref())
-        ))),
+        ))
+        .about(&pending.generation)),
         _ => Ok(()),
     }
 }
@@ -60,7 +62,8 @@ pub(super) fn check_switch(state: &State, id: &str) -> R<Option<String>> {
         return Err(invalid_state(format!(
             "{} is still waiting for confirm; `fawkes confirm` or `fawkes rollback` first",
             txn.generation()
-        )));
+        ))
+        .about(txn.generation()));
     }
     let g = state.find(id).ok_or_else(|| not_found(id))?;
     if !allowed(g.state, GenState::Current) {
@@ -81,14 +84,15 @@ pub(super) fn check_rollback(state: &State) -> R<&Pending> {
 }
 
 /// What `rollback --keep-storage` needs of the state: a rollback whose restore failed. Gives the switch and the
-/// reason it was rolled back.
-pub(super) fn check_abandon(state: &State) -> R<(Pending, String)> {
+/// reason it was rolled back, as text and as a code.
+pub(super) fn check_abandon(state: &State) -> R<(Pending, String, Option<RollbackCause>)> {
     match &state.txn {
         Some(Txn::RollingBack {
             pending,
             reason,
+            cause,
             restore_failed: true,
-        }) => Ok((pending.clone(), reason.clone())),
+        }) => Ok((pending.clone(), reason.clone(), *cause)),
         _ => Err(invalid_state(
             "--keep-storage only gives up a restore that failed, and none has; `fawkes rollback` first",
         )),
@@ -233,6 +237,7 @@ impl Daemon {
                     confirmed_at: None,
                     rolled_back_at: None,
                     rollback_reason: None,
+                    rollback_cause: None,
                     failed_starts: 0,
                     restore_abandoned_at: None,
                 });
@@ -244,7 +249,7 @@ impl Daemon {
             // A failed install's log outlives the generation, for the agent to read.
             let _ = std::fs::rename(self.paths.install_log(&id), self.paths.failed_install_log());
             let removed = self.remove_generation(&m, &id);
-            self.event(
+            self.event_with(
                 EventKind::Error,
                 Some(&id),
                 format!(
@@ -252,6 +257,10 @@ impl Daemon {
                     e.message,
                     removed.err().map_or(String::new(), |e| format!("; {e}"))
                 ),
+                Facts {
+                    error_code: Some(e.code),
+                    ..Facts::default()
+                },
             );
             return Err(e);
         }
@@ -365,6 +374,7 @@ impl Daemon {
                 ErrorCode::InstallFailed,
                 format!("{e}; see {}", self.paths.failed_install_log().display()),
             )
+            .with_log(self.paths.failed_install_log())
         })
     }
 
@@ -456,6 +466,8 @@ impl Daemon {
                 ErrorCode::StorageFailed,
                 format!("{e}; see {}", log.display()),
             )
+            .about(id)
+            .with_log(&log)
         })
     }
 
@@ -474,6 +486,7 @@ impl Daemon {
                 ErrorCode::StorageFailed,
                 format!("cannot make {} afresh: {e}", dir.display()),
             )
+            .about(id)
         })?;
         let Some(command) = &m.hooks.snapshot else {
             return Ok(());
@@ -550,6 +563,7 @@ impl Daemon {
                         m.spare_ports[0], m.spare_ports[1]
                     ),
                 )
+                .about(id)
             })?;
         let test_home = self.paths.test_home(id);
         let _ = std::fs::remove_dir_all(&test_home);
@@ -562,6 +576,7 @@ impl Daemon {
                     test_home.display()
                 ),
             )
+            .about(id)
         })?;
         // Without hooks the test home stays empty: never the live one, which the test must not touch.
         let with = match &m.hooks.test_copy {
@@ -602,6 +617,8 @@ impl Daemon {
                     ErrorCode::StartFailed,
                     format!("cannot start {id} for its test: {e}"),
                 )
+                .about(id)
+                .with_log(&log)
             })?;
 
         let check = m.health_check(&vars);
@@ -623,8 +640,16 @@ impl Daemon {
             let message = format!(
                 "spare port {port} was taken by another process during the test of {id}; {id} is unchanged, run `fawkes test {id}` again"
             );
-            self.event(EventKind::Error, Some(id), &message);
-            return Err(err(ErrorCode::PortInUse, message));
+            self.event_with(
+                EventKind::Error,
+                Some(id),
+                &message,
+                Facts {
+                    error_code: Some(ErrorCode::PortInUse),
+                    ..Facts::default()
+                },
+            );
+            return Err(err(ErrorCode::PortInUse, message).about(id));
         }
 
         let passed = result.is_ok();
@@ -649,24 +674,32 @@ impl Daemon {
                 g.clone()
             })
         })?;
+        let facts = Facts {
+            port: Some(port),
+            seconds: Some(info.seconds),
+            ..Facts::default()
+        };
         match result {
             Ok(()) => {
-                self.event(
+                self.event_with(
                     EventKind::Tested,
                     Some(id),
                     format!("test passed on port {port} in {}s", info.seconds),
+                    facts,
                 );
                 Ok(record)
             }
             Err(e) => {
-                self.event(EventKind::TestFailed, Some(id), &e);
+                self.event_with(EventKind::TestFailed, Some(id), &e, facts);
                 Err(err(
                     ErrorCode::HealthFailed,
                     format!(
                         "{id} failed its test: {e}; see {}; fix the ref and stage it again, or `fawkes test {id}` to retry",
                         log.display()
                     ),
-                ))
+                )
+                .about(id)
+                .with_log(&log))
             }
         }
     }
@@ -777,24 +810,32 @@ impl Daemon {
         if let Err(e) = self.start_live(&mut inner, id, Why::Fresh) {
             drop(inner);
             // The ordinary rollback undoes the recorded switch and starts the permanent generation again.
-            let message = match self.rollback_pending(out, &format!("start failed: {}", e.message))
-            {
+            let message = match self.rollback_pending(
+                out,
+                &format!("start failed: {}", e.message),
+                Some(RollbackCause::StartFailed),
+            ) {
                 Ok(_) => format!("{}; {id} is rolled back", e.message),
                 Err(rollback) => format!(
                     "{}; rolling {id} back failed too: {}",
                     e.message, rollback.message
                 ),
             };
-            return Err(err(e.code, message));
+            return Err(Error { message, ..e });
         }
         drop(inner);
-        self.event(
+        self.event_with(
             EventKind::Switched,
             Some(id),
             format!(
                 "switched from {}; confirm before {deadline}",
                 previous.as_deref().unwrap_or("nothing")
             ),
+            Facts {
+                previous: previous.clone(),
+                deadline: Some(deadline.clone()),
+                ..Facts::default()
+            },
         );
         Ok(SwitchResult {
             generation: id.into(),
@@ -816,7 +857,8 @@ impl Daemon {
                 return Err(invalid_state(format!(
                     "{} is being rolled back ({reason}) and can no longer be confirmed",
                     pending.generation
-                )));
+                ))
+                .about(&pending.generation));
             }
             Some(Txn::Pending(pending))
                 if parse_time(&pending.deadline).is_none_or(|deadline| now_secs() >= deadline) =>
@@ -824,7 +866,8 @@ impl Daemon {
                 return Err(invalid_state(format!(
                     "{} missed its confirm deadline ({}) and is being rolled back",
                     pending.generation, pending.deadline
-                )));
+                ))
+                .about(&pending.generation));
             }
             _ => {}
         }
@@ -847,7 +890,8 @@ impl Daemon {
                     "{id} is {}, not pending; {} is the one waiting for confirm",
                     g.state.as_str(),
                     pending.generation
-                )),
+                ))
+                .about(id),
                 None => not_found(id),
             });
         }
@@ -860,14 +904,16 @@ impl Daemon {
                         "{} exited ({}) before it was confirmed and is being rolled back",
                         pending.generation,
                         LastExit::new(Some(status), false).describe()
-                    )));
+                    ))
+                    .about(&pending.generation));
                 }
             }
             _ => {
                 return Err(invalid_state(format!(
                     "{} is not running, so it cannot be confirmed; `fawkes start` it and confirm again, or `fawkes rollback`",
                     pending.generation
-                )));
+                ))
+                .about(&pending.generation));
             }
         }
         Ok(pending)
@@ -913,31 +959,40 @@ impl Daemon {
         } else {
             "the confirm named no generation"
         };
-        self.event(
+        self.event_with(
             EventKind::Confirmed,
             Some(&pending.generation),
             format!("{} is permanent ({by})", pending.generation),
+            Facts {
+                named: Some(id.is_some()),
+                ..Facts::default()
+            },
         );
         Ok((record, true))
     }
 
     /// Roll the pending generation back (the caller holds the rollback slots). A rollback already decided, or
-    /// retried after a failed restore, keeps its first reason and time; `reason` applies when none is decided yet.
+    /// retried after a failed restore, keeps its first reason, cause and time; `reason` and `cause` apply when none is
+    /// decided yet.
     pub(super) fn rollback_pending(
         self: &Arc<Self>,
         out: &mut Out,
         reason: &str,
+        cause: Option<RollbackCause>,
     ) -> R<RollbackResult> {
         let m = self.manifest();
-        let (id, reason, app) = {
+        let (id, reason, cause, app) = {
             let mut inner = self.inner();
             check_rollback(inner.store.state())?;
             // Saved with the generation's `rolled_back` state before anything is stopped. Only a best-effort
             // save: rolling back is the safe direction and a disk that still says pending rolls back at the next
             // start, so a full disk must not stop it.
-            self.decide_rollback(&mut inner, reason);
+            self.decide_rollback(&mut inner, reason, cause);
             let Some(Txn::RollingBack {
-                pending, reason, ..
+                pending,
+                reason,
+                cause,
+                ..
             }) = &inner.store.state().txn
             else {
                 return Err(err(
@@ -945,14 +1000,19 @@ impl Daemon {
                     "the rollback was decided but the state does not say so",
                 ));
             };
-            let (id, reason) = (pending.generation.clone(), reason.clone());
-            (id, reason, inner.take_running())
+            let (id, reason, cause) = (pending.generation.clone(), reason.clone(), *cause);
+            (id, reason, cause, inner.take_running())
         };
         self.say(out, &id, format!("rolling back {id}: {reason}"));
         if let Some(app) = app {
             self.stop_app(app);
         }
         // Every time: whether the storage goes back is not the hook's to decide (only `--keep-storage` gives it up).
+        let storage = if m.hooks.restore.is_some() {
+            StorageOutcome::Restored
+        } else {
+            StorageOutcome::Nothing
+        };
         let restored = match &m.hooks.restore {
             Some(restore) => {
                 self.say(out, &id, "restoring storage");
@@ -964,25 +1024,33 @@ impl Daemon {
 
         let mut inner = self.inner();
         let permanent = inner.store.state().permanent.clone();
+        let facts = |storage| Facts {
+            to: permanent.clone(),
+            reason: Some(reason.clone()),
+            cause,
+            storage: Some(storage),
+            ..Facts::default()
+        };
         if let Err(e) = restored {
             // Starting the permanent generation on storage in an unknown state could do more harm. The step stays
             // in state.json, so `rollback` or the next daemon start retries the restore (the code is not retried:
             // the generation is rolled_back for good).
             self.update(&mut inner.store, State::fail_restore);
             inner.live = Live::Failed;
-            self.event(
+            self.event_with(
                 EventKind::RolledBack,
                 Some(&id),
                 format!("{reason}; storage restore failed"),
+                facts(StorageOutcome::RestoreFailed),
             );
-            return Err(err(
-                ErrorCode::StorageFailed,
-                format!(
+            return Err(Error {
+                message: format!(
                     "{id} was rolled back but its storage could not be restored: {}; the app stays stopped; {}",
                     e.message,
                     restore_way_out(permanent.as_deref())
                 ),
-            ));
+                ..e
+            });
         }
         // Until the end of the switch is on disk the app stays stopped and the step stays, like a failed restore:
         // `rollback` or the next daemon start finishes it (restoring the same snapshot again is harmless).
@@ -993,10 +1061,11 @@ impl Daemon {
             // The save that just failed is reported; this one only records that the restore awaits a retry.
             let _ = inner.store.update(State::fail_restore);
             inner.live = Live::Failed;
-            self.event(
+            self.event_with(
                 EventKind::RolledBack,
                 Some(&id),
                 format!("{reason}; state.json could not be written"),
+                facts(storage),
             );
             return Err(err(
                 e.code,
@@ -1004,15 +1073,17 @@ impl Daemon {
                     "{id} was rolled back but {}; the app stays stopped and `fawkes rollback` retries",
                     e.message
                 ),
-            ));
+            )
+            .about(&id));
         }
-        self.event(
+        self.event_with(
             EventKind::RolledBack,
             Some(&id),
             format!(
                 "{reason}; back to {}",
                 permanent.as_deref().unwrap_or("nothing")
             ),
+            facts(storage),
         );
         if let Some(permanent) = &permanent
             && self.start_or_give_up(&mut inner, permanent, Why::Fresh)
@@ -1023,6 +1094,7 @@ impl Daemon {
             from: id,
             to: permanent,
             reason,
+            cause,
         })
     }
 
@@ -1032,7 +1104,7 @@ impl Daemon {
     /// the storage may be one the failed generation already migrated.
     pub(super) fn abandon_restore(self: &Arc<Self>) -> R<RollbackResult> {
         let mut inner = self.inner();
-        let (pending, reason) = check_abandon(inner.store.state())?;
+        let (pending, reason, cause) = check_abandon(inner.store.state())?;
         let id = pending.generation;
         let permanent = inner.store.state().permanent.clone();
         self.modify(&mut inner.store, |state| {
@@ -1042,13 +1114,20 @@ impl Daemon {
             }
             Ok(())
         })?;
-        self.event(
+        self.event_with(
             EventKind::RolledBack,
             Some(&id),
             format!(
                 "{reason}; restore given up on request, storage kept as it was: {} now runs on storage that {id} may already have migrated",
                 permanent.as_deref().unwrap_or("nothing")
             ),
+            Facts {
+                to: permanent.clone(),
+                reason: Some(reason.clone()),
+                cause,
+                storage: Some(StorageOutcome::Kept),
+                ..Facts::default()
+            },
         );
         if let Some(permanent) = &permanent
             && self.start_or_give_up(&mut inner, permanent, Why::Fresh)
@@ -1059,6 +1138,7 @@ impl Daemon {
             from: id,
             to: permanent,
             reason,
+            cause,
         })
     }
 }
@@ -1081,7 +1161,15 @@ impl Daemon {
         for id in doomed {
             self.say(out, &id, format!("removing {id}"));
             if let Err(e) = self.remove_generation(&m, &id) {
-                self.event(EventKind::Error, Some(&id), format!("prune: {e}"));
+                self.event_with(
+                    EventKind::Error,
+                    Some(&id),
+                    format!("prune: {e}"),
+                    Facts {
+                        error_code: Some(ErrorCode::Internal),
+                        ..Facts::default()
+                    },
+                );
                 return Err(err(
                     ErrorCode::Internal,
                     format!(
@@ -1097,10 +1185,14 @@ impl Daemon {
             removed.push(id);
         }
         if !removed.is_empty() {
-            self.event(
+            self.event_with(
                 EventKind::Pruned,
                 None,
                 format!("removed {} (keep = {keep})", removed.join(", ")),
+                Facts {
+                    removed: Some(removed.clone()),
+                    ..Facts::default()
+                },
             );
         }
         let kept: Vec<String> = self
@@ -1147,12 +1239,17 @@ impl Daemon {
                 .map(|g| g.id.clone())
                 .collect()
         };
+        let cleaned_up = || Facts {
+            action: Some(DaemonAction::CleanedUp),
+            ..Facts::default()
+        };
         for id in staging {
             match self.remove_generation(&m, &id) {
-                Ok(()) => self.event(
+                Ok(()) => self.event_with(
                     EventKind::Daemon,
                     Some(&id),
                     format!("removed {id}, whose stage the end of the last daemon cut short"),
+                    cleaned_up(),
                 ),
                 Err(e) => self.event(
                     EventKind::Error,
@@ -1168,10 +1265,11 @@ impl Daemon {
             let name = dir.file_name().to_string_lossy().into_owned();
             if self.inner().store.state().find(&name).is_none() {
                 match std::fs::remove_dir_all(dir.path()) {
-                    Ok(()) => self.event(
+                    Ok(()) => self.event_with(
                         EventKind::Daemon,
                         None,
                         format!("removed {}, which no generation owns", dir.path().display()),
+                        cleaned_up(),
                     ),
                     Err(e) => self.event(
                         EventKind::Error,
@@ -1197,6 +1295,7 @@ fn left_to_next_start(id: &str, permanent: &str) -> Error {
             "{id} is rolled back, but the daemon is shutting down, so {permanent} was not started; the next daemon start runs it"
         ),
     )
+    .about(id)
 }
 
 /// Whether nothing listens on `port`, on the loopback address or on all addresses: an app may bind either.

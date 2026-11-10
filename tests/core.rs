@@ -126,6 +126,20 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
         g2["rollback_reason"].as_str().unwrap().contains("deadline"),
         "reason: {g2}"
     );
+    assert_eq!(g2["rollback_cause"], "deadline", "{g2}");
+    // The facts are fields of the events, so nobody reads them out of the message.
+    let switched_event = &event_of(&h, "switched", "g2");
+    assert_eq!(switched_event["previous"], "g1", "{switched_event}");
+    assert_eq!(switched_event["deadline"], switched["deadline"]);
+    let rolled_back = &event_of(&h, "rolled_back", "g2");
+    assert_eq!(rolled_back["to"], "g1", "{rolled_back}");
+    assert_eq!(rolled_back["cause"], "deadline", "{rolled_back}");
+    assert_eq!(rolled_back["reason"], g2["rollback_reason"]);
+    assert_eq!(rolled_back["storage"], "restored", "{rolled_back}");
+    assert_eq!(
+        h.ok(&["history"])["generations"][1]["rollback_cause"],
+        "deadline"
+    );
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
     assert!(
         !h.versions().contains(&"v2".to_string()),
@@ -203,6 +217,7 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
         h.generation("g2")["state"] == "rolled_back"
     });
     assert_eq!(h.generation("g2")["rollback_reason"], "daemon_restart");
+    assert_eq!(h.generation("g2")["rollback_cause"], "daemon_restart");
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
     assert!(
         !h.versions().contains(&"v2".to_string()),
@@ -293,6 +308,16 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
             .unwrap()
             .contains("exited before confirm")
     );
+    assert_eq!(h.generation("g2")["rollback_cause"], "exited");
+    let exited = &event_of(&h, "exited", "g2");
+    assert_eq!(exited["code"], 3, "{exited}");
+    assert_eq!(exited["signal"], Value::Null, "{exited}");
+    assert_eq!(
+        exited["restart_at"],
+        Value::Null,
+        "no restart for a rolled back generation"
+    );
+    assert_eq!(event_of(&h, "rolled_back", "g2")["cause"], "exited");
     // Waited for, not read once: the killed process stays a zombie until init reaps it, which a loaded machine delays.
     h.wait("g2's background process to be gone", 5, || !running("g2"));
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
@@ -447,6 +472,12 @@ install_timeout = 1"#,
             .starts_with("install for g1 failed (exit status: 1); see "),
         "{error}"
     );
+    assert_eq!(
+        error["log"].as_str(),
+        Some(state_path(&h, "install-failed.log").as_str()),
+        "{error}"
+    );
+    assert_eq!(error["generation"], Value::Null, "g1 is gone: {error}");
     let failed = h.ok(&["history"])["failed_install_tail"].clone();
     assert!(
         failed.as_str().is_some_and(|t| t.contains("install broke")),
@@ -1103,6 +1134,37 @@ fn messages(h: &Harness, kind: &str) -> Vec<String> {
         .collect()
 }
 
+/// The events of `kind` for generation `id`, oldest first, with their typed facts.
+fn events_of(h: &Harness, kind: &str, id: &str) -> Vec<Value> {
+    h.ok(&["log", "-n", "1000"])["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == kind && event["generation"] == id)
+        .cloned()
+        .collect()
+}
+
+/// The first event of `kind` for generation `id`, once it is logged: a state change is saved before its event.
+fn event_of(h: &Harness, kind: &str, id: &str) -> Value {
+    h.wait(&format!("the {kind} event of {id}"), 10, || {
+        !events_of(h, kind, id).is_empty()
+    });
+    events_of(h, kind, id).remove(0)
+}
+
+/// `path` below the state directory, as the daemon names it: the resolved one (`/tmp` is `/private/tmp` on macOS).
+fn state_path(h: &Harness, path: &str) -> String {
+    h.dir
+        .join("s")
+        .canonicalize()
+        .unwrap()
+        .join(path)
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
 /// An idle daemon sleeps until something happens, then acts at once: a crash of the app is reaped and restarted when
 /// its backoff ends, SIGHUP reloads, SIGTERM stops the app and the daemon. A lost wake-up would wait for the next
 /// timer, ten seconds away or none at all.
@@ -1300,7 +1362,20 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
     std::fs::rename(&snapshot, &moved).unwrap();
     // Both messages name the way out, and the permanent generation it starts.
     let way_out = "`fawkes rollback` retries the restore, or `fawkes rollback --keep-storage` starts g1 on the storage as it is (it may already be migrated)";
-    refused(&h, &["rollback"], "storage_failed", way_out);
+    let (_, error) = h.fk(&["rollback"]);
+    assert_eq!(error["code"], "storage_failed", "{error}");
+    assert!(
+        error["message"].as_str().unwrap().contains(way_out),
+        "{error}"
+    );
+    assert_eq!(error["generation"], "g2", "{error}");
+    assert_eq!(
+        error["log"].as_str(),
+        Some(state_path(&h, "generations/g2/logs/hooks.log").as_str()),
+        "{error}"
+    );
+    let failed_restore = events_of(&h, "rolled_back", "g2");
+    assert_eq!(failed_restore.last().unwrap()["storage"], "restore_failed");
     let status = h.status();
     assert_eq!(status["process"]["state"], "failed", "{status}");
     assert_eq!(status["pending"]["generation"], "g2", "{status}");
@@ -1325,8 +1400,10 @@ fn failed_writes_and_restores_keep_the_switch_pending_until_a_rollback_gets_thro
         (Some("g1"), Value::Null)
     );
     assert_eq!(status["process"]["state"], "running");
+    assert_eq!(rolled["cause"], "requested", "{rolled}");
     // The first rollback's reason stays; the retries only finished it.
     assert_eq!(h.generation("g2")["rollback_reason"], "rollback requested");
+    assert_eq!(h.generation("g2")["rollback_cause"], "requested");
 }
 
 /// Every event carries a `seq`, and `subscribe {since}` replays exactly the events after it, in order, before the
@@ -2359,7 +2436,19 @@ fn a_failing_test_leaves_the_generation_test_failed_until_a_retest_passes() {
     h.start_daemon();
     h.ok(&["stage", "v1"]);
 
-    refused(&h, &["test", "g1"], "health_failed", "g1 failed its test");
+    let (_, error) = h.fk(&["test", "g1"]);
+    assert_eq!(error["code"], "health_failed", "{error}");
+    assert_eq!(error["generation"], "g1", "{error}");
+    assert_eq!(
+        error["log"].as_str(),
+        Some(state_path(&h, "generations/g1/logs/app.log").as_str()),
+        "{error}"
+    );
+    let failed = &event_of(&h, "test_failed", "g1");
+    assert!(
+        failed["port"].is_u64() && failed["seconds"].is_f64(),
+        "{failed}"
+    );
     let g1 = h.generation("g1");
     assert_eq!(g1["state"], "test_failed");
     assert_eq!(g1["test"]["passed"], false);

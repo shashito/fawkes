@@ -155,8 +155,9 @@ in `state.json` (Fawkes itself died mid-switch). A deadline in `state.json` that
 and is reported as an `error` event.
 Code and storage roll back together:
 
-1. Mark the pending generation `rolled_back` with the reason and save the step `rolling_back` with it. Deciding is
-   one step under the daemon's lock, so no confirm fits in between, and the first reason stays. The save is best
+1. Mark the pending generation `rolled_back` with the reason and its cause (below) and save the step `rolling_back`
+   with them. Deciding is one step under the daemon's lock, so no confirm fits in between, and the first reason and
+   cause stay. The save is best
    effort: rolling back is the safe direction, and a `state.json` that still says `pending` rolls back at the next
    start anyway.
 2. Stop the pending generation.
@@ -176,6 +177,23 @@ not begun yet.
 A `SIGTERM` that arrives during a rollback (requested, automatic, or the one a daemon start carries out) lets it
 finish, but a daemon on its way out does not start the permanent generation: it logs a `daemon` event saying so (not
 `failed`), the next daemon start runs it, and a requested rollback is answered `busy` instead of ok.
+
+**The cause** is the reason as a code, for an agent that decides what to do next: the generation record's
+`rollback_cause`, the `cause` of the `rollback` result and of the `rolled_back` event. `rollback_reason` stays the
+readable text.
+
+| `cause` | The rollback was decided because |
+|---|---|
+| `deadline` | the pending generation was not confirmed before its deadline |
+| `exited` | its process exited before confirm |
+| `unhealthy` | its health check gave up and `rollback_on_unhealthy` is set |
+| `start_failed` | the switch could not start its process |
+| `requested` | `fawkes rollback` asked for it |
+| `daemon_restart` | a daemon start found the switch pending in `state.json` |
+
+`rollback_cause` is null on a generation that was not rolled back, and on one rolled back before the cause existed;
+the step in `state.json` carries it too (`cause`, null when written before), so a rollback that a daemon start
+retries keeps its cause. A client reads a cause it does not know as `unknown`.
 
 Rollback happens at most once per generation and only ever goes to the permanent generation. If that one then fails
 too, Fawkes does not roll further back; the restart policy below applies and the failure is reported in `status`.
@@ -269,8 +287,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    - `switching`: the target never ran (the last daemon was killed, or stopped by `SIGTERM` while the switch stopped
      the old generation). Log that the switch to it was cut short (it stays `tested`), clear the step and start the
      permanent generation;
-   - `pending`: roll the switch back (reason `daemon_restart`); a pending switch is never resumed;
-   - `rolling_back`: retry the rollback with its recorded reason (a `restore` hook is safe to run again, see
+   - `pending`: roll the switch back (reason `daemon_restart`, cause `daemon_restart`); a pending switch is never resumed;
+   - `rolling_back`: retry the rollback with its recorded reason and cause (a `restore` hook is safe to run again, see
      Hooks), then start the permanent generation.
 
 ## Manifest
@@ -674,6 +692,14 @@ dropped, so its stream simply ends. Live clients reconnect.
 {"ok": false, "error": {"code": "invalid_state", "message": "g3 is staged, not tested; run `fawkes test g3` first"}}
 ```
 
+An error object may also carry `generation`, the generation the failure is about when it is a specific one that
+exists, and `log`, the absolute path of the log that explains it; both are left out when they do not apply. A
+failed install carries `log` (`<state_dir>/install-failed.log`) and no `generation`, which the failed stage has
+removed. `health_failed` of a test and a start that fails carry `generation` and `log` (the generation's
+`logs/app.log`); `storage_failed` of a hook carries `generation` and `log` (its `logs/hooks.log`); an `invalid_state`
+about one generation (a refused switch, test or confirm, a rollback in the way) carries `generation`. The message
+says the same in words.
+
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
 `storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable`, `no_answer` and `service_failed` are
 produced by the client only: no daemon answers, or it closed the connection without an answer; the daemon accepted a
@@ -698,7 +724,7 @@ Results per command:
 | `test` | `generation` | the generation record (its `test` field holds port, outcome, duration) |
 | `switch` | `generation`, `deadline?` (seconds, `1..=604800`, else `usage`) | `generation`, `previous`, `deadline` |
 | `confirm` | `generation?` | the generation record, now permanent (naming the generation that already is permanent answers ok with its record and changes nothing) |
-| `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason` |
+| `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason`, `cause` (see Rollback; of the first rollback decided, so a retry after a failed restore answers that one's) |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
 | `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
@@ -718,8 +744,10 @@ Every event, including progress lines of a step another client started, reaches 
 first field of an event, a number the daemon counts across all its events: it increases by one, continues after a
 daemon restart, and is `0` for lines written before events were numbered.
 
-**Events.** Every event has a `kind`, a `generation` (or `null`) and a `message`. The kinds, with what `generation`
-holds:
+**Events.** Every event has a `seq`, an `at`, a `kind`, a `generation` (or `null`) and a `message`, and the facts of
+its kind as further fields, each present only when it applies. The `message` is for people; an agent reads the
+fields. A reader ignores a field it does not know, and an event written before a field existed lacks it. The kinds,
+with what `generation` holds and the fields each carries (the table below the kinds lists them):
 
 | Kind | Logged when | `generation` |
 |---|---|---|
@@ -740,15 +768,36 @@ holds:
 | `pruned` | `prune` removed at least one generation; the message lists them | `null` |
 | `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a panic | the generation concerned, else `null` |
 
+| Kind | Fields |
+|---|---|
+| `daemon` | `action`: `started`, `stopped`, `reloaded`, `cleaned_up` (a leftover app, step or hook stopped, a cut-short stage or a stray directory removed), `switch_cut_short`, `deferred` (a start left to the next daemon). `started` adds `pid` and `version`; `reloaded` adds `changed`, the manifest fields that changed (empty when none); `cleaned_up` adds `pid` when it stopped a process |
+| `started` | `pid`, `port` |
+| `exited` | `code` (exit status) or `signal`, as in `last_exit`; `restart_at` (UTC time) when a restart is scheduled |
+| `tested`, `test_failed` | `port` (the spare port), `seconds` |
+| `switched` | `previous` (the generation left, absent on the first switch), `deadline` |
+| `confirmed` | `named`: `true` when the confirm named the generation (an app confirms itself that way), `false` when it did not |
+| `rolled_back` | `to` (the permanent generation it returns to, absent when none), `reason` (the readable text), `cause` (see Rollback), `storage`: `restored`, `kept` (`--keep-storage`), `restore_failed`, or `none` (no `restore` hook: a code-only rollback) |
+| `pruned` | `removed`: the ids |
+| `error` | `error_code`: the error code of the failure, when it has one (a failed stage, a lost spare port, a failed prune). Not `code`, which is the exit status of `exited` |
+| `progress`, `healthy`, `unhealthy`, `failed`, `stopped`, `staged` | none |
+
+A client reads an `action`, `storage` or `cause` it does not know as `unknown`, like the other enumerations.
+
+```json
+{"event": {"seq": 43, "at": "2026-11-03T14:00:09Z", "kind": "rolled_back", "generation": "g3", "message": "missed confirm deadline; back to g2",
+           "to": "g2", "reason": "missed confirm deadline", "cause": "deadline", "storage": "restored"}}
+```
+
 A generation record:
 
 ```json
 {"id": "g3", "ref": "main", "commit": "238c447f…", "state": "current", "dir": "/Users/me/.fawkes/sample/generations/g3/code",
  "staged_at": "…", "test": {"port": 4791, "passed": true, "at": "…", "seconds": 2.1, "message": "healthy"},
- "switched_at": "…", "confirmed_at": null, "rolled_back_at": null, "rollback_reason": null, "failed_starts": 0,
+ "switched_at": "…", "confirmed_at": null, "rolled_back_at": null, "rollback_reason": null, "rollback_cause": null, "failed_starts": 0,
  "restore_abandoned_at": null}
 ```
 
+`rollback_cause` is the reason of a rollback as a code (see Rollback), null unless the generation was rolled back.
 `restore_abandoned_at` is set on a rolled-back generation whose failed restore `rollback --keep-storage` gave up.
 
 `history` adds, to each generation's record, `log_tail`: the last 50 lines of its `logs/app.log`, read from the last
@@ -866,7 +915,7 @@ event log started over`. Until the first `status` line names the app, a note nam
   lock                   flock'ed by the running daemon; empty
   fawkes.sock            the daemon's socket
   state.json             generations, permanent, `txn` (the transaction step in flight: `switching`, `pending`
-                         with its deadline, or `rolling_back` with its reason; null between switches); durable
+                         with its deadline, or `rolling_back` with its reason and cause; null between switches); durable
                          writes (temp file, fsync, rename, fsync of the directory). A file with the older
                          `pending` field instead of `txn` still loads
   app.pid                pid (= process group) of the live app, written by its start wrapper

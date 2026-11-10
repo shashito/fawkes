@@ -23,7 +23,10 @@ use server::{Admission, bind, refuse, register};
 
 use crate::manifest::{Manifest, Vars};
 use crate::process;
-use crate::protocol::{ErrorCode, Event, EventKind, LastExit, Out, Pending, R, err};
+use crate::protocol::{
+    DaemonAction, Error, ErrorCode, Event, EventKind, Facts, LastExit, Out, Pending, R,
+    RollbackCause, err,
+};
 use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time, with_suffix};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{FlockOperation, flock};
@@ -491,7 +494,7 @@ impl Daemon {
             daemon: daemon.clone(),
             finished: echo_finished,
         };
-        daemon.event(
+        daemon.event_with(
             EventKind::Daemon,
             None,
             format!(
@@ -499,6 +502,12 @@ impl Daemon {
                 std::process::id(),
                 daemon.socket.display()
             ),
+            Facts {
+                action: Some(DaemonAction::Started),
+                pid: Some(std::process::id()),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+                ..Facts::default()
+            },
         );
         if let Some(warning) = recovered {
             daemon.event(EventKind::Error, None, warning);
@@ -518,10 +527,15 @@ impl Daemon {
         ] {
             if let Some(pid) = process::leftover(&pid_file) {
                 process::stop_group(pid, daemon.manifest().stop_timeout, None);
-                daemon.event(
+                daemon.event_with(
                     EventKind::Daemon,
                     None,
                     format!("stopped {what} (pid {pid}) left by an earlier daemon"),
+                    Facts {
+                        action: Some(DaemonAction::CleanedUp),
+                        pid: Some(pid),
+                        ..Facts::default()
+                    },
                 );
             }
         }
@@ -539,18 +553,26 @@ impl Daemon {
         match txn {
             None => daemon.start_permanent(),
             Some(Txn::Switching { generation, .. }) => {
-                daemon.event(
+                daemon.event_with(
                     EventKind::Daemon,
                     Some(&generation),
                     format!(
                         "the switch to {generation} was cut short by the end of the last daemon; it stays tested"
                     ),
+                    Facts {
+                        action: Some(DaemonAction::SwitchCutShort),
+                        ..Facts::default()
+                    },
                 );
                 daemon.update(&mut daemon.inner().store, |state| state.txn = None);
                 daemon.start_permanent();
             }
-            Some(Txn::Pending(_)) => daemon.roll_back_at_start("daemon_restart")?,
-            Some(Txn::RollingBack { reason, .. }) => daemon.roll_back_at_start(&reason)?,
+            Some(Txn::Pending(_)) => {
+                daemon.roll_back_at_start("daemon_restart", Some(RollbackCause::DaemonRestart))?;
+            }
+            Some(Txn::RollingBack { reason, cause, .. }) => {
+                daemon.roll_back_at_start(&reason, cause)?;
+            }
         }
 
         let watcher = daemon.clone();
@@ -612,14 +634,19 @@ impl Daemon {
         }
     }
 
-    /// Carry out the rollback that startup found pending or under way; `reason` applies when it was not decided yet.
-    fn roll_back_at_start(self: &Arc<Self>, reason: &str) -> Result<(), String> {
+    /// Carry out the rollback that startup found pending or under way; `reason` and `cause` apply when it was not
+    /// decided yet.
+    fn roll_back_at_start(
+        self: &Arc<Self>,
+        reason: &str,
+        cause: Option<RollbackCause>,
+    ) -> Result<(), String> {
         let _busy = self.begin("rollback", Slot::Both).map_err(|e| e.message)?;
         // `busy` is a rollback that ended while the daemon shuts down: `start_or_give_up` logged what it did not start.
-        if let Err(e) = self.rollback_pending(&mut Out::none(), reason)
+        if let Err(e) = self.rollback_pending(&mut Out::none(), reason, cause)
             && e.code != ErrorCode::Busy
         {
-            self.event(EventKind::Error, None, e.message);
+            self.error_event(&e);
         }
         Ok(())
     }
@@ -668,18 +695,28 @@ impl Daemon {
         };
         match reloaded {
             Ok(changed) if changed.is_empty() => {
-                self.event(
+                self.event_with(
                     EventKind::Daemon,
                     None,
                     "manifest reloaded, nothing changed",
+                    Facts {
+                        action: Some(DaemonAction::Reloaded),
+                        changed: Some(Vec::new()),
+                        ..Facts::default()
+                    },
                 );
             }
             Ok(changed) => {
                 *lock(&self.manifest) = Arc::new(new);
-                self.event(
+                self.event_with(
                     EventKind::Daemon,
                     None,
                     format!("manifest reloaded, changed: {}", changed.join(", ")),
+                    Facts {
+                        action: Some(DaemonAction::Reloaded),
+                        changed: Some(changed.into_iter().map(String::from).collect()),
+                        ..Facts::default()
+                    },
                 );
             }
             Err(e) => {
@@ -716,7 +753,15 @@ impl Daemon {
             process::kill_group(pgid);
         }
         self.update(&mut self.inner().store, |state| state.daemon_pid = None);
-        self.event(EventKind::Daemon, None, "stopped");
+        self.event_with(
+            EventKind::Daemon,
+            None,
+            "stopped",
+            Facts {
+                action: Some(DaemonAction::Stopped),
+                ..Facts::default()
+            },
+        );
     }
 }
 
@@ -819,6 +864,7 @@ fn log_panics(events: PathBuf, sequence: Arc<AtomicU64>) {
                 kind: EventKind::Error,
                 generation: None,
                 message: format!("panic: {info}; the daemon aborts, and its next start recovers"),
+                facts: Box::default(),
             },
         );
         report(info);
@@ -914,12 +960,24 @@ impl Daemon {
         generation: Option<&str>,
         message: impl Into<String>,
     ) -> Event {
+        self.event_with(kind, generation, message, Facts::default())
+    }
+
+    /// `event` with the typed facts its message tells. Built by the caller before any lock is taken.
+    fn event_with(
+        &self,
+        kind: EventKind,
+        generation: Option<&str>,
+        message: impl Into<String>,
+        facts: Facts,
+    ) -> Event {
         let event = Event {
             seq: 0,
             at: now(),
             kind,
             generation: generation.map(String::from),
             message: message.into(),
+            facts: Box::new(facts),
         };
         // Subscribers get the event while the log is still held: `stream` joins the hub and reads its replay under
         // the same lock, so an event is in the replay or on the channel, never both and never neither, and the
@@ -944,6 +1002,19 @@ impl Daemon {
             self.changed();
         }
         event
+    }
+
+    /// An `error` event for a failure that has an `ErrorCode`, which it carries as `error_code`.
+    fn error_event(&self, error: &Error) {
+        self.event_with(
+            EventKind::Error,
+            None,
+            &error.message,
+            Facts {
+                error_code: Some(error.code),
+                ..Facts::default()
+            },
+        );
     }
 
     /// A progress line: logged, and sent to the client waiting for this step.
@@ -1417,6 +1488,7 @@ mod tests {
             confirmed_at: None,
             rolled_back_at: None,
             rollback_reason: None,
+            rollback_cause: None,
             failed_starts: 0,
             restore_abandoned_at: None,
         };
@@ -1450,6 +1522,7 @@ mod tests {
                         Step::RollingBack { restore_failed } => Some(Txn::RollingBack {
                             pending: pending(120),
                             reason: "unhealthy".into(),
+                            cause: Some(RollbackCause::Unhealthy),
                             restore_failed,
                         }),
                     };

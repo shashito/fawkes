@@ -1,7 +1,9 @@
 //! The socket server: binding and publishing the socket, and answering each client's request.
 
 use super::{Daemon, MAX_REQUEST, Msg, Slot, lock};
-use crate::protocol::{ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, err};
+use crate::protocol::{
+    ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, RollbackCause, err,
+};
 use rustix::fs::Mode;
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::DirBuilderExt;
@@ -228,7 +230,7 @@ impl Daemon {
                 if keep_storage {
                     self.abandon_restore().map(Reply::from)
                 } else {
-                    self.rollback_pending(out, "rollback requested")
+                    self.rollback_pending(out, "rollback requested", Some(RollbackCause::Requested))
                         .map(Reply::from)
                 }
             }
