@@ -2442,13 +2442,16 @@ if (process.argv[2] === 'listen') {
     assert!(h.dir.join("s/squat.pid").exists(), "the listener never ran");
     drop(listener);
     std::fs::remove_file(h.dir.join("s/squat")).unwrap();
+    // The nine are bound together and retried as a whole: right after the listener is killed, a bind can find its port
+    // free and the next one still be refused (under load, before the kernel has let go of all its sockets).
+    let mut held = Vec::new();
     h.wait("the listener to release the spare port", 10, || {
-        std::net::TcpListener::bind(("127.0.0.1", h.port + 1)).is_ok()
+        held = (h.port + 1..=h.port + 9)
+            .map(|port| std::net::TcpListener::bind(("127.0.0.1", port)))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_default();
+        !held.is_empty()
     });
-
-    let held: Vec<_> = (h.port + 1..=h.port + 9)
-        .map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).unwrap())
-        .collect();
     refused(&h, &["test", "g1"], "start_failed", "no free spare port");
     assert_eq!(record(&h), staged);
     drop(held);
