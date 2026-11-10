@@ -10,8 +10,9 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { actionRef, api, cn, defineWebExtension, formatAgo, useAction, useNow } from '@/sdk'
-import { awaitingConfirm, restoreFailed, rollbackNote } from './step.ts'
-import type { FawkesState, Generation } from './types.ts'
+import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
+import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
+import type { FawkesState, Generation, Upgrade } from './types.ts'
 
 type Supervised = Extract<FawkesState, { supervised: true }>
 
@@ -19,7 +20,7 @@ type Supervised = Extract<FawkesState, { supervised: true }>
 const StateAction = actionRef<null, FawkesState>('fawkes', 'state')
 /** No arguments → fetch the clone and count what an upgrade would bring. */
 const CheckAction = actionRef<null, FawkesState>('fawkes', 'check')
-/** `{ ref? }` → start an upgrade (stage, test, switch). */
+/** `{ ref? }` → start an upgrade (`fawkes up`). */
 const UpgradeAction = actionRef<{ ref?: string }, FawkesState>('fawkes', 'upgrade')
 /** No arguments → confirm the pending generation now. */
 const ConfirmAction = actionRef<null, FawkesState>('fawkes', 'confirm')
@@ -35,6 +36,18 @@ const countdown = (deadline: string, now: number) => {
   return `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`
 }
 
+/** A time the daemon sent, as the user's clock shows it. */
+const clock = (iso: string) => new Date(iso).toLocaleTimeString()
+
+const running = (upgrade: Upgrade | undefined) => upgrade?.state === 'fetching' || upgrade?.state === 'running'
+
+/** How the latest switch ended, once it is decided. */
+function lastOutcome(state: Supervised) {
+  const target = lastSwitched(state.generations)
+  const decided = target && outcome(state.status, state.generations, target.id)
+  return decided && decided.state !== 'waiting' ? { target: target!, decided } : undefined
+}
+
 /** One word for what the status line shows, in order of what matters most. */
 function itemOf(state: Supervised) {
   const { status, upgrade } = state
@@ -42,20 +55,17 @@ function itemOf(state: Supervised) {
   if (awaitingConfirm(status)) return 'pending'
   if (restoreFailed(status)) return 'restore_failed'
   if (status?.pending && status.step === 'rolling_back') return 'rolling_back'
-  if (upgrade && !['done', 'failed'].includes(upgrade.step)) return 'upgrading'
-  if (upgrade?.step === 'failed' && Date.now() - upgrade.at < 3_600_000) return 'failed'
-  const rolled = state.generations.at(-1)
-  if (rolled?.state === 'rolled_back' && Date.now() - Date.parse(rolled.rolled_back_at ?? '') < 3_600_000)
+  if (outdated(status)) return 'outdated'
+  if (running(upgrade) || status?.busy) return 'upgrading'
+  if (upgrade?.state === 'failed' && Date.now() - upgrade.at < 3_600_000) return 'failed'
+  const last = lastOutcome(state)
+  if (
+    last?.decided.state === 'rolled_back' &&
+    Date.now() - Date.parse(last.target.rolled_back_at ?? '') < 3_600_000
+  )
     return 'rolled_back'
   if (state.behind?.count) return 'behind'
   return 'current'
-}
-
-const stepLabel: Record<string, string> = {
-  fetching: 'fetching',
-  staging: 'installing',
-  testing: 'testing',
-  switching: 'switching',
 }
 
 const genTone: Partial<Record<Generation['state'], string>> = {
@@ -71,18 +81,101 @@ function Generations({ state }: { state: Supervised }) {
   if (!rows.length) return <div className="text-muted-foreground">No generations yet.</div>
   return (
     <ul className="space-y-0.5">
-      {rows.map((g) => (
-        <li className="flex min-w-0 gap-2" key={g.id}>
-          <span className={cn('w-7 shrink-0', g.id === state.generation && 'text-brand')}>{g.id}</span>
-          <span className="w-24 shrink-0 truncate text-muted-foreground" title={g.commit}>
-            {g.commit.slice(0, 8)}
-          </span>
-          <span className={cn('w-20 shrink-0', genTone[g.state] ?? 'text-muted-foreground')}>
-            {g.state.replace('_', ' ')}
-          </span>
-          <span className="min-w-0 truncate text-muted-foreground" title={g.rollback_reason ?? undefined}>
-            {g.rollback_reason ??
-              (g.id === state.generation ? 'this one' : g.test ? `test ${g.test.seconds.toFixed(1)}s` : '')}
+      {rows.map((g) => {
+        const note =
+          g.state === 'rolled_back'
+            ? causeText(g.rollback_cause, g.rollback_reason)
+            : g.id === state.generation
+              ? 'this one'
+              : g.test
+                ? `test ${g.test.seconds.toFixed(1)}s`
+                : ''
+        return (
+          <li className="flex min-w-0 gap-2" key={g.id}>
+            <span className={cn('w-7 shrink-0', g.id === state.generation && 'text-brand')}>{g.id}</span>
+            <span className="w-24 shrink-0 truncate text-muted-foreground" title={g.commit}>
+              {g.commit.slice(0, 8)}
+            </span>
+            <span className={cn('w-20 shrink-0', genTone[g.state] ?? 'text-muted-foreground')}>
+              {g.state.replace('_', ' ')}
+            </span>
+            <span className="min-w-0 truncate text-muted-foreground" title={g.rollback_reason ?? note}>
+              {note}
+            </span>
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+/** The upgrade this process started: the step `fawkes up` is on (the daemon's `busy`), or how it failed. */
+function UpgradeRow({ state }: { state: Supervised }) {
+  const { upgrade, status } = state
+  if (!upgrade) return null
+  const { error, result } = upgrade
+  const progress = running(upgrade) ? state.events.findLast((event) => event.kind === 'progress') : undefined
+  return (
+    <div>
+      Upgrade to {upgrade.ref}:{' '}
+      {upgrade.state === 'failed' ? (
+        <span className="text-error">failed{error?.step ? ` at its ${error.step} step` : ''}</span>
+      ) : upgrade.state === 'switched' ? (
+        <span className="text-brand">
+          switched to {result?.generation}
+          {result?.existing ? ' (already built)' : ''}
+        </span>
+      ) : (
+        <span className="text-brand">{upgrade.state === 'fetching' ? 'fetching' : (status?.busy ?? 'starting')}</span>
+      )}
+      {progress && (
+        <div className="truncate text-muted-foreground" title={progress.message}>
+          {progress.message}
+        </div>
+      )}
+      {error && (
+        <pre className="max-h-32 overflow-auto whitespace-pre-wrap text-error">
+          {error.code ? `${error.code}: ` : ''}
+          {error.message}
+        </pre>
+      )}
+      {error?.log && <div className="truncate text-muted-foreground" title={error.log}>log: {error.log}</div>}
+    </div>
+  )
+}
+
+/** How the latest switch ended, when it rolled back: its cause in words, where it went, what became of the storage. */
+function LastSwitch({ state }: { state: Supervised }) {
+  const last = lastOutcome(state)
+  if (!last || last.decided.state === 'permanent') return null
+  const event = rollbackEvent(state.events, last.target.id)
+  const details = [
+    event?.to && `back to ${event.to}`,
+    event?.storage && storageText(event.storage),
+    last.target.rolled_back_at && clock(last.target.rolled_back_at),
+  ].filter(Boolean)
+  return (
+    <div className="flex items-start gap-1.5 text-error">
+      <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
+      <span>
+        {outcomeText(last.decided)}
+        {details.length > 0 && <span className="text-muted-foreground"> · {details.join(' · ')}</span>}
+      </span>
+    </div>
+  )
+}
+
+/** The latest events that changed something, newest first, each said from its fields. */
+function Recent({ state }: { state: Supervised }) {
+  const events = state.events.filter((event) => event.kind !== 'progress').slice(-4).reverse()
+  if (!events.length) return null
+  return (
+    <ul className="space-y-0.5 border-t border-border/60 pt-2 text-muted-foreground">
+      {events.map((event) => (
+        <li className="flex min-w-0 gap-2" key={event.seq}>
+          <span className="shrink-0">{clock(event.at)}</span>
+          <span className="min-w-0 truncate" title={event.message}>
+            {eventLine(event, clock)}
           </span>
         </li>
       ))}
@@ -95,6 +188,11 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
   const pending = awaitingConfirm(status)
   const now = useNow(1000, Boolean(pending))
   const rollbackText = rollbackNote(status)
+  const old = outdated(status)
+  // Only what the daemon would accept right now (`status.actions`).
+  const canConfirm = !!pending && allows(status, `confirm ${pending.generation}`)
+  const canRollback = allows(status, 'rollback')
+  const canUpgrade = !!behind?.count && !running(upgrade) && !upgradeRefusal(status)
   return (
     <>
       <div className="border-b border-border/70 px-3 py-2 text-[11.5px]">
@@ -102,6 +200,7 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
         <div className="text-muted-foreground">
           {status?.name ?? 'ultimate'} · running {state.generation}
           {status?.permanent && status.permanent !== state.generation && ` · permanent ${status.permanent}`}
+          {status?.version && ` · daemon ${status.version}`}
         </div>
       </div>
       <div className="space-y-2 px-3 py-2 text-[11.5px] leading-[1.55]">
@@ -109,6 +208,12 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
           <div className="flex items-start gap-1.5 text-warning">
             <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
             <span>The Fawkes daemon does not answer{state.error ? `: ${state.error}` : ''}. Retrying.</span>
+          </div>
+        )}
+        {old && (
+          <div className="flex items-start gap-1.5 text-warning">
+            <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
+            <span>{old}.</span>
           </div>
         )}
         {rollbackText && (
@@ -131,23 +236,8 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
             {confirming?.state === 'refused' && <div className="text-error">{confirming.reason}</div>}
           </div>
         )}
-        {upgrade && (
-          <div>
-            Upgrade to {upgrade.ref}
-            {upgrade.generation && ` as ${upgrade.generation}`}:{' '}
-            <span className={upgrade.step === 'failed' ? 'text-error' : 'text-brand'}>
-              {stepLabel[upgrade.step] ?? upgrade.step}
-            </span>
-            {upgrade.progress && !['done', 'failed'].includes(upgrade.step) && (
-              <div className="truncate text-muted-foreground" title={upgrade.progress}>
-                {upgrade.progress}
-              </div>
-            )}
-            {upgrade.error && (
-              <pre className="max-h-32 overflow-auto whitespace-pre-wrap text-error">{upgrade.error}</pre>
-            )}
-          </div>
-        )}
+        {!pending && !rollbackText && <LastSwitch state={state} />}
+        <UpgradeRow state={state} />
         {!pending && behind && (
           <div>
             {behind.count ? (
@@ -177,49 +267,45 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
         <div className="border-t border-border/60 pt-2">
           <Generations state={state} />
         </div>
+        <Recent state={state} />
       </div>
       <div className="flex items-center justify-between gap-2 border-t border-border/70 px-3 py-1.5">
         <span className="text-[10.5px] text-muted-foreground">
           {behind ? `checked ${formatAgo(behind.fetchedAt, Date.now(), { ago: true })}` : ''}
         </span>
         <div className="flex items-center gap-1">
-          {pending ? (
-            <>
-              <Button className={smallButton} disabled={!!busy} onClick={() => act('rollback')} size="sm" variant="ghost">
-                {busy === 'rollback' ? 'Rolling back…' : 'Roll back'}
-              </Button>
-              <Button className={smallButton} disabled={!!busy} onClick={() => act('confirm')} size="sm" variant="outline">
-                {busy === 'confirm' ? 'Confirming…' : 'Confirm'}
-              </Button>
-            </>
-          ) : restoreFailed(status) ? (
-            <Button className={smallButton} disabled={!!busy} onClick={() => act('rollback')} size="sm" variant="outline">
+          {!pending && (
+            <Button
+              className={cn(smallButton, 'text-muted-foreground')}
+              disabled={!!busy}
+              onClick={() => act('check')}
+              size="sm"
+              variant="ghost"
+            >
+              {busy === 'check' ? <LoaderCircleIcon className="size-3 animate-spin" /> : <RefreshCwIcon className="size-3" />}
+              {busy === 'check' ? 'Checking…' : 'Check now'}
+            </Button>
+          )}
+          {canRollback && (
+            <Button
+              className={smallButton}
+              disabled={!!busy}
+              onClick={() => act('rollback')}
+              size="sm"
+              variant={canConfirm ? 'ghost' : 'outline'}
+            >
               {busy === 'rollback' ? 'Rolling back…' : 'Roll back'}
             </Button>
-          ) : (
-            <>
-              <Button
-                className={cn(smallButton, 'text-muted-foreground')}
-                disabled={!!busy}
-                onClick={() => act('check')}
-                size="sm"
-                variant="ghost"
-              >
-                {busy === 'check' ? <LoaderCircleIcon className="size-3 animate-spin" /> : <RefreshCwIcon className="size-3" />}
-                {busy === 'check' ? 'Checking…' : 'Check now'}
-              </Button>
-              {!!behind?.count && (
-                <Button
-                  className={smallButton}
-                  disabled={!!busy || !!status?.busy || (upgrade && !['done', 'failed'].includes(upgrade.step))}
-                  onClick={() => act('upgrade')}
-                  size="sm"
-                  variant="outline"
-                >
-                  Upgrade
-                </Button>
-              )}
-            </>
+          )}
+          {canConfirm && (
+            <Button className={smallButton} disabled={!!busy} onClick={() => act('confirm')} size="sm" variant="outline">
+              {busy === 'confirm' ? 'Confirming…' : 'Confirm'}
+            </Button>
+          )}
+          {canUpgrade && (
+            <Button className={smallButton} disabled={!!busy} onClick={() => act('upgrade')} size="sm" variant="outline">
+              Upgrade
+            </Button>
           )}
         </div>
       </div>
@@ -232,7 +318,7 @@ function Fawkes() {
   const { data, refetch } = useAction(StateAction, null, { onError: () => {} })
   const [busy, setBusy] = useState<string>()
   const [error, setError] = useState<string>()
-  const live = data?.supervised && (data.status?.pending || (data.upgrade && !['done', 'failed'].includes(data.upgrade.step)))
+  const live = data?.supervised && (data.status?.pending || data.status?.busy || running(data.upgrade))
   useEffect(() => {
     const timer = setInterval(() => void refetch(), live ? 2000 : 30_000)
     return () => clearInterval(timer)
@@ -275,10 +361,15 @@ function Fawkes() {
         <TriangleAlertIcon className="size-3" />
         restore failed
       </>
+    ) : item === 'outdated' ? (
+      <>
+        <TriangleAlertIcon className="size-3" />
+        fawkes too old
+      </>
     ) : item === 'upgrading' ? (
       <>
         <LoaderCircleIcon className="size-3 animate-spin" />
-        {stepLabel[data.upgrade!.step]} {data.upgrade!.generation ?? ''}
+        {data.upgrade?.state === 'fetching' ? 'fetching' : (data.status?.busy ?? 'upgrading')}
       </>
     ) : item === 'failed' ? (
       <>
@@ -288,7 +379,7 @@ function Fawkes() {
     ) : item === 'rolled_back' ? (
       <>
         <TriangleAlertIcon className="size-3" />
-        {data.generations.at(-1)!.id} rolled back
+        {lastSwitched(data.generations)!.id} rolled back
       </>
     ) : item === 'behind' ? (
       <>
@@ -311,7 +402,7 @@ function Fawkes() {
               ? 'text-muted-foreground/70 hover:text-foreground'
               : ['failed', 'rolled_back', 'restore_failed', 'disconnected'].includes(item)
                 ? 'text-error'
-                : item === 'pending'
+                : item === 'pending' || item === 'outdated'
                   ? 'text-warning'
                   : 'text-brand',
           )}

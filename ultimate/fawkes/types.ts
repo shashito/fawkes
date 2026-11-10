@@ -13,6 +13,14 @@ export type GenState =
   | 'retired'
   | 'rolled_back'
 
+/** Why a rollback was decided (DESIGN.md, "Rollback"). A newer daemon may send a cause this list lacks. */
+export type Cause = 'deadline' | 'exited' | 'unhealthy' | 'start_failed' | 'requested' | 'daemon_restart'
+
+/** What became of the storage in a rollback. */
+export type StorageOutcome = 'restored' | 'kept' | 'restore_failed' | 'none'
+
+export type TestInfo = { port: number; passed: boolean; at: string; seconds: number; message: string }
+
 export type Generation = {
   id: string
   ref: string
@@ -20,11 +28,13 @@ export type Generation = {
   state: GenState
   dir: string
   staged_at: string
-  test: { port: number; passed: boolean; at: string; seconds: number; message: string } | null
+  test: TestInfo | null
   switched_at: string | null
   confirmed_at: string | null
   rolled_back_at: string | null
   rollback_reason: string | null
+  /** The reason as a code; null unless rolled back, or rolled back before causes existed. */
+  rollback_cause?: Cause | null
   failed_starts: number
 }
 
@@ -41,6 +51,10 @@ export type Status = {
   /** Absent from an older daemon's status. */
   step?: Step | null
   busy: string | null
+  /** The daemon's build; a status without it is older than this extension expects (`step.ts`, `outdated`). */
+  version?: string
+  /** The commands the daemon accepts right now, as command lines without `fawkes` (`confirm g3`, `rollback`). */
+  actions?: string[]
   process: {
     state: 'running' | 'stopped' | 'failed'
     generation: string | null
@@ -53,24 +67,74 @@ export type Status = {
   }
 }
 
+/** An event: the message is for people, the facts of its kind are fields beside it (DESIGN.md, "Events"). */
 export type FawkesEvent = {
   seq: number
   at: string
   kind: string
   generation: string | null
   message: string
+  pid?: number
+  port?: number
+  previous?: string
+  deadline?: string
+  code?: number
+  signal?: number
+  restart_at?: string
+  seconds?: number
+  named?: boolean
+  to?: string
+  reason?: string
+  cause?: Cause
+  storage?: StorageOutcome
+  removed?: string[]
+  error_code?: string
+  action?: string
+  version?: string
+  changed?: string[]
 }
 
-/** The upgrade this Ultimate runs: stage, test and switch of one ref, as the status line follows it. */
+/** `fawkes up --json`: the switch's result, plus what the stage and the test learned. */
+export type UpResult = {
+  generation: string
+  previous: string | null
+  deadline: string
+  /** The stage found the commit already built. */
+  existing: boolean
+  test: TestInfo | null
+}
+
+/** A failed upgrade: `fawkes up`'s error object, with `step` naming the step that failed. */
+export type UpError = {
+  /** Fawkes's error code; absent when the extension's own fetch of the ref failed, before `up` ran. */
+  code?: string
+  message: string
+  step?: 'stage' | 'test' | 'switch'
+  generation?: string
+  log?: string
+}
+
+/**
+ * The upgrade this Ultimate started: the fetch of its ref, then `fawkes up`, whose step the daemon's `status.busy` names
+ * while it runs. In the live app it ends with the switch, which stops this process; the generation that runs next reads
+ * the outcome (`facts.ts`, `outcome`).
+ */
 export type Upgrade = {
   ref: string
-  step: 'fetching' | 'staging' | 'testing' | 'switching' | 'done' | 'failed'
-  generation?: string
-  /** The latest progress line of the step. */
-  progress?: string
-  error?: string
+  state: 'fetching' | 'running' | 'switched' | 'failed'
+  result?: UpResult
+  error?: UpError
   at: number
 }
+
+/**
+ * Where a switched generation stands, decided as `fawkes wait` decides it: `permanent` (exit 0), `rolled_back` with its
+ * cause, `storage_failed` when the rollback could not restore the storage, or still `waiting` (pending, or its rollback
+ * under way).
+ */
+export type Outcome =
+  | { generation: string; state: 'waiting' | 'permanent' | 'storage_failed' }
+  | { generation: string; state: 'rolled_back'; cause: Cause | null; reason: string | null }
 
 /** Why this generation has not confirmed itself yet, while it is pending. */
 export type Confirming =

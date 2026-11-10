@@ -1,6 +1,7 @@
 /**
  * A client of the Fawkes daemon's Unix socket (DESIGN.md, "Socket protocol"): newline-delimited JSON, one request per
- * connection. `request` answers one command; `subscribe` keeps the live stream and reconnects with `since`.
+ * connection. `request` answers one command; `subscribe` keeps the live stream and reconnects with `since`. An upgrade
+ * runs `fawkes up` instead (`up.ts`), so its composition of stage, test and switch stays Fawkes's own.
  */
 import { connect } from 'node:net'
 import type { Socket } from 'node:net'
@@ -35,14 +36,14 @@ function lines(socket: Socket, line: (value: Record<string, unknown>) => void) {
 }
 
 /**
- * Send one command and resolve its `result`, or reject with the daemon's error. `progress` gets each event the step
- * reports while it runs. `timeout` bounds silence on the connection (a stage's install can take minutes but reports).
+ * Send one command and resolve its `result`, or reject with the daemon's error. `timeout` bounds silence on the
+ * connection (a rollback's restore can take minutes). Its progress lines reach every subscriber, so they are skipped.
  */
 export function request<T>(
   socket: string,
   command: string,
   args?: Record<string, unknown>,
-  options: { progress?: (event: FawkesEvent) => void; timeout?: number } = {},
+  options: { timeout?: number } = {},
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const connection = connect(socket)
@@ -64,8 +65,7 @@ export function request<T>(
       finish(new FawkesError('daemon_unreachable', `The Fawkes daemon closed ${command} without an answer`)),
     )
     lines(connection, (line) => {
-      if ('event' in line) options.progress?.(line.event as FawkesEvent)
-      else if (line.ok === true) finish(undefined, line.result as T)
+      if (line.ok === true) finish(undefined, line.result as T)
       else if (line.ok === false) {
         const error = line.error as { code: string; message: string }
         finish(new FawkesError(error.code, error.message))

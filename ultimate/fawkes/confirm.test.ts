@@ -10,7 +10,7 @@ import test from 'node:test'
 import type { ExtensionInfo } from 'ultimate/shared/protocol.ts'
 import { judge } from './confirm.ts'
 import { role } from './role.ts'
-import { awaitingConfirm, restoreFailed, rollbackNote } from './step.ts'
+import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
 import type { Status, Step } from './types.ts'
 
 const extension = (name: string, error?: string): ExtensionInfo => ({
@@ -20,6 +20,7 @@ const extension = (name: string, error?: string): ExtensionInfo => ({
   layer: 'default',
   path: `/x/${name}`,
   actions: [],
+  events: [],
   facets: { server: true, web: false },
   server: { tools: [], sections: [], hooks: 0, docs: [], ...(error ? { error } : {}) },
 })
@@ -50,6 +51,32 @@ test('a confirm is offered only while the switch awaits it, though pending stays
   assert.equal(rollbackNote(status('pending')), undefined)
   assert.match(rollbackNote(status('rolling_back'))!, /g2 is being rolled back to g1/)
   assert.match(rollbackNote(status('restore_failed'))!, /g2's storage could not be restored/)
+})
+
+test('buttons and upgrades follow status.actions, and a daemon without version is older than expected', () => {
+  const status = (more: Partial<Status>) =>
+    ({ pending: null, step: null, busy: null, version: '0.1.0', actions: ['stop', 'restart', 'stage'], ...more }) as Status
+  assert.equal(upgradeRefusal(status({})), undefined)
+  assert.equal(allows(status({}), 'rollback'), false)
+  // A pending switch: stage is listed, but its switch would be refused, so no upgrade starts.
+  const pending = status({
+    pending: { generation: 'g3', previous: 'g2', deadline: 't' },
+    step: 'pending',
+    actions: ['stop', 'stage', 'confirm g3', 'rollback'],
+  })
+  assert.equal(allows(pending, 'confirm g3'), true)
+  assert.equal(allows(pending, 'rollback'), true)
+  assert.equal(upgradeRefusal(pending), 'g3 still awaits its confirm')
+  // Deadline passed: the daemon no longer lists the confirm.
+  assert.equal(allows({ ...pending, actions: ['stop', 'stage', 'rollback'] }, 'confirm g3'), false)
+  assert.equal(upgradeRefusal(status({ busy: 'test g4', actions: ['stop', 'restart'] })), 'Fawkes is busy: test g4')
+  assert.equal(upgradeRefusal(undefined), 'The Fawkes daemon has not answered yet')
+  // An older daemon: no version, no actions, so no button, no upgrade, but a clear state.
+  const old = { pending: null, busy: null } as Status
+  assert.match(outdated(old)!, /older than this extension expects/)
+  assert.match(upgradeRefusal(old)!, /older than this extension expects/)
+  assert.equal(allows(old, 'stage'), false)
+  assert.equal(outdated(status({})), undefined)
 })
 
 test('only the Ultimate start.ts prepared acts on Fawkes; a preview that inherited its variables is inert', () => {
