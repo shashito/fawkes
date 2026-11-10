@@ -423,20 +423,27 @@ fn main() -> ExitCode {
     // confirm towards another daemon (which would send none and so confirm whatever is pending there), is another's.
     if let Command::Confirm { generation } = &cli.command
         && test_run
-        && own_generation
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .is_none_or(|own| generation.as_deref().unwrap_or(own) != own)
     {
-        let named = generation
-            .as_deref()
-            .map_or_else(String::new, |id| format!(" {id}"));
-        let message = format!(
-            "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes confirm{named}`, which \
-             names a generation other than its own $FAWKES_GENERATION or a daemon other than $FAWKES_SOCKET; the live \
-             app or a shell outside the app does"
-        );
-        return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::TestPhase, message));
+        let own = own_generation.as_deref().filter(|id| !id.is_empty());
+        let refused = if !endpoint.own {
+            Some("towards a daemon other than $FAWKES_SOCKET")
+        } else if own.is_none() {
+            Some("without a $FAWKES_GENERATION of its own")
+        } else if generation.as_deref().is_some_and(|id| Some(id) != own) {
+            Some("of a generation other than its own $FAWKES_GENERATION")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            let named = generation
+                .as_deref()
+                .map_or_else(String::new, |id| format!(" {id}"));
+            let message = format!(
+                "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes confirm{named}` \
+                 {why}; the live app or a shell outside the app does"
+            );
+            return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::TestPhase, message));
+        }
     }
     if let Command::Up { git_ref, deadline } = &cli.command {
         return ExitCode::from(run_up(&cli, git_ref, *deadline, &endpoint, &mut stdout));

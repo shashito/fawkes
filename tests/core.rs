@@ -435,21 +435,26 @@ fn a_test_run_may_not_confirm_another_generation() {
 
     let own = h.dir.join("s/fawkes.sock");
     let other = h.dir.join("gone.sock");
-    let confirm = |socket: &std::path::Path, args: &[&str]| {
+    let confirm = |socket: &std::path::Path, generation: &str, args: &[&str]| {
         let output = h
             .cli()
             .arg("confirm")
             .args(args)
             .env("FAWKES_PHASE", "test")
-            .env("FAWKES_GENERATION", "g3")
+            .env("FAWKES_GENERATION", generation)
             .env("FAWKES_SOCKET", socket)
             .output()
             .unwrap();
         let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
         (output.status.code(), answer)
     };
-    for (socket, args) in [(&own, &["g2"][..]), (&other, &["g2"]), (&other, &[])] {
-        let (code, error) = confirm(socket, args);
+    for (socket, generation, args, why) in [
+        (&own, "g3", &["g2"][..], "other than its own"),
+        (&other, "g3", &["g2"], "other than $FAWKES_SOCKET"),
+        (&other, "g3", &[], "other than $FAWKES_SOCKET"),
+        (&own, "", &[], "without a $FAWKES_GENERATION"),
+    ] {
+        let (code, error) = confirm(socket, generation, args);
         assert_eq!(
             (code, error["code"].as_str()),
             (Some(1), Some("test_phase")),
@@ -462,10 +467,11 @@ fn a_test_run_may_not_confirm_another_generation() {
                 .contains("does not `fawkes confirm"),
             "{error}"
         );
+        assert!(error["message"].as_str().unwrap().contains(why), "{error}");
     }
     // Its own generation, named or not, reaches the daemon, which has no g3 to confirm.
     for args in [&["g3"][..], &[]] {
-        let (code, error) = confirm(&own, args);
+        let (code, error) = confirm(&own, "g3", args);
         assert_eq!(
             (code, error["code"].as_str()),
             (Some(1), Some("not_found")),
