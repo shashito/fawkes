@@ -2849,3 +2849,23 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     assert_eq!((exit, missing["code"].as_str()), (1, Some("not_found")));
     assert_eq!(calls, Vec::<String>::new());
 }
+
+/// Without launchd, every `fawkes service` command is a usage error that says what to run instead.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn service_is_refused_without_launchd() {
+    let h = Harness::new("");
+    for action in ["install", "uninstall", "restart"] {
+        let (exit, error) = h.fk(&["service", action]);
+        assert_eq!(
+            (exit, error["code"].as_str()),
+            (2, Some("usage")),
+            "{error}"
+        );
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("macOS only") && message.contains("fawkes daemon --manifest"),
+            "{message}"
+        );
+    }
+}
