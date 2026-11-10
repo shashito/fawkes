@@ -1825,7 +1825,10 @@ fn running_group(pid: &str) -> Option<i32> {
     // fields 3, 5 and 20. A process whose main thread alone has exited shows a zombie, with its other threads counted.
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
     if matches!(fields.first(), Some(&("Z" | "X")))
-        && fields.get(17).is_none_or(|&threads| threads == "1")
+        && fields
+            .get(17)
+            .and_then(|threads| threads.parse::<u32>().ok())
+            .is_none_or(|threads| threads <= 1)
     {
         return None;
     }
