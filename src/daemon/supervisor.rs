@@ -964,20 +964,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let daemon = scratch_daemon(temp.path());
         let record = |id: &str, state: GenState| Generation {
-            id: id.into(),
-            git_ref: "main".into(),
-            commit: "0".into(),
             state,
-            dir: PathBuf::new(),
-            staged_at: String::new(),
-            test: None,
-            switched_at: None,
-            confirmed_at: None,
-            rolled_back_at: None,
-            rollback_reason: None,
-            rollback_cause: None,
-            failed_starts: 0,
-            restore_abandoned_at: None,
+            ..Generation::staging(id, "main", "0", PathBuf::new())
         };
         // g1 is permanent and g2 is pending with its deadline `seconds_from_now` (negative: passed), or no switch.
         let set_txn = |seconds_from_now: Option<i64>| {

@@ -350,6 +350,10 @@ pub fn kill_group(pgid: u32) {
     signal_group(pgid, Signal::KILL);
 }
 
+/// How often `wait_group` looks again at members of a group that outlive its leader: short enough that a stop
+/// returns promptly, long enough that the poll costs nothing.
+const GROUP_POLL: Duration = Duration::from_millis(20);
+
 /// How long `stop_group` waits for a `SIGKILL`ed group to disappear. Bounded, because a process stuck in the kernel
 /// (uninterruptible sleep) outlives even SIGKILL for as long as it is stuck.
 const KILL_WAIT: Duration = Duration::from_secs(2);
@@ -398,7 +402,7 @@ fn wait_group(
         if Instant::now() >= until {
             return false;
         }
-        sleep(Duration::from_millis(20));
+        sleep(GROUP_POLL);
     }
 }
 

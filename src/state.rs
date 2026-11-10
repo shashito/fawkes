@@ -163,7 +163,6 @@ pub struct State {
     pub next_id: u32,
     pub permanent: Option<String>,
     pub txn: Option<Txn>,
-    pub daemon_pid: Option<u32>,
 }
 
 /// What `state.json` may hold: the current shape and the one before `txn`, which kept a `pending` switch and
@@ -177,7 +176,6 @@ struct StateFile {
     permanent: Option<String>,
     txn: Option<Txn>,
     pending: Option<Pending>,
-    daemon_pid: Option<u32>,
 }
 
 impl From<StateFile> for State {
@@ -188,7 +186,6 @@ impl From<StateFile> for State {
             permanent,
             txn,
             pending,
-            daemon_pid,
         } = file;
         let txn = txn.or_else(|| {
             let pending = pending?;
@@ -213,7 +210,6 @@ impl From<StateFile> for State {
             next_id,
             permanent,
             txn,
-            daemon_pid,
         }
     }
 }
@@ -302,7 +298,7 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     let dir = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     File::open(dir)?.sync_all()
 }
 
@@ -709,36 +705,22 @@ impl EventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ErrorCode, EventKind};
+    use crate::protocol::{ErrorCode, EventKind, Facts};
 
     fn generation(id: &str, state: GenState) -> Generation {
         Generation {
-            id: id.into(),
-            git_ref: "main".into(),
-            commit: "0".into(),
             state,
-            dir: PathBuf::new(),
-            staged_at: String::new(),
-            test: None,
-            switched_at: None,
-            confirmed_at: None,
-            rolled_back_at: None,
-            rollback_reason: None,
-            rollback_cause: None,
-            failed_starts: 0,
-            restore_abandoned_at: None,
+            ..Generation::staging(id, "main", "0", PathBuf::new())
         }
     }
 
     fn event(n: usize) -> Event {
-        Event {
-            seq: 0,
-            at: now(),
-            kind: EventKind::Progress,
-            generation: None,
-            message: format!("event {n}"),
-            facts: Box::default(),
-        }
+        Event::new(
+            EventKind::Progress,
+            None,
+            format!("event {n}"),
+            Facts::default(),
+        )
     }
 
     #[test]
@@ -944,10 +926,7 @@ mod tests {
         let state = load(phase_two_state(pending, "current", "null"));
         assert_eq!(state.generations.len(), 3);
         assert!(["g1", "g2", "g3"].iter().all(|id| state.find(id).is_some()));
-        assert_eq!(
-            (state.next_id, state.permanent.as_deref(), state.daemon_pid),
-            (3, Some("g2"), Some(812))
-        );
+        assert_eq!((state.next_id, state.permanent.as_deref()), (3, Some("g2")));
         let Some(Txn::Pending(p)) = &state.txn else {
             panic!("{:?}", state.txn);
         };

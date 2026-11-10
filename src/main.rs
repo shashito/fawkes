@@ -198,7 +198,7 @@ enum Command {
     Log {
         /// Show the last N events [default: 20, or all of them with --since]
         #[arg(short = 'n', long, value_name = "N")]
-        limit: Option<u64>,
+        limit: Option<usize>,
         /// Show the events after event N, as far back as the daemon keeps them (the newest 1000); with --limit, the
         /// newest N of those
         #[arg(long, value_name = "N")]
@@ -269,7 +269,7 @@ impl Command {
 /// (or anything it left behind) cannot confirm another generation that happens to be pending.
 fn confirm_generation(named: Option<&str>, own_generation: Option<&str>) -> Option<String> {
     named
-        .or(own_generation.filter(|id| !id.is_empty()))
+        .or_else(|| own_generation.filter(|id| !id.is_empty()))
         .map(String::from)
 }
 

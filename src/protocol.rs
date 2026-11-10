@@ -19,6 +19,10 @@ use std::time::Duration;
 /// counts as gone, instead of stalling the step or the stream that writes to it.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How many events `log` shows when it gets neither `limit` nor `since`: enough to see what just happened, short
+/// enough for a terminal.
+pub const DEFAULT_LOG_EVENTS: usize = 20;
+
 /// How long a client waits for each line of the answer to a quick request (`Request::is_quick`).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -168,7 +172,7 @@ pub fn not_found(id: &str) -> Error {
 // ----------------------------------------------------------- requests
 
 /// One command with its arguments. On the wire it is `{"command": "stage", "args": {"ref": "main"}}`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     Start,
     Stop,
@@ -198,8 +202,8 @@ pub enum Request {
     /// Read the manifest again, as SIGHUP does, and answer what changed.
     Reload,
     Log {
-        /// How many events: the newest ones, 20 when absent and no `since` is given.
-        limit: Option<u64>,
+        /// How many events: the newest ones, `DEFAULT_LOG_EVENTS` when absent and no `since` is given.
+        limit: Option<usize>,
         /// The events after this `seq` that the daemon still keeps, as `Subscribe` replays them; ignored when the log
         /// started over and no event can reach it.
         since: Option<u64>,
@@ -207,7 +211,7 @@ pub enum Request {
     },
     Subscribe {
         /// How many recent events to replay first.
-        limit: Option<u64>,
+        limit: Option<usize>,
         /// Replay the events after this `seq` instead of the last `limit`.
         since: Option<u64>,
     },
@@ -253,12 +257,12 @@ impl Request {
             "history" => Request::History,
             "reload" => Request::Reload,
             "log" => Request::Log {
-                limit: optional_count(&args, "limit")?,
+                limit: optional_limit(&args)?,
                 since: optional_count(&args, "since")?,
                 follow: optional_bool(&args, "follow")?,
             },
             "subscribe" => Request::Subscribe {
-                limit: optional_count(&args, "limit")?,
+                limit: optional_limit(&args)?,
                 since: optional_count(&args, "since")?,
             },
             other => {
@@ -374,6 +378,12 @@ fn optional_text(args: &Value, key: &str) -> R<Option<String>> {
 
 fn optional_count(args: &Value, key: &str) -> R<Option<u64>> {
     optional_arg(args, key, "a non-negative whole number", Value::as_u64)
+}
+
+/// The `limit` argument: a count that sizes a list in memory, so a `usize` (saturating where `usize` is narrower).
+fn optional_limit(args: &Value) -> R<Option<usize>> {
+    optional_count(args, "limit")
+        .map(|limit| limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX)))
 }
 
 /// A flag: false when absent or null.
@@ -505,10 +515,40 @@ pub struct Generation {
 }
 
 impl Generation {
+    /// A record at the start of its life: `staging`, with no test, switch or rollback behind it.
+    pub fn staging(
+        id: impl Into<String>,
+        git_ref: impl Into<String>,
+        commit: impl Into<String>,
+        dir: PathBuf,
+    ) -> Generation {
+        Generation {
+            id: id.into(),
+            git_ref: git_ref.into(),
+            commit: commit.into(),
+            state: GenState::Staging,
+            dir,
+            staged_at: now(),
+            test: None,
+            switched_at: None,
+            confirmed_at: None,
+            rolled_back_at: None,
+            rollback_reason: None,
+            rollback_cause: None,
+            failed_starts: 0,
+            restore_abandoned_at: None,
+        }
+    }
+
     /// The first eight characters of the commit.
     pub fn short_commit(&self) -> String {
-        self.commit.chars().take(8).collect()
+        short_commit(&self.commit)
     }
+}
+
+/// The first eight characters of a commit id, as every message names a commit.
+pub fn short_commit(commit: &str) -> String {
+    commit.chars().take(8).collect()
 }
 
 /// A switch that is live and not yet confirmed. `Status::step` says whether it still awaits its confirm: while it is
@@ -617,6 +657,25 @@ pub struct Event {
     /// event usually carries few.
     #[serde(flatten)]
     pub facts: Box<Facts>,
+}
+
+impl Event {
+    /// An event stamped now, not yet numbered: the log gives it its `seq` when it appends it.
+    pub fn new(
+        kind: EventKind,
+        generation: Option<&str>,
+        message: impl Into<String>,
+        facts: Facts,
+    ) -> Event {
+        Event {
+            seq: 0,
+            at: now(),
+            kind,
+            generation: generation.map(String::from),
+            message: message.into(),
+            facts: Box::new(facts),
+        }
+    }
 }
 
 /// What `daemon` events did.
@@ -882,13 +941,8 @@ pub struct Events {
     pub events: Vec<Event>,
 }
 
-/// The result of `switch`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwitchResult {
-    pub generation: String,
-    pub previous: Option<String>,
-    pub deadline: String,
-}
+/// The result of `switch`: the pending switch it started.
+pub type SwitchResult = Pending;
 
 /// The result of `up`: the switch's, and what the steps before it learned.
 #[derive(Debug, Clone, Serialize, Deserialize)]

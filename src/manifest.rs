@@ -64,7 +64,7 @@ pub fn run_dir() -> Result<PathBuf, String> {
 
 /// The manifest as validated and resolved by `load`: paths absolute, `state_dir` decided, the health check one of
 /// its two kinds.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub name: String,
     pub repo: PathBuf,
@@ -89,7 +89,7 @@ pub struct Manifest {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Health {
     pub check: Check,
     pub interval: Duration,
@@ -98,7 +98,7 @@ pub struct Health {
 
 /// The commands that carry the app's storage through a switch, a rollback and a test (DESIGN.md → Hooks). Without
 /// them a rollback is code-only and a test starts on an empty home.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hooks {
     pub snapshot: Option<String>,
     pub restore: Option<String>,
@@ -356,6 +356,9 @@ const SPARE_PORTS: u16 = 10;
 /// The health check when `[health]` gives neither a `url` nor a `command`.
 const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:{port}/";
 
+/// The template a `health.url` may hold in place of a port number.
+const PORT_TEMPLATE: &str = "{port}";
+
 /// The longest confirm window, in seconds. A `deadline` in the manifest and `switch --deadline` are both held to it,
 /// so a typo cannot leave a generation unconfirmed (and its predecessor not rolled back to) for weeks.
 pub const MAX_DEADLINE: u64 = 7 * 86_400;
@@ -372,7 +375,7 @@ fn default_max_failed_starts() -> u32 {
 
 /// What a health check does: the URL to fetch or the command to run, as written in the manifest (templates are
 /// expanded by `health_check`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
     Url(String),
     Command(String),
@@ -490,7 +493,7 @@ fn has_port(url: &str) -> bool {
     match authority.rsplit_once(':') {
         Some((host, port)) => {
             !host.is_empty()
-                && (port == "{port}" || port.parse::<u16>().is_ok_and(|port| port != 0))
+                && (port == PORT_TEMPLATE || port.parse::<u16>().is_ok_and(|port| port != 0))
         }
         None => false,
     }
@@ -551,7 +554,9 @@ impl Manifest {
         if let Ok(fawkes_home) = fawkes_home() {
             named_after_its_file(&absolute, &name, &fawkes_home)?;
         }
-        let base = absolute.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let base = absolute
+            .parent()
+            .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         let state_dir = match &written.state_dir {
             Some(dir) => base.join(dir),
             None => fawkes_home()?.join(&name),

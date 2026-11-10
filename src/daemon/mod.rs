@@ -9,7 +9,7 @@
 //!
 //! Neither the accept loop nor the supervisor polls: the accept loop sleeps in `poll(2)` on the socket and a pipe the
 //! signal handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.
-//! A subscribed client's thread looks every 500 ms whether its client has gone.
+//! A subscribed client's thread looks every `CLOSE_CHECK` whether its client has gone.
 //!
 //! Panics abort the process (`Cargo.toml`): the init system restarts the daemon and its startup recovers a pending
 //! switch, so no thread ever carries on past a broken invariant and no mutex is ever poisoned.
@@ -404,6 +404,9 @@ pub struct Daemon {
     echo: Mutex<Option<Echo>>,
 }
 
+/// How long the accept loop pauses after a failed `accept` or `poll`, so an error that persists does not spin.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
 /// How long a daemon on its way out waits for stderr to take its last lines.
 const FLUSH_FOR: Duration = Duration::from_secs(1);
 
@@ -553,9 +556,6 @@ impl Daemon {
         daemon.forget_step_pid_file();
         // Best effort, as for `step.pid`: `leftover` never mistakes a stale file for a live hook.
         let _ = std::fs::remove_file(daemon.paths.hook_pid());
-        daemon.update(&mut daemon.inner().store, |state| {
-            state.daemon_pid = Some(std::process::id());
-        });
         daemon.sweep_generations();
 
         // What the last daemon was doing when it ended, from the step it saved before each side effect. A
@@ -641,7 +641,7 @@ impl Daemon {
             if let Some(e) = failed {
                 self.event(EventKind::Error, None, e);
                 // An error that persists (out of file descriptors) would otherwise repeat as fast as it fails.
-                sleep(Duration::from_millis(100));
+                sleep(ACCEPT_RETRY);
             }
         }
     }
@@ -756,7 +756,6 @@ impl Daemon {
         for pgid in lock(&self.step_pgids).drain(..) {
             process::kill_group(pgid);
         }
-        self.update(&mut self.inner().store, |state| state.daemon_pid = None);
         self.event_with(
             EventKind::Daemon,
             None,
@@ -862,14 +861,12 @@ fn log_panics(events: PathBuf, sequence: Arc<AtomicU64>) {
         EventLog::append_once(
             &events,
             &sequence,
-            Event {
-                seq: 0,
-                at: now(),
-                kind: EventKind::Error,
-                generation: None,
-                message: format!("panic: {info}; the daemon aborts, and its next start recovers"),
-                facts: Box::default(),
-            },
+            Event::new(
+                EventKind::Error,
+                None,
+                format!("panic: {info}; the daemon aborts, and its next start recovers"),
+                Facts::default(),
+            ),
         );
         report(info);
     }));
@@ -975,14 +972,7 @@ impl Daemon {
         message: impl Into<String>,
         facts: Facts,
     ) -> Event {
-        let event = Event {
-            seq: 0,
-            at: now(),
-            kind,
-            generation: generation.map(String::from),
-            message: message.into(),
-            facts: Box::new(facts),
-        };
+        let event = Event::new(kind, generation, message, facts);
         // Subscribers get the event while the log is still held: `stream` joins the hub and reads its replay under
         // the same lock, so an event is in the replay or on the channel, never both and never neither, and the
         // channel carries events in `seq` order. `hub.send` and `Echo::line` only `try_send`, so holding the log
@@ -1481,20 +1471,8 @@ mod tests {
         use crate::state::{format_time, now_secs};
 
         let record = |id: &str, state| Generation {
-            id: id.into(),
-            git_ref: "main".into(),
-            commit: "0".into(),
             state,
-            dir: PathBuf::new(),
-            staged_at: String::new(),
-            test: None,
-            switched_at: None,
-            confirmed_at: None,
-            rolled_back_at: None,
-            rollback_reason: None,
-            rollback_cause: None,
-            failed_starts: 0,
-            restore_abandoned_at: None,
+            ..Generation::staging(id, "main", "0", PathBuf::new())
         };
         // Held to the end: a failed assertion must not leave a `sleep` behind.
         let mut sleepers = Vec::new();
@@ -1575,20 +1553,8 @@ mod tests {
             .store
             .modify(|state| {
                 state.generations = vec![Generation {
-                    id: "g1".into(),
-                    git_ref: "main".into(),
-                    commit: "0".into(),
                     state: GenState::Permanent,
-                    dir: PathBuf::new(),
-                    staged_at: String::new(),
-                    test: None,
-                    switched_at: None,
-                    confirmed_at: None,
-                    rolled_back_at: None,
-                    rollback_reason: None,
-                    rollback_cause: None,
-                    failed_starts: 0,
-                    restore_abandoned_at: None,
+                    ..Generation::staging("g1", "main", "0", PathBuf::new())
                 }];
                 state.permanent = Some("g1".into());
                 Ok(())

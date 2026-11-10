@@ -2982,7 +2982,9 @@ fn json_output_is_one_document_on_stdout_and_progress_lines_on_stderr() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         let result: Value = serde_json::from_str(&stdout).expect(&stdout);
         assert_eq!(
-            result["id"].as_str().or(result["generation"].as_str()),
+            result["id"]
+                .as_str()
+                .or_else(|| result["generation"].as_str()),
             Some("g1")
         );
         let stderr = String::from_utf8(output.stderr).unwrap();

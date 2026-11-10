@@ -2,7 +2,8 @@
 
 use super::{Daemon, MAX_REQUEST, Msg, Slot, lock};
 use crate::protocol::{
-    ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, RollbackCause, err,
+    DEFAULT_LOG_EVENTS, ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, RollbackCause,
+    err,
 };
 use rustix::fs::Mode;
 use std::io::{ErrorKind, Read};
@@ -38,11 +39,15 @@ pub(super) fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
     Ok(link)
 }
 
+/// The longest socket path `bind` accepts. `sockaddr_un.sun_path` holds 104 bytes on macOS and 108 on Linux; 100
+/// leaves room for the terminating nul on both.
+const SOCKET_PATH_LIMIT: usize = 100;
+
 /// Bind the socket. The caller holds the state lock, so a socket file nobody answers on belongs to a dead daemon.
 pub(super) fn bind(socket: &Path) -> Result<UnixListener, String> {
-    if socket.as_os_str().len() >= 100 {
+    if socket.as_os_str().len() >= SOCKET_PATH_LIMIT {
         return Err(format!(
-            "socket path {} is too long (limit about 100 bytes); use a shorter state_dir",
+            "socket path {} is too long (limit about {SOCKET_PATH_LIMIT} bytes); use a shorter state_dir",
             socket.display()
         ));
     }
@@ -70,8 +75,13 @@ pub(super) fn bind(socket: &Path) -> Result<UnixListener, String> {
     bound.map_err(|e| format!("cannot bind {}: {e}", socket.display()))
 }
 
-/// How long a client has to send its whole request line.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client has to send its whole request line. A local client sends it at once, so this only ends one
+/// that connected and stalled, before it holds a connection slot for long.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often a streaming client's thread looks whether its client has gone when no event arrives: the longest a
+/// closed `watch` or `log --follow` holds its thread and connection slot.
+const CLOSE_CHECK: Duration = Duration::from_millis(500);
 
 /// How many connections may be open at once, streams (`subscribe`, `log --follow`) excepted: each holds a thread and
 /// a file descriptor, and a client that opens them without end must not starve `confirm` of both.
@@ -123,7 +133,7 @@ fn read_request(stream: &UnixStream, until: Instant, limit: u64) -> R<String> {
             ErrorCode::Usage,
             format!(
                 "the request did not arrive within {} s",
-                REQUEST_TIMEOUT.as_secs()
+                REQUEST_DEADLINE.as_secs()
             ),
         )
     };
@@ -189,7 +199,7 @@ impl Daemon {
             );
             return;
         }
-        let read = read_request(&stream, Instant::now() + REQUEST_TIMEOUT, MAX_REQUEST);
+        let read = read_request(&stream, Instant::now() + REQUEST_DEADLINE, MAX_REQUEST);
         let mut out = Out::new(stream);
         let result = read
             .and_then(|line| Request::parse(&line))
@@ -241,10 +251,8 @@ impl Daemon {
                 since,
                 follow,
             } => {
-                // Without `since`, the last 20 events; with it, all that come after it.
-                let limit = limit
-                    .or_else(|| since.is_none().then_some(20))
-                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+                // Without `since`, the last `DEFAULT_LOG_EVENTS`; with it, all that come after it.
+                let limit = limit.or_else(|| since.is_none().then_some(DEFAULT_LOG_EVENTS));
                 if follow {
                     self.stream(out, since, limit, false);
                     return Ok(Reply::Streamed);
@@ -256,7 +264,6 @@ impl Daemon {
             }
             Request::Reload => self.reload_manifest().map(Reply::from),
             Request::Subscribe { limit, since } => {
-                let limit = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                 self.stream(out, since, limit, true);
                 Ok(Reply::Streamed)
             }
@@ -274,7 +281,7 @@ impl Daemon {
         let mut ok = replay.iter().all(|e| out.event(e));
         ok = ok && (!snapshots || self.send_snapshot(out));
         while ok && !self.shutting_down() {
-            let first = match rx.recv_timeout(Duration::from_millis(500)) {
+            let first = match rx.recv_timeout(CLOSE_CHECK) {
                 Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => {
                     ok = !out.closed();

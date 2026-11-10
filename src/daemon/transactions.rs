@@ -6,7 +6,7 @@ use crate::process;
 use crate::protocol::{
     DaemonAction, Error, ErrorCode, EventKind, Facts, GenState, Generation, Out, Pending,
     PruneResult, R, RollbackCause, RollbackResult, StageResult, StorageOutcome, SwitchResult,
-    TestInfo, describe_status, err, invalid_state, not_found,
+    TestInfo, describe_status, err, invalid_state, not_found, short_commit,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, parse_time, refusal};
 use std::net::TcpListener;
@@ -103,12 +103,14 @@ pub(super) fn check_abandon(state: &State) -> R<(Pending, String, Option<Rollbac
 }
 
 /// What `prune` needs of the manifest: a `keep`. Gives it.
-pub(super) fn check_prune(m: &Manifest) -> R<u32> {
-    m.keep.ok_or_else(|| {
-        invalid_state(
-            "pruning needs `keep = N` in the manifest; without it every generation is kept",
-        )
-    })
+pub(super) fn check_prune(m: &Manifest) -> R<usize> {
+    m.keep
+        .map(|keep| usize::try_from(keep).unwrap_or(usize::MAX))
+        .ok_or_else(|| {
+            invalid_state(
+                "pruning needs `keep = N` in the manifest; without it every generation is kept",
+            )
+        })
 }
 
 /// Removes a directory when dropped, on every way out of the function that made it. Best effort: a directory that
@@ -126,6 +128,10 @@ enum Place {
     Snapshot(PathBuf),
     TestHome(PathBuf),
 }
+
+/// How long the background prune waits before it asks for the step slot again: a stage or test holds it for seconds
+/// to minutes, so a faster retry would only wake the thread.
+const PRUNE_RETRY: Duration = Duration::from_secs(1);
 
 /// How long the quick git calls (rev-parse, prune, remove) get.
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -227,23 +233,13 @@ impl Daemon {
                 let reuse_from = state
                     .permanent
                     .as_ref()
-                    .map_or(m.repo.clone(), |p| self.paths.code(p));
-                state.generations.push(Generation {
-                    id: id.clone(),
-                    git_ref: git_ref.into(),
-                    commit: commit.clone(),
-                    state: GenState::Staging,
-                    dir: self.paths.code(&id),
-                    staged_at: now(),
-                    test: None,
-                    switched_at: None,
-                    confirmed_at: None,
-                    rolled_back_at: None,
-                    rollback_reason: None,
-                    rollback_cause: None,
-                    failed_starts: 0,
-                    restore_abandoned_at: None,
-                });
+                    .map_or_else(|| m.repo.clone(), |p| self.paths.code(p));
+                state.generations.push(Generation::staging(
+                    id.clone(),
+                    git_ref,
+                    commit.clone(),
+                    self.paths.code(&id),
+                ));
                 Ok((id, reuse_from))
             })
             .map_err(|e| e.with_hint("nothing was staged"))?
@@ -306,11 +302,7 @@ impl Daemon {
         self.say(
             out,
             id,
-            format!(
-                "checking out {} at {}",
-                git_ref,
-                &commit[..commit.len().min(8)]
-            ),
+            format!("checking out {git_ref} at {}", short_commit(commit)),
         );
         let code_arg = code.to_string_lossy().into_owned();
         // The repository's hooks never run here: the generation's own install is the place for setup, and a
@@ -1157,11 +1149,7 @@ impl Daemon {
         let _busy = self.begin("prune", Slot::Step)?;
         let m = self.manifest();
         let keep = check_prune(&m)?;
-        let doomed = self
-            .inner()
-            .store
-            .state()
-            .prunable(usize::try_from(keep).unwrap_or(usize::MAX));
+        let doomed = self.inner().store.state().prunable(keep);
         let mut removed = Vec::new();
         for id in doomed {
             self.say(out, &id, format!("removing {id}"));
@@ -1221,7 +1209,7 @@ impl Daemon {
         thread::spawn(move || {
             while !daemon.shutting_down() {
                 match daemon.prune(&mut Out::none()) {
-                    Err(e) if e.code == ErrorCode::Busy => sleep(Duration::from_secs(1)),
+                    Err(e) if e.code == ErrorCode::Busy => sleep(PRUNE_RETRY),
                     // Reported as an event already, and the next confirm or `fawkes prune` tries again.
                     _ => return,
                 }

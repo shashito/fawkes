@@ -1,4 +1,4 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
-# The daemon's transaction steps read top to bottom, in the order they happen; the longest is 138 lines.
+# The daemon's transaction steps read top to bottom, in the order they happen; the longest is 149 (`Daemon::test`).
 too-many-lines-threshold = 150
