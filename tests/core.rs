@@ -2110,6 +2110,76 @@ fn a_usage_error_exits_2_and_help_exits_0() {
     }
 }
 
+/// Without `--manifest` or `--socket` the client finds the app from where it runs: the nearest `fawkes.toml` above
+/// it, else the manifest in `FAWKES_HOME` whose repo holds it; `--manifest` takes that manifest's name too, and beats an
+/// inherited `FAWKES_SOCKET`, which beats what is found.
+#[test]
+fn the_client_finds_the_app_from_where_it_runs() {
+    let mut h = Harness::new("");
+    h.start_daemon();
+    let registry = h.dir.join("registry");
+    let below = h.dir.join("below/deeper");
+    std::fs::create_dir_all(&below).unwrap();
+    std::fs::create_dir(&registry).unwrap();
+    let status = |cwd: &std::path::Path, args: &[&str], socket: Option<&str>| {
+        let mut command = common::fawkes();
+        command
+            .args(["--json", "status"])
+            .args(args)
+            .current_dir(cwd)
+            .env("FAWKES_HOME", &registry);
+        if let Some(socket) = socket {
+            command.env("FAWKES_SOCKET", socket);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json: Value = serde_json::from_str(&stdout).expect(&stdout);
+        (output.status.code().unwrap(), json)
+    };
+    let found = |(code, json): (i32, Value)| code == 0 && json["name"] == "t";
+
+    // `/tmp/fk<port>/fawkes.toml`, two levels up.
+    assert!(found(status(&below, &[], None)));
+    // The repository's `.git` ends the walk before it, and the registry has nothing yet.
+    let repo = h.dir.join("repo");
+    let (code, error) = status(&repo, &[], None);
+    assert_eq!(
+        (code, &error["code"]),
+        (2, &Value::from("usage")),
+        "{error}"
+    );
+    std::fs::copy(h.dir.join("fawkes.toml"), registry.join("t.toml")).unwrap();
+    assert!(found(status(&repo, &[], None)));
+    assert!(found(status(&h.dir, &["--manifest", "t"], None)));
+
+    let gone = h.dir.join("gone.sock");
+    let gone = gone.to_str().unwrap();
+    let (code, error) = status(&below, &[], Some(gone));
+    assert_eq!(
+        (code, &error["code"]),
+        (3, &Value::from("daemon_unreachable")),
+        "{error}"
+    );
+    assert!(found(status(&below, &["--manifest", "t"], Some(gone))));
+}
+
+#[test]
+fn the_binary_prints_its_version_and_its_skill() {
+    let run = |args: &[&str]| {
+        let output = common::fawkes().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        run(&["--version"]),
+        format!("fawkes {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let skill = std::fs::read_to_string("skills/fawkes/SKILL.md").unwrap();
+    assert_eq!(run(&["skill"]), skill);
+    let json: Value = serde_json::from_str(&run(&["skill", "--json"])).unwrap();
+    assert_eq!(json, serde_json::json!({ "skill": skill }));
+}
+
 // ------------------------------------------------ failing tests, health commands, retired generations, startup
 
 /// Ends, when dropped, the process whose pid is in the file, if it wrote one: a listener in a session of its own,

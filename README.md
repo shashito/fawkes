@@ -69,7 +69,7 @@ hooks that snapshot and restore its storage, its live port and a range of spare 
 [`examples/sample/fawkes.toml`](examples/sample/fawkes.toml) and [`examples/ultimate.toml`](examples/ultimate.toml).
 
 ```sh
-fawkes daemon --manifest fawkes.toml      # one daemon per app, in the foreground
+fawkes daemon                             # one daemon per app, in the foreground
 fawkes stage main                         # → g1
 fawkes test g1
 fawkes switch g1                          # the new generation then runs `fawkes confirm`
@@ -78,7 +78,9 @@ fawkes status
 fawkes watch                              # every supervised app's events, one line each
 ```
 
-Every command takes `--json` and answers with readable errors and stable error codes, made for agents. The same
+Run from the app's repository, a command finds its `fawkes.toml`; from anywhere else, `--manifest <name>` names a
+manifest in `~/.fawkes` (DESIGN.md → Finding the app). `fawkes skill` prints the skill that teaches an agent all of
+this. Every command takes `--json` and answers with readable errors and stable error codes, made for agents. The same
 commands are available over the daemon's Unix socket, with a live event stream for in-app UIs.
 [DESIGN.md](DESIGN.md) is the full contract: manifest, CLI, socket protocol, on-disk layout and state machine.
 

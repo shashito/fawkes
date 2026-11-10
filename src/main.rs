@@ -1,6 +1,7 @@
 //! `fawkes`: the daemon (`fawkes daemon`) and the thin command-line client of its socket.
 
 mod daemon;
+mod discovery;
 mod manifest;
 mod process;
 mod protocol;
@@ -9,6 +10,7 @@ mod state;
 mod watch;
 
 use clap::{Parser, Subcommand};
+use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
     ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
@@ -17,10 +19,11 @@ use protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use std::ffi::OsString;
 use std::fmt::Display;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -29,26 +32,58 @@ const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
 
+/// `skills/fawkes/SKILL.md` as it was when this binary was built, for `fawkes skill`.
+const SKILL: &str = include_str!("../skills/fawkes/SKILL.md");
+
+const EXIT_CODES: &str =
+    "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers.";
+
+/// The end of `fawkes --help` (not `-h`): how the app is found, what `--json` prints, examples, and the exit codes.
+const LONG_HELP_END: &str = "\
+Finding the app: --socket, else --manifest, else $FAWKES_SOCKET (set for the processes Fawkes starts), else
+$FAWKES_MANIFEST, else the nearest fawkes.toml from the current directory up to the repository root (the first
+directory with a .git), else the manifest in $FAWKES_HOME (default ~/.fawkes) whose repo holds the current
+directory; when several do, name one. --manifest and $FAWKES_MANIFEST take a path (a value with a / or ending in
+.toml) or an app name, for $FAWKES_HOME/<APP>.toml.
+
+JSON: stdout carries one document, the result or the error object {\"code\", \"message\"}, and progress goes to
+stderr as JSON lines. A result only ever gains fields. The streams differ: `log --follow` prints one event per
+line, `watch` one {\"name\", \"event\"} document per event. `daemon` prints text only.
+
+Examples:
+  fawkes up main                     stage, test and switch main; the new generation confirms itself
+  fawkes status --json               what runs, what is pending, and the commands accepted now
+  fawkes rollback                    undo the pending switch
+  fawkes --manifest xana log -n 20   the last 20 events of the app xana, from anywhere
+  fawkes skill                       how an agent uses Fawkes, for this version
+
+Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers.";
+
 /// A process supervisor whose upgrades are transactions: stage, test, switch, confirm, or roll back.
 #[derive(Parser)]
 #[command(
     name = "fawkes",
+    version,
     disable_help_subcommand = true,
-    after_help = "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers."
+    after_help = EXIT_CODES,
+    after_long_help = LONG_HELP_END
 )]
 struct Cli {
-    /// Print the result (or the error) as one JSON document, and progress as JSON lines on stderr; `log --follow`
-    /// prints one event document per line, `watch` one `{"name", "event"}` document. Not for `daemon`
+    /// Print the result as one JSON document (see `fawkes --help`)
     #[arg(long, global = true)]
     json: bool,
-    /// The app's manifest [default: fawkes.toml]
-    #[arg(long, global = true, value_name = "FILE")]
-    manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "APP",
+        help = "The app: a manifest's path, or an app name in $FAWKES_HOME [env: FAWKES_MANIFEST]"
+    )]
+    manifest: Option<OsString>,
     #[arg(
         long,
         global = true,
         value_name = "PATH",
-        help = "The daemon's socket [default: $FAWKES_SOCKET, else the manifest's]"
+        help = "The daemon's socket [env: FAWKES_SOCKET]"
     )]
     socket: Option<PathBuf>,
     #[command(subcommand)]
@@ -58,7 +93,7 @@ struct Cli {
 /// What the command line asks for: one of the two local programs, or a request to a daemon.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the supervisor in the foreground
+    /// Run the supervisor of one app in the foreground
     Daemon,
     /// Run the current generation (pending, else permanent)
     Start,
@@ -68,24 +103,37 @@ enum Command {
     Restart,
     /// Check out and install a git ref as a new generation
     Stage {
+        /// A git branch, tag or commit
         #[arg(value_name = "REF")]
         git_ref: String,
     },
-    /// Start a generation on a spare port with a copy of the storage (the `test_copy` hook), or an empty home
+    /// Run a generation on a spare port with a copy of the storage
+    ///
+    /// The copy is the manifest's `test_copy` hook; an app without hooks is tested on an empty home. The test passes
+    /// when the health check does, and the live app keeps running meanwhile.
     Test {
+        /// A generation id, as `history` shows it (g4)
         #[arg(value_name = "GEN")]
         generation: String,
     },
     /// Go live; roll back unless confirmed in time
     Switch {
+        /// A generation id, as `history` shows it (g4)
         #[arg(value_name = "GEN")]
         generation: String,
         /// Seconds to confirm in, 1 to 604800 [default: the manifest's `deadline`]
         #[arg(long, value_name = "SECS")]
         deadline: Option<u64>,
     },
-    /// Stage a git ref, test it and switch to it in one call; confirming stays the new generation's own step
+    /// Stage, test and switch a git ref in one call
+    ///
+    /// Confirming stays the new generation's own step: it runs `fawkes confirm` once it works, and the deadline rolls
+    /// it back otherwise. A failed step ends the command with that step's error, and nothing after it runs.
+    #[command(after_long_help = "Examples:\n  \
+                                 fawkes up main\n  \
+                                 fawkes up v1.4 --deadline 300 --json")]
     Up {
+        /// A git branch, tag or commit
         #[arg(value_name = "REF")]
         git_ref: String,
         /// Seconds to confirm in, 1 to 604800 [default: the manifest's `deadline`]
@@ -93,6 +141,8 @@ enum Command {
         deadline: Option<u64>,
     },
     /// Make the pending generation permanent
+    #[command(after_long_help = "Example, from the app once it knows it works:\n  \
+                                 \"$FAWKES_BIN\" confirm \"$FAWKES_GENERATION\"")]
     Confirm {
         #[arg(
             value_name = "GEN",
@@ -122,22 +172,36 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
-    /// Print the events of every daemon in `<fawkes_home>/run/` as they happen, one line each with the app's name
-    /// first; `--manifest` or `--socket` names one daemon instead
+    /// Print the events of every running daemon, one line each
+    #[command(
+        long_about = "Print the events of every running daemon, one line each\n\n\
+                            Each line starts with the app's name. The daemons are the ones linked in \
+                            $FAWKES_HOME/run/, including those started later; --manifest, --socket, $FAWKES_SOCKET \
+                            or $FAWKES_MANIFEST names one daemon instead."
+    )]
     Watch {
         /// Start after event N of each daemon, as far back as it keeps them [default: from now]
         #[arg(long, value_name = "N")]
         since: Option<u64>,
     },
-    /// Run the daemon of --manifest as a launchd user agent (macOS only; --socket is not accepted)
+    /// Run the app's daemon as a launchd user agent (macOS only)
+    ///
+    /// The agent runs the daemon on the manifest's own socket, so --socket is not accepted.
     Service {
         #[command(subcommand)]
         action: service::Action,
     },
+    /// Print the agent skill for this version of Fawkes
+    ///
+    /// The skill is the SKILL.md built into this binary: how an agent finds, calls and confirms with Fawkes. Under
+    /// --json it is the string of {"skill"}.
+    #[command(after_long_help = "Example:\n  fawkes skill > .agents/skills/fawkes/SKILL.md")]
+    Skill,
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon`, `watch`, `service` and `up` (three requests) send none.
+    /// The request this command sends to the daemon; `daemon`, `watch`, `service`, `skill` and `up` (three requests)
+    /// send none.
     /// `own_generation` is `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from
     /// it names that generation, so an app's test run (or anything it left behind) cannot confirm another generation
     /// that happens to be pending.
@@ -146,6 +210,7 @@ impl Command {
             Command::Daemon
             | Command::Watch { .. }
             | Command::Service { .. }
+            | Command::Skill
             | Command::Up { .. } => return None,
             Command::Start => Request::Start,
             Command::Stop => Request::Stop,
@@ -208,10 +273,17 @@ fn main() -> ExitCode {
             };
         }
     };
-    let manifest_path = cli.manifest.clone().unwrap_or_else(|| "fawkes.toml".into());
+    let given = Given::new(cli.socket.clone(), cli.manifest.clone());
     if matches!(cli.command, Command::Daemon) {
-        // A manifest that cannot be loaded is a usage error here as for every other command; the rest of the
-        // daemon's startup failures are not.
+        // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of
+        // the daemon's startup failures are not.
+        let manifest_path = match given.manifest() {
+            Ok(path) => path,
+            Err(message) => {
+                warn(format!("error: {message}"));
+                return ExitCode::from(EXIT_USAGE);
+            }
+        };
         if let Err(message) = Manifest::load(&manifest_path) {
             warn(format!("error: {message}"));
             return ExitCode::from(EXIT_USAGE);
@@ -225,34 +297,36 @@ fn main() -> ExitCode {
         };
     }
     let mut stdout = std::io::stdout().lock();
+    if matches!(cli.command, Command::Skill) {
+        if cli.json {
+            say(&mut stdout, serde_json::json!({ "skill": SKILL }));
+        } else {
+            // A reader that has gone (`fawkes skill | head`) is no failure of the command.
+            let _ = stdout.write_all(SKILL.as_bytes());
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Command::Watch { since } = cli.command {
-        return ExitCode::from(run_watch(&cli, since, &manifest_path, &mut stdout));
+        return ExitCode::from(run_watch(&cli, &given, since, &mut stdout));
     }
     if let Command::Service { action } = cli.command {
-        return ExitCode::from(run_service(&cli, action, &manifest_path, &mut stdout));
+        return ExitCode::from(run_service(&cli, &given, action, &mut stdout));
     }
-    let socket = match socket_path(&cli, &manifest_path) {
-        Ok(socket) => socket,
+    let endpoint = match Endpoint::find(&given) {
+        Ok(endpoint) => endpoint,
         Err(message) => {
             return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
         }
     };
-    // Only towards the daemon that started the caller: generation ids repeat across apps, so another daemon, picked
-    // with `--socket`, may have a pending generation of the same name.
+    // Only towards the daemon that started the caller, the one `FAWKES_SOCKET` names: generation ids repeat across
+    // apps, so another daemon, picked with `--socket` or `--manifest`, may have a pending generation of the same name.
     let own_generation = std::env::var("FAWKES_GENERATION")
         .ok()
-        .filter(|_| cli.socket.is_none());
+        .filter(|_| endpoint.own);
     if let Command::Up { git_ref, deadline } = &cli.command {
-        return ExitCode::from(run_up(
-            &cli,
-            git_ref,
-            *deadline,
-            &socket,
-            &manifest_path,
-            &mut stdout,
-        ));
+        return ExitCode::from(run_up(&cli, git_ref, *deadline, &endpoint, &mut stdout));
     }
-    // `daemon`, `watch` and `up` returned above, so every command left sends a request.
+    // `daemon`, `watch`, `service`, `skill` and `up` returned above, so every command left sends a request.
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
         let message = "this command sends no request to a daemon".to_string();
         return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
@@ -260,23 +334,66 @@ fn main() -> ExitCode {
     ExitCode::from(client(
         &cli,
         &request,
-        &socket,
-        &manifest_path,
+        &endpoint,
         REQUEST_TIMEOUT,
         &mut stdout,
     ))
 }
 
-/// `fawkes watch`: every daemon linked in `<fawkes_home>/run/`, unless `--manifest`, `--socket` or `FAWKES_SOCKET`
-/// names one, which must then answer. Returns the exit code.
-fn run_watch(cli: &Cli, since: Option<u64>, manifest_path: &Path, out: &mut dyn Write) -> u8 {
-    let target = if cli.socket.is_none()
-        && cli.manifest.is_none()
-        && std::env::var_os("FAWKES_SOCKET").is_none()
-    {
-        manifest::run_dir().map(watch::Target::Discover)
+/// The daemon a client command talks to.
+struct Endpoint {
+    socket: PathBuf,
+    /// The manifest it was found by, for the message that says how to start it; none for a socket named outright.
+    manifest: Option<PathBuf>,
+    /// The socket is `FAWKES_SOCKET`: the daemon that started the caller.
+    own: bool,
+}
+
+impl Endpoint {
+    /// The daemon `given` names (`discovery`): a socket as given, or the socket of the manifest found.
+    fn find(given: &Given) -> Result<Endpoint, String> {
+        Ok(match given.target()? {
+            Target::Socket { path, inherited } => Endpoint {
+                socket: path,
+                manifest: None,
+                own: inherited,
+            },
+            Target::Manifest(path) => {
+                let manifest = Manifest::load(&path).map_err(|e| {
+                    format!("{e}; pass --manifest or --socket to say which daemon to talk to")
+                })?;
+                Endpoint {
+                    socket: manifest.paths().socket(),
+                    manifest: Some(path),
+                    own: false,
+                }
+            }
+        })
+    }
+
+    /// How to start the daemon that does not answer.
+    fn start_hint(&self) -> String {
+        let manifest = self
+            .manifest
+            .as_ref()
+            .map_or_else(|| "<app>".into(), |path| path.display().to_string());
+        format!("start one with `fawkes daemon --manifest {manifest}`")
+    }
+}
+
+/// `fawkes watch`: every daemon linked in `<fawkes_home>/run/`, unless a flag or a variable names one, which must
+/// then answer. Returns the exit code.
+fn run_watch(cli: &Cli, given: &Given, since: Option<u64>, out: &mut dyn Write) -> u8 {
+    let (target, endpoint) = if given.names_one() {
+        match Endpoint::find(given) {
+            Ok(endpoint) => (
+                Ok(watch::Target::One(endpoint.socket.clone())),
+                Some(endpoint),
+            ),
+            Err(message) => (Err(message), None),
+        }
     } else {
-        socket_path(cli, manifest_path).map(watch::Target::One)
+        (manifest::run_dir().map(watch::Target::Discover), None)
     };
     let target = match target {
         Ok(target) => target,
@@ -285,29 +402,33 @@ fn run_watch(cli: &Cli, since: Option<u64>, manifest_path: &Path, out: &mut dyn 
     match watch::run(&target, cli.json, since, out) {
         Ok(()) => 0,
         Err(why) => {
-            let message = format!(
-                "{why}; start one with `fawkes daemon --manifest {}`",
-                manifest_path.display()
+            let hint = endpoint.map_or_else(
+                || "start one with `fawkes daemon --manifest <app>`".into(),
+                |endpoint| endpoint.start_hint(),
             );
-            fail(cli.json, out, ErrorCode::DaemonUnreachable, message)
+            fail(
+                cli.json,
+                out,
+                ErrorCode::DaemonUnreachable,
+                format!("{why}; {hint}"),
+            )
         }
     }
 }
 
 /// `fawkes service`: the service of the manifest's daemon, which it reaches by its own socket. Returns the exit code.
-fn run_service(
-    cli: &Cli,
-    action: service::Action,
-    manifest_path: &Path,
-    out: &mut dyn Write,
-) -> u8 {
+fn run_service(cli: &Cli, given: &Given, action: service::Action, out: &mut dyn Write) -> u8 {
     if cli.socket.is_some() {
         let message =
             "the service runs the daemon on the manifest's own socket, so --socket does not apply"
                 .into();
         return fail(cli.json, out, ErrorCode::Usage, message);
     }
-    match service::run(action, manifest_path) {
+    let manifest_path = match given.manifest() {
+        Ok(path) => path,
+        Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
+    };
+    match service::run(action, &manifest_path) {
         Ok((result, text)) => {
             if cli.json {
                 say(out, result);
@@ -326,19 +447,6 @@ fn json_asked() -> bool {
         .skip(1)
         .take_while(|arg| arg != "--")
         .any(|arg| arg == "--json")
-}
-
-/// `--socket`, else `FAWKES_SOCKET`, else the manifest's `<state_dir>/fawkes.sock`.
-fn socket_path(cli: &Cli, manifest_path: &Path) -> Result<PathBuf, String> {
-    if let Some(socket) = &cli.socket {
-        return Ok(socket.clone());
-    }
-    if let Some(socket) = std::env::var_os("FAWKES_SOCKET") {
-        return Ok(socket.into());
-    }
-    let manifest = Manifest::load(manifest_path)
-        .map_err(|e| format!("{e}; pass --manifest or --socket to say which daemon to talk to"))?;
-    Ok(manifest.paths().socket())
 }
 
 /// Print a line on `out`, the client's stdout; false when it could not be written. A reader that has gone
@@ -403,12 +511,11 @@ fn fail(json: bool, out: &mut dyn Write, code: ErrorCode, message: String) -> u8
 fn client(
     cli: &Cli,
     request: &Request,
-    socket: &Path,
-    manifest_path: &Path,
+    endpoint: &Endpoint,
     timeout: Duration,
     out: &mut dyn Write,
 ) -> u8 {
-    match exchange(cli, request, socket, manifest_path, timeout, out) {
+    match exchange(cli, request, endpoint, timeout, out) {
         // A followed log printed its events as they came; there is no result to show.
         Ok(_) if matches!(request, Request::Log { follow: true, .. }) => 0,
         Ok(result) => {
@@ -429,8 +536,7 @@ fn run_up(
     cli: &Cli,
     git_ref: &str,
     deadline: Option<u64>,
-    socket: &Path,
-    manifest_path: &Path,
+    endpoint: &Endpoint,
     out: &mut dyn Write,
 ) -> u8 {
     // Refused before anything is staged, as `switch --deadline` is before anything is stopped.
@@ -439,8 +545,7 @@ fn run_up(
     {
         return fail(cli.json, out, error.code, error.message);
     }
-    let mut step =
-        |request: &Request| exchange(cli, request, socket, manifest_path, REQUEST_TIMEOUT, out);
+    let mut step = |request: &Request| exchange(cli, request, endpoint, REQUEST_TIMEOUT, out);
     let stage = Request::Stage {
         git_ref: git_ref.into(),
     };
@@ -485,16 +590,16 @@ fn run_up(
 fn exchange(
     cli: &Cli,
     request: &Request,
-    socket: &Path,
-    manifest_path: &Path,
+    endpoint: &Endpoint,
     timeout: Duration,
     out: &mut dyn Write,
 ) -> Result<Value, Failure> {
+    let socket = &endpoint.socket;
     let Ok(mut stream) = UnixStream::connect(socket) else {
         let message = format!(
-            "no daemon answers on {}; start one with `fawkes daemon --manifest {}`",
+            "no daemon answers on {}; {}",
             socket.display(),
-            manifest_path.display()
+            endpoint.start_hint()
         );
         return Err(Failure::new(ErrorCode::DaemonUnreachable, message));
     };
@@ -787,6 +892,7 @@ mod tests {
     use super::*;
     use protocol::Pending;
     use std::os::unix::net::UnixListener;
+    use std::path::Path;
     use std::time::Instant;
 
     fn parse(args: &str) -> Cli {
@@ -1144,6 +1250,14 @@ mod tests {
         assert_eq!(text, unknown.to_string());
     }
 
+    fn endpoint(socket: &Path) -> Endpoint {
+        Endpoint {
+            socket: socket.into(),
+            manifest: None,
+            own: false,
+        }
+    }
+
     /// Run `status` against a daemon that accepts and then says nothing for 3 s; returns the exit code, what the
     /// client printed on stdout, and how long it waited.
     fn status_from_a_silent_daemon(json: bool) -> (u8, String, Duration) {
@@ -1169,8 +1283,7 @@ mod tests {
         let code = client(
             &cli,
             &Request::Status,
-            &socket,
-            Path::new("fawkes.toml"),
+            &endpoint(&socket),
             Duration::from_millis(300),
             &mut out,
         );
@@ -1208,8 +1321,7 @@ mod tests {
             let code = client(
                 &cli,
                 &Request::Status,
-                &socket,
-                Path::new("fawkes.toml"),
+                &endpoint(&socket),
                 Duration::from_secs(2),
                 &mut out,
             );
@@ -1282,8 +1394,7 @@ mod tests {
         let code = client(
             &cli,
             &request,
-            &socket,
-            Path::new("fawkes.toml"),
+            &endpoint(&socket),
             Duration::from_secs(5),
             &mut out,
         );

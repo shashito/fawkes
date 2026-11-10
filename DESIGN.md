@@ -133,7 +133,8 @@ daemon start runs the permanent generation.
 `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE`). An app confirms only when `FAWKES_PHASE` is
 `live`, and names itself: `"$FAWKES_BIN" confirm "$FAWKES_GENERATION"`. Its test run gets the same variables, with
 `FAWKES_PHASE=test`, while another generation may be pending. Without `<gen>` the CLI sends `$FAWKES_GENERATION`
-when it is set (and no `--socket` points it at another daemon), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
+when it is set and the daemon was found through `$FAWKES_SOCKET` (no `--socket` or `--manifest` points it at another
+daemon), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
 an app, a bare `confirm` confirms whichever generation is pending. The `confirmed` event says whether the confirm
 named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
 deadline is cleared. Confirming a generation that is not pending is `invalid_state`, except the permanent one:
@@ -464,7 +465,7 @@ add `[hooks]` to the manifest.
 ## CLI
 
 ```
-fawkes daemon   [--manifest FILE]
+fawkes daemon
 fawkes start
 fawkes stop
 fawkes restart
@@ -480,12 +481,43 @@ fawkes log      [-n N] [--follow]
 fawkes history
 fawkes watch    [--since N]
 fawkes service  install|uninstall|restart
+fawkes skill
+fawkes --version
 ```
 
-Global options, before or after the command: `--json`, `--manifest FILE` (default `./fawkes.toml`), `--socket PATH`.
-A command's own options come after it. A client finds the daemon by `--socket`, else `FAWKES_SOCKET`, else
-`<state_dir>/fawkes.sock` from the manifest. `--help` (or `-h`), after `fawkes` or after a command, prints its usage
-and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`.
+Global options, before or after the command: `--json`, `--manifest APP`, `--socket PATH`. A command's own options come
+after it. `-h` prints a command's usage and `--help` its long help (details, examples), after `fawkes` or after a
+command, and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`. A mistyped command is a
+usage error that names the similar commands (`tip: a similar subcommand exists: 'log'`), never one run in its place.
+`fawkes --version` (or `-V`) prints `fawkes <version>` and exits 0.
+
+`fawkes skill` prints `skills/fawkes/SKILL.md` as it was when the binary was built, so the skill an agent installs
+(`fawkes skill > .agents/skills/fawkes/SKILL.md`) always matches the binary. Under `--json`: `{"skill": "<text>"}`.
+
+### Finding the app
+
+A client command reaches its daemon by the first of:
+
+1. `--socket PATH`;
+2. `--manifest APP`: that manifest's `<state_dir>/fawkes.sock`;
+3. `$FAWKES_SOCKET`, which Fawkes sets for every process it starts, so an app reaches its own daemon without a word;
+4. `$FAWKES_MANIFEST`, read like `--manifest`;
+5. the nearest `fawkes.toml`, from the current directory up, stopping at the first directory that holds a `.git` (the
+   repository root, so a project inside another never takes the outer one's manifest);
+6. the manifest in `<fawkes_home>` (`*.toml`, the app named by the file name) whose `repo` is the current directory
+   or one of its parents. When more than one does, the command is refused (`usage`) with their names and asks for
+   `--manifest <name>`; when none does, the error names the apps there are.
+
+`APP`, for `--manifest` and `$FAWKES_MANIFEST`, is a path when it has a `/` or ends in `.toml`, and otherwise an app
+name: `<fawkes_home>/<APP>.toml`, which must exist. An empty variable counts as unset. There is no guess beyond this:
+not finding the app is a `usage` error (exit 2), and a running daemon is never picked because it is the only one.
+`daemon` and `service`, which need a manifest, take steps 2, 4, 5 and 6; `watch` takes steps 1 to 4 and otherwise
+follows every daemon (see Watch).
+
+This order puts the flags before the environment, which **changes the earlier contract**, where `$FAWKES_SOCKET`
+beat `--manifest` and only `./fawkes.toml` was read: an app Fawkes runs that names another app's manifest now
+reaches that app's daemon, and its bare `confirm` then sends no `$FAWKES_GENERATION` (Confirm). An app that names
+nothing still reaches its own daemon, since `$FAWKES_SOCKET` comes before every discovered manifest.
 
 `--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped (for
 `up`, nothing is staged either).
@@ -520,6 +552,8 @@ parse and a manifest that cannot be read are `usage`, no daemon on the socket, a
 streams. `log --follow`: stdout carries one event document per line, as they happen, and nothing else when the
 daemon ends the stream (in text mode too). `watch` (see Watch): one `{"name", "event"}` document per event, for as
 long as it runs. `--json` does not apply to `daemon`, which prints text only.
+**A `--json` result only ever gains fields:** a field is never removed, renamed or given another meaning, so a
+reader ignores the fields it does not know. Enumerations may gain values (see Socket protocol).
 Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
 for `daemon` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
 cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
@@ -541,8 +575,9 @@ error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with
 `fawkes service install|uninstall|restart` runs the daemon under launchd as a user LaunchAgent, for a Mac that is a
 server. A desktop user never needs it. It is a client-side convenience: it writes a plist and calls `launchctl`, and the
 daemon cannot tell it was started this way (it has no code for it). macOS only; elsewhere each action is a `usage` error
-(run `fawkes daemon --manifest …` under the init system; systemd user units are **Later**). `--manifest` names the app
-(default `./fawkes.toml`); `--socket` is a usage error, since the service runs the daemon on the manifest's own socket.
+(run `fawkes daemon --manifest …` under the init system; systemd user units are **Later**). The manifest is found as
+for `daemon` (Finding the app); `--socket` is a usage error, since the service runs the daemon on the manifest's own
+socket.
 `--json` applies to all three: one result object, or the usual error object, with the usual exit codes.
 
 The label is `dev.fawkes.<name>` and the plist `$HOME/Library/LaunchAgents/<label>.plist` (`HOME` must be set and
@@ -765,7 +800,8 @@ supervisor's `reap`, `restart` and `rollback`).
 `fawkes watch [--since N]` prints the events of every supervised app as they happen, one line per event with the
 app's name first: for a person at a terminal, or an agent reading `--json`. It holds one `subscribe` stream per daemon
 and no state of its own, so it works against daemons started elsewhere, and quitting it never affects an app.
-`--manifest`, `--socket` or `FAWKES_SOCKET` names one daemon instead, which must answer the first connection: if it
+`--manifest`, `--socket`, `FAWKES_SOCKET` or `FAWKES_MANIFEST` names one daemon instead (the current directory never
+does), which must answer the first connection: if it
 does not, `watch` fails with `daemon_unreachable` (exit 3).
 
 **Discovery:** each daemon links its socket as `<fawkes_home>/run/<name>.sock` when it starts and removes the link
@@ -843,10 +879,12 @@ event log started over`. Until the first `status` line names the app, a note nam
 For the daemon and CLI, each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
-- **clap** (no default features; `std`, `derive`, `help`, `usage`, `error-context`): the command line, declared as
-  one struct and one enum whose doc comments are the help text. It keeps the global options valid on either side of
-  the command, exits 2 on a usage error and gives every command its own `--help`, which a hand-written parser had
-  to spell out in a usage string kept in step by hand.
+- **clap** (no default features; `std`, `derive`, `help`, `usage`, `error-context`, `suggestions`): the command line,
+  declared as one struct and one enum whose doc comments are the help text. It keeps the global options valid on
+  either side of the command, exits 2 on a usage error and gives every command its own `--help`, which a
+  hand-written parser had to spell out in a usage string kept in step by hand.
+- **strsim** (through clap's `suggestions`): the similar names in the error for a mistyped command or option
+  (`fawkes logs` → `log`), which would otherwise be a hand-written edit distance.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
 - **rustix** (features `event`, `fs`, `net`, `param`, `process`): safe wrappers for the system calls std lacks:
