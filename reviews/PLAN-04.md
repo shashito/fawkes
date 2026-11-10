@@ -132,8 +132,8 @@ entry; the swap file in the user's checkout is left to them).
 
 ## Needs the user
 
-- **Tools (L50, L52):** cargo-deny (advisories, licences) is not installed, and no Linux target is installed, so
-  Linux-only paths (crash recovery's leftover check among them) have never been compiled. Both are installs.
+- **Tools (L50):** cargo-deny (advisories, licences) is not installed. L52 is done: `cargo clippy` and `cargo test`
+  pass in an Alpine Linux micro-VM, crash recovery's leftover check included (there is still no CI).
 - **Overlap with the extension (#2227):** its code lives in this repository (the user's choice), and its doc fixes
   touch `examples/ultimate.toml` and DESIGN.md's "Later", which 7.1 also changes. Phase 5 touches neither, so it can
   run alongside the extension; 7.1 waits until the extension's doc fixes have landed.

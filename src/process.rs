@@ -202,15 +202,21 @@ fn start_time(pid: u32) -> Option<f64> {
     (written == size).then(|| info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1e6)
 }
 
-/// When process `pid` started, in seconds since the epoch; None when there is no such process.
+/// The fields of `/proc/<pid>/stat` from field 3, the state, on; None when there is no such process, or when it has
+/// exited and waits to be reaped (a zombie), as on macOS, where neither `proc_pidinfo` nor a group's `kill` finds one.
+/// The command name before them, in parentheses, is free to contain spaces.
+#[cfg(target_os = "linux")]
+fn running_stat(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(')')?.1.trim_start();
+    (!fields.starts_with(['Z', 'X'])).then(|| fields.to_owned())
+}
+
+/// When process `pid` started, in seconds since the epoch; None when there is no such process, or it has exited.
 #[cfg(target_os = "linux")]
 fn start_time(pid: u32) -> Option<f64> {
-    // Field 22 of /proc/<pid>/stat, in clock ticks since boot; the fields after the command name (in parentheses,
-    // and free to contain spaces) start at field 3.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let ticks: f64 = stat
-        .rsplit_once(')')?
-        .1
+    // Field 22, in clock ticks since boot.
+    let ticks: f64 = running_stat(&pid.to_string())?
         .split_whitespace()
         .nth(19)?
         .parse()
@@ -285,9 +291,35 @@ pub fn leftover(pid_file: &Path) -> Option<u32> {
     (written - 60.0 <= started && started <= written + 1.0 && group_alive(pid)).then_some(pid)
 }
 
-/// Does any process of group `pgid` still exist?
+/// Does any process of group `pgid` still run? A member that has exited is not counted, reaped or not.
+#[cfg(target_os = "macos")]
 pub fn group_alive(pgid: u32) -> bool {
     group(pgid).is_some_and(|group| test_kill_process_group(group).is_ok())
+}
+
+/// Does any process of group `pgid` still run? A member that has exited is not counted, reaped or not.
+///
+/// Linux's `kill` also finds a zombie, a member that has exited and waits for its parent to reap it, and the parent
+/// of an orphaned member may never do so: an init that does not reap, as some containers' and sandboxes' do not,
+/// keeps it for good. So a group the kernel still finds is looked up in /proc, for a member that has not exited.
+#[cfg(target_os = "linux")]
+pub fn group_alive(pgid: u32) -> bool {
+    if group(pgid).is_none_or(|group| test_kill_process_group(group).is_err()) {
+        return false;
+    }
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        // Without /proc, the kernel's answer is all there is.
+        return true;
+    };
+    let pgid = pgid.to_string();
+    processes.flatten().any(|process| {
+        let name = process.file_name();
+        name.to_str()
+            .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(running_stat)
+            // Field 5, the process group.
+            .is_some_and(|fields| fields.split_whitespace().nth(2) == Some(pgid.as_str()))
+    })
 }
 
 pub fn kill_group(pgid: u32) {
@@ -554,6 +586,24 @@ mod tests {
 
         stop_group(pgid, 1.0, None);
         assert_eq!(leftover(&pid_file), None, "the group is gone");
+    }
+
+    #[test]
+    fn a_group_whose_members_have_all_exited_has_ended_before_they_are_reaped() {
+        // An exited member stays a zombie until its parent reaps it, and an init that never reaps orphans (a
+        // container's or a sandbox's) keeps one for good. Here the test is the parent that has not reaped it yet.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        exited(&child)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no notice of the exit");
+
+        assert!(!group_alive(child.id()), "a zombie counted as alive");
+        assert_eq!(start_time(child.id()), None, "a zombie has a start time");
+        child.wait().unwrap();
     }
 
     #[test]

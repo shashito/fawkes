@@ -275,10 +275,9 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
     h.commit("v1", "confirm");
     h.commit("v2", "crash-live");
     h.start_daemon();
-    let alive = |id: &str| {
+    let running = |id: &str| {
         let dir = h.generation(id)["dir"].as_str().unwrap().to_string();
-        let pid = read_pid(format!("{dir}/background.pid"));
-        test_kill_process(pid).is_ok()
+        alive(read_pid(format!("{dir}/background.pid")))
     };
 
     make_permanent(&h, "v1", "g1");
@@ -295,10 +294,10 @@ fn a_crash_before_confirm_ends_the_whole_process_group_before_rolling_back() {
             .contains("exited before confirm")
     );
     // Waited for, not read once: the killed process stays a zombie until init reaps it, which a loaded machine delays.
-    h.wait("g2's background process to be gone", 5, || !alive("g2"));
+    h.wait("g2's background process to be gone", 5, || !running("g2"));
     h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
     assert!(
-        alive("g1"),
+        running("g1"),
         "g1 runs again, with its own background process"
     );
 }
@@ -465,7 +464,7 @@ install_timeout = 1"#,
     );
     let pid = read_pid(h.dir.join("s/install.pid"));
     assert!(
-        test_kill_process_group(pid).is_err(),
+        !group_alive(pid),
         "the hanging install's process group outlived its timeout"
     );
     for id in ["g1", "g2"] {
@@ -837,7 +836,7 @@ fn a_daemon_killed_during_a_stage_leaves_no_install_running() {
     stage.wait().unwrap();
 
     h.start_daemon();
-    let alive = test_kill_process_group(pid).is_ok();
+    let alive = group_alive(pid);
     if alive {
         // The group is the orphaned install this test started.
         let _ = kill_process_group(pid, Signal::KILL);
@@ -927,7 +926,7 @@ fn a_test_copy_hook_that_hangs_is_ended_with_its_group_and_leaves_no_copy() {
     );
     let pid = read_pid(h.dir.join("s/hook.pgid"));
     assert!(
-        test_kill_process_group(pid).is_err(),
+        !group_alive(pid),
         "the hanging hook's process group outlived its timeout"
     );
     assert!(!h.dir.join("s/generations/g1/test-home").exists());
@@ -1032,14 +1031,11 @@ fn a_daemon_killed_during_a_restore_hook_stops_it_and_restores_again() {
     let pid = read_pid(&pid_file);
     h.kill_daemon();
     rollback.wait().unwrap();
-    assert!(
-        test_kill_process_group(pid).is_ok(),
-        "the hook ended with its daemon"
-    );
+    assert!(group_alive(pid), "the hook ended with its daemon");
 
     std::fs::remove_file(h.dir.join("s/hang")).unwrap();
     h.start_daemon();
-    let alive = test_kill_process_group(pid).is_ok();
+    let alive = group_alive(pid);
     if alive {
         // The group is the orphaned hook this test started.
         let _ = kill_process_group(pid, Signal::KILL);
@@ -1163,10 +1159,7 @@ fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
     );
     let stopped = signalled.elapsed();
     assert!(stopped < Duration::from_secs(4), "SIGTERM took {stopped:?}");
-    assert!(
-        test_kill_process_group(app).is_err(),
-        "the app outlived the daemon"
-    );
+    assert!(!group_alive(app), "the app outlived the daemon");
 }
 
 /// The permanent generation crash-loops: a crash after a long run restarts it in 1 s, each failed start in a row then
@@ -1800,6 +1793,40 @@ fn refused(h: &Harness, args: &[&str], code: &str, says: &str) {
     );
     let message = error["message"].as_str().unwrap();
     assert!(message.contains(says), "{args:?}: {message}");
+}
+
+/// Does process `pid` still run? One that has exited is not counted, reaped or not, as Fawkes's own check does: on
+/// Linux an init that never reaps orphans, as a sandbox's may not, keeps a killed one a zombie for good.
+fn alive(pid: Pid) -> bool {
+    if cfg!(target_os = "linux") {
+        running_group(&pid.as_raw_nonzero().to_string()).is_some()
+    } else {
+        test_kill_process(pid).is_ok()
+    }
+}
+
+/// Does any process of group `pgid` still run? Exited members are not counted, as in `alive`.
+fn group_alive(pgid: Pid) -> bool {
+    if cfg!(target_os = "linux") {
+        let pgid = Some(pgid.as_raw_nonzero().get());
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .any(|process| process.file_name().to_str().and_then(running_group) == pgid)
+    } else {
+        test_kill_process_group(pgid).is_ok()
+    }
+}
+
+/// The process group of process `pid`, from Linux's /proc, unless it has exited (a zombie).
+fn running_group(pid: &str) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name, in parentheses, may contain spaces; the state and the group are fields 3 and 5.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    if matches!(fields.first(), Some(&("Z" | "X"))) {
+        return None;
+    }
+    fields.get(2)?.parse().ok()
 }
 
 /// The pid a process wrote to `path`.

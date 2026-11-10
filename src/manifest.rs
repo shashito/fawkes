@@ -700,8 +700,16 @@ test_copy = "store save {home} {test_home}"
 
         set(0o664);
         trusted(&path, &metadata(), me).unwrap();
-        let refused = trusted(&path, &metadata(), me + 1).unwrap_err();
+        if me == 0 {
+            // Root's manifests are trusted by every user, so as root the refusal is tried on another user's file.
+            trusted(&path, &metadata(), 1).unwrap();
+            std::os::unix::fs::chown(&path, Some(1), None).unwrap();
+        }
+        let refused = trusted(&path, &metadata(), metadata().uid() + 1).unwrap_err();
         assert!(refused.contains("belongs to uid"), "{refused}");
+        if me == 0 {
+            std::os::unix::fs::chown(&path, Some(0), None).unwrap();
+        }
         set(0o646);
         let refused = trusted(&path, &metadata(), me).unwrap_err();
         assert!(refused.contains("changed by other users"), "{refused}");
