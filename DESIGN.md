@@ -282,7 +282,7 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    was written after the machine booted.
    The install, test or `test_copy` hook that daemon was running is found and stopped the same way, through
    `step.pid`, before the next step removes the directory it runs in, and a `snapshot` or `restore` hook through
-   `hook.pid`, before the rollback below runs the restore again.
+   `hook.pid`, before the rollback below runs the restore again. All three files are then removed, stopped or stale.
 6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
    owns, and the worktrees git still lists for them (`git worktree prune`).
 7. Act on the step `state.json` says was in flight (`txn`):

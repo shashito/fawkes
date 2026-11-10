@@ -553,6 +553,8 @@ impl Daemon {
                 );
             }
         }
+        // Each was stopped or is stale. The app's goes before `start_permanent` writes a new one.
+        daemon.forget_pid_file();
         daemon.forget_step_pid_file();
         // Best effort, as for `step.pid`: `leftover` never mistakes a stale file for a live hook.
         let _ = std::fs::remove_file(daemon.paths.hook_pid());

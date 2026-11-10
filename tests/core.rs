@@ -1162,6 +1162,22 @@ fn a_daemon_killed_during_a_restore_hook_stops_it_and_restores_again() {
     );
 }
 
+/// An `app.pid` left by an earlier daemon whose app is gone is removed at startup, as `step.pid` and `hook.pid` are:
+/// the state directory keeps no pid file that names a process which has ended.
+#[test]
+fn a_stale_app_pid_file_is_removed_at_startup() {
+    let mut h = Harness::new("");
+    std::fs::create_dir(h.dir.join("s")).unwrap();
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    let pid_file = h.dir.join("s/app.pid");
+    std::fs::write(&pid_file, format!("{pid}\n")).unwrap();
+
+    h.start_daemon();
+    assert!(!pid_file.exists(), "the stale app.pid outlived the startup");
+}
+
 /// A manifest without hooks gets a code-only rollback: the old generation starts on the storage the rolled-back one
 /// left. Its tests start on an empty home, never the live one.
 #[test]

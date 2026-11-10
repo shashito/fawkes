@@ -558,7 +558,7 @@ impl Daemon {
 
     /// The app's group is gone: its pid file names nothing a later daemon must stop. Best effort, since `leftover`
     /// never mistakes a stale file for a live app.
-    fn forget_pid_file(&self) {
+    pub(super) fn forget_pid_file(&self) {
         let _ = std::fs::remove_file(self.paths.app_pid());
     }
 
