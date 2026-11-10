@@ -10,7 +10,7 @@ import test from 'node:test'
 import type { ExtensionInfo } from 'ultimate/shared/protocol.ts'
 import { judge } from './confirm.ts'
 import { role } from './role.ts'
-import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
+import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import type { Status, Step } from './types.ts'
 
 const extension = (name: string, error?: string): ExtensionInfo => ({
@@ -70,6 +70,10 @@ test('buttons and upgrades follow status.actions, and a daemon without version i
   // Deadline passed: the daemon no longer lists the confirm.
   assert.equal(allows({ ...pending, actions: ['stop', 'stage', 'rollback'] }, 'confirm g3'), false)
   assert.equal(upgradeRefusal(status({ busy: 'test g4', actions: ['stop', 'restart'] })), 'Fawkes is busy: test g4')
+  // The switch that stops this process, and an up with it, from its start on.
+  assert.equal(switching(status({ busy: 'switch g4' })), true)
+  assert.equal(switching(status({ step: 'switching' })), true)
+  assert.equal(switching(status({ busy: 'test g4' })), false)
   assert.equal(upgradeRefusal(undefined), 'The Fawkes daemon has not answered yet')
   // An older daemon: no version, no actions, so no button, no upgrade, but a clear state.
   const old = { pending: null, busy: null } as Status

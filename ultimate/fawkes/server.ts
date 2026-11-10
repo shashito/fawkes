@@ -3,7 +3,8 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { obj, oneOf, opt, str } from '@earendil-works/pi-schema'
-import { defineExtension, defineTool, section } from '@earendil-works/pi-durable'
+import { defineDoc, defineExtension, defineTool, GenerationTask, hook, section } from '@earendil-works/pi-durable'
+import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 // Types only: at runtime this folder must not load code from a clone other than the generation it runs in.
 import type { ExtensionHost } from 'ultimate/server/extensions.ts'
 import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
@@ -12,7 +13,7 @@ import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { HELD_MARKER, role } from './role.ts'
-import { awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
+import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import type { Confirming, FawkesEvent, FawkesState, Generation, Status, Upgrade } from './types.ts'
 import { up, UpFailure } from './up.ts'
 
@@ -193,21 +194,24 @@ function upgrade(host: ExtensionHost, socket: string, ref: string) {
   if (refusal) throw new Error(refusal)
   const bin = process.env.FAWKES_BIN
   if (!bin) throw new Error('FAWKES_BIN is not set, though Fawkes sets it for every app it starts')
-  const upgrade: Upgrade = { ref, state: 'fetching', at: Date.now() }
+  const upgrade: Upgrade = { ref, state: 'fetching', since: s.events.at(-1)?.seq ?? 0, at: Date.now() }
   const set = (next: Partial<Upgrade>) => (s.upgrade = Object.assign(upgrade, next, { at: Date.now() }))
   s.upgrade = upgrade
   s.upgradeRun = (async () => {
     try {
       await check(host, true, ref)
     } catch (error) {
-      set({ state: 'failed', error: { message: `cannot fetch ${ref}: ${(error as Error).message.split('\n')[0]}` } })
+      set({ state: 'failed', error: { message: `cannot check ${ref}: ${(error as Error).message.split('\n')[0]}` } })
       return
     }
     set({ state: 'running' })
     try {
       set({ state: 'switched', result: await up(bin, socket, ref) })
     } catch (error) {
-      set({ state: 'failed', error: error instanceof UpFailure ? error.error : { message: String(error) } })
+      const failure = error instanceof UpFailure ? error.error : { message: String(error) }
+      // The switch stopped this process's group and `up` with it, before its answer: no failure, this process ends too.
+      if (!failure.code && switching(s.status)) return
+      set({ state: 'failed', error: failure })
     }
   })().finally(() => (s.upgradeRun = undefined))
 }
@@ -259,15 +263,57 @@ function describe(state: FawkesState) {
   return lines.join('\n')
 }
 
-/** What an agent must know right now, for the prompt section: a pending confirm, the latest rollback, an old daemon. */
+/**
+ * What an agent must know right now: a pending confirm, a rollback of the last hour, an old daemon. Nothing otherwise.
+ */
 function attention(state: FawkesState) {
   if (!state.supervised || !state.status) return undefined
   const pending = awaitingConfirm(state.status)
   if (pending) return `${pending.generation} awaits its confirm by ${pending.deadline}.`
   const target = lastSwitched(state.generations)
   const decided = target && outcome(state.status, state.generations, target.id)
-  const failed = decided?.state === 'rolled_back' || decided?.state === 'storage_failed'
+  const recent = Date.now() - Date.parse(target?.rolled_back_at ?? '') < 3_600_000
+  const failed = recent && (decided?.state === 'rolled_back' || decided?.state === 'storage_failed')
   return outdated(state.status) ?? rollbackNote(state.status) ?? (failed ? lastSwitchLine(state) : undefined)
+}
+
+/** What a conversation last heard from `attention`, so a note comes only when it changed. */
+const Seen = defineDoc<{ text?: string }>({
+  kind: 'fawkes.seen',
+  checkpointWhen: () => false,
+  version: 1,
+  scope: 'conversation',
+  history: 'latest',
+  fork: 'initial',
+  initial: () => ({}),
+})
+
+/**
+ * A per-input note when what needs an agent's attention changed since its conversation last heard; a prompt section
+ * stays the same between turns, so the prompt stays cached. Once it no longer applies, one note says so.
+ */
+async function attentionNote(host: ExtensionHost, tx: Tx, conversationId: ConversationId) {
+  const current = state(host)
+  const now = attention(current) ?? ''
+  const seen = await tx.doc(Seen, conversationId)
+  if ((seen.text ?? '') === now) return undefined
+  seen.text = now
+  const running = current.supervised ? current.generation : 'this generation'
+  return {
+    entries: [
+      {
+        kind: 'fawkes.note',
+        data: {},
+        model: [
+          {
+            role: 'user' as const,
+            content: now ? `Fawkes: ${now}` : `Fawkes: ${running} runs and nothing awaits a confirm.`,
+            timestamp: Date.now(),
+          },
+        ],
+      },
+    ],
+  }
 }
 
 /** The live generation's socket; every action that moves the app refuses elsewhere (a test run, an inert process). */
@@ -366,9 +412,15 @@ export default function fawkesExtension(host: ExtensionHost) {
   return defineExtension({
     name: 'fawkes',
     sections: [
-      section('fawkes', () => {
-        const now = attention(state(host))
-        return `This Ultimate runs under the Fawkes supervisor as a generation: a git worktree of the Ultimate clone at a fixed commit. Never edit the generation's folder (\`${host.ultimateRoot}\`); landed changes go live only through an upgrade (fawkes tool, action upgrade: \`fawkes up\` stages, tests and switches, then the new generation confirms itself, or Fawkes rolls back code and storage). \`restart\` reboots the same generation.${now ? `\nNow: ${now}` : ''}`
+      section(
+        'fawkes',
+        () =>
+          `This Ultimate runs under the Fawkes supervisor as a generation: a git worktree of the Ultimate clone at a fixed commit. Never edit the generation's folder (\`${host.ultimateRoot}\`); landed changes go live only through an upgrade (fawkes tool, action upgrade: \`fawkes up\` stages, tests and switches, then the new generation confirms itself, or Fawkes rolls back code and storage). \`restart\` reboots the same generation.`,
+      ),
+    ],
+    hooks: [
+      hook(GenerationTask, {
+        beforeInput: async (_input, { tx, conversationId }) => attentionNote(host, tx, conversationId),
       }),
     ],
     tools: [

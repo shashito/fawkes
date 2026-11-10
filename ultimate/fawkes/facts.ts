@@ -27,8 +27,16 @@ const storages: Record<StorageOutcome, string> = {
 
 export const storageText = (storage: string) => storages[storage as StorageOutcome] ?? `storage ${storage}`
 
-/** The generation the latest switch went to: the newest one switched to, whatever became of it. */
-export const lastSwitched = (generations: Generation[]) => generations.findLast((g) => g.switched_at)
+/**
+ * The generation the latest switch went to, whatever became of it. By `switched_at`, not by the order of the history:
+ * a retired generation can be tested and switched to again after a newer one.
+ */
+export const lastSwitched = (generations: Generation[]) =>
+  generations.reduce<Generation | undefined>(
+    (latest, g) =>
+      g.switched_at && (!latest || Date.parse(g.switched_at) >= Date.parse(latest.switched_at!)) ? g : latest,
+    undefined,
+  )
 
 /**
  * Where generation `id` stands, as `fawkes wait` decides it from the same `status` and `history` pictures: confirmed

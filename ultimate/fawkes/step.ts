@@ -25,12 +25,19 @@ export function rollbackNote(status: Status | undefined) {
 
 /**
  * Why the daemon is older than this extension expects, or nothing. Every daemon that reports `version` also sends what
- * the extension reads (`step`, `actions`, the event fields, `rollback_cause`) and its binary has `up` and `wait`.
+ * the extension reads: `step`, `actions`, the event fields and `rollback_cause`.
  */
 export function outdated(status: Status | undefined) {
   if (!status || (status.version && status.actions)) return undefined
   return 'The Fawkes daemon is older than this extension expects: its status has no version. Upgrade Fawkes and restart its daemon (a pending switch rolls back); until then this generation still confirms itself, but upgrades are off'
 }
+
+/**
+ * Whether a switch is under way: `busy` names it (`switch g3`) from its start, and `step` from when its intent is
+ * saved. The switch stops the live app's process group, an `up` run from here with it.
+ */
+export const switching = (status: Status | undefined) =>
+  status?.step === 'switching' || !!status?.busy?.startsWith('switch ')
 
 /** Whether the daemon accepts `command` (`rollback`, `confirm g3`) right now, from `status.actions`. */
 export const allows = (status: Status | undefined, command: string) => !!status?.actions?.includes(command)

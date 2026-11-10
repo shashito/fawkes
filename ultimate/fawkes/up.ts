@@ -20,17 +20,35 @@ export class UpFailure extends Error {
 /** The end of a child's stderr kept for a failure that printed no error object (a binary that crashed). */
 const TAIL = 2000
 
-/** Run `bin up ref --json` against `socket`; the `up` result, or an `UpFailure` with its error object. */
-export function up(bin: string, socket: string, ref: string): Promise<UpResult> {
+/**
+ * Run `bin up ref --json` against `socket`; the `up` result, or an `UpFailure` with its error object. The manifest's
+ * timeouts bound every step; `timeout` only frees the extension from a daemon that hangs, whose step carries on.
+ */
+export function up(bin: string, socket: string, ref: string, timeout = 3_600_000): Promise<UpResult> {
   return new Promise((resolve, reject) => {
     // After `--`, a ref that starts with `-` is still the ref.
     const child = spawn(bin, ['up', '--json', '--socket', socket, '--', ref], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let late = false
+    const timer = setTimeout(() => {
+      late = true
+      child.kill()
+    }, timeout)
     let stdout = ''
     let stderr = ''
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk))
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr = (stderr + chunk).slice(-TAIL)))
-    child.on('error', (error) => reject(new UpFailure({ message: `cannot run ${bin}: ${error.message}` })))
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      reject(new UpFailure({ message: `cannot run ${bin}: ${error.message}` }))
+    })
     child.on('close', (code, signal) => {
+      clearTimeout(timer)
+      if (late)
+        return reject(
+          new UpFailure({
+            message: `${bin} up did not answer within ${Math.round(timeout / 60_000)} minutes; the daemon's step carries on, \`fawkes status\` shows it`,
+          }),
+        )
       let answer: unknown
       try {
         answer = JSON.parse(stdout)

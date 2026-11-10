@@ -15,7 +15,8 @@ const generation = (id: string, state: Generation['state'], more: Partial<Genera
   dir: `/f/generations/${id}/code`,
   staged_at: 't',
   test: null,
-  switched_at: state === 'staged' || state === 'tested' ? null : 't',
+  // Switched to in the order of their ids, unless a test says otherwise.
+  switched_at: state === 'staged' || state === 'tested' ? null : `2026-11-03T10:00:0${id.slice(1)}Z`,
   confirmed_at: null,
   rolled_back_at: null,
   rollback_reason: null,
@@ -73,6 +74,12 @@ test('a confirmed generation is permanent, a pending one waits, one never switch
     lastSwitched([generation('g2', 'permanent'), generation('g3', 'rolled_back'), generation('g4', 'tested')])?.id,
     'g3',
   )
+  // A retired generation tested and switched to again is the latest switch, though older generations come first.
+  const again = [
+    generation('g2', 'permanent', { switched_at: '2026-11-03T15:00:00Z' }),
+    generation('g4', 'rolled_back', { switched_at: '2026-11-03T14:00:00Z', rollback_cause: 'exited' }),
+  ]
+  assert.equal(lastSwitched(again)?.id, 'g2')
 })
 
 test('an event is said from its fields, not from its message', () => {

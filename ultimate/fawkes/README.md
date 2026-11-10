@@ -93,7 +93,8 @@ the status and the latest events. Everything shown is read from fields (`status.
 The popover says how the latest switch ended (its cause in words, where it went back to and what became of the
 storage), lists the newest generations with the cause of each rollback and the latest events, and offers only what
 `status.actions` allows: Confirm (`confirm gN`), Roll back (`rollback`, which also retries a failed restore), and
-Upgrade when the ref has new commits, `stage` is allowed and no switch is in flight. Check now is always there.
+Upgrade when the ref has new commits, `stage` is allowed and no switch is in flight. Check now is there unless a
+switch awaits its confirm. An older daemon sends no `actions`: its pending switch still offers Confirm and Roll back.
 
 ## Actions
 
@@ -106,9 +107,11 @@ Upgrade when the ref has new commits, `stage` is allowed and no switch is in fli
 ## For agents
 
 A live generation adds a prompt section (the generation's folder is the running host and is never edited; landed
-changes go live only through an upgrade; `restart` reboots the same generation; and, when it matters, a line on a
-pending confirm, the latest rollback and its cause, or a daemon that is too old) and the `fawkes` tool: `status`
-(the generations, how the latest switch ended, what `status.actions` allows, recent events), or `upgrade {ref?}`.
+changes go live only through an upgrade; `restart` reboots the same generation), which never changes between turns
+so the prompt stays cached, and the `fawkes` tool: `status` (the generations, how the latest switch ended, what
+`status.actions` allows, recent events), or `upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
+rollback of the last hour with its cause, a daemon that is too old) comes as a note with its next input, only when it
+changed since that conversation last heard, and once more when it no longer applies.
 
 ## Checks
 

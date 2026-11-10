@@ -122,6 +122,8 @@ export type UpError = {
 export type Upgrade = {
   ref: string
   state: 'fetching' | 'running' | 'switched' | 'failed'
+  /** The `seq` of the newest event when it started: the progress lines after it are this upgrade's. */
+  since: number
   result?: UpResult
   error?: UpError
   at: number

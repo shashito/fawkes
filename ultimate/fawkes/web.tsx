@@ -114,7 +114,9 @@ function UpgradeRow({ state }: { state: Supervised }) {
   const { upgrade, status } = state
   if (!upgrade) return null
   const { error, result } = upgrade
-  const progress = running(upgrade) ? state.events.findLast((event) => event.kind === 'progress') : undefined
+  const progress = running(upgrade)
+    ? state.events.findLast((event) => event.kind === 'progress' && event.seq > upgrade.since)
+    : undefined
   return (
     <div>
       Upgrade to {upgrade.ref}:{' '}
@@ -189,9 +191,10 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
   const now = useNow(1000, Boolean(pending))
   const rollbackText = rollbackNote(status)
   const old = outdated(status)
-  // Only what the daemon would accept right now (`status.actions`).
-  const canConfirm = !!pending && allows(status, `confirm ${pending.generation}`)
-  const canRollback = allows(status, 'rollback')
+  // Only what the daemon would accept right now (`status.actions`). An older daemon sends no actions: its pending
+  // switch keeps both ways out, as the server actions accept them.
+  const canConfirm = !!pending && (old ? true : allows(status, `confirm ${pending.generation}`))
+  const canRollback = old ? !!pending || restoreFailed(status) : allows(status, 'rollback')
   const canUpgrade = !!behind?.count && !running(upgrade) && !upgradeRefusal(status)
   return (
     <>
@@ -423,4 +426,6 @@ function Fawkes() {
 
 export default defineWebExtension({
   slots: { 'statusline.right': [{ component: Fawkes, order: -2 }] },
+  // The server's per-input note for the model; the status line already shows the same.
+  entries: { 'fawkes.note': () => null },
 })
