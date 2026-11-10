@@ -18,6 +18,7 @@ use protocol::{
     read_line, timed_out,
 };
 use render::{render_decided, render_event, render_progress, render_result, render_switch};
+use serde::Serialize;
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fmt::Display;
@@ -234,62 +235,6 @@ enum Command {
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon`, `watch`, `wait`, `service`, `skill` and `up` (three
-    /// requests) send none.
-    /// `own_generation` is `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from
-    /// it names that generation, so an app's test run (or anything it left behind) cannot confirm another generation
-    /// that happens to be pending.
-    fn request(&self, own_generation: Option<&str>) -> Option<Request> {
-        Some(match self {
-            Command::Daemon
-            | Command::Watch { .. }
-            | Command::Service { .. }
-            | Command::Wait { .. }
-            | Command::Skill
-            | Command::Up { .. } => return None,
-            Command::Start => Request::Start,
-            Command::Stop => Request::Stop,
-            Command::Restart => Request::Restart,
-            Command::Stage { git_ref } => Request::Stage {
-                git_ref: git_ref.clone(),
-            },
-            Command::Test { generation } => Request::Test {
-                generation: generation.clone(),
-            },
-            Command::Switch {
-                generation,
-                deadline,
-            } => Request::Switch {
-                generation: generation.clone(),
-                deadline: *deadline,
-            },
-            Command::Confirm { generation } => Request::Confirm {
-                generation: generation
-                    .as_deref()
-                    .or(own_generation.filter(|id| !id.is_empty()))
-                    .map(String::from),
-            },
-            Command::Rollback { keep_storage } => Request::Rollback {
-                keep_storage: *keep_storage,
-            },
-            Command::Prune => Request::Prune,
-            Command::Status => Request::Status,
-            Command::History => Request::History,
-            Command::Reload => Request::Reload,
-            Command::Log {
-                limit,
-                since,
-                follow,
-            } => Request::Log {
-                limit: *limit,
-                since: *since,
-                follow: *follow,
-            },
-        })
-    }
-}
-
-impl Command {
     /// The name of a command that changes the app or its daemon, which a test run (`FAWKES_PHASE=test`) may not run:
     /// it serves its health check and nothing else. Every command is listed, so a new one must say which it is.
     fn changes_the_app(&self) -> Option<&'static str> {
@@ -304,8 +249,8 @@ impl Command {
             Command::Rollback { .. } => Some("rollback"),
             Command::Prune => Some("prune"),
             Command::Reload => Some("reload"),
-            // A test run may confirm its own generation, which is never pending; `main` refuses the rest once it knows
-            // which daemon the confirm reaches (DESIGN.md, Refusals).
+            // A test run may confirm its own generation, which is never pending; `run_confirm` refuses the rest once it
+            // knows which daemon the confirm reaches (DESIGN.md, Refusals).
             Command::Daemon
             | Command::Confirm { .. }
             | Command::Status
@@ -317,6 +262,20 @@ impl Command {
             | Command::Skill => None,
         }
     }
+}
+
+/// The generation a `confirm` names: the one asked for, else `own_generation`, which is `$FAWKES_GENERATION`, the
+/// generation a process Fawkes started runs as. A bare `confirm` from it names that generation, so an app's test run
+/// (or anything it left behind) cannot confirm another generation that happens to be pending.
+fn confirm_generation(named: Option<&str>, own_generation: Option<&str>) -> Option<String> {
+    named
+        .or(own_generation.filter(|id| !id.is_empty()))
+        .map(String::from)
+}
+
+/// Whether the caller is a test run (`FAWKES_PHASE=test`), which serves its health check and nothing else.
+fn in_test_run() -> bool {
+    std::env::var("FAWKES_PHASE").is_ok_and(|phase| phase == "test")
 }
 
 fn main() -> ExitCode {
@@ -345,115 +304,169 @@ fn main() -> ExitCode {
         }
     };
     let given = Given::new(cli.socket.clone(), cli.manifest.clone());
-    if matches!(cli.command, Command::Daemon) {
-        // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of
-        // the daemon's startup failures are not.
-        let manifest_path = match given.manifest() {
-            Ok(path) => path,
-            Err(message) => {
-                warn(format!("error: {message}"));
-                return ExitCode::from(EXIT_USAGE);
-            }
-        };
-        if let Err(message) = Manifest::load(&manifest_path) {
-            warn(format!("error: {message}"));
-            return ExitCode::from(EXIT_USAGE);
-        }
-        return match daemon::Daemon::run(manifest_path, cli.socket) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(message) => {
-                warn(format!("error: {message}"));
-                ExitCode::from(EXIT_FAILED)
-            }
-        };
-    }
-    let mut stdout = std::io::stdout().lock();
-    let test_run = std::env::var("FAWKES_PHASE").is_ok_and(|phase| phase == "test");
+    let out = &mut std::io::stdout();
     // Whichever daemon it targets: a test run serves its health check and nothing else.
     if let Some(name) = cli.command.changes_the_app()
-        && test_run
+        && in_test_run()
     {
         let message = format!(
             "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {name}`; the live app \
              or a shell outside the app does"
         );
-        return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::TestPhase, message));
+        return ExitCode::from(fail(cli.json, out, ErrorCode::TestPhase, message));
     }
-    if matches!(cli.command, Command::Skill) {
-        if cli.json {
-            say(&mut stdout, serde_json::json!({ "skill": SKILL }));
-        } else {
-            // A reader that has gone (`fawkes skill | head`) is no failure of the command.
-            let _ = stdout.write_all(SKILL.as_bytes());
-        }
-        return ExitCode::SUCCESS;
-    }
-    if let Command::Watch { since } = cli.command {
-        return ExitCode::from(run_watch(&cli, &given, since, &mut stdout));
-    }
-    if let Command::Service { action } = cli.command {
-        return ExitCode::from(run_service(&cli, &given, action, &mut stdout));
-    }
-    let endpoint = match Endpoint::find(&given) {
-        Ok(endpoint) => endpoint,
+    // One request to the daemon, for the commands that send exactly one.
+    let request = |request: Request| {
+        let out = &mut std::io::stdout();
+        with_endpoint(&cli, &given, out, |endpoint, out| {
+            client(&cli, &request, &endpoint, REQUEST_TIMEOUT, out)
+        })
+    };
+    let code = match &cli.command {
+        Command::Daemon => run_daemon(&given, cli.socket.clone()),
+        Command::Skill => run_skill(&cli, out),
+        Command::Watch { since } => run_watch(&cli, &given, *since, out),
+        Command::Service { action } => run_service(&cli, &given, *action, out),
+        Command::Up { git_ref, deadline } => with_endpoint(&cli, &given, out, |endpoint, out| {
+            run_up(&cli, git_ref, *deadline, &endpoint, out)
+        }),
+        Command::Wait { generation } => with_endpoint(&cli, &given, out, |endpoint, out| {
+            run_wait(&cli, generation.as_deref(), &endpoint, out)
+        }),
+        Command::Confirm { generation } => with_endpoint(&cli, &given, out, |endpoint, out| {
+            run_confirm(&cli, generation.as_deref(), &endpoint, out)
+        }),
+        Command::Start => request(Request::Start),
+        Command::Stop => request(Request::Stop),
+        Command::Restart => request(Request::Restart),
+        Command::Stage { git_ref } => request(Request::Stage {
+            git_ref: git_ref.clone(),
+        }),
+        Command::Test { generation } => request(Request::Test {
+            generation: generation.clone(),
+        }),
+        Command::Switch {
+            generation,
+            deadline,
+        } => request(Request::Switch {
+            generation: generation.clone(),
+            deadline: *deadline,
+        }),
+        Command::Rollback { keep_storage } => request(Request::Rollback {
+            keep_storage: *keep_storage,
+        }),
+        Command::Prune => request(Request::Prune),
+        Command::Status => request(Request::Status),
+        Command::History => request(Request::History),
+        Command::Reload => request(Request::Reload),
+        Command::Log {
+            limit,
+            since,
+            follow,
+        } => request(Request::Log {
+            limit: *limit,
+            since: *since,
+            follow: *follow,
+        }),
+    };
+    ExitCode::from(code)
+}
+
+/// `fawkes daemon`: the supervisor of one app, in the foreground. Returns the exit code.
+fn run_daemon(given: &Given, socket: Option<PathBuf>) -> u8 {
+    // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of the
+    // daemon's startup failures are not.
+    let manifest_path = match given.manifest() {
+        Ok(path) => path,
         Err(message) => {
-            return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
+            warn(format!("error: {message}"));
+            return EXIT_USAGE;
         }
     };
+    if let Err(message) = Manifest::load(&manifest_path) {
+        warn(format!("error: {message}"));
+        return EXIT_USAGE;
+    }
+    match daemon::Daemon::run(manifest_path, socket) {
+        Ok(()) => 0,
+        Err(message) => {
+            warn(format!("error: {message}"));
+            EXIT_FAILED
+        }
+    }
+}
+
+/// `fawkes skill`: the agent skill built into this binary. Returns the exit code.
+fn run_skill(cli: &Cli, out: &mut dyn Write) -> u8 {
+    if cli.json {
+        say(out, serde_json::json!({ "skill": SKILL }));
+    } else {
+        // A reader that has gone (`fawkes skill | head`) is no failure of the command.
+        let _ = out.write_all(SKILL.as_bytes());
+    }
+    0
+}
+
+/// Find the daemon the command line names and run `run` against it; a daemon that cannot be found is a usage error.
+fn with_endpoint(
+    cli: &Cli,
+    given: &Given,
+    out: &mut dyn Write,
+    run: impl FnOnce(Endpoint, &mut dyn Write) -> u8,
+) -> u8 {
+    match Endpoint::find(given) {
+        Ok(endpoint) => run(endpoint, out),
+        Err(message) => fail(cli.json, out, ErrorCode::Usage, message),
+    }
+}
+
+/// `fawkes confirm`: the generation that vouches for itself, towards `endpoint`. Returns the exit code.
+fn run_confirm(
+    cli: &Cli,
+    generation: Option<&str>,
+    endpoint: &Endpoint,
+    out: &mut dyn Write,
+) -> u8 {
     // Only towards the daemon that started the caller, the one `FAWKES_SOCKET` names: generation ids repeat across
     // apps, so another daemon, picked with `--socket` or `--manifest`, may have a pending generation of the same name.
     let own_generation = std::env::var("FAWKES_GENERATION")
         .ok()
         .filter(|_| endpoint.own);
-    // A test run confirms its own generation towards its own daemon, or nothing: a generation it names, or a bare
-    // confirm towards another daemon (which would send none and so confirm whatever is pending there), is another's.
-    if let Command::Confirm { generation } = &cli.command
-        && test_run
+    if in_test_run()
+        && let Some(why) = test_run_refusal(generation, own_generation.as_deref(), endpoint.own)
     {
-        let own = own_generation.as_deref().filter(|id| !id.is_empty());
-        let refused = if !endpoint.own {
-            Some("towards a daemon other than $FAWKES_SOCKET")
-        } else if own.is_none() {
-            Some("without a $FAWKES_GENERATION of its own")
-        } else if generation.as_deref().is_some_and(|id| Some(id) != own) {
-            Some("of a generation other than its own $FAWKES_GENERATION")
-        } else {
-            None
-        };
-        if let Some(why) = refused {
-            let named = generation
-                .as_deref()
-                .map_or_else(String::new, |id| format!(" {id}"));
-            let message = format!(
-                "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes confirm{named}` \
-                 {why}; the live app or a shell outside the app does"
-            );
-            return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::TestPhase, message));
-        }
+        let named = generation.map_or_else(String::new, |id| format!(" {id}"));
+        let message = format!(
+            "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes confirm{named}` \
+             {why}; the live app or a shell outside the app does"
+        );
+        return fail(cli.json, out, ErrorCode::TestPhase, message);
     }
-    if let Command::Up { git_ref, deadline } = &cli.command {
-        return ExitCode::from(run_up(&cli, git_ref, *deadline, &endpoint, &mut stdout));
-    }
-    if let Command::Wait { generation } = &cli.command {
-        return ExitCode::from(run_wait(
-            &cli,
-            generation.as_deref(),
-            &endpoint,
-            &mut stdout,
-        ));
-    }
-    // `daemon`, `watch`, `wait`, `service`, `skill` and `up` returned above, so every command left sends a request.
-    let Some(request) = cli.command.request(own_generation.as_deref()) else {
-        let message = "this command sends no request to a daemon".to_string();
-        return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
+    let request = Request::Confirm {
+        generation: confirm_generation(generation, own_generation.as_deref()),
     };
-    ExitCode::from(client(
-        &cli,
-        &request,
-        &endpoint,
-        REQUEST_TIMEOUT,
-        &mut stdout,
-    ))
+    client(cli, &request, endpoint, REQUEST_TIMEOUT, out)
+}
+
+/// Why a test run may not `confirm`, completing "it does not `fawkes confirm` …"; none when it may. A test run confirms
+/// its own generation towards its own daemon, or nothing: a generation it names, or a bare confirm towards another
+/// daemon (which would send none and so confirm whatever is pending there), is another's. `own_generation` is
+/// `$FAWKES_GENERATION`, already dropped when `own_endpoint` is false.
+fn test_run_refusal(
+    generation: Option<&str>,
+    own_generation: Option<&str>,
+    own_endpoint: bool,
+) -> Option<&'static str> {
+    let own = own_generation.filter(|id| !id.is_empty());
+    if !own_endpoint {
+        Some("towards a daemon other than $FAWKES_SOCKET")
+    } else if own.is_none() {
+        Some("without a $FAWKES_GENERATION of its own")
+    } else if generation.is_some_and(|id| Some(id) != own) {
+        Some("of a generation other than its own $FAWKES_GENERATION")
+    } else {
+        None
+    }
 }
 
 /// The daemon a client command talks to.
@@ -596,17 +609,11 @@ fn run_service(cli: &Cli, given: &Given, action: service::Action, out: &mut dyn 
         );
         return fail(cli.json, out, ErrorCode::InvalidState, message);
     }
-    match service::run(action, &manifest_path) {
-        Ok((result, text)) => {
-            if cli.json {
-                say(out, result);
-            } else {
-                say(out, text);
-            }
-            0
-        }
-        Err(error) => fail(cli.json, out, error.code, error.message),
-    }
+    finish(
+        cli,
+        out,
+        service::run(action, &manifest_path).map_err(Failure::of),
+    )
 }
 
 /// Whether the caller is a process of the app whose daemon listens on `socket`: Fawkes started it (`FAWKES_PHASE` is
@@ -695,6 +702,27 @@ fn fail(json: bool, out: &mut dyn Write, code: ErrorCode, message: String) -> u8
     Failure::new(code, message).report(json, out)
 }
 
+/// The end of a command that worked or failed, the one way every such command goes out: its result as one JSON
+/// document under `--json`, else its text (a line, or nothing when the text is empty, as an empty log is), and exit
+/// 0; or the failure. Returns the exit code.
+fn finish(
+    cli: &Cli,
+    out: &mut dyn Write,
+    outcome: Result<(impl Serialize, String), Failure>,
+) -> u8 {
+    match outcome {
+        Ok((result, text)) => {
+            if cli.json {
+                say(out, serde_json::to_string(&result).unwrap_or_default());
+            } else if !text.is_empty() {
+                say(out, text);
+            }
+            0
+        }
+        Err(failure) => failure.report(cli.json, out),
+    }
+}
+
 /// Send one request, show progress, render the answer on `out`. Returns the exit code. A quick command waits
 /// `timeout` for each line of the answer.
 fn client(
@@ -707,19 +735,14 @@ fn client(
     match exchange(cli, request, endpoint, timeout, out) {
         // A followed log printed its events as they came; there is no result to show.
         Ok(_) if matches!(request, Request::Log { follow: true, .. }) => 0,
-        Ok(result) => {
-            if cli.json {
-                say(out, result);
-            } else {
-                // An empty log or history is no blank line.
+        outcome => finish(
+            cli,
+            out,
+            outcome.map(|result| {
                 let text = render_result(request, &result);
-                if !text.is_empty() {
-                    say(out, text);
-                }
-            }
-            0
-        }
-        Err(failure) => failure.report(cli.json, out),
+                (result, text)
+            }),
+        ),
     }
 }
 
@@ -739,17 +762,11 @@ fn run_up(
     {
         return fail(cli.json, out, error.code, error.message);
     }
-    match up(cli, git_ref, deadline, endpoint, out) {
-        Ok(result) => {
-            if cli.json {
-                say(out, serde_json::to_string(&result).unwrap_or_default());
-            } else {
-                say(out, render_switch(&result.switch));
-            }
-            0
-        }
-        Err(failure) => failure.report(cli.json, out),
-    }
+    let outcome = up(cli, git_ref, deadline, endpoint, out).map(|result| {
+        let text = render_switch(&result.switch);
+        (result, text)
+    });
+    finish(cli, out, outcome)
 }
 
 /// The three steps of `up`; what each answered is read as its command's result.
@@ -811,24 +828,19 @@ fn run_wait(cli: &Cli, id: Option<&str>, endpoint: &Endpoint, out: &mut dyn Writ
             warn(line);
         }
     };
-    match watch::wait(&endpoint.socket, id, &mut progress) {
-        Ok(generation) => {
-            if cli.json {
-                say(out, serde_json::to_string(&generation).unwrap_or_default());
-            } else {
-                say(out, render_decided(&generation));
-            }
-            0
-        }
-        Err(error) => {
-            let error = if error.code == ErrorCode::DaemonUnreachable {
+    let outcome = watch::wait(&endpoint.socket, id, &mut progress)
+        .map(|generation| {
+            let text = render_decided(&generation);
+            (generation, text)
+        })
+        .map_err(|error| {
+            Failure::of(if error.code == ErrorCode::DaemonUnreachable {
                 error.with_hint(endpoint.start_hint())
             } else {
                 error
-            };
-            Failure::of(error).report(cli.json, out)
-        }
-    }
+            })
+        });
+    finish(cli, out, outcome)
 }
 
 /// Send one request and stream its progress to stderr; the daemon's final result, or why there is none. A followed
@@ -978,68 +990,52 @@ mod tests {
             assert!(cli.json, "{args}");
             assert_eq!(cli.manifest, Some("f.toml".into()), "{args}");
             assert_eq!(cli.socket, Some("s.sock".into()), "{args}");
-            assert_eq!(cli.command.request(None), Some(Request::Status), "{args}");
+            assert!(matches!(cli.command, Command::Status), "{args}");
         }
         let daemon = parse("daemon --manifest f.toml");
         assert!(matches!(daemon.command, Command::Daemon));
         assert_eq!(daemon.manifest, Some("f.toml".into()));
-        // `up` sends three requests, none of them its own.
         let up = parse("up main --deadline 60");
         assert!(
             matches!(&up.command, Command::Up { git_ref, deadline: Some(60) } if git_ref == "main")
         );
-        assert_eq!(up.command.request(None), None);
     }
 
     #[test]
-    fn each_command_sends_its_request() {
-        for (args, request) in [
-            (
-                "switch g3 --deadline 60",
-                Request::Switch {
-                    generation: "g3".into(),
-                    deadline: Some(60),
-                },
-            ),
-            (
-                "log -n 5 --follow",
-                Request::Log {
-                    limit: Some(5),
-                    since: None,
-                    follow: true,
-                },
-            ),
-            (
-                "log --limit 2 --since 40",
-                Request::Log {
-                    limit: Some(2),
-                    since: Some(40),
-                    follow: false,
-                },
-            ),
-            ("reload", Request::Reload),
-            ("confirm", Request::Confirm { generation: None }),
-            (
-                "confirm g2",
-                Request::Confirm {
-                    generation: Some("g2".into()),
-                },
-            ),
-            (
-                "rollback --keep-storage",
-                Request::Rollback { keep_storage: true },
-            ),
-            // `help` is no command, so it can name a git ref.
-            (
-                "stage help",
-                Request::Stage {
-                    git_ref: "help".into(),
-                },
-            ),
-        ] {
-            assert_eq!(parse(args).command.request(None), Some(request), "{args}");
-        }
-        assert_eq!(parse("watch --since 3").command.request(None), None);
+    fn a_command_line_parses_to_its_command() {
+        assert!(matches!(
+            parse("switch g3 --deadline 60").command,
+            Command::Switch { generation, deadline: Some(60) } if generation == "g3"
+        ));
+        assert!(matches!(
+            parse("log -n 5 --follow").command,
+            Command::Log {
+                limit: Some(5),
+                since: None,
+                follow: true
+            }
+        ));
+        assert!(matches!(
+            parse("log --limit 2 --since 40").command,
+            Command::Log {
+                limit: Some(2),
+                since: Some(40),
+                follow: false
+            }
+        ));
+        assert!(matches!(
+            parse("rollback --keep-storage").command,
+            Command::Rollback { keep_storage: true }
+        ));
+        assert!(matches!(
+            parse("confirm g2").command,
+            Command::Confirm { generation: Some(id) } if id == "g2"
+        ));
+        // `help` is no command, so it can name a git ref.
+        assert!(matches!(
+            parse("stage help").command,
+            Command::Stage { git_ref } if git_ref == "help"
+        ));
         assert!(matches!(
             parse("watch --since 3").command,
             Command::Watch { since: Some(3) }
@@ -1048,14 +1044,32 @@ mod tests {
 
     #[test]
     fn a_bare_confirm_names_the_generation_the_caller_runs_as() {
-        let confirm = |args: &str, own: Option<&str>| match parse(args).command.request(own) {
-            Some(Request::Confirm { generation }) => generation,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(confirm("confirm", Some("g3")).as_deref(), Some("g3"));
-        assert_eq!(confirm("confirm g2", Some("g3")).as_deref(), Some("g2"));
-        assert_eq!(confirm("confirm", Some("")), None);
-        assert_eq!(confirm("confirm", None), None);
+        let confirm = confirm_generation;
+        assert_eq!(confirm(None, Some("g3")).as_deref(), Some("g3"));
+        assert_eq!(confirm(Some("g2"), Some("g3")).as_deref(), Some("g2"));
+        assert_eq!(confirm(None, Some("")), None);
+        assert_eq!(confirm(None, None), None);
+    }
+
+    /// A test run confirms its own generation towards its own daemon, and nothing else.
+    #[test]
+    fn a_test_run_may_confirm_only_its_own_generation_towards_its_own_daemon() {
+        let refusal = test_run_refusal;
+        let other = Some("towards a daemon other than $FAWKES_SOCKET");
+        let none = Some("without a $FAWKES_GENERATION of its own");
+        let another = Some("of a generation other than its own $FAWKES_GENERATION");
+        // Another daemon: whatever it names, whatever it runs as.
+        assert_eq!(refusal(None, None, false), other);
+        assert_eq!(refusal(Some("g3"), Some("g3"), false), other);
+        // Its own daemon, but no generation of its own, an empty one included.
+        assert_eq!(refusal(None, None, true), none);
+        assert_eq!(refusal(None, Some(""), true), none);
+        assert_eq!(refusal(Some("g3"), Some(""), true), none);
+        // A generation it names must be its own.
+        assert_eq!(refusal(Some("g2"), Some("g3"), true), another);
+        assert_eq!(refusal(Some("g3"), Some("g3"), true), None);
+        // A bare confirm towards its own daemon names its own generation.
+        assert_eq!(refusal(None, Some("g3"), true), None);
     }
 
     /// Only a manifest that is not there asks for another one: an invalid one, or one others can write, is fixed in
