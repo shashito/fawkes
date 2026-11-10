@@ -615,6 +615,10 @@ impl Daemon {
         Status {
             name: self.manifest().name.clone(),
             daemon_pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            manifest: self.manifest_path.clone(),
+            state_dir: self.paths.root.clone(),
+            socket: self.socket.clone(),
             permanent: inner.store.state().permanent.clone(),
             current: inner.store.state().current().map(String::from),
             pending: inner.store.state().pending().cloned(),

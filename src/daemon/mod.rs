@@ -25,7 +25,7 @@ use crate::manifest::{Manifest, Vars};
 use crate::process;
 use crate::protocol::{
     DaemonAction, Error, ErrorCode, Event, EventKind, Facts, LastExit, Out, Pending, R,
-    RollbackCause, err,
+    ReloadResult, RollbackCause, err,
 };
 use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time, with_suffix};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -453,6 +453,8 @@ impl Daemon {
                 .and_then(|pipe| signal_hook::low_level::pipe::register(signal, pipe))
                 .map_err(|e| format!("cannot install the signal handlers: {e}"))?;
         }
+        // `status` names it, and a reload reads it again whatever the working directory is by then.
+        let manifest_path = std::path::absolute(manifest_path).map_err(|e| e.to_string())?;
         let manifest = Manifest::load(&manifest_path)?;
         let owner = rustix::process::geteuid().as_raw();
         let mut paths = manifest.paths();
@@ -600,7 +602,8 @@ impl Daemon {
                 return Ok(());
             }
             if self.reload.swap(false, Ordering::SeqCst) {
-                self.reload_manifest();
+                // Logged by `reload_manifest`; a signal has no one to answer.
+                let _ = self.reload_manifest();
             }
             let failed = match listener.accept() {
                 Ok((stream, _)) => {
@@ -662,18 +665,24 @@ impl Daemon {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// SIGHUP: apply what may change while the daemon runs (`Manifest::reload`), or keep the old manifest whole.
-    fn reload_manifest(&self) {
+    /// `fawkes reload` and SIGHUP: apply what may change while the daemon runs (`Manifest::reload`), or keep the old
+    /// manifest whole. Either way the outcome is logged; the answer is for the client that asked, if any.
+    fn reload_manifest(&self) -> R<ReloadResult> {
+        let refuse = |code, message: String| {
+            self.event_with(
+                EventKind::Error,
+                None,
+                format!("manifest not reloaded: {message}"),
+                Facts {
+                    error_code: Some(code),
+                    ..Facts::default()
+                },
+            );
+            Err(err(code, message))
+        };
         let new = match Manifest::load(&self.manifest_path) {
             Ok(new) => new,
-            Err(e) => {
-                self.event(
-                    EventKind::Error,
-                    None,
-                    format!("manifest not reloaded: {e}"),
-                );
-                return;
-            }
+            Err(e) => return refuse(ErrorCode::Usage, e),
         };
         // Held across the swap, so no app starts between the check of `port` and the swap.
         let inner = self.inner();
@@ -693,40 +702,27 @@ impl Daemon {
             }
             _ => reloaded,
         };
-        match reloaded {
-            Ok(changed) if changed.is_empty() => {
-                self.event_with(
-                    EventKind::Daemon,
-                    None,
-                    "manifest reloaded, nothing changed",
-                    Facts {
-                        action: Some(DaemonAction::Reloaded),
-                        changed: Some(Vec::new()),
-                        ..Facts::default()
-                    },
-                );
-            }
-            Ok(changed) => {
-                *lock(&self.manifest) = Arc::new(new);
-                self.event_with(
-                    EventKind::Daemon,
-                    None,
-                    format!("manifest reloaded, changed: {}", changed.join(", ")),
-                    Facts {
-                        action: Some(DaemonAction::Reloaded),
-                        changed: Some(changed.into_iter().map(String::from).collect()),
-                        ..Facts::default()
-                    },
-                );
-            }
-            Err(e) => {
-                self.event(
-                    EventKind::Error,
-                    None,
-                    format!("manifest not reloaded: {e}"),
-                );
-            }
-        }
+        let changed = match reloaded {
+            Ok(changed) => changed.into_iter().map(String::from).collect::<Vec<_>>(),
+            Err(e) => return refuse(ErrorCode::InvalidState, e),
+        };
+        let message = if changed.is_empty() {
+            "manifest reloaded, nothing changed".to_string()
+        } else {
+            *lock(&self.manifest) = Arc::new(new);
+            format!("manifest reloaded, changed: {}", changed.join(", "))
+        };
+        self.event_with(
+            EventKind::Daemon,
+            None,
+            message,
+            Facts {
+                action: Some(DaemonAction::Reloaded),
+                changed: Some(changed.clone()),
+                ..Facts::default()
+            },
+        );
+        Ok(ReloadResult { changed })
     }
 
     /// Stop the live app and any test and clean up; the generations keep their state.

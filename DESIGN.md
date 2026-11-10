@@ -14,7 +14,7 @@ implements all of it except where a section says **later**.
 `fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive; on macOS `fawkes service
 install` sets up launchd, see Service). It is the parent of the app's live process and the only writer of the state
 directory. Every other command (`start`, `stop`, `restart`, `stage`, `test`, `switch`, `up`, `confirm`, `rollback`,
-`prune`, `status`, `log`, `history`, `watch`) is a thin client that sends requests over the daemon's Unix socket and
+`prune`, `status`, `log`, `history`, `reload`, `watch`) is a thin client that sends requests over the daemon's Unix socket and
 renders the answer. One daemon supervises one app; run one daemon per manifest.
 
 A step takes one or both of two slots. The *step* slot belongs to the transaction steps: `stage`, `test` and `prune`
@@ -24,8 +24,8 @@ supervisor's own work (reaping the app after a crash, restarting it after its ba
 lifecycle commands exclude each other and a switch or rollback, and get `busy` while the supervisor works, but a
 `stage`, `test` or `prune` never delays them, and an automatic rollback never waits for a stage or test (it runs
 beside them; a `switch` or `rollback` asked meanwhile gets `busy` from the stage or test). When both slots are
-taken, `busy` names the step in the step slot first, and the live slot's step otherwise. `status`, `log`, `history`
-and `confirm` are always answered.
+taken, `busy` names the step in the step slot first, and the live slot's step otherwise. `status`, `log`, `history`,
+`reload` and `confirm` are always answered.
 
 The daemon is a few threads and no async runtime: one accepts clients, one per client answers it, one supervises
 the app, one per running child waits for its exit, and short-lived ones run health checks and read a step's output.
@@ -43,14 +43,17 @@ file to `daemon.log.1` (replacing the one before) and empties it, between two li
 the daemon decides where stderr goes; the daemon only looks at what it is.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
-state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
-`daemon` event naming the changed fields, or an `error` event saying why it was refused:
+state, so the next start resumes it), `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
+is logged as a `daemon` event naming the changed fields, or an `error` event (with its `error_code`) saying why it was
+refused. `fawkes reload` also answers: the changed fields (`{"changed": ["port", "env"]}`, empty when nothing
+changed), or the refusal, `usage` for a manifest that is invalid and `invalid_state` for the two cases below. A signal
+has no one to answer, so `SIGHUP` only logs:
 
 - `name`, `repo`, `state_dir` and `home` never change by reload; they need a daemon restart. (A changed `home` would
   restore a snapshot into another directory than the one it was taken from.)
 - `port` does not change while the app runs (`stop` it first), nor while a step holds the live process (a switch,
   restart, rollback or the supervisor's own restart: between stopping the old process and starting the new one no app
-  runs, yet the step announces the port it starts on). The reload is refused whole; send `SIGHUP` again once the step
+  runs, yet the step announces the port it starts on). The reload is refused whole; reload again once the step
   has finished.
 - Everything else (`start`, `env`, `health`, `hooks`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`,
   `spare_ports`, `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch, rollback
@@ -512,8 +515,9 @@ fawkes confirm  [<gen>]
 fawkes rollback [--keep-storage]
 fawkes prune
 fawkes status
-fawkes log      [-n N] [--follow]
+fawkes log      [-n, --limit N] [--since N] [--follow]
 fawkes history
+fawkes reload
 fawkes watch    [--since N]
 fawkes service  install|uninstall|restart
 fawkes skill
@@ -525,6 +529,10 @@ after it. `-h` prints a command's usage and `--help` its long help (details, exa
 command, and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`. A mistyped command is a
 usage error that names the similar commands (`tip: a similar subcommand exists: 'log'`), never one run in its place.
 `fawkes --version` (or `-V`) prints `fawkes <version>` and exits 0.
+
+In text, `log` and `history` print nothing, not a blank line, when there are no events or generations to show (`log -n 0`
+included); under `--json` the result is `{"events": []}` as ever. `log --since N` is how an agent asks for what came after
+the last event it saw; with `-n` the newest of those, as `subscribe` replays them.
 
 `fawkes skill` prints `skills/fawkes/SKILL.md` as it was when the binary was built, so the skill an agent installs
 (`fawkes skill > .agents/skills/fawkes/SKILL.md`) always matches the binary. Under `--json`: `{"skill": "<text>"}`.
@@ -596,7 +604,7 @@ for `daemon` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdou
 cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
 decides, and `log --follow` ends with `0`.
 
-`start`, `confirm`, `status`, `history` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
+`start`, `confirm`, `status`, `history`, `reload` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
 fail with exit 1 and `no_answer`, "the daemon … did not answer in time". The other commands wait as long as their step runs, which the
 manifest's timeouts bound, and `log --follow` waits for ever.
 
@@ -727,8 +735,9 @@ Results per command:
 | `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason`, `cause` (see Rollback; of the first rollback decided, so a retry after a failed restore answers that one's) |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
-| `log` | `limit?` (default 20, at most the 1000 newest), `follow?` | `events`; with `follow` the daemon instead sends the newest `limit` events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
+| `log` | `limit?` (default 20 without `since`, at most the 1000 newest), `since?` (a `seq`: the events after it still kept, the newest `limit` of them when both are given; ignored as `subscribe` ignores it), `follow?` | `events`, oldest first; with `follow` the daemon instead sends the same events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
 | `history` | — | `generations`, oldest first, each the generation record plus `log_tail`; `failed_install_tail` |
+| `reload` | — | `changed`: the manifest fields that changed, empty when none; the manifest is read again as for `SIGHUP` (see Process model), and a refusal is `usage` (invalid manifest) or `invalid_state` (a field that cannot change now) |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
 
 `subscribe` is the stream for live clients such as `watch`. With `limit` it first replays that many recent events as
@@ -810,7 +819,8 @@ explain its predecessor's rollback with one call. A client reads a missing field
 `status`:
 
 ```json
-{"name": "sample", "daemon_pid": 812, "permanent": "g2", "current": "g3", "pending": {"generation": "g3",
+{"name": "sample", "daemon_pid": 812, "version": "0.1.0", "manifest": "/apps/sample/fawkes.toml",
+ "state_dir": "/home/me/.fawkes/sample", "socket": "/home/me/.fawkes/sample/fawkes.sock", "permanent": "g2", "current": "g3", "pending": {"generation": "g3",
  "previous": "g2", "deadline": "…"}, "step": "pending", "busy": null,
  "actions": ["stop", "restart", "stage", "confirm g3", "rollback"],
  "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
@@ -825,7 +835,12 @@ the app stays stopped until `rollback` retries it or `rollback --keep-storage` g
 reads `step`, not the presence of `pending`, to know whether a confirm can still happen. A status without `step` is an
 older daemon's; its `pending` awaits a confirm. The text form of `fawkes status` says `waiting for confirm until …`
 only for `pending`, `rolling back gN to gM` for `rolling_back`, and for `restore_failed` that the storage could not be
-restored and which command retries or gives it up. A line `actions: …` (or `actions: none`) comes before the process.
+restored and which command retries or gives it up. A line `actions: …` (or `actions: none`) comes before the process,
+and a line `daemon <version>  manifest …  state_dir …  socket …` follows it.
+
+`version` is the daemon's build, `manifest` the absolute path it loaded and re-reads on `reload`, `state_dir` the
+resolved state directory and `socket` the socket it listens on: they say which daemon answered, which matters when
+several run or a binary was upgraded under a daemon that still runs. A status without them is an older daemon's.
 
 `actions` lists the commands the daemon would accept right now, each as the command line without `fawkes`, so an agent
 picks from it instead of encoding the state machine. The order is fixed: `start`, `stop`, `restart`, `stage`,

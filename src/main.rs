@@ -14,8 +14,8 @@ use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
     ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
-    REQUEST_TIMEOUT, Request, RollbackResult, StageResult, Status, Step, SwitchResult, err,
-    timed_out,
+    REQUEST_TIMEOUT, ReloadResult, Request, RollbackResult, StageResult, Status, Step,
+    SwitchResult, err, timed_out,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -165,11 +165,20 @@ enum Command {
     Status,
     /// Show the generations
     History,
+    /// Read the manifest again, as SIGHUP does
+    ///
+    /// Answers which fields changed. A manifest that is invalid, or a field that cannot change while the daemon (or
+    /// the app) runs, is refused, and the daemon keeps the manifest it has.
+    Reload,
     /// Show the event log
     Log {
-        /// Show the last N events
-        #[arg(short = 'n', value_name = "N")]
+        /// Show the last N events [default: 20, or all of them with --since]
+        #[arg(short = 'n', long, value_name = "N")]
         limit: Option<u64>,
+        /// Show the events after event N, as far back as the daemon keeps them (the newest 1000); with --limit, the
+        /// newest N of those
+        #[arg(long, value_name = "N")]
+        since: Option<u64>,
         /// Keep printing events as they happen
         #[arg(long)]
         follow: bool,
@@ -242,8 +251,14 @@ impl Command {
             Command::Prune => Request::Prune,
             Command::Status => Request::Status,
             Command::History => Request::History,
-            Command::Log { limit, follow } => Request::Log {
+            Command::Reload => Request::Reload,
+            Command::Log {
+                limit,
+                since,
+                follow,
+            } => Request::Log {
                 limit: *limit,
+                since: *since,
                 follow: *follow,
             },
         })
@@ -557,7 +572,11 @@ fn client(
             if cli.json {
                 say(out, result);
             } else {
-                say(out, render_result(request, &result));
+                // An empty log or history is no blank line.
+                let text = render_result(request, &result);
+                if !text.is_empty() {
+                    say(out, text);
+                }
             }
             0
         }
@@ -809,8 +828,20 @@ fn render_status(s: &Status) -> String {
             _ => String::new(),
         }
     };
+    // An older daemon's status has none of these.
+    let daemon = if s.version.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\ndaemon {}  manifest {}  state_dir {}  socket {}",
+            s.version,
+            s.manifest.display(),
+            s.state_dir.display(),
+            s.socket.display()
+        )
+    };
     format!(
-        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nactions: {}\nprocess {}",
+        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nactions: {}\nprocess {}{}",
         s.name,
         s.daemon_pid,
         or_dash(s.busy.as_deref()),
@@ -822,7 +853,8 @@ fn render_status(s: &Status) -> String {
         } else {
             s.actions.join(", ")
         },
-        render_process(&s.process)
+        render_process(&s.process),
+        daemon
     )
 }
 
@@ -918,6 +950,13 @@ fn render_result(request: &Request, result: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }),
+        Request::Reload => typed(result, |r: ReloadResult| {
+            if r.changed.is_empty() {
+                "reloaded the manifest; nothing changed".into()
+            } else {
+                format!("reloaded the manifest; changed: {}", r.changed.join(", "))
+            }
+        }),
         Request::Subscribe { .. } => result.to_string(),
     }
 }
@@ -972,9 +1011,19 @@ mod tests {
                 "log -n 5 --follow",
                 Request::Log {
                     limit: Some(5),
+                    since: None,
                     follow: true,
                 },
             ),
+            (
+                "log --limit 2 --since 40",
+                Request::Log {
+                    limit: Some(2),
+                    since: Some(40),
+                    follow: false,
+                },
+            ),
+            ("reload", Request::Reload),
             ("confirm", Request::Confirm { generation: None }),
             (
                 "confirm g2",
@@ -1019,6 +1068,10 @@ mod tests {
         Status {
             name: "sample".into(),
             daemon_pid: 812,
+            version: "0.3.0".into(),
+            manifest: "/apps/sample/fawkes.toml".into(),
+            state_dir: "/apps/sample/state".into(),
+            socket: "/apps/sample/state/fawkes.sock".into(),
             permanent: Some("g1".into()),
             current: Some("g2".into()),
             pending: with_pending.then(|| Pending {
@@ -1064,6 +1117,18 @@ mod tests {
             "{rolling_back}"
         );
 
+        // Which daemon answered, on a line of its own; an older daemon's status has none of it.
+        let mut status = status_in(None, false);
+        assert!(
+            render_status(&status).ends_with(
+                "\ndaemon 0.3.0  manifest /apps/sample/fawkes.toml  state_dir /apps/sample/state  socket /apps/sample/state/fawkes.sock"
+            ),
+            "{}",
+            render_status(&status)
+        );
+        status.version.clear();
+        assert!(!render_status(&status).contains("manifest"));
+
         let failed = text(Some(Step::RestoreFailed), true);
         assert!(!failed.contains("confirm"), "{failed}");
         assert!(
@@ -1107,6 +1172,7 @@ mod tests {
             Request::History => 10,
             Request::Log { .. } => 11,
             Request::Subscribe { .. } => 12,
+            Request::Reload => 13,
         }
     }
 
@@ -1214,10 +1280,16 @@ mod tests {
             (
                 Request::Log {
                     limit: None,
+                    since: None,
                     follow: false,
                 },
                 serde_json::json!({"events": [event]}),
                 vec!["2030-01-01T00:00:00Z", "switched", "g3", "went live"],
+            ),
+            (
+                Request::Reload,
+                serde_json::json!({"changed": ["port", "env"]}),
+                vec!["reloaded the manifest; changed: port, env"],
             ),
             (
                 Request::Subscribe {
@@ -1487,6 +1559,7 @@ mod tests {
         };
         let request = Request::Log {
             limit: None,
+            since: None,
             follow: true,
         };
         let mut out = Vec::new();
