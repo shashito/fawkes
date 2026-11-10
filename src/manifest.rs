@@ -230,8 +230,6 @@ struct Written {
     health_interval: Duration,
     health_timeout: Duration,
     env: BTreeMap<String, String>,
-    /// Whether the file has `storage`, which `[hooks]` replaced.
-    has_storage: bool,
 }
 
 impl Written {
@@ -289,8 +287,6 @@ impl Written {
             }
         }
 
-        // `storage` is no key of the manifest, so it is not among the valid keys the unknown ones are listed with.
-        let has_storage = top.table.remove("storage").is_some();
         let mut problems = health.finish();
         problems.extend(hooks.finish());
         problems.extend(top.finish());
@@ -316,7 +312,6 @@ impl Written {
             health_interval: interval,
             health_timeout,
             env,
-            has_storage,
         };
         (written, problems)
     }
@@ -762,15 +757,9 @@ impl Written {
         problems
     }
 
-    /// What is wrong with `[hooks]`, and with `storage`, which it replaced.
+    /// What is wrong with `[hooks]`.
     fn hook_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
-        if self.has_storage {
-            problems.push(
-                "storage is no longer read: Fawkes runs the app's own commands instead, `snapshot`, `restore` and `test_copy` in [hooks] (DESIGN.md → Hooks)"
-                    .into(),
-            );
-        }
         let hooks = &self.hooks;
         // A snapshot nothing restores is useless, a restore without a snapshot has nothing to read, and an app whose
         // storage is worth a snapshot must not be tested on an empty home.
@@ -995,10 +984,6 @@ test_copy = "store save {home} {test_home}"
             ("name", with("\"app\"", "\"\"")),
             ("name", with("\"app\"", "\"a b\"")),
             (
-                "storage is no longer read",
-                with("port = 4790", "storage = [\"app.db\"]\nport = 4790"),
-            ),
-            (
                 "hooks.snapshot needs hooks.restore too",
                 with("restore = \"store load {snapshot} {home}\"\n", ""),
             ),
@@ -1108,8 +1093,6 @@ A = 1
 "#;
         let err = Scratch::new().load(text).unwrap_err();
         assert_eq!(err.lines().count(), 1, "{err}");
-        // `storage` is refused with its own message, never offered as a valid key.
-        assert!(!err.contains("`storage`"), "{err}");
         for problem in [
             "unknown key `stop_timout`",
             "unknown key `health.intervall`",

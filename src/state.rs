@@ -157,61 +157,12 @@ impl Txn {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(from = "StateFile")]
+#[serde(default)]
 pub struct State {
     pub generations: Vec<Generation>,
     pub next_id: u32,
     pub permanent: Option<String>,
     pub txn: Option<Txn>,
-}
-
-/// What `state.json` may hold: the current shape and the one before `txn`, which kept a `pending` switch and
-/// derived a failed restore from its generation being `rolled_back`.
-#[derive(Deserialize)]
-struct StateFile {
-    #[serde(default)]
-    generations: Vec<Generation>,
-    #[serde(default)]
-    next_id: u32,
-    permanent: Option<String>,
-    txn: Option<Txn>,
-    pending: Option<Pending>,
-}
-
-impl From<StateFile> for State {
-    fn from(file: StateFile) -> State {
-        let StateFile {
-            generations,
-            next_id,
-            permanent,
-            txn,
-            pending,
-        } = file;
-        let txn = txn.or_else(|| {
-            let pending = pending?;
-            let rolled_back = generations
-                .iter()
-                .find(|g| g.id == pending.generation && g.state == GenState::RolledBack);
-            Some(match rolled_back {
-                Some(g) => Txn::RollingBack {
-                    reason: g
-                        .rollback_reason
-                        .clone()
-                        .unwrap_or_else(|| "no reason recorded".into()),
-                    cause: g.rollback_cause,
-                    pending,
-                    restore_failed: true,
-                },
-                None => Txn::Pending(pending),
-            })
-        });
-        State {
-            generations,
-            next_id,
-            permanent,
-            txn,
-        }
-    }
 }
 
 /// The edges of the generation diagram (DESIGN.md → Generations and states). A stage that fails and `prune` remove
@@ -513,7 +464,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// `State::load`, with its migration and its fall back to the copy.
+    /// `State::load`, with its fall back to the copy.
     pub fn load(path: PathBuf) -> Result<(Store, Option<String>), String> {
         let (state, recovered) = State::load(&path)?;
         Ok((Store { path, state }, recovered))
@@ -894,115 +845,22 @@ mod tests {
         }
     }
 
-    /// A `state.json` as phase 2 wrote it (`State::save` before `txn`): three generations and the `pending` field
-    /// in place of `txn`. `pending` and the state of `g3` vary.
-    fn phase_two_state(pending: &str, g3_state: &str, g3_reason: &str) -> String {
-        let generation = |id: &str, state: &str, reason: &str| {
-            format!(
-                r#"    {{
-      "id": "{id}",
-      "ref": "main",
-      "commit": "0123456789abcdef",
-      "state": "{state}",
-      "dir": "/tmp/fk/generations/{id}/code",
-      "staged_at": "2026-11-03T14:00:00Z",
-      "test": null,
-      "switched_at": null,
-      "confirmed_at": null,
-      "rolled_back_at": null,
-      "rollback_reason": {reason},
-      "failed_starts": 0
-    }}"#
-            )
-        };
-        format!(
-            r#"{{
-  "generations": [
-{},
-{},
-{}
-  ],
-  "next_id": 3,
-  "permanent": "g2",
-  "pending": {pending},
-  "daemon_pid": 812
-}}"#,
-            generation("g1", "retired", "null"),
-            generation("g2", "permanent", "null"),
-            generation("g3", g3_state, g3_reason),
-        )
-    }
-
-    #[test]
-    fn a_phase_two_state_json_loads_with_its_pending_switch_as_a_txn() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let path = root.join("state.json");
-        let pending = pending_json();
-        let load = |text: String| {
-            std::fs::write(&path, text).unwrap();
-            let (state, warning) = State::load(&path).unwrap();
-            assert_eq!(warning, None);
-            state
-        };
-
-        let state = load(phase_two_state(pending, "current", "null"));
-        assert_eq!(state.generations.len(), 3);
-        assert!(["g1", "g2", "g3"].iter().all(|id| state.find(id).is_some()));
-        assert_eq!((state.next_id, state.permanent.as_deref()), (3, Some("g2")));
-        let Some(Txn::Pending(p)) = &state.txn else {
-            panic!("{:?}", state.txn);
-        };
-        assert_eq!(
-            (p.generation.as_str(), p.previous.as_deref()),
-            ("g3", Some("g2"))
-        );
-        assert_eq!(state.current(), Some("g3"));
-
-        // Its generation is rolled back: the switch ended and only the storage restore awaits a retry.
-        let state = load(phase_two_state(
-            pending,
-            "rolled_back",
-            r#""missed confirm deadline""#,
-        ));
-        let Some(Txn::RollingBack {
-            pending,
-            reason,
-            cause,
-            restore_failed,
-        }) = &state.txn
-        else {
-            panic!("{:?}", state.txn);
-        };
-        assert_eq!(pending.generation, "g3");
-        assert_eq!(reason, "missed confirm deadline");
-        assert_eq!(*cause, None, "a state.json written before has no cause");
-        assert!(restore_failed);
-
-        let state = load(phase_two_state("null", "tested", "null"));
-        assert!(state.txn.is_none());
-        assert_eq!(state.current(), Some("g2"));
-
-        // Saved, it keeps `txn` only and reads back the same.
-        let state = load(phase_two_state(pending_json(), "current", "null"));
-        state.save(&path).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(r#""step": "pending""#) && !text.contains(r#""pending":"#));
-        let (again, _) = State::load(&path).unwrap();
-        assert_eq!(
-            serde_json::to_value(&again).unwrap(),
-            serde_json::to_value(&state).unwrap()
-        );
-    }
-
-    fn pending_json() -> &'static str {
-        r#"{"generation": "g3", "previous": "g2", "deadline": "2026-11-03T14:05:00Z"}"#
-    }
-
     #[test]
     fn the_first_reason_of_a_rollback_sticks() {
-        let mut state: State =
-            serde_json::from_str(&phase_two_state(pending_json(), "current", "null")).unwrap();
+        let mut state = State {
+            generations: vec![
+                generation("g1", GenState::Retired),
+                generation("g2", GenState::Permanent),
+                generation("g3", GenState::Current),
+            ],
+            permanent: Some("g2".into()),
+            txn: Some(Txn::Pending(Pending {
+                generation: "g3".into(),
+                previous: Some("g2".into()),
+                deadline: "2026-11-03T14:05:00Z".into(),
+            })),
+            ..State::default()
+        };
         assert!(state.decide_rollback("health check failed", Some(RollbackCause::Unhealthy)));
         assert_eq!(state.rolling_back(), Some("health check failed"));
         let g = state.find("g3").unwrap();

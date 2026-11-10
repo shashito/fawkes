@@ -58,10 +58,6 @@ This builds a release binary and puts `fawkes` in `~/.cargo/bin`, which rustup
 adds to your `PATH`. Run that installed copy rather than `target/`: a supervisor should not run from a build directory
 that the next `cargo build` replaces. To update, pull and run the same command again.
 
-**Upgrading from a build with `storage = [...]`:** that field is gone and such a manifest no longer loads; name the
-app's storage hooks in `[hooks]` instead (DESIGN.md → Hooks). A snapshot the old build took is not one the hooks can
-restore, so install the new build only while no switch is pending (`fawkes status` shows no `pending`).
-
 ## Using it
 
 Each app gets a small TOML manifest: its repository, start and install commands, a health check (URL or command), the

@@ -366,7 +366,6 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
 
 - `name` is not made of letters, digits, `_` and `-` (it becomes a file name);
 - a `reuse` entry is empty, absolute or contains `..` (it is joined onto the worktree);
-- it has `storage`, which `[hooks]` replaced: the error says so;
 - `hooks.snapshot` comes without `hooks.restore` or `hooks.test_copy`, or `hooks.restore` without `hooks.snapshot`
   (the error names the hook that is missing);
 - `{snapshot}` appears anywhere but in `hooks.snapshot` and `hooks.restore`, or `{test_home}` anywhere but in
@@ -489,16 +488,11 @@ are tracked in `hook.pid`, `test_copy` in `step.pid`, so a stopping daemon kills
 the last one left.
 
 **An app without hooks gets a code-only rollback.** The old generation then starts on whatever storage the failed one
-left, migrations included, and every test starts on an empty home, never the live one. This is a change from the
-first design, where Fawkes copied the SQLite files listed in `storage` itself: that is now the app's hook (the
-sample's `examples/sample/hooks.js` and the Ultimate extension's `ultimate/fawkes/storage.ts` copy with `VACUUM
-INTO` a file beside the target and a rename, which a plain `cp` of a live WAL database is not). `snapshot` and
-`restore` come together, and `snapshot` requires `test_copy`, so an app whose storage is worth a snapshot is never
-tested on an empty home.
-
-**Upgrading to this contract:** a manifest with `storage` no longer loads, and a `snapshot/` written before
-(`index.json` and `<n>.sqlite`) is not what the new hooks read. Install this build only with no switch pending, and
-add `[hooks]` to the manifest.
+left, migrations included, and every test starts on an empty home, never the live one. Fawkes never copies the
+storage itself: the hooks do (the sample's `examples/sample/hooks.js` and the Ultimate extension's
+`ultimate/fawkes/storage.ts` copy with `VACUUM INTO` a file beside the target and a rename, which a plain `cp` of a
+live WAL database is not). `snapshot` and `restore` come together, and `snapshot` requires `test_copy`, so an app
+whose storage is worth a snapshot is never tested on an empty home.
 
 ## CLI
 
