@@ -17,10 +17,23 @@ its confirm deadline, Fawkes rolls back to the permanent generation, code and st
 back at most once and is never started again. `DESIGN.md` in the Fawkes repository is the full contract; this file
 is what you need to act.
 
-Every command but `daemon` takes `--json`. Then stdout is exactly one JSON document, the result or an error object
-`{"code": "...", "message": "..."}`, and progress lines go to stderr. Read the `code`, never parse the message.
-Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers. A result only ever gains fields:
-ignore the ones you do not know. `fawkes skill` prints this file as built into the binary you run.
+Every command but `daemon` takes `--json`. Then stdout is one JSON document, the result or an error object
+`{"code": "...", "message": "..."}`, and progress lines go to stderr. The two streams are the exception:
+`log --follow --json` prints one event per line, and `watch --json` one `{"name", "event"}` per line, for as long as
+they run. Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers.
+
+**Read fields, never parse the message.** The message is for people; every fact in it is also a field:
+
+- An error object has `code`, and when they apply `generation` (the generation it is about) and `log` (the absolute
+  path of the log that explains it: read that file).
+- An event has `kind`, `generation` and `message`, plus the facts of its kind: `started` has `pid` and `port`;
+  `switched` has `previous` and `deadline`; `exited` has `code`, `signal` and `restart_at`; `tested` and
+  `test_failed` have `port` and `seconds`; `confirmed` has `named`; `rolled_back` has `to`, `reason`, `cause` and
+  `storage` (`restored`, `kept`, `restore_failed`, `none`); `pruned` has `removed`; `error` has `error_code`; `daemon`
+  has `action` (`started`, `stopped`, `reloaded`, `cleaned_up`, `switch_cut_short`, `deferred`).
+
+A result only ever gains fields, and an enumeration may gain values: ignore the fields you do not know, and treat a
+value you do not know as "something else happened". `fawkes skill` prints this file as built into the binary you run.
 
 ## Which app does a command reach?
 
@@ -46,7 +59,10 @@ None of them set: Fawkes does not run you. Run from the app's repository, or pas
 
 In the `test` phase your home is a copy of the live storage (or empty), and the live app may be running beside you.
 Serve your health check and nothing else: no confirm, no upgrade, no work with effects outside your home (messages
-sent, jobs run, remote writes), since your code is not trusted yet.
+sent, jobs run, remote writes), since your code is not trusted yet. Fawkes enforces part of it: with `FAWKES_PHASE=test`
+every command that changes something (`stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop`,
+`restart`, `reload`) fails with `test_phase`, whichever app it names. `status`, `history`, `log`, `wait` and `watch`
+still work.
 
 ## Confirm yourself
 
@@ -69,16 +85,24 @@ effects.
 ## Upgrade
 
 ```sh
-fawkes up <ref> [--deadline SECS] --json
+fawkes up <ref> [--deadline SECS] --json && fawkes wait --json
 ```
 
 `up` stages the ref, tests it and switches to it, streaming each step's progress on stderr; it ends with the result
-of the switch (`generation`, `previous`, `deadline`). Any step's failure is that step's error, and nothing is
-switched. `up` never confirms: the new generation confirms itself.
+of the switch (`generation`, `previous`, `deadline`), plus `existing` (the stage found the commit already built) and
+`test` (the test's record). Any step's failure is that step's error, with `step` (`stage`, `test` or `switch`) saying
+which, and nothing is switched. `up` never confirms: the new generation confirms itself.
+
+`up` returns as soon as the new generation is live. `fawkes wait [<gen>]` (default: the pending generation) then
+waits for the outcome: exit `0` with the record once it is permanent, or exit `1` with `rolled_back` (its `cause`
+says why) or, when the rollback could not restore the storage, `storage_failed`. It is bounded by the confirm
+deadline, answers at once for a generation already decided, so it is safe to retry, and fails `invalid_state` when
+nothing is pending. Upgrading an app other than yourself, always follow `up` with `wait`.
 
 If you run `up` on yourself (you are the live app upgrading your own code), the switch stops you, and your `up`
-client with you. That is expected: the daemon finishes the switch without you, and the new generation reads the
-outcome. A failed stage or test still reaches you, since you are only stopped once the switch begins.
+client with you, so there is no `wait` for you. That is expected: the daemon finishes the switch without you, and the
+new generation reads the outcome. A failed stage or test still reaches you, since you are only stopped once the switch
+begins.
 
 Before retrying an `up` whose answer you never got, read `status`: if a switch is pending (`step` is `pending`), the
 last `up` got as far as the switch, and another one would only be refused at its switch. Otherwise `up` again is safe:
@@ -111,15 +135,31 @@ machine yourself. While `busy` names a step in progress, the commands it would r
 status again when `busy` is null. An empty list means a step is under way that leaves nothing else to do: wait for it. `step` says where a transaction is: `switching`, `pending` (awaits confirm), `rolling_back`,
 `restore_failed`, or null.
 
+`status` also says which daemon answered: `version`, `manifest` (the file it loaded), `state_dir` and `socket`. After
+editing the manifest, `fawkes reload --json` applies it and answers `changed` (the fields that changed), or refuses
+(`usage` for an invalid manifest, `invalid_state` for a field that needs a daemon restart or a stopped app).
+
 ## When something rolled back
 
 ```sh
 fawkes history --json
 ```
 
-Each generation carries its `state`, `rollback_reason` (`missed confirm deadline`, `health check failed`, a crash, …),
-its last `test`, and `log_tail`: the last lines of its app log. `failed_install_tail` holds the end of the latest
-failed install's log (that stage's generation is removed). `fawkes log -n 50 --json` gives the event log.
+Each generation carries its `state`, `rollback_cause`, its last `test`, and `log_tail`: the last lines of its app
+log. `rollback_cause` decides what you do next:
+
+| `rollback_cause` | Means | What to do |
+|---|---|---|
+| `deadline` | It did not confirm before its deadline. | Confirm sooner, or switch with a longer `--deadline`. |
+| `exited` | Its process exited before it confirmed. | Read `log_tail`; fix the code. |
+| `unhealthy` | Its health check gave up (`rollback_on_unhealthy`). | Read `log_tail`; fix the code or the check. |
+| `start_failed` | The switch could not start it. | Check the manifest's `start`. |
+| `requested` | `fawkes rollback` asked for it. | Nothing went wrong by itself. |
+| `daemon_restart` | The daemon ended while it was pending. | Upgrade again. |
+
+`rollback_reason` is the same as text for people. `failed_install_tail` holds the end of the latest failed install's
+log (that stage's generation is removed). `fawkes log -n 50 --json` gives the event log; `fawkes log --since N --json`
+gives the events after the `seq` N you saw last.
 
 ## Error codes
 
@@ -132,10 +172,12 @@ failed install's log (that stage's generation is removed). `fawkes log -n 50 --j
 | `git_failed` | The ref is not a commit in the repository, or git failed creating the worktree. | Check the ref (push or fetch it into the repository Fawkes stages from). |
 | `install_failed` | The install command failed or timed out; the generation is removed. | Read `failed_install_tail` in `history`, fix, stage again. |
 | `health_failed` | The test run never passed its health check; the generation is `test_failed`. | Read its `log_tail` and `test.message`; fix and stage a new commit, or `test` again. |
-| `storage_failed` | A storage hook (`snapshot`, `restore`, `test_copy`) failed or timed out. A failed snapshot means no switch happened; a failed restore leaves the app stopped. | Read `generations/<id>/logs/hooks.log`. After a failed restore: `fawkes rollback` retries it; `fawkes rollback --keep-storage` gives it up and starts the permanent generation on the storage as it is (it may already be migrated). |
+| `storage_failed` | A storage hook (`snapshot`, `restore`, `test_copy`) failed or timed out. A failed snapshot means no switch happened; a failed restore leaves the app stopped. | Read the file the error's `log` names. After a failed restore: `fawkes rollback` retries it; `fawkes rollback --keep-storage` gives it up and starts the permanent generation on the storage as it is (it may already be migrated). |
 | `start_failed` | The process could not be started, or no spare port was free for a test. A switch whose target cannot start is rolled back at once. | Check the `start` command and the spare ports. |
 | `port_in_use` | Another process took the test's spare port. The generation is unchanged. | `test` again. |
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
+| `rolled_back` | `fawkes wait`: the generation rolled back. Produced by the client. | Read its `cause` and `fawkes history`. |
+| `test_phase` | A command that changes something, run with `FAWKES_PHASE=test`. Produced by the client. | Nothing: a test run serves its health check only. |
 | `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes daemon --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a launchd agent. |
 | `no_answer` | The daemon took a quick request and did not answer within 30 s. Produced by the client. | Check `fawkes status`; the daemon may be stuck. |
 | `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; from a shell outside the app, `fawkes service install` again replaces the plist and reloads it. |
@@ -146,9 +188,10 @@ A code not in this table comes from a newer Fawkes: treat it as a failed command
 
 On macOS the daemon may run as a launchd agent (`fawkes service install`, plist
 `~/Library/LaunchAgents/dev.fawkes.<name>.plist`, its stderr in `<state_dir>/daemon.log`). Nothing changes for you:
-the same commands reach it over the same socket. Never run `fawkes service` (`install`, `restart` or `uninstall`) from inside
-the app it supervises: each stops the daemon and the app, you with it, and a pending switch rolls back; a client
-that dies before its `bootstrap` leaves the agent unloaded until someone logs in.
+the same commands reach it over the same socket. `fawkes service` (`install`, `restart` or `uninstall`) run from inside
+the app it supervises is refused (`invalid_state`): each stops the daemon and the app, you with it, and a pending
+switch rolls back; a client that dies before its `bootstrap` leaves the agent unloaded until someone logs in. Ask a
+person to run it from a shell outside the app.
 
 ## Storage rolls back only through the app's hooks
 
