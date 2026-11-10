@@ -37,7 +37,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -72,6 +72,15 @@ impl App {
             started: Instant::now(),
             started_at: now(),
         }
+    }
+
+    /// The app's exit status once it has exited, None while it runs: the one answer to "has the live app exited?".
+    /// `try_wait` keeps the status it reaps, so the supervisor's `reap` still sees an exit found here first. An error
+    /// (which a child of ours never gives) counts as running: only `reap` takes an app out, so an exit counted
+    /// without a status would be one nothing ever handles, while a pending generation that counts as running still
+    /// rolls back on a failed health check or at its deadline.
+    fn exit_status(&mut self) -> Option<ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 }
 
@@ -162,7 +171,7 @@ impl Inner {
     /// stop that was asked for.
     fn refuse_exited(&mut self) -> R<()> {
         if let Some(app) = self.running_mut()
-            && matches!(app.child.try_wait(), Ok(Some(_)))
+            && app.exit_status().is_some()
         {
             return Err(err(
                 ErrorCode::Busy,

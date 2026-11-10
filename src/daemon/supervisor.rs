@@ -204,7 +204,7 @@ impl Daemon {
         }
         let exited = inner
             .running_mut()
-            .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_))));
+            .is_some_and(|app| app.exit_status().is_some());
         let rollback = match &inner.store.state().txn {
             Some(Txn::Pending(pending)) => {
                 exited
@@ -286,9 +286,7 @@ impl Daemon {
     /// other is restarted after a backoff or, after too many failed starts, given up. Returns the process group, which
     /// the caller ends once it has released `inner`.
     fn reap(&self, inner: &mut Inner) -> Option<u32> {
-        let status = inner
-            .running_mut()
-            .and_then(|a| a.child.try_wait().ok().flatten())?;
+        let status = inner.running_mut().and_then(App::exit_status)?;
         let app = inner.take_running()?;
         let ran = app.started.elapsed();
         let m = self.manifest();
@@ -506,10 +504,10 @@ impl Daemon {
     fn judge_unhealthy(&self, id: &str, pid: u32, roll_back: bool) -> bool {
         let mut inner = self.inner();
         // A process that has exited is not news either, though the supervisor may not have reaped it yet: its exit
-        // ended the check, and `reap` judges it with its own reason. `try_wait` keeps the status for `reap`.
+        // ended the check, and `reap` judges it with its own reason.
         if inner
             .running_mut()
-            .is_none_or(|app| app.child.id() != pid || !matches!(app.child.try_wait(), Ok(None)))
+            .is_none_or(|app| app.child.id() != pid || app.exit_status().is_some())
         {
             return false;
         }
@@ -906,7 +904,7 @@ mod tests {
             daemon
                 .inner()
                 .running_mut()
-                .is_some_and(|app| matches!(app.child.try_wait(), Ok(Some(_)))),
+                .is_some_and(|app| app.exit_status().is_some()),
             "the exit is still there for `reap`"
         );
     }

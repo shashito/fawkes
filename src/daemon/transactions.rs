@@ -901,7 +901,7 @@ impl Daemon {
         // by the supervisor; making it permanent would keep crashed code.
         match inner.running_mut() {
             Some(app) if app.generation == pending.generation => {
-                if let Ok(Some(status)) = app.child.try_wait() {
+                if let Some(status) = app.exit_status() {
                     return Err(invalid_state(format!(
                         "{} exited ({}) before it was confirmed and is being rolled back",
                         pending.generation,
