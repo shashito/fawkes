@@ -593,13 +593,36 @@ impl Manifest {
         reason = "the timeouts are copied from the manifest text, never computed: any difference is a change the user wrote"
     )]
     pub fn reload(&self, new: &Manifest, app_running: bool) -> Result<Vec<&'static str>, String> {
+        // Every field is named, so a new one fails to compile until it is named here, and is an unused variable until
+        // one of the two lists below compares it.
+        let Manifest {
+            name,
+            repo,
+            state_dir,
+            home,
+            hooks,
+            port,
+            spare_ports,
+            install,
+            install_timeout,
+            reuse,
+            keep,
+            start,
+            deadline,
+            stop_timeout,
+            min_uptime,
+            max_failed_starts,
+            rollback_on_unhealthy,
+            health,
+            env,
+        } = self;
         // The daemon's identity, its state and the home a restore writes to are fixed for its lifetime: a changed
         // `home` would restore a snapshot into a different directory than the one it was taken from.
         let fixed = [
-            ("name", self.name != new.name),
-            ("repo", self.repo != new.repo),
-            ("state_dir", self.state_dir != new.state_dir),
-            ("home", self.home != new.home),
+            ("name", *name != new.name),
+            ("repo", *repo != new.repo),
+            ("state_dir", *state_dir != new.state_dir),
+            ("home", *home != new.home),
         ];
         let refused = differing(&fixed);
         let mut problems = Vec::new();
@@ -609,7 +632,7 @@ impl Manifest {
                 refused.join(", ")
             ));
         }
-        if app_running && self.port != new.port {
+        if app_running && *port != new.port {
             problems.push(
                 "port cannot change while the app is running: `fawkes stop` the app first, then reload again".into(),
             );
@@ -618,30 +641,27 @@ impl Manifest {
             return Err(problems.join("; "));
         }
         let reloadable = [
-            ("port", self.port != new.port),
-            ("spare_ports", self.spare_ports != new.spare_ports),
-            ("install", self.install != new.install),
-            (
-                "install_timeout",
-                self.install_timeout != new.install_timeout,
-            ),
-            ("keep", self.keep != new.keep),
-            ("reuse", self.reuse != new.reuse),
-            ("start", self.start != new.start),
-            ("deadline", self.deadline != new.deadline),
-            ("stop_timeout", self.stop_timeout != new.stop_timeout),
-            ("min_uptime", self.min_uptime != new.min_uptime),
+            ("port", *port != new.port),
+            ("spare_ports", *spare_ports != new.spare_ports),
+            ("install", *install != new.install),
+            ("install_timeout", *install_timeout != new.install_timeout),
+            ("keep", *keep != new.keep),
+            ("reuse", *reuse != new.reuse),
+            ("start", *start != new.start),
+            ("deadline", *deadline != new.deadline),
+            ("stop_timeout", *stop_timeout != new.stop_timeout),
+            ("min_uptime", *min_uptime != new.min_uptime),
             (
                 "max_failed_starts",
-                self.max_failed_starts != new.max_failed_starts,
+                *max_failed_starts != new.max_failed_starts,
             ),
             (
                 "rollback_on_unhealthy",
-                self.rollback_on_unhealthy != new.rollback_on_unhealthy,
+                *rollback_on_unhealthy != new.rollback_on_unhealthy,
             ),
-            ("health", self.health != new.health),
-            ("hooks", self.hooks != new.hooks),
-            ("env", self.env != new.env),
+            ("health", *health != new.health),
+            ("hooks", *hooks != new.hooks),
+            ("env", *env != new.env),
         ];
         Ok(differing(&reloadable))
     }
