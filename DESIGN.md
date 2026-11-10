@@ -368,6 +368,11 @@ that hangs nor what a finished one left running outlives it. `git worktree add` 
 `install_timeout` seconds, the other git calls 60. Past it the step fails with "timed out".
 `git worktree add` skips the repository's hooks (`core.hooksPath=/dev/null`); the install is the place for setup.
 
+A process group, the app's, a step's or a leftover's, has ended once none of its members runs: a member that has
+exited counts as gone before it is reaped. macOS's `kill` of a group already skips such a zombie. Linux's still finds
+it, so there the members are looked up in `/proc`: an init that never reaps orphans, as in some containers and
+sandboxes, would otherwise keep a killed member, and so its group, alive for good.
+
 A health attempt is bounded too. A `url` attempt must connect, send and read the status line (at most 1 KiB of it)
 within 2 s in all, however slowly the app answers. A `command` attempt gets 10 s, and its process group is ended when
 it finishes, passed or not, so nothing it backgrounded outlives it; the wait for the group after SIGKILL is bounded
@@ -900,7 +905,8 @@ For the daemon and CLI, each replacing something not worth hand-writing:
 - **jiff** (no default features; `std`): UTC timestamps in `state.json`, the event log and the protocol, and the
   times `watch` compares to its start. It replaces hand-written calendar arithmetic.
 - **libc:** what neither std nor rustix has: a process's start time for the leftover-app check (`proc_pidinfo` on
-  macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS).
+  macOS) and the boot time (`sysctlbyname("kern.boottime")` on macOS). Linux reads both, and a process group's
+  members, from `/proc` (`/proc/<pid>/stat`, `/proc/stat`'s `btime`) without it.
 
 For the tests only, **tempfile**: the unit tests' scratch directories, removed even when a test fails. The
 integration harness keeps `/tmp/fk<port>`, which belongs to its port claim and stays short for socket paths. It and

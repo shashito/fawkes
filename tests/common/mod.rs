@@ -391,7 +391,8 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
         command
     }
 
-    /// The binary under test, to copy.
+    /// The binary under test, to copy for the launchd tests, which are macOS's alone.
+    #[cfg(target_os = "macos")]
     pub fn binary() -> &'static Path {
         Path::new(BIN)
     }

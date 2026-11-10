@@ -47,8 +47,8 @@ The semantics are borrowed, not invented:
 
 ## Installation
 
-Fawkes builds with stable Rust ([rustup](https://rustup.rs)) and needs `git` at run time. It runs on macOS; Linux is
-not tested yet. From a checkout of this repository:
+Fawkes builds with stable Rust ([rustup](https://rustup.rs)) and needs `git` at run time. It runs on macOS and
+Linux. From a checkout of this repository:
 
 ```sh
 cargo install --path . --locked
@@ -116,7 +116,7 @@ Login, reachable over the tailnet or your network) before you depend on it.
 A working prototype. Everything in [DESIGN.md](DESIGN.md) is built except its **Later** section: the transaction
 (`stage`, `test`, `switch`, `confirm`, automatic and manual `rollback`), `start`, `stop` and `restart` with crash
 restarts and backoff, `prune`, manifest reload on SIGHUP, and `watch`. It has been tested against a copy of an
-Ultimate fork, never a live install. It runs on macOS; the Linux code paths have not been compiled or tested yet.
+Ultimate fork, never a live install. The test suite passes on macOS and on Linux (an Alpine micro-VM).
 
 ## Running the tests
 

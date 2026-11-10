@@ -202,15 +202,34 @@ fn start_time(pid: u32) -> Option<f64> {
     (written == size).then(|| info.pbi_start_tvsec as f64 + info.pbi_start_tvusec as f64 / 1e6)
 }
 
-/// When process `pid` started, in seconds since the epoch; None when there is no such process.
+/// The fields of `/proc/<pid>/stat` from field 3, the state, on, while the process runs; None when there is no such
+/// process, or when it has exited and waits to be reaped (a zombie), as on macOS, where neither `proc_pidinfo` nor a
+/// group's `kill` finds one. The command name before them, in parentheses, is free to contain spaces.
+#[cfg(target_os = "linux")]
+fn running_stat(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(')')?.1.trim_start();
+    (!has_exited(fields)).then(|| fields.to_owned())
+}
+
+/// Whether the `/proc/<pid>/stat` fields of `running_stat` are a process's that has exited. The state is its main
+/// thread's, which is a zombie too when only that thread has exited and the others run on: field 20, the number of
+/// threads, tells the two apart.
+#[cfg(target_os = "linux")]
+fn has_exited(fields: &str) -> bool {
+    let mut fields = fields.split_whitespace();
+    matches!(fields.next(), Some("Z" | "X"))
+        && fields
+            .nth(16)
+            .and_then(|threads| threads.parse::<u32>().ok())
+            .is_none_or(|threads| threads <= 1)
+}
+
+/// When process `pid` started, in seconds since the epoch; None when there is no such process, or it has exited.
 #[cfg(target_os = "linux")]
 fn start_time(pid: u32) -> Option<f64> {
-    // Field 22 of /proc/<pid>/stat, in clock ticks since boot; the fields after the command name (in parentheses,
-    // and free to contain spaces) start at field 3.
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let ticks: f64 = stat
-        .rsplit_once(')')?
-        .1
+    // Field 22, in clock ticks since boot.
+    let ticks: f64 = running_stat(&pid.to_string())?
         .split_whitespace()
         .nth(19)?
         .parse()
@@ -285,9 +304,45 @@ pub fn leftover(pid_file: &Path) -> Option<u32> {
     (written - 60.0 <= started && started <= written + 1.0 && group_alive(pid)).then_some(pid)
 }
 
-/// Does any process of group `pgid` still exist?
+/// Does any process of group `pgid` still run? A member that has exited is not counted, reaped or not.
+#[cfg(target_os = "macos")]
 pub fn group_alive(pgid: u32) -> bool {
     group(pgid).is_some_and(|group| test_kill_process_group(group).is_ok())
+}
+
+/// Does any process of group `pgid` still run? A member that has exited is not counted, reaped or not.
+///
+/// Linux's `kill` also finds a zombie, a member that has exited and waits for its parent to reap it, and the parent
+/// of an orphaned member may never do so: an init that does not reap, as some containers' and sandboxes' do not,
+/// keeps it for good. So a group the kernel still finds is looked up in /proc, for a member that has not exited.
+#[cfg(target_os = "linux")]
+pub fn group_alive(pgid: u32) -> bool {
+    if group(pgid).is_none_or(|group| test_kill_process_group(group).is_err()) {
+        return false;
+    }
+    // Without a /proc of our own, the kernel's answer is all there is: another PID namespace's numbers its processes
+    // differently, and would find none of the group.
+    if std::fs::read_link("/proc/self").ok() != Some(std::process::id().to_string().into()) {
+        return true;
+    }
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    let pgid = pgid.to_string();
+    // Field 5, the process group.
+    let member = |pid: &str| {
+        running_stat(pid)
+            .is_some_and(|fields| fields.split_whitespace().nth(2) == Some(pgid.as_str()))
+    };
+    // The leader is the member that runs most of the time, and saves reading every other process.
+    member(&pgid)
+        || processes.flatten().any(|process| {
+            process
+                .file_name()
+                .to_str()
+                .filter(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+                .is_some_and(member)
+        })
 }
 
 pub fn kill_group(pgid: u32) {
@@ -310,7 +365,7 @@ pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Op
         return status;
     }
     kill_group(pgid);
-    // The leader is reaped inside the same bound: until it is, it stays a zombie, and a zombie still counts as alive.
+    // The leader is reaped inside the same bound, for its exit status and so that it leaves no zombie behind.
     wait_group(pgid, leader, &mut status, Instant::now() + KILL_WAIT);
     status
 }
@@ -554,6 +609,38 @@ mod tests {
 
         stop_group(pgid, 1.0, None);
         assert_eq!(leftover(&pid_file), None, "the group is gone");
+    }
+
+    #[test]
+    fn a_group_whose_members_have_all_exited_has_ended_before_they_are_reaped() {
+        // An exited member stays a zombie until its parent reaps it, and an init that never reaps orphans (a
+        // container's or a sandbox's) keeps one for good. Here the test is the parent that has not reaped it yet.
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        exited(&child)
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no notice of the exit");
+
+        assert!(!group_alive(child.id()), "a zombie counted as alive");
+        assert_eq!(start_time(child.id()), None, "a zombie has a start time");
+        child.wait().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_main_thread_has_exited_runs_on_while_another_thread_does() {
+        // `/proc/<pid>/stat` after the command name, from Linux: a zombie, a process whose main thread called
+        // `pthread_exit` while a second thread sleeps, and that second thread.
+        let zombie = "Z 1 0 0 0 -1 4227084 62 0 0 0 0 0 0 0 20 0 1 0 151 0 0";
+        let main_thread_exited = "Z 654 656 656 0 -1 4227084 65 3176 0 26 0 0 2 2 20 0 2 0 50 0 0";
+        let thread = "S 654 656 656 0 -1 4194368 0 0 0 0 0 0 0 0 20 0 2 0 67 0 0";
+
+        assert!(has_exited(zombie));
+        assert!(!has_exited(main_thread_exited));
+        assert!(!has_exited(thread));
     }
 
     #[test]
@@ -810,7 +897,7 @@ mod tests {
         let _cleanup = KillGroup(pgid);
         assert_eq!(result, Err("health command timed out after 1s".into()));
         assert!(waited < Duration::from_secs(5), "waited {waited:?}");
-        // The killed `sleep`s are gone once whoever inherited them has reaped them.
+        // The killed `sleep`s take a moment to exit, longer on a loaded machine.
         let give_up = Instant::now() + Duration::from_secs(5);
         while group_alive(pgid) {
             assert!(
