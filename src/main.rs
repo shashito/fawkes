@@ -1175,10 +1175,12 @@ mod tests {
     #[test]
     fn the_service_is_refused_only_from_inside_its_own_app() {
         let dir = tempfile::tempdir().unwrap();
+        // Plain files: `same_file` compares inodes, and a socket bound under a long temp directory would exceed the
+        // socket path limit.
         let socket = dir.path().join("fawkes.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
+        std::fs::write(&socket, "").unwrap();
         let other = dir.path().join("other.sock");
-        let _other = UnixListener::bind(&other).unwrap();
+        std::fs::write(&other, "").unwrap();
         let spelt_otherwise = dir.path().join(".").join("fawkes.sock");
 
         assert!(inside_its_app(true, Some(&socket), &socket));
