@@ -535,9 +535,6 @@ In text, `log` and `history` print nothing, not a blank line, when there are no 
 included); under `--json` the result is `{"events": []}` as ever. `log --since N` is how an agent asks for what came after
 the last event it saw; with `-n` the newest of those, as `subscribe` replays them.
 
-`fawkes tui` is a hidden tombstone for the removed terminal UI: a usage error (exit 2), "the TUI was removed; `fawkes
-watch` prints every app's events", as an error object under `--json`.
-
 `fawkes skill` prints `skills/fawkes/SKILL.md` as it was when the binary was built, so the skill an agent installs
 (`fawkes skill > .agents/skills/fawkes/SKILL.md`) always matches the binary. Under `--json`: `{"skill": "<text>"}`.
 

@@ -231,13 +231,10 @@ enum Command {
     /// --json it is the string of {"skill"}.
     #[command(after_long_help = "Example:\n  fawkes skill > .agents/skills/fawkes/SKILL.md")]
     Skill,
-    /// Removed: `fawkes watch` replaced it
-    #[command(hide = true)]
-    Tui,
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon`, `watch`, `wait`, `service`, `skill`, `tui` and `up` (three
+    /// The request this command sends to the daemon; `daemon`, `watch`, `wait`, `service`, `skill` and `up` (three
     /// requests) send none.
     /// `own_generation` is `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from
     /// it names that generation, so an app's test run (or anything it left behind) cannot confirm another generation
@@ -249,7 +246,6 @@ impl Command {
             | Command::Service { .. }
             | Command::Wait { .. }
             | Command::Skill
-            | Command::Tui
             | Command::Up { .. } => return None,
             Command::Start => Request::Start,
             Command::Stop => Request::Stop,
@@ -318,8 +314,7 @@ impl Command {
             | Command::Watch { .. }
             | Command::Wait { .. }
             | Command::Service { .. }
-            | Command::Skill
-            | Command::Tui => None,
+            | Command::Skill => None,
         }
     }
 }
@@ -349,15 +344,6 @@ fn main() -> ExitCode {
             };
         }
     };
-    if matches!(cli.command, Command::Tui) {
-        let message = "the TUI was removed; `fawkes watch` prints every app's events".into();
-        return ExitCode::from(fail(
-            cli.json,
-            &mut std::io::stdout(),
-            ErrorCode::Usage,
-            message,
-        ));
-    }
     let given = Given::new(cli.socket.clone(), cli.manifest.clone());
     if matches!(cli.command, Command::Daemon) {
         // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of
@@ -456,7 +442,7 @@ fn main() -> ExitCode {
             &mut stdout,
         ));
     }
-    // `daemon`, `watch`, `wait`, `service`, `skill`, `tui` and `up` returned above, so every command left sends a request.
+    // `daemon`, `watch`, `wait`, `service`, `skill` and `up` returned above, so every command left sends a request.
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
         let message = "this command sends no request to a daemon".to_string();
         return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
