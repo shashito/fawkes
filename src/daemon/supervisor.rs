@@ -8,8 +8,8 @@ use super::transactions::{check_abandon, check_prune, check_rollback, check_swit
 use super::{App, Daemon, Inner, LOG_BYTES, Live, Slot, Why, tenths};
 use crate::process;
 use crate::protocol::{
-    ErrorCode, EventKind, History, HistoryEntry, LastExit, Out, Process, ProcessState, R, Status,
-    err, not_found,
+    DaemonAction, ErrorCode, EventKind, Facts, History, HistoryEntry, LastExit, Out, Process,
+    ProcessState, R, RollbackCause, Status, err, not_found,
 };
 use crate::state::{Txn, format_time, now_secs, parse_time, with_suffix};
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -178,10 +178,11 @@ impl Daemon {
         if let Some(reason) = rollback {
             // `busy` is a rollback that ended while the daemon shuts down: `start_or_give_up` logged what it did
             // not start.
-            if let Err(e) = self.rollback_pending(&mut Out::none(), &reason)
+            // Decided already, so it keeps the cause it was decided for.
+            if let Err(e) = self.rollback_pending(&mut Out::none(), &reason, None)
                 && e.code != ErrorCode::Busy
             {
-                self.event(EventKind::Error, None, e.message);
+                self.error_event(&e);
             }
             return Pass::Acted;
         }
@@ -272,7 +273,11 @@ impl Daemon {
         if let Some(Txn::Pending(pending)) = &inner.store.state().txn
             && now_secs() >= self.deadline_secs(pending)
         {
-            self.decide_rollback(inner, "missed confirm deadline");
+            self.decide_rollback(
+                inner,
+                "missed confirm deadline",
+                Some(RollbackCause::Deadline),
+            );
         }
     }
 
@@ -310,25 +315,35 @@ impl Daemon {
                 None => (0, outcome(0, pending, m.max_failed_starts)),
             };
             if pending {
-                state.decide_rollback(&format!("exited before confirm ({})", exit.describe()));
+                state.decide_rollback(
+                    &format!("exited before confirm ({})", exit.describe()),
+                    Some(RollbackCause::Exited),
+                );
             }
             decided
         });
         let mut message = format!("{} after {:.1}s", exit.describe(), ran.as_secs_f64());
+        let mut facts = Facts {
+            code: exit.code,
+            signal: exit.signal,
+            ..Facts::default()
+        };
         match outcome {
             // The next supervision pass carries the rollback out.
             Outcome::RollBack => {}
             Outcome::GiveUp => inner.live = Live::Failed,
             Outcome::Restart { after } => {
+                let at = format_time(now_secs() + after.as_secs());
+                facts.restart_at = Some(at.clone());
                 inner.live = Live::Backoff {
                     until: Instant::now() + after,
-                    at: format_time(now_secs() + after.as_secs()),
+                    at,
                 };
                 message = format!("{message}; restarting in {}s", after.as_secs());
             }
         }
         inner.last_exit = Some(exit);
-        self.event(EventKind::Exited, Some(&app.generation), message);
+        self.event_with(EventKind::Exited, Some(&app.generation), message, facts);
         if outcome == Outcome::GiveUp {
             self.event(
                 EventKind::Failed,
@@ -367,6 +382,7 @@ impl Daemon {
                     ErrorCode::StartFailed,
                     format!("cannot create the home {} for {id}: {e}", m.home.display()),
                 )
+                .about(id)
             })?;
         let child = process::spawn(
             &vars.expand_command(&m.start),
@@ -376,7 +392,11 @@ impl Daemon {
             &format!("start {id} live port {}", m.port),
             Some(&self.paths.app_pid()),
         )
-        .map_err(|e| err(ErrorCode::StartFailed, format!("cannot start {id}: {e}")))?;
+        .map_err(|e| {
+            err(ErrorCode::StartFailed, format!("cannot start {id}: {e}"))
+                .about(id)
+                .with_log(self.paths.app_log(id))
+        })?;
         let pid = child.id();
         // Its exit wakes the supervisor to reap it, and ends the health check's wait between two tries.
         let (tell_health, exited) = mpsc::channel();
@@ -404,10 +424,15 @@ impl Daemon {
             }
         });
         self.point_current_link(&g.dir);
-        self.event(
+        self.event_with(
             EventKind::Started,
             Some(id),
             format!("pid {pid} on port {}", m.port),
+            Facts {
+                pid: Some(pid),
+                port: Some(m.port),
+                ..Facts::default()
+            },
         );
 
         // Health never confirms: only `confirm` makes a generation permanent. With `rollback_on_unhealthy` a pending
@@ -455,12 +480,16 @@ impl Daemon {
             return false;
         };
         if self.shutting_down() {
-            self.event(
+            self.event_with(
                 EventKind::Daemon,
                 Some(id),
                 format!(
                     "{id} not started: the daemon is shutting down, and its next start runs {id}"
                 ),
+                Facts {
+                    action: Some(DaemonAction::Deferred),
+                    ..Facts::default()
+                },
             );
             return true;
         }
@@ -487,7 +516,11 @@ impl Daemon {
         if roll_back
             && matches!(&inner.store.state().txn, Some(Txn::Pending(pending)) if pending.generation == id)
         {
-            self.decide_rollback(&mut inner, "health check failed");
+            self.decide_rollback(
+                &mut inner,
+                "health check failed",
+                Some(RollbackCause::Unhealthy),
+            );
         }
         true
     }
@@ -495,9 +528,16 @@ impl Daemon {
     /// Decide to roll back the pending switch for `reason` (`State::decide_rollback`), and save the decision. The
     /// caller holds `inner` from learning why, so no confirm fits in between. The save is bookkeeping: the decision
     /// stands in memory, and a daemon that restarts rolls a pending switch back either way.
-    pub(super) fn decide_rollback(&self, inner: &mut Inner, reason: &str) {
+    pub(super) fn decide_rollback(
+        &self,
+        inner: &mut Inner,
+        reason: &str,
+        cause: Option<RollbackCause>,
+    ) {
         if matches!(inner.store.state().txn, Some(Txn::Pending(_))) {
-            self.update(&mut inner.store, |state| state.decide_rollback(reason));
+            self.update(&mut inner.store, |state| {
+                state.decide_rollback(reason, cause)
+            });
         }
     }
 
@@ -881,6 +921,7 @@ mod tests {
         let rolling_back = |restore_failed| Txn::RollingBack {
             pending: pending(),
             reason: "unhealthy".into(),
+            cause: Some(RollbackCause::Unhealthy),
             restore_failed,
         };
         let cases = [
@@ -932,6 +973,7 @@ mod tests {
             confirmed_at: None,
             rolled_back_at: None,
             rollback_reason: None,
+            rollback_cause: None,
             failed_starts: 0,
             restore_abandoned_at: None,
         };

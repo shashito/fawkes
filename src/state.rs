@@ -1,7 +1,8 @@
 //! state.json (the source of truth), events.jsonl, on-disk paths and UTC timestamps.
 
 use crate::protocol::{
-    Error, Event, EventKind, GenState, Generation, Pending, R, Step, invalid_state, not_found,
+    Error, Event, EventKind, GenState, Generation, Pending, R, RollbackCause, Step, invalid_state,
+    not_found,
 };
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -124,12 +125,15 @@ pub enum Txn {
     },
     /// The switch is live and awaits confirm by `deadline`. Written before the target is started.
     Pending(Pending),
-    /// The pending switch is being rolled back for `reason`. Written, together with the generation's `rolled_back`
-    /// state, before the target is stopped. `restore_failed`: the restore (or the save that ends the switch)
-    /// failed; the app stays stopped until `rollback` or the next daemon start retries.
+    /// The pending switch is being rolled back for `reason`, which `cause` gives as a code (null in a state.json
+    /// written before it existed). Written, together with the generation's `rolled_back` state, before the target is
+    /// stopped. `restore_failed`: the restore (or the save that ends the switch) failed; the app stays stopped until
+    /// `rollback` or the next daemon start retries.
     RollingBack {
         pending: Pending,
         reason: String,
+        #[serde(default)]
+        cause: Option<RollbackCause>,
         restore_failed: bool,
     },
 }
@@ -197,6 +201,7 @@ impl From<StateFile> for State {
                         .rollback_reason
                         .clone()
                         .unwrap_or_else(|| "no reason recorded".into()),
+                    cause: g.rollback_cause,
                     pending,
                     restore_failed: true,
                 },
@@ -261,6 +266,7 @@ pub fn refusal(g: &Generation, to: GenState) -> Error {
         }
         (_, to) => format!("{id} is {state}, it cannot become {}", to.as_str()),
     })
+    .about(id)
 }
 
 /// `path` with `suffix` appended to its last component: `state.json` and `.bak` give `state.json.bak`.
@@ -416,7 +422,7 @@ impl State {
 
     /// The only way a generation changes state: refuses an edge `allowed` does not list (`invalid_state`, with the
     /// reason the command gives), otherwise sets the state and the timestamp of the edge. The caller sets
-    /// `rollback_reason` and `test`.
+    /// `rollback_reason`, `rollback_cause` and `test`.
     pub fn transition(&mut self, id: &str, to: GenState) -> R<&mut Generation> {
         let g = self.find_mut(id).ok_or_else(|| not_found(id))?;
         if !allowed(g.state, to) {
@@ -433,10 +439,10 @@ impl State {
         Ok(g)
     }
 
-    /// Decide to roll back the pending switch for `reason`: the generation becomes `rolled_back` and the step
-    /// `RollingBack`. Does nothing when no switch is pending, so the first reason sticks and a generation rolls back
-    /// at most once. Says whether it decided.
-    pub fn decide_rollback(&mut self, reason: &str) -> bool {
+    /// Decide to roll back the pending switch for `reason`, which `cause` gives as a code: the generation becomes
+    /// `rolled_back` and the step `RollingBack`. Does nothing when no switch is pending, so the first reason sticks
+    /// and a generation rolls back at most once. Says whether it decided.
+    pub fn decide_rollback(&mut self, reason: &str, cause: Option<RollbackCause>) -> bool {
         let Some(Txn::Pending(pending)) = self.txn.clone() else {
             return false;
         };
@@ -447,10 +453,12 @@ impl State {
             && let Ok(g) = self.transition(&pending.generation, GenState::RolledBack)
         {
             g.rollback_reason = Some(reason.into());
+            g.rollback_cause = cause;
         }
         self.txn = Some(Txn::RollingBack {
             pending,
             reason: reason.into(),
+            cause,
             restore_failed: false,
         });
         true
@@ -716,6 +724,7 @@ mod tests {
             confirmed_at: None,
             rolled_back_at: None,
             rollback_reason: None,
+            rollback_cause: None,
             failed_starts: 0,
             restore_abandoned_at: None,
         }
@@ -728,6 +737,7 @@ mod tests {
             kind: EventKind::Progress,
             generation: None,
             message: format!("event {n}"),
+            facts: Box::default(),
         }
     }
 
@@ -956,6 +966,7 @@ mod tests {
         let Some(Txn::RollingBack {
             pending,
             reason,
+            cause,
             restore_failed,
         }) = &state.txn
         else {
@@ -963,6 +974,7 @@ mod tests {
         };
         assert_eq!(pending.generation, "g3");
         assert_eq!(reason, "missed confirm deadline");
+        assert_eq!(*cause, None, "a state.json written before has no cause");
         assert!(restore_failed);
 
         let state = load(phase_two_state("null", "tested", "null"));
@@ -989,15 +1001,20 @@ mod tests {
     fn the_first_reason_of_a_rollback_sticks() {
         let mut state: State =
             serde_json::from_str(&phase_two_state(pending_json(), "current", "null")).unwrap();
-        assert!(state.decide_rollback("health check failed"));
+        assert!(state.decide_rollback("health check failed", Some(RollbackCause::Unhealthy)));
         assert_eq!(state.rolling_back(), Some("health check failed"));
         let g = state.find("g3").unwrap();
         assert_eq!(g.state, GenState::RolledBack);
         assert_eq!(g.rollback_reason.as_deref(), Some("health check failed"));
+        assert_eq!(g.rollback_cause, Some(RollbackCause::Unhealthy));
         let at = g.rolled_back_at.clone();
 
-        assert!(!state.decide_rollback("rollback requested"));
+        assert!(!state.decide_rollback("rollback requested", Some(RollbackCause::Requested)));
         assert_eq!(state.rolling_back(), Some("health check failed"));
+        assert_eq!(
+            state.find("g3").unwrap().rollback_cause,
+            Some(RollbackCause::Unhealthy)
+        );
         assert_eq!(state.find("g3").unwrap().rolled_back_at, at);
         assert_eq!(state.pending().map(|p| p.generation.as_str()), Some("g3"));
 

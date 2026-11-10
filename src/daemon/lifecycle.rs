@@ -19,7 +19,8 @@ impl Daemon {
                     "{} is being rolled back ({reason}); try again when the rollback has finished",
                     pending.generation
                 ),
-            ));
+            )
+            .about(&pending.generation));
         }
         inner.store.state().current().map(String::from).ok_or_else(|| {
             invalid_state(
@@ -32,10 +33,10 @@ impl Daemon {
     pub(super) fn check_start(inner: &Inner) -> R<String> {
         let id = Self::current_generation(inner)?;
         if let Some(app) = inner.running() {
-            return Err(invalid_state(format!(
-                "{id} is already running (pid {})",
-                app.child.id()
-            )));
+            return Err(
+                invalid_state(format!("{id} is already running (pid {})", app.child.id()))
+                    .about(&id),
+            );
         }
         Ok(id)
     }
@@ -46,9 +47,9 @@ impl Daemon {
         let id = Self::current_generation(inner)?;
         inner.refuse_exited()?;
         if inner.running().is_none() && !matches!(inner.live, Live::Backoff { .. }) {
-            return Err(invalid_state(format!(
-                "{id} is not running; `fawkes start` starts it"
-            )));
+            return Err(
+                invalid_state(format!("{id} is not running; `fawkes start` starts it")).about(&id),
+            );
         }
         Ok(id)
     }

@@ -59,17 +59,42 @@ pub enum ErrorCode {
     Unknown,
 }
 
-/// An error answer: a stable code and a message written for an agent.
+/// An error answer: a stable code and a message written for an agent, and the facts the message names as fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
+    /// The generation the failure is about, when it is a specific one that exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// The absolute path of the log that explains the failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<PathBuf>,
 }
 
 impl Error {
     /// The same error with `hint` (what changed, what to do next) after its message.
     pub fn with_hint(self, hint: impl std::fmt::Display) -> Error {
-        err(self.code, format!("{}; {hint}", self.message))
+        Error {
+            message: format!("{}; {hint}", self.message),
+            ..self
+        }
+    }
+
+    /// The same error, saying it is about generation `id`.
+    pub fn about(self, id: &str) -> Error {
+        Error {
+            generation: Some(id.into()),
+            ..self
+        }
+    }
+
+    /// The same error, naming the log at `path` that explains it.
+    pub fn with_log(self, path: impl Into<PathBuf>) -> Error {
+        Error {
+            log: Some(path.into()),
+            ..self
+        }
     }
 }
 
@@ -79,6 +104,8 @@ pub fn err(code: ErrorCode, message: impl Into<String>) -> Error {
     Error {
         code,
         message: message.into(),
+        generation: None,
+        log: None,
     }
 }
 
@@ -363,6 +390,27 @@ impl GenState {
     }
 }
 
+/// Why a switch was rolled back, as a code. `rollback_reason` keeps the readable text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackCause {
+    /// It was not confirmed before its deadline.
+    Deadline,
+    /// Its process exited before it was confirmed.
+    Exited,
+    /// Its health check failed and the manifest asks to roll back on that.
+    Unhealthy,
+    /// The switch could not start it.
+    StartFailed,
+    /// `rollback` asked for it.
+    Requested,
+    /// The daemon ended while it was pending, and its next start rolled it back.
+    DaemonRestart,
+    /// A cause a newer daemon records that this client does not know. Decode-only.
+    #[serde(other)]
+    Unknown,
+}
+
 /// The outcome of a generation's last test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestInfo {
@@ -388,6 +436,9 @@ pub struct Generation {
     pub confirmed_at: Option<String>,
     pub rolled_back_at: Option<String>,
     pub rollback_reason: Option<String>,
+    /// Why it was rolled back, as a code; null when it was not, and for a record written before the cause existed.
+    #[serde(default)]
+    pub rollback_cause: Option<RollbackCause>,
     pub failed_starts: u32,
     /// When `rollback --keep-storage` gave up this generation's failed restore; null otherwise.
     #[serde(default)]
@@ -503,6 +554,104 @@ pub struct Event {
     pub kind: EventKind,
     pub generation: Option<String>,
     pub message: String,
+    /// The facts the message tells, as fields of the event itself (DESIGN.md → Events). Boxed: they are many and an
+    /// event usually carries few.
+    #[serde(flatten)]
+    pub facts: Box<Facts>,
+}
+
+/// What `daemon` events did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonAction {
+    Started,
+    Stopped,
+    Reloaded,
+    /// A leftover app, step or hook was stopped, or a cut-short stage or a stray directory removed.
+    CleanedUp,
+    /// A switch the last daemon did not finish was dropped.
+    SwitchCutShort,
+    /// A start was left to the next daemon because this one shuts down.
+    Deferred,
+    /// An action a newer daemon logs that this client does not know. Decode-only.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What became of the storage in a rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageOutcome {
+    Restored,
+    /// `rollback --keep-storage` gave up a failed restore.
+    Kept,
+    RestoreFailed,
+    /// The manifest has no `restore` hook: the rollback changed code only.
+    #[serde(rename = "none")]
+    Nothing,
+    /// An outcome a newer daemon logs that this client does not know. Decode-only.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The typed facts of an event, which kinds use which is in DESIGN.md → Events. Every field is optional and left out
+/// of the JSON when absent, so an old reader ignores what it does not know and a line written before still loads.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Facts {
+    /// `started`, `daemon` (`started`): the process id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// `started`, `tested`, `test_failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// `switched`: the generation the switch leaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+    /// `switched`: the time the confirm is due by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+    /// `exited`: the exit status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<i32>,
+    /// `exited`: the signal that ended it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// `exited`: when the restart is scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_at: Option<String>,
+    /// `tested`, `test_failed`: how long the test took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<f64>,
+    /// `confirmed`: whether the confirm named the generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named: Option<bool>,
+    /// `rolled_back`: the generation it returns to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// `rolled_back`: the readable reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `rolled_back`: the reason as a code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<RollbackCause>,
+    /// `rolled_back`: what became of the storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageOutcome>,
+    /// `pruned`: the generations removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed: Option<Vec<String>>,
+    /// `error`: the `ErrorCode` of the failure, when it has one. Not `code`, which is the exit status of `exited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<ErrorCode>,
+    /// `daemon`: what happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<DaemonAction>,
+    /// `daemon` (`started`): the daemon's version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// `daemon` (`reloaded`): the manifest fields that changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed: Option<Vec<String>>,
 }
 
 /// How the app's most recent process ended, and whether Fawkes asked for it.
@@ -660,6 +809,10 @@ pub struct RollbackResult {
     pub from: String,
     pub to: Option<String>,
     pub reason: String,
+    /// The reason as a code; null when a daemon that predates it answers, or when a retried rollback's cause was
+    /// never recorded.
+    #[serde(default)]
+    pub cause: Option<RollbackCause>,
 }
 
 /// The result of `prune`: the generation ids removed (oldest first) and those kept.
@@ -1177,6 +1330,44 @@ mod tests {
             panic!("an event line reads as one");
         };
         assert_eq!((event.seq, event.kind), (7, EventKind::Unknown));
+    }
+
+    /// The facts are additions: an event or a generation written before them loads, an event without facts
+    /// serializes as it always did, a value a newer daemon adds decodes, and an error names a generation or a log only
+    /// when it has one.
+    #[test]
+    fn facts_are_optional_on_events_errors_and_records() {
+        let old = r#"{"seq":3,"at":"t","kind":"switched","generation":"g2","message":"m"}"#;
+        let event: Event = serde_json::from_str(old).unwrap();
+        assert_eq!(*event.facts, Facts::default());
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::from_str::<Value>(old).unwrap(),
+            "no null is added to an event without facts"
+        );
+
+        let new = r#"{"seq":4,"at":"t","kind":"rolled_back","generation":"g2","message":"m","to":"g1","cause":"from_the_future","storage":"none","seconds":1.5}"#;
+        let event: Event = serde_json::from_str(new).unwrap();
+        assert_eq!(event.facts.to.as_deref(), Some("g1"));
+        assert_eq!(event.facts.cause, Some(RollbackCause::Unknown));
+        assert_eq!(event.facts.storage, Some(StorageOutcome::Nothing));
+        assert_eq!(event.facts.seconds, Some(1.5));
+        assert_eq!(event.facts.reason, None);
+
+        let record = r#"{"id":"g1","ref":"main","commit":"0","state":"rolled_back","dir":"/d","staged_at":"t","test":null,"switched_at":null,"confirmed_at":null,"rolled_back_at":"t","rollback_reason":"missed confirm deadline","failed_starts":0}"#;
+        let generation: Generation = serde_json::from_str(record).unwrap();
+        assert_eq!(generation.rollback_cause, None);
+
+        let plain = serde_json::to_value(err(ErrorCode::Busy, "m")).unwrap();
+        assert_eq!(plain, json!({"code": "busy", "message": "m"}));
+        let detailed = err(ErrorCode::HealthFailed, "m")
+            .about("g2")
+            .with_log("/s/g2/logs/app.log")
+            .with_hint("fix it");
+        assert_eq!(
+            serde_json::to_value(detailed).unwrap(),
+            json!({"code": "health_failed", "message": "m; fix it", "generation": "g2", "log": "/s/g2/logs/app.log"})
+        );
     }
 
     #[test]
