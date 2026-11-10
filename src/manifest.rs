@@ -1,8 +1,7 @@
 //! The manifest: one TOML file per app (see DESIGN.md, "Manifest").
 
 use crate::state::Paths;
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
@@ -98,73 +97,247 @@ pub struct Health {
 
 /// The commands that carry the app's storage through a switch, a rollback and a test (DESIGN.md → Hooks). Without
 /// them a rollback is code-only and a test starts on an empty home.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Hooks {
     pub snapshot: Option<String>,
     pub restore: Option<String>,
     pub test_copy: Option<String>,
-    #[serde(default = "default_hook_timeout")]
     pub timeout: f64,
 }
 
-impl Default for Hooks {
-    fn default() -> Hooks {
-        Hooks {
-            snapshot: None,
-            restore: None,
-            test_copy: None,
-            timeout: default_hook_timeout(),
+// ------------------------------------------------ reading the file
+
+/// One TOML table whose keys are taken out one by one: what is left when the reading is done is what the manifest
+/// does not know. A key that is missing or of the wrong type is recorded as a problem and reads as nothing, so one
+/// pass finds every problem instead of stopping at the first.
+struct Section {
+    /// `""` for the top level, else the section's name (`health`).
+    path: &'static str,
+    table: toml::Table,
+    /// The keys the section asked for, in the order of the manifest's documentation: the valid ones.
+    keys: Vec<&'static str>,
+    problems: Vec<String>,
+}
+
+impl Section {
+    fn new(path: &'static str, table: toml::Table) -> Section {
+        Section {
+            path,
+            table,
+            keys: Vec::new(),
+            problems: Vec::new(),
+        }
+    }
+
+    /// `key` as the manifest names it: `health.url` inside `[health]`.
+    fn full(&self, key: &str) -> String {
+        if self.path.is_empty() {
+            key.to_string()
+        } else {
+            format!("{}.{key}", self.path)
+        }
+    }
+
+    /// The value of an optional key. None when it is absent or not a `T`, the second case recorded.
+    fn take<T: DeserializeOwned>(&mut self, key: &'static str) -> Option<T> {
+        self.keys.push(key);
+        let value = self.table.remove(key)?;
+        value
+            .try_into()
+            .map_err(|e: toml::de::Error| {
+                let problem = format!("{}: {}", self.full(key), e.message());
+                self.problems.push(problem);
+            })
+            .ok()
+    }
+
+    /// The value of a key the manifest cannot do without: absent is a problem too.
+    fn require<T: DeserializeOwned>(&mut self, key: &'static str) -> Option<T> {
+        if !self.table.contains_key(key) {
+            self.keys.push(key);
+            self.problems
+                .push(format!("missing required key `{}`", self.full(key)));
+            return None;
+        }
+        self.take(key)
+    }
+
+    /// The table under `key`, empty when absent or of another type (recorded). Its problems join this section's
+    /// once it is `finish`ed.
+    fn section(&mut self, key: &'static str) -> Section {
+        let table = self.take(key).unwrap_or_default();
+        Section::new(key, table)
+    }
+
+    /// The problems so far, and one for every key nobody asked for.
+    fn finish(mut self) -> Vec<String> {
+        let keys: Vec<String> = self.keys.iter().map(|key| format!("`{key}`")).collect();
+        let within = if self.path.is_empty() {
+            String::new()
+        } else {
+            format!(" in [{}]", self.path)
+        };
+        for key in self.table.keys() {
+            self.problems.push(format!(
+                "unknown key `{}`, the valid keys{within} are {}",
+                self.full(key),
+                keys.join(", ")
+            ));
+        }
+        self.problems
+    }
+}
+
+/// The manifest as written in the TOML file, before `load` has validated and resolved it. What could not be read is
+/// None (and has been recorded as a problem), so the checks of `problems` run on what could.
+struct Written {
+    name: Option<String>,
+    repo: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    hooks: Hooks,
+    port: Option<u16>,
+    spare_ports: Option<[u16; 2]>,
+    install: Option<String>,
+    install_timeout: f64,
+    reuse: Vec<String>,
+    keep: Option<u32>,
+    start: Option<String>,
+    deadline: u64,
+    stop_timeout: f64,
+    min_uptime: f64,
+    max_failed_starts: u32,
+    rollback_on_unhealthy: bool,
+    /// Without a `url` or a `command` in `[health]`, the default url; None when both are given.
+    check: Option<Check>,
+    health_interval: f64,
+    health_timeout: f64,
+    env: BTreeMap<String, String>,
+    /// Whether the file has `storage`, which `[hooks]` replaced.
+    has_storage: bool,
+}
+
+impl Written {
+    /// Read every key of `table`, with the problems found on the way: unknown keys, missing keys, wrong types.
+    fn read(table: toml::Table) -> (Written, Vec<String>) {
+        let mut top = Section::new("", table);
+        let name = top.require("name");
+        let repo = top.require("repo");
+        let state_dir = top.take("state_dir");
+        let home = top.require("home");
+        let port: Option<u16> = top.require("port");
+        let spare_ports = Self::read_spare_ports(&mut top, port);
+        let install = top.take("install");
+        let install_timeout = top.take("install_timeout");
+        let reuse = top.take("reuse");
+        let keep = top.take("keep");
+        let start = top.require("start");
+        let deadline = top.take("deadline");
+        let stop_timeout = top.take("stop_timeout");
+        let min_uptime = top.take("min_uptime");
+        let max_failed_starts = top.take("max_failed_starts");
+        let rollback_on_unhealthy = top.take("rollback_on_unhealthy");
+
+        let mut health = top.section("health");
+        let url = health.take("url");
+        let command = health.take("command");
+        let interval = health.take("interval");
+        let health_timeout = health.take("timeout");
+        let check = match (url, command) {
+            (Some(url), None) => Some(Check::Url(url)),
+            (None, Some(command)) => Some(Check::Command(command)),
+            (None, None) => Some(Check::Url(DEFAULT_HEALTH_URL.into())),
+            (Some(_), Some(_)) => None,
+        };
+
+        let mut hooks = top.section("hooks");
+        let hooks_written = Hooks {
+            snapshot: hooks.take("snapshot"),
+            restore: hooks.take("restore"),
+            test_copy: hooks.take("test_copy"),
+            timeout: hooks.take("timeout").unwrap_or_else(default_hook_timeout),
+        };
+
+        let mut env = BTreeMap::new();
+        let env_table: toml::Table = top.take("env").unwrap_or_default();
+        for (key, value) in env_table {
+            match value {
+                toml::Value::String(value) => {
+                    env.insert(key, value);
+                }
+                other => top.problems.push(format!(
+                    "env.{key} must be a string, not {}",
+                    other.type_str()
+                )),
+            }
+        }
+
+        // `storage` is no key of the manifest, so it is not among the valid keys the unknown ones are listed with.
+        let has_storage = top.table.remove("storage").is_some();
+        let mut problems = health.finish();
+        problems.extend(hooks.finish());
+        problems.extend(top.finish());
+        let written = Written {
+            name,
+            repo,
+            state_dir,
+            home,
+            hooks: hooks_written,
+            port,
+            spare_ports,
+            install,
+            install_timeout: install_timeout.unwrap_or_else(default_install_timeout),
+            reuse: reuse.unwrap_or_default(),
+            keep,
+            start,
+            deadline: deadline.unwrap_or_else(default_deadline),
+            stop_timeout: stop_timeout.unwrap_or_else(default_stop_timeout),
+            min_uptime: min_uptime.unwrap_or_else(default_min_uptime),
+            max_failed_starts: max_failed_starts.unwrap_or_else(default_max_failed_starts),
+            rollback_on_unhealthy: rollback_on_unhealthy.unwrap_or(false),
+            check,
+            health_interval: interval.unwrap_or_else(default_interval),
+            health_timeout: health_timeout.unwrap_or_else(default_health_timeout),
+            env,
+            has_storage,
+        };
+        (written, problems)
+    }
+
+    /// `spare_ports`: the range as written, else the ten ports after `port`.
+    fn read_spare_ports(top: &mut Section, port: Option<u16>) -> Option<[u16; 2]> {
+        let written = top.table.contains_key("spare_ports");
+        match (top.take::<Vec<u16>>("spare_ports"), port) {
+            (Some(ports), _) => <[u16; 2]>::try_from(&ports[..])
+                .inspect_err(|_| {
+                    top.problems.push(format!(
+                        "spare_ports is a range [low, high], not a list: it has {} ports; give the first and the \
+                         last port of the range",
+                        ports.len()
+                    ));
+                })
+                .ok(),
+            // Written wrongly: recorded by `take`.
+            (None, _) if written => None,
+            // A missing port is a problem of its own.
+            (None, None) => None,
+            (None, Some(port)) if port > u16::MAX - SPARE_PORTS => {
+                top.problems.push(format!(
+                    "port {port} leaves no {SPARE_PORTS} ports after it for the default spare_ports: set \
+                     spare_ports = [low, high], a range outside port"
+                ));
+                None
+            }
+            (None, Some(port)) => Some([port + 1, port + SPARE_PORTS]),
         }
     }
 }
 
-/// The manifest as written in the TOML file, before `load` has validated and resolved it.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Written {
-    name: String,
-    repo: PathBuf,
-    state_dir: Option<PathBuf>,
-    home: PathBuf,
-    /// Read only to refuse it with a pointer to `[hooks]`, which replaced it.
-    storage: Option<IgnoredAny>,
-    #[serde(default)]
-    hooks: Hooks,
-    port: u16,
-    spare_ports: [u16; 2],
-    install: Option<String>,
-    #[serde(default = "default_install_timeout")]
-    install_timeout: f64,
-    #[serde(default)]
-    reuse: Vec<String>,
-    keep: Option<u32>,
-    start: String,
-    #[serde(default = "default_deadline")]
-    deadline: u64,
-    #[serde(default = "default_stop_timeout")]
-    stop_timeout: f64,
-    #[serde(default = "default_min_uptime")]
-    min_uptime: f64,
-    #[serde(default = "default_max_failed_starts")]
-    max_failed_starts: u32,
-    #[serde(default)]
-    rollback_on_unhealthy: bool,
-    health: WrittenHealth,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-}
+/// How many spare ports follow `port` when `spare_ports` is left out.
+const SPARE_PORTS: u16 = 10;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WrittenHealth {
-    url: Option<String>,
-    command: Option<String>,
-    #[serde(default = "default_interval")]
-    interval: f64,
-    #[serde(default = "default_health_timeout")]
-    timeout: f64,
-}
+/// The health check when `[health]` gives neither a `url` nor a `command`.
+const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:{port}/";
 
 /// The longest confirm window, in seconds. A `deadline` in the manifest and `switch --deadline` are both held to it,
 /// so a typo cannot leave a generation unconfirmed (and its predecessor not rolled back to) for weeks.
@@ -339,45 +512,65 @@ impl Manifest {
         )?;
         let mut text = String::new();
         file.read_to_string(&mut text).map_err(cannot_read)?;
-        let written: Written = toml::from_str(&text)
+        let table: toml::Table = text
+            .parse()
             .map_err(|e| format!("invalid manifest {}: {e}", path.display()))?;
-        // Without exactly one of url and command there is no check, and `problems` says so among the rest.
-        let problems = written.problems();
-        let check = match (&written.health.url, &written.health.command) {
-            (Some(url), None) => Some(Check::Url(url.clone())),
-            (None, Some(command)) => Some(Check::Command(command.clone())),
-            _ => None,
-        };
-        let (true, Some(check)) = (problems.is_empty(), check) else {
-            return Err(format!(
+        let (written, mut problems) = Written::read(table);
+        problems.extend(written.problems());
+        let invalid = |problems: &[String]| {
+            format!(
                 "invalid manifest {}: {}",
                 path.display(),
                 problems.join("; ")
-            ));
+            )
         };
+        // What is missing or unreadable is among the problems, so there is something to say whenever this fails.
+        let (
+            Some(name),
+            Some(repo),
+            Some(home),
+            Some(port),
+            Some(spare_ports),
+            Some(start),
+            Some(check),
+        ) = (
+            written.name,
+            written.repo,
+            written.home,
+            written.port,
+            written.spare_ports,
+            written.start,
+            written.check,
+        )
+        else {
+            return Err(invalid(&problems));
+        };
+        if !problems.is_empty() {
+            return Err(invalid(&problems));
+        }
         let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
         // Without a fawkes_home there is no app name to look up, so no name to disagree with.
-        if let Ok(home) = fawkes_home() {
-            named_after_its_file(&absolute, &written.name, &home)?;
+        if let Ok(fawkes_home) = fawkes_home() {
+            named_after_its_file(&absolute, &name, &fawkes_home)?;
         }
         let base = absolute.parent().unwrap_or(Path::new("/")).to_path_buf();
         let state_dir = match &written.state_dir {
             Some(dir) => base.join(dir),
-            None => fawkes_home()?.join(&written.name),
+            None => fawkes_home()?.join(&name),
         };
         Ok(Manifest {
-            name: written.name,
-            repo: base.join(&written.repo),
+            name,
+            repo: base.join(&repo),
             state_dir,
-            home: base.join(&written.home),
+            home: base.join(&home),
             hooks: written.hooks,
-            port: written.port,
-            spare_ports: written.spare_ports,
+            port,
+            spare_ports,
             install: written.install,
             install_timeout: written.install_timeout,
             reuse: written.reuse,
             keep: written.keep,
-            start: written.start,
+            start,
             deadline: written.deadline,
             stop_timeout: written.stop_timeout,
             min_uptime: written.min_uptime,
@@ -385,8 +578,8 @@ impl Manifest {
             rollback_on_unhealthy: written.rollback_on_unhealthy,
             health: Health {
                 check,
-                interval: written.health.interval,
-                timeout: written.health.timeout,
+                interval: written.health_interval,
+                timeout: written.health_timeout,
             },
             env: written.env,
         })
@@ -478,36 +671,39 @@ fn differing(fields: &[(&'static str, bool)]) -> Vec<&'static str> {
 }
 
 impl Written {
-    /// Everything wrong with the manifest as written, each saying what is allowed. Empty when valid.
+    /// What is wrong with the values that could be read, each saying what is allowed. Empty when valid.
     fn problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
-        if self.name.is_empty()
-            || !self
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        if let Some(name) = &self.name
+            && (name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
         {
             problems.push(format!(
-                "name {:?} must be non-empty and use only letters, digits, '_' and '-' (it becomes a file name)",
-                self.name
+                "name {name:?} must be non-empty and use only letters, digits, '_' and '-' (it becomes a file name)"
             ));
         }
-        if self.health.url.is_some() == self.health.command.is_some() {
+        if self.check.is_none() {
             problems.push("[health] needs exactly one of url or command".into());
         }
-        if self.port == 0 {
+        if self.port == Some(0) {
             problems.push("port must be between 1 and 65535".into());
         }
-        if self.spare_ports[0] == 0 {
-            problems.push("spare_ports must start at 1 or higher".into());
-        }
-        if self.spare_ports[0] > self.spare_ports[1] {
-            problems.push("spare_ports must be [low, high]".into());
-        } else if (self.spare_ports[0]..=self.spare_ports[1]).contains(&self.port) {
-            problems.push(format!(
-                "port {} must lie outside spare_ports {:?}: the spare range is for staged generations",
-                self.port, self.spare_ports
-            ));
+        if let Some([low, high]) = self.spare_ports {
+            if low == 0 {
+                problems.push("spare_ports must start at 1 or higher".into());
+            }
+            if low > high {
+                problems.push("spare_ports must be [low, high]".into());
+            } else if let Some(port) = self.port
+                && (low..=high).contains(&port)
+            {
+                problems.push(format!(
+                    "port {port} must lie outside spare_ports {:?}: the spare range is for staged generations",
+                    [low, high]
+                ));
+            }
         }
         if !(1..=MAX_DEADLINE).contains(&self.deadline) {
             problems.push(format!(
@@ -525,8 +721,8 @@ impl Written {
             ("install_timeout", self.install_timeout),
             ("stop_timeout", self.stop_timeout),
             ("min_uptime", self.min_uptime),
-            ("health.interval", self.health.interval),
-            ("health.timeout", self.health.timeout),
+            ("health.interval", self.health_interval),
+            ("health.timeout", self.health_timeout),
             ("hooks.timeout", self.hooks.timeout),
         ] {
             if !(seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS) {
@@ -543,7 +739,8 @@ impl Written {
             }
         }
         problems.extend(self.hook_problems());
-        if let Some(url) = &self.health.url
+        if let Some(Check::Url(url)) = &self.check
+            && url != DEFAULT_HEALTH_URL
             && !has_port(url)
         {
             problems.push(format!(
@@ -556,7 +753,7 @@ impl Written {
     /// What is wrong with `[hooks]`, and with `storage`, which it replaced.
     fn hook_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
-        if self.storage.is_some() {
+        if self.has_storage {
             problems.push(
                 "storage is no longer read: Fawkes runs the app's own commands instead, `snapshot`, `restore` and `test_copy` in [hooks] (DESIGN.md → Hooks)"
                     .into(),
@@ -576,7 +773,7 @@ impl Written {
         }
         // A template only the hooks get would stay as written anywhere else, and name a path that does not exist.
         let mut fields: Vec<(String, &str, &[&str])> = vec![
-            ("start".into(), &self.start, &[]),
+            ("start".into(), self.start.as_deref().unwrap_or(""), &[]),
             (
                 "hooks.snapshot".into(),
                 hooks.snapshot.as_deref().unwrap_or(""),
@@ -592,13 +789,12 @@ impl Written {
                 hooks.test_copy.as_deref().unwrap_or(""),
                 &["{test_home}"],
             ),
+            ("install".into(), self.install.as_deref().unwrap_or(""), &[]),
         ];
-        for (field, text) in [
-            ("install", &self.install),
-            ("health.url", &self.health.url),
-            ("health.command", &self.health.command),
-        ] {
-            fields.push((field.into(), text.as_deref().unwrap_or(""), &[]));
+        match &self.check {
+            Some(Check::Url(url)) => fields.push(("health.url".into(), url, &[])),
+            Some(Check::Command(command)) => fields.push(("health.command".into(), command, &[])),
+            None => {}
         }
         for (name, value) in &self.env {
             fields.push((format!("env.{name}"), value, &[]));
@@ -857,10 +1053,6 @@ test_copy = "store save {home} {test_home}"
                 with("[health]", "[health]\ncommand = \"true\""),
             ),
             (
-                "[health] needs exactly one of url or command",
-                with("url = \"http://127.0.0.1:{port}/\"", "interval = 1.0"),
-            ),
-            (
                 "spare_ports must be [low, high]",
                 with("[4791, 4795]", "[4795, 4791]"),
             ),
@@ -874,6 +1066,59 @@ test_copy = "store save {home} {test_home}"
             assert!(err.starts_with("invalid manifest "), "{err}");
             assert!(err.contains(field), "{field} not named in {err}");
         }
+    }
+
+    #[test]
+    fn a_list_of_spare_ports_is_refused() {
+        let text = with("[4791, 4795]", "[4791, 4792, 4793]");
+        let err = Scratch::new().load(&text).unwrap_err();
+        assert!(
+            err.contains("spare_ports is a range [low, high], not a list"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_problem_of_a_manifest_is_named_at_once() {
+        let text = r#"
+name = "app"
+repo = "repo"
+port = "x"
+stop_timout = 5
+deadline = 0
+start = "node app.js"
+[health]
+intervall = 1.0
+[hooks]
+snapshoot = "x"
+[env]
+A = 1
+"#;
+        let err = Scratch::new().load(text).unwrap_err();
+        assert_eq!(err.lines().count(), 1, "{err}");
+        for problem in [
+            "unknown key `stop_timout`",
+            "unknown key `health.intervall`",
+            "unknown key `hooks.snapshoot`",
+            "missing required key `home`",
+            "port: invalid type: string \"x\"",
+            "deadline 0 must be between",
+            "env.A must be a string",
+        ] {
+            assert!(err.contains(problem), "{problem} not named in {err}");
+        }
+    }
+
+    #[test]
+    fn a_minimal_manifest_gets_the_default_spare_ports_and_health_url() {
+        let text = "name = \"app\"\nrepo = \"repo\"\nhome = \"home\"\nport = 4790\nstart = \"node app.js\"\n";
+        let m = Scratch::new().load(text).unwrap();
+        assert_eq!(m.spare_ports, [4791, 4800]);
+        assert_eq!(
+            m.health.check,
+            Check::Url("http://127.0.0.1:{port}/".to_string())
+        );
+        assert_eq!((m.health.interval, m.health.timeout), (0.5, 60.0));
     }
 
     #[test]

@@ -306,9 +306,9 @@ working for paths without special characters, so commands use the bare template,
 name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
 # state_dir = "state"         # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes (absolute)
-home = "sample-home"           # the app's own state directory
+home = "sample-home"           # the app's own state directory; no default
 port = 4790                    # live port
-spare_ports = [4791, 4799]     # inclusive range for `test`
+# spare_ports = [4791, 4800]   # inclusive range [low, high] for `test`; default [port + 1, port + 10]
 install = "npm ci"             # run in the worktree after checkout; optional
 install_timeout = 1800         # seconds before a hanging install is stopped and the stage fails
 reuse = ["node_modules"]       # cloned (copy-on-write) from the permanent generation before install; optional
@@ -320,8 +320,8 @@ min_uptime = 10                # seconds a start must survive to not count as fa
 max_failed_starts = 3
 rollback_on_unhealthy = false  # roll a pending switch back as soon as its health check gives up
 
-[health]                       # exactly one of url or command
-url = "http://127.0.0.1:{port}/"   # healthy on a 2xx or 3xx answer
+[health]                       # optional; at most one of url or command, and without either the url below
+# url = "http://127.0.0.1:{port}/"   # the default; healthy on a 2xx or 3xx answer
 # command = "curl -fsS http://127.0.0.1:{port}/health"   # healthy on exit 0
 interval = 0.5                 # seconds between attempts
 timeout = 60                   # seconds until `test` gives up
@@ -350,7 +350,9 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
   (the error names the hook that is missing);
 - `{snapshot}` appears anywhere but in `hooks.snapshot` and `hooks.restore`, or `{test_home}` anywhere but in
   `hooks.test_copy` (elsewhere they would stay as written);
-- `port` lies inside `spare_ports`, or `spare_ports` is not `[low, high]`;
+- `port` lies inside `spare_ports`, or `spare_ports` is not a range `[low, high]` (a list of three ports is
+  refused, not read as a range: the error says `spare_ports is a range [low, high], not a list`), or `spare_ports` is
+  left out and `port` is above 65525, which leaves no ten ports after it (the error says to set `spare_ports`);
 - `deadline` is not between 1 and 604800 seconds (a week);
 - `install_timeout`, `stop_timeout`, `min_uptime`, `health.interval`, `health.timeout` or `hooks.timeout` is not a
   number of seconds above 0 and at most 86400;
@@ -358,12 +360,18 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
 - it lies in `<fawkes_home>` under another file name than `<name>.toml`: `--manifest <name>` finds an app there by
   its file name, and everything else (`status`, `watch`, the state directory, the service label) shows its `name`,
   so the error says to rename the file;
-- `[health]` does not have exactly one of `url` and `command`, or `url` is not `http://` with an explicit port
+- `[health]` has both `url` and `command` (having neither is the default `url`), or `url` is not `http://` with an explicit port
   after the host (`:{port}`, or a number from 1 to 65535);
 - `port` or the first of `spare_ports` is 0;
-- the file has a key the manifest does not know (a misspelt `stop_timeout` is an error, never silently ignored).
+- the file has a key the manifest does not know, at the top level or in `[health]` or `[hooks]` (a misspelt
+  `stop_timeout` is an error, never silently ignored; the error lists the valid keys, and `[env]` takes any key);
+- a required key (`name`, `repo`, `home`, `port`, `start`) is missing, or a value has the wrong type (the error names
+  its key).
 
-The error names every problem at once.
+The error names every problem at once: the unknown keys, the missing keys, the values of the wrong type and the
+problems above, in one message. Only a file that is not TOML at all is reported alone, with the position of the
+syntax error. A minimal manifest is `name`, `repo`, `home`, `port` and `start`; the defaults are resolved when the
+manifest is loaded, so `reload` compares the values in force, whether written out or defaulted.
 
 Every child that must end by itself (`install`, the hooks, `git`, `cp` and a health command) goes through one
 runner: its own process group, stdin closed, a bound, and the whole group ended on every way out (SIGTERM, then
