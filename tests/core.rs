@@ -1820,6 +1820,11 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     let (exit, error) = h.fk(&["wait"]);
     assert_eq!((exit, error["code"].as_str()), (1, Some("storage_failed")));
     assert_eq!(error["generation"], "g2");
+    let log = std::path::PathBuf::from(error["log"].as_str().unwrap());
+    assert!(
+        log.ends_with("generations/g2/logs/hooks.log") && log.exists(),
+        "{log:?}"
+    );
     let message = error["message"].as_str().unwrap();
     assert!(
         message.contains("`fawkes rollback` retries")
