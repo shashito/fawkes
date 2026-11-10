@@ -49,7 +49,7 @@ mod launchd {
     use super::Action;
     use crate::manifest::Manifest;
     use crate::process::{Finished, run_bounded};
-    use crate::protocol::{Error, ErrorCode, R, err, invalid_state};
+    use crate::protocol::{Error, ErrorCode, R, describe_status, err, invalid_state};
     use serde_json::{Value, json};
     use std::ffi::OsStr;
     use std::fs::DirBuilder;
@@ -337,7 +337,7 @@ mod launchd {
             ErrorCode::ServiceFailed,
             format!(
                 "launchctl {what} failed ({}){}{printed}",
-                done.status,
+                describe_status(done.status),
                 if printed.is_empty() { "" } else { ": " }
             ),
         )

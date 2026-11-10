@@ -7,10 +7,10 @@
 
 use crate::protocol::{
     Error, ErrorCode, Event, GenState, Generation, History, Line, Request, Status, Step, err,
-    invalid_state, not_found, timed_out,
+    invalid_state, not_found, read_line, timed_out,
 };
 use crate::state::{now_secs, parse_time};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -217,10 +217,7 @@ impl Reader {
         let mut held = Vec::new();
         let mut answered = false;
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
-            let Ok(raw) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let Ok(message) = Line::<Value>::deserialize(&raw) else {
+            let Some((raw, message)) = read_line(&line) else {
                 continue;
             };
             if let Line::Failed { error, .. } = message {
@@ -300,7 +297,7 @@ impl Reader {
             };
             serde_json::to_string(&named).unwrap_or_default()
         } else {
-            format!("{name}  {}", crate::render_event(event))
+            format!("{name}  {}", crate::render::render_event(event))
         };
         self.tx.send(Msg::Event(line)).is_ok()
     }
@@ -425,15 +422,13 @@ impl Waiter<'_> {
                 Ok(_) => {
                     self.answered = true;
                     self.lost = None;
-                    let message = serde_json::from_str::<Value>(&line)
-                        .ok()
-                        .and_then(|raw| Line::<Value>::deserialize(&raw).ok());
+                    let message = read_line(&line);
                     line.clear();
                     match message {
-                        Some(Line::Status { status: new }) => status = Some(*new),
-                        Some(Line::History { history: new }) => history = Some(new),
+                        Some((_, Line::Status { status: new })) => status = Some(*new),
+                        Some((_, Line::History { history: new })) => history = Some(new),
                         // `busy`: too many connections.
-                        Some(Line::Failed { .. }) => return Ok(None),
+                        Some((_, Line::Failed { .. })) => return Ok(None),
                         _ => {}
                     }
                 }

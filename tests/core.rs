@@ -541,7 +541,7 @@ install_timeout = 1"#,
         error["message"]
             .as_str()
             .unwrap()
-            .starts_with("install for g1 failed (exit status: 1); see "),
+            .starts_with("install for g1 failed (exit status 1); see "),
         "{error}"
     );
     assert_eq!(

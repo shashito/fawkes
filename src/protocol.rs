@@ -732,12 +732,22 @@ impl LastExit {
         }
     }
 
+    /// How it ended, in words: events, refusals and `status` all spell it this way.
     pub fn describe(&self) -> String {
-        match (self.code, self.signal) {
-            (Some(code), _) => format!("exit status {code}"),
-            (_, Some(signal)) => format!("signal {signal}"),
-            _ => "unknown exit".into(),
-        }
+        describe_exit(self.code, self.signal)
+    }
+}
+
+/// How a process that was waited for ended, spelt as `LastExit::describe` does, not as std's `ExitStatus` Display.
+pub fn describe_status(status: ExitStatus) -> String {
+    describe_exit(status.code(), status.signal())
+}
+
+fn describe_exit(code: Option<i32>, signal: Option<i32>) -> String {
+    match (code, signal) {
+        (Some(code), _) => format!("exit status {code}"),
+        (_, Some(signal)) => format!("signal {signal}"),
+        _ => "unknown exit".into(),
     }
 }
 
@@ -987,6 +997,14 @@ impl<T> Line<T> {
     pub fn failed(error: Error) -> Line<T> {
         Line::Failed { ok: false, error }
     }
+}
+
+/// One line of a response as the document the daemon sent (what `--json` shows) and as the `Line` a client acts on;
+/// none for a line that is neither, which a client skips.
+pub fn read_line(line: &str) -> Option<(Value, Line<Value>)> {
+    let raw = serde_json::from_str::<Value>(line).ok()?;
+    let message = Line::<Value>::deserialize(&raw).ok()?;
+    Some((raw, message))
 }
 
 // ----------------------------------------------------- connection

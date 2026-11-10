@@ -2,6 +2,7 @@
 //! the group, and health checks.
 
 use crate::manifest::Check;
+use crate::protocol::describe_status;
 use crate::state;
 use rustix::io::Errno;
 use rustix::process::{
@@ -464,7 +465,10 @@ fn run_check(command: &str, cwd: &Path, env: &Env, timeout: Duration) -> Result<
     if finished.status.success() {
         Ok(())
     } else {
-        Err(format!("health command failed ({})", finished.status))
+        Err(format!(
+            "health command failed ({})",
+            describe_status(finished.status)
+        ))
     }
 }
 
@@ -868,7 +872,7 @@ mod tests {
         assert_eq!(check("exit 0"), Ok(()));
         let failed = check("exit 1").unwrap_err();
         assert!(
-            failed.contains("health command failed") && failed.contains("exit status: 1"),
+            failed.contains("health command failed") && failed.contains("exit status 1"),
             "{failed}"
         );
     }

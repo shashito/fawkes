@@ -4,9 +4,9 @@ use super::{Daemon, Inner, Live, Slot, Why, lock, tenths};
 use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
-    DaemonAction, Error, ErrorCode, EventKind, Facts, GenState, Generation, LastExit, Out, Pending,
+    DaemonAction, Error, ErrorCode, EventKind, Facts, GenState, Generation, Out, Pending,
     PruneResult, R, RollbackCause, RollbackResult, StageResult, StorageOutcome, SwitchResult,
-    TestInfo, err, invalid_state, not_found,
+    TestInfo, describe_status, err, invalid_state, not_found,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, parse_time, refusal};
 use std::net::TcpListener;
@@ -421,7 +421,10 @@ impl Daemon {
         if finished.status.success() {
             Ok(())
         } else {
-            Err(format!("{what} failed ({})", finished.status))
+            Err(format!(
+                "{what} failed ({})",
+                describe_status(finished.status)
+            ))
         }
     }
 
@@ -905,7 +908,7 @@ impl Daemon {
                     return Err(invalid_state(format!(
                         "{} exited ({}) before it was confirmed and is being rolled back",
                         pending.generation,
-                        LastExit::new(Some(status), false).describe()
+                        describe_status(status)
                     ))
                     .about(&pending.generation));
                 }
@@ -1323,6 +1326,6 @@ fn clone_directory(from: &Path, to: &Path, timeout: Duration) -> Result<(), Stri
     if finished.status.success() {
         Ok(())
     } else {
-        Err(format!("cp {}", finished.status))
+        Err(format!("cp failed ({})", describe_status(finished.status)))
     }
 }
