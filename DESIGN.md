@@ -626,8 +626,9 @@ object and stderr stays quiet. `wait` only reads, so it is the same in a test ru
 **Refusals, before a request is sent** (a change of the earlier contract, which let a test run call every command): with
 `FAWKES_PHASE=test` in the environment, `stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop`,
 `restart` and `reload` fail `test_phase` (exit 1) whatever daemon they would reach: a test run serves its health check and nothing
-else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) and `confirm`, which `FAWKES_GENERATION`
-gates (Confirm), still run. `fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value)
+else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) and `confirm` still run: a bare
+`confirm` sends the test run's own `FAWKES_GENERATION`, which is never the pending one (Confirm), but a `confirm` that
+names another generation is not refused. `fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value)
 and `FAWKES_SOCKET` naming the socket file of the manifest they would act on fail `invalid_state`: they stop that
 daemon and its app, the caller with it, so they are run from a shell outside the app.
 
@@ -784,7 +785,7 @@ Results per command:
 | `rollback` | `keep_storage?` (`true` gives up a restore that failed, see Rollback: the permanent generation then runs on storage the failed generation may already have migrated; `invalid_state` unless one failed) | `from`, `to`, `reason`, `cause` (see Rollback; of the first rollback decided, so a retry after a failed restore answers that one's) |
 | `prune` | — | `removed` (ids, oldest first), `kept` (ids); `invalid_state` without `keep` in the manifest |
 | `status` | — | see below |
-| `log` | `limit?` (default 20 without `since`, at most the 1000 newest), `since?` (a `seq`: the events after it still kept, the newest `limit` of them when both are given; ignored as `subscribe` ignores it), `follow?` | `events`, oldest first; with `follow` the daemon instead sends the same events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
+| `log` | `limit?` (default 20 without `since`, at most the 1000 newest), `since?` (a `seq`: the events after it still kept, the newest `limit` of them when both are given; ignored as `subscribe` ignores it; a daemon older than `since` ignores the argument and answers the newest 20), `follow?` | `events`, oldest first; with `follow` the daemon instead sends the same events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
 | `history` | — | `generations`, oldest first, each the generation record plus `log_tail`; `failed_install_tail` |
 | `reload` | — | `changed`: the manifest fields that changed, empty when none; the manifest is read again as for `SIGHUP` (see Process model), and a refusal is `usage` (invalid manifest) or `invalid_state` (a field that cannot change now) |
 | `subscribe` | `limit?`, `since?` | never ends; see below |

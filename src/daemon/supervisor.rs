@@ -361,10 +361,7 @@ impl Daemon {
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
     pub(super) fn start_live(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) -> R<()> {
         if self.shutting_down() {
-            return Err(err(
-                ErrorCode::Busy,
-                "the daemon is shutting down; try again once a daemon has started",
-            ));
+            return Err(err(ErrorCode::Busy, "the daemon is shutting down"));
         }
         let m = self.manifest();
         let g = inner

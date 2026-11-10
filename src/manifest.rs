@@ -1096,6 +1096,8 @@ A = 1
 "#;
         let err = Scratch::new().load(text).unwrap_err();
         assert_eq!(err.lines().count(), 1, "{err}");
+        // `storage` is refused with its own message, never offered as a valid key.
+        assert!(!err.contains("`storage`"), "{err}");
         for problem in [
             "unknown key `stop_timout`",
             "unknown key `health.intervall`",

@@ -495,13 +495,12 @@ fn decide(
     let live = status.pending.as_ref().filter(|p| p.generation == id);
     match (g.state, live.and(status.step)) {
         (GenState::Permanent | GenState::Retired, _) => Ok(Some(g.clone())),
-        (GenState::RolledBack, Some(Step::RollingBack)) => Ok(None),
         (GenState::RolledBack, Some(Step::RestoreFailed)) => {
             let runs = status.permanent.as_deref().map_or_else(
                 || "leaves the app stopped (there is no permanent generation)".into(),
                 |permanent| format!("starts {permanent}"),
             );
-            Err(err(
+            let error = err(
                 ErrorCode::StorageFailed,
                 format!(
                     "{id} was rolled back but its storage could not be restored; `fawkes rollback` retries the \
@@ -509,9 +508,18 @@ fn decide(
                      migrated)"
                 ),
             )
-            .about(id))
+            .about(id);
+            // An older daemon's status names no state directory, so there is no path to give.
+            Err(if status.state_dir.as_os_str().is_empty() {
+                error
+            } else {
+                error.with_log(status.state_dir.join("generations").join(id).join("logs/hooks.log"))
+            })
         }
-        (GenState::RolledBack, _) => {
+        // Still the live switch: the rollback is decided but not over (or the history is newer than the status of
+        // the same picture), and its restore may yet fail.
+        (GenState::RolledBack, Some(_)) => Ok(None),
+        (GenState::RolledBack, None) => {
             let reason = g.rollback_reason.as_deref().unwrap_or("no reason recorded");
             let runs = status
                 .permanent
@@ -878,6 +886,12 @@ mod tests {
         // The rollback is decided: its end is waited for, and a restore that failed is its own answer.
         assert!(
             decide_in(rolled_back("g2"), Some("rolling_back"), PAST, None)
+                .unwrap()
+                .is_none()
+        );
+        // A history newer than the status beside it: the rollback has only been decided.
+        assert!(
+            decide_in(rolled_back("g2"), Some("pending"), PAST, None)
                 .unwrap()
                 .is_none()
         );

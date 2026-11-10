@@ -66,7 +66,14 @@ impl Daemon {
         let _busy = self.begin("start", Slot::Live)?;
         let mut inner = self.inner();
         let id = Self::check_start(&inner)?;
-        self.start_live(&mut inner, &id, Why::Fresh)?;
+        // The hint belongs to this answer, not to the reason a switch's rollback records from the same refusal.
+        self.start_live(&mut inner, &id, Why::Fresh).map_err(|e| {
+            if e.code == ErrorCode::Busy {
+                e.with_hint("try again once a daemon has started")
+            } else {
+                e
+            }
+        })?;
         Ok(self.process(&inner))
     }
 

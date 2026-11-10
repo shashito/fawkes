@@ -308,7 +308,8 @@ impl Command {
             Command::Rollback { .. } => Some("rollback"),
             Command::Prune => Some("prune"),
             Command::Reload => Some("reload"),
-            // `confirm` is gated by `FAWKES_GENERATION`, which names the one generation it may confirm.
+            // A bare `confirm` sends `FAWKES_GENERATION`, the test run's own generation, which is never pending; one
+            // that names another generation is not refused (DESIGN.md, Refusals).
             Command::Daemon
             | Command::Confirm { .. }
             | Command::Status
@@ -564,10 +565,12 @@ fn run_service(cli: &Cli, given: &Given, action: service::Action, out: &mut dyn 
         Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
     };
     // `restart` stops the daemon and its app, this process with them; `install` and `uninstall` act on the same agent.
-    if std::env::var_os("FAWKES_PHASE").is_some()
-        && let Some(own) = &given.socket_env
-        && let Ok(manifest) = Manifest::load(&manifest_path)
-        && same_file(&manifest.paths().socket(), Path::new(own))
+    if let Ok(manifest) = Manifest::load(&manifest_path)
+        && inside_its_app(
+            std::env::var_os("FAWKES_PHASE").is_some(),
+            given.socket_env.as_deref().map(Path::new),
+            &manifest.paths().socket(),
+        )
     {
         let name = match action {
             service::Action::Install => "install",
@@ -591,6 +594,12 @@ fn run_service(cli: &Cli, given: &Given, action: service::Action, out: &mut dyn 
         }
         Err(error) => fail(cli.json, out, error.code, error.message),
     }
+}
+
+/// Whether the caller is a process of the app whose daemon listens on `socket`: Fawkes started it (`FAWKES_PHASE` is
+/// set) and its `FAWKES_SOCKET` is that very socket file.
+fn inside_its_app(phase_set: bool, own_socket: Option<&Path>, socket: &Path) -> bool {
+    phase_set && own_socket.is_some_and(|own| same_file(socket, own))
 }
 
 /// Whether the command line has `--json` before any `--`, for an error clap found before it could say.
@@ -1159,6 +1168,30 @@ mod tests {
     fn parse(args: &str) -> Cli {
         Cli::try_parse_from(["fawkes"].into_iter().chain(args.split_whitespace()))
             .unwrap_or_else(|e| panic!("`{args}`: {e}"))
+    }
+
+    /// `fawkes service` is refused only to a process of the app it would act on: one Fawkes started whose
+    /// `FAWKES_SOCKET` is the manifest's own socket, however the path is spelt.
+    #[test]
+    fn the_service_is_refused_only_from_inside_its_own_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fawkes.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let other = dir.path().join("other.sock");
+        let _other = UnixListener::bind(&other).unwrap();
+        let spelt_otherwise = dir.path().join(".").join("fawkes.sock");
+
+        assert!(inside_its_app(true, Some(&socket), &socket));
+        assert!(inside_its_app(true, Some(&spelt_otherwise), &socket));
+        assert!(
+            !inside_its_app(false, Some(&socket), &socket),
+            "not started by Fawkes"
+        );
+        assert!(
+            !inside_its_app(true, Some(&other), &socket),
+            "another app's process"
+        );
+        assert!(!inside_its_app(true, None, &socket));
     }
 
     #[test]
