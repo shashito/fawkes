@@ -1561,6 +1561,46 @@ mod tests {
         }
     }
 
+    /// `switch` and `rollback` answer `busy` while the daemon shuts down (DESIGN.md → Error codes); `start` does too.
+    #[test]
+    fn start_while_the_daemon_shuts_down_is_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(scratch_daemon(temp.path()));
+        daemon
+            .inner()
+            .store
+            .modify(|state| {
+                state.generations = vec![Generation {
+                    id: "g1".into(),
+                    git_ref: "main".into(),
+                    commit: "0".into(),
+                    state: GenState::Permanent,
+                    dir: PathBuf::new(),
+                    staged_at: String::new(),
+                    test: None,
+                    switched_at: None,
+                    confirmed_at: None,
+                    rolled_back_at: None,
+                    rollback_reason: None,
+                    rollback_cause: None,
+                    failed_starts: 0,
+                    restore_abandoned_at: None,
+                }];
+                state.permanent = Some("g1".into());
+                Ok(())
+            })
+            .unwrap();
+        daemon.shutdown.store(true, Ordering::SeqCst);
+
+        let refused = daemon.start_command().unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Busy, "{}", refused.message);
+        assert!(
+            refused.message.contains("shutting down"),
+            "{}",
+            refused.message
+        );
+    }
+
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
