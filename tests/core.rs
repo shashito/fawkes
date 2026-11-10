@@ -1821,9 +1821,12 @@ fn group_alive(pgid: Pid) -> bool {
 /// The process group of process `pid`, from Linux's /proc, unless it has exited (a zombie).
 fn running_group(pid: &str) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // The command name, in parentheses, may contain spaces; the state and the group are fields 3 and 5.
+    // The command name, in parentheses, may contain spaces; the state, the group and the number of threads are
+    // fields 3, 5 and 20. A process whose main thread alone has exited shows a zombie, with its other threads counted.
     let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-    if matches!(fields.first(), Some(&("Z" | "X"))) {
+    if matches!(fields.first(), Some(&("Z" | "X")))
+        && fields.get(17).is_none_or(|&threads| threads == "1")
+    {
         return None;
     }
     fields.get(2)?.parse().ok()
