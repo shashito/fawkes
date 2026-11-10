@@ -11,11 +11,11 @@ implements all of it except where a section says **later**.
 
 ## Process model
 
-`fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive). It is the parent of the
-app's live process and the only writer of the state directory. Every other command (`start`, `stop`, `restart`,
-`stage`, `test`, `switch`, `up`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `watch`) is a thin client that
-sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run one daemon per
-manifest.
+`fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive; on macOS `fawkes service
+install` sets up launchd, see Service). It is the parent of the app's live process and the only writer of the state
+directory. Every other command (`start`, `stop`, `restart`, `stage`, `test`, `switch`, `up`, `confirm`, `rollback`,
+`prune`, `status`, `log`, `history`, `watch`) is a thin client that sends requests over the daemon's Unix socket and
+renders the answer. One daemon supervises one app; run one daemon per manifest.
 
 A step takes one or both of two slots. The *step* slot belongs to the transaction steps: `stage`, `test` and `prune`
 take it alone, `switch` and `rollback` take it together with the live slot, and a second step gets `busy`. The *live*
@@ -37,7 +37,10 @@ its thread look every 500 ms whether the client has gone.
 
 The daemon writes every event to stderr as a line, for whoever watches the terminal. That copy is best effort, from
 a thread of its own: a stderr that blocks or breaks (a closed terminal, a `| tee` that died) never stalls or ends the
-daemon, and lines it cannot take are dropped. `events.jsonl` is the record.
+daemon, and lines it cannot take are dropped. `events.jsonl` is the record. When stderr is `<state_dir>/daemon.log`
+(the same file, as a launchd service's is), the thread that writes it keeps it under 10 MiB: past that it copies the
+file to `daemon.log.1` (replacing the one before) and empties it, between two lines, so none is lost. Whoever starts
+the daemon decides where stderr goes; the daemon only looks at what it is.
 
 Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
 state, so the next start resumes it), `SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a
@@ -481,6 +484,7 @@ fawkes status
 fawkes log      [-n N] [--follow]
 fawkes history
 fawkes watch    [--since N]
+fawkes service  install|uninstall|restart
 ```
 
 Global options, before or after the command: `--json`, `--manifest FILE` (default `./fawkes.toml`), `--socket PATH`.
@@ -537,6 +541,57 @@ error: g4 was rolled back at 2026-11-03T14:02:11Z (missed confirm deadline); sta
 error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with `fawkes daemon --manifest fawkes.toml`
 ```
 
+### Service
+
+`fawkes service install|uninstall|restart` runs the daemon under launchd as a user LaunchAgent, for a Mac that is a
+server. A desktop user never needs it. It is a client-side convenience: it writes a plist and calls `launchctl`, and the
+daemon cannot tell it was started this way (it has no code for it). macOS only; elsewhere each action is a `usage` error
+(run `fawkes daemon --manifest …` under the init system; systemd user units are **Later**). `--manifest` names the app
+(default `./fawkes.toml`); `--socket` is a usage error, since the service runs the daemon on the manifest's own socket.
+`--json` applies to all three: one result object, or the usual error object, with the usual exit codes.
+
+The label is `dev.fawkes.<name>` and the plist `$HOME/Library/LaunchAgents/<label>.plist` (`HOME` must be set and
+absolute; the directory is created), loaded in the domain `gui/<uid>`. `HOME` and `PATH` decide where the plist goes and
+which `launchctl` runs. The plist holds:
+
+- `ProgramArguments`: the canonical path of the running binary, `daemon --manifest <absolute manifest path>`.
+- `EnvironmentVariables`: the installing process's `PATH` (launchd's own is minimal, and the app's commands need
+  `node`, `git` and the rest), and `FAWKES_HOME` when it is set, because it decides the default `state_dir` and the
+  `run/` links. The paths and variables must be UTF-8.
+- `RunAtLoad` and `KeepAlive { SuccessfulExit = false }`: the daemon starts at login and again after a failed exit, and
+  stays down after a clean one (a SIGTERM).
+- `ExitTimeOut`: `3 × stop_timeout + 5`, rounded up, plus 10 s: the longest a daemon's shutdown takes (it waits up
+  to `2 × stop_timeout + 5` s for a switch or rollback in flight, then stops the app with `stop_timeout` of grace).
+  launchd's default of 20 s would SIGKILL it partway, and the next daemon start would have to recover. A changed
+  `stop_timeout` reaches the plist with the next `install`.
+- `StandardErrorPath`: `<state_dir>/daemon.log`, where the daemon's stderr goes. `install` creates `state_dir` (mode
+  `0700`) when it is missing, because launchd opens that file before the daemon exists to create the directory. The
+  daemon caps it at 10 MiB (Process model), but only the lines its own writer writes: a daemon that fails before it
+  gets that far (an invalid manifest) adds its error at every start launchd retries, about every 10 s, uncapped.
+- The binary is named as it was run, not resolved, so a symlinked install (Homebrew's `bin/fawkes`) keeps working
+  after an upgrade removes the version it pointed at; a binary that moved needs `install` again.
+
+**install** refuses a binary with a `CACHEDIR.TAG` in any ancestor directory (`usage`): cargo writes one at the top of
+every target directory, and the next `cargo build` replaces the binary under the running daemon. Install a copy
+(`cargo install --path . --locked`) and run `fawkes service install` from it. With a plist, `install` replaces it: it
+boots the old agent out and waits until `launchctl print` no longer finds it (launchd answers a bootout before it has
+let go of the service, and a bootstrap until then fails), writes the new plist beside it and renames it into place,
+then bootstraps. Unless a loaded agent was just booted out, it refuses (`invalid_state`) when a daemon already answers
+on the manifest's socket (one started from a terminal): it holds the state lock, so the agent's daemon would fail at
+every start. Stop it first. A failing `launchctl` is `service_failed` with its message; after a failed
+bootstrap the plist stays, and running `install` again or `uninstall` cleans up. Result:
+`{"label", "plist", "log", "replaced"}` (`replaced`: the plist existed before).
+
+**uninstall** boots the agent out and removes the plist; the state directory stays. It is idempotent: an agent that is
+not loaded (`launchctl` exits 3, "No such process") is fine. Result: `{"label", "plist", "removed"}`, where `removed`
+is false when there was neither a plist nor a loaded agent.
+
+**restart** boots the agent out (a SIGTERM and the wait for a graceful stop) and bootstraps the existing plist, which
+launchd reads afresh. Without a plist it fails with `not_found`: `install` first. The daemon starts as at any start, so
+a pending switch is rolled back (see Daemon start). Result: `{"label", "plist"}`.
+
+`launchctl` runs through `run_bounded` with `ExitTimeOut` plus 30 s.
+
 ## Socket protocol
 
 `<state_dir>/fawkes.sock`, mode `0600`, newline-delimited JSON, one request per connection. Keep the state directory
@@ -567,9 +622,9 @@ dropped, so its stream simply ends. Live clients reconnect.
 ```
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable` and `no_answer` are produced by the
-client only: no daemon answers, or it closed the connection without an answer, and the daemon accepted a quick request
-and did not answer in time.)
+`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable`, `no_answer` and `service_failed` are
+produced by the client only: no daemon answers, or it closed the connection without an answer; the daemon accepted a
+quick request and did not answer in time; `fawkes service` could not write its plist or `launchctl` refused.)
 A client treats a code it does not know as a failed command.
 
 The same goes for the other enumerations a newer daemon may extend: a client reads an event `kind`, a generation
@@ -782,6 +837,8 @@ event log started over`. Until the first `status` line names the app, a note nam
                          10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines
                          written during the copy are lost)
   install-failed.log     install output of the latest stage that failed (its generation is removed)
+  daemon.log             the daemon's stderr under `fawkes service` (launchd writes it); past 10 MiB copied to
+                         daemon.log.1 and emptied by the daemon
 ```
 
 `state.json` is the source of truth; the deadline is an absolute time so it survives a daemon restart.

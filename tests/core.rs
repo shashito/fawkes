@@ -2665,3 +2665,187 @@ fn up_stops_at_a_failing_test_and_switches_nothing() {
     let (exit, error) = h.fk(&["up", "v1", "--deadline", "0"]);
     assert_eq!((exit, error["code"].as_str()), (2, Some("usage")));
 }
+
+/// A fake `launchctl` in `<dir>/fakebin` that appends its arguments to `<dir>/calls` and keeps `<dir>/loaded` as the
+/// service's loaded state: `bootout` of an unloaded service fails the way launchd does, `bootstrap` loads it. As
+/// launchd does, a booted-out service lingers until `print` has seen it once more, and a `bootstrap` before it has gone
+/// fails with `5: Input/output error`.
+#[cfg(target_os = "macos")]
+fn fake_launchctl(h: &Harness) -> std::path::PathBuf {
+    let bin = h.dir.join("fakebin");
+    std::fs::create_dir(&bin).unwrap();
+    let d = h.dir.display();
+    let script = bin.join("launchctl");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+echo "$*" >> {d}/calls
+case "$1" in
+bootout)
+	if [ -e {d}/loaded ]; then mv {d}/loaded {d}/unloading; exit 0; fi
+	echo "Boot-out failed: 3: No such process" >&2
+	exit 3 ;;
+print)
+	if [ -e {d}/unloading ]; then rm {d}/unloading; exit 0; fi
+	if [ -e {d}/loaded ]; then exit 0; fi
+	exit 113 ;;
+bootstrap)
+	if [ -e {d}/loaded ] || [ -e {d}/unloading ]; then
+		echo "Bootstrap failed: 5: Input/output error" >&2
+		exit 5
+	fi
+	touch {d}/loaded ;;
+esac
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// `fawkes --json service <action>` with a `HOME` and a `launchctl` of the test's own; the exit code, the JSON document
+/// and the `launchctl` calls it made.
+#[cfg(target_os = "macos")]
+fn service(h: &Harness, binary: &std::path::Path, action: &str) -> (i32, Value, Vec<String>) {
+    let path = format!(
+        "{}:{}",
+        h.dir.join("fakebin").display(),
+        std::env::var("PATH").unwrap()
+    );
+    let output = h
+        .cli_with(common::fawkes_at(binary))
+        .args(["service", action])
+        .env("HOME", h.dir.join("home"))
+        .env("PATH", path)
+        .env("FAWKES_HOME", h.dir.join("fh"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let calls = std::fs::read_to_string(h.dir.join("calls")).unwrap_or_default();
+    let _ = std::fs::remove_file(h.dir.join("calls"));
+    (
+        output.status.code().unwrap(),
+        json,
+        calls.lines().map(String::from).collect(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
+    let h = Harness::new("");
+    fake_launchctl(&h);
+    std::fs::create_dir(h.dir.join("bin")).unwrap();
+    // The binary in `target/` is refused; a copy elsewhere is what gets installed.
+    let binary = h.dir.join("bin/fawkes");
+    std::fs::copy(Harness::binary(), &binary).unwrap();
+    let uid = rustix::process::getuid().as_raw();
+    let d = h.dir.display();
+    let plist = format!("{d}/home/Library/LaunchAgents/dev.fawkes.t.plist");
+    let target = format!("gui/{uid}/dev.fawkes.t");
+    let bootstrap = format!("bootstrap gui/{uid} {plist}");
+
+    let (exit, error, calls) = service(&h, Harness::binary(), "install");
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (2, Some("usage")),
+        "{error}"
+    );
+    assert!(error["message"].as_str().unwrap().contains("CACHEDIR.TAG"));
+    assert_eq!(calls, Vec::<String>::new());
+
+    let (exit, installed, calls) = service(&h, &binary, "install");
+    assert_eq!(exit, 0, "{installed}");
+    assert_eq!(calls, std::slice::from_ref(&bootstrap));
+    assert_eq!(
+        installed,
+        serde_json::json!({
+            "label": "dev.fawkes.t",
+            "plist": plist,
+            "log": format!("{d}/s/daemon.log"),
+            "replaced": false,
+        })
+    );
+    let state_dir = std::fs::metadata(h.dir.join("s")).unwrap();
+    assert_eq!(state_dir.permissions().mode() & 0o777, 0o700);
+    let path = format!(
+        "{d}/fakebin:{}",
+        std::env::var("PATH").unwrap().replace('&', "&amp;")
+    );
+    let expected = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.fawkes.t</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{}</string>
+		<string>daemon</string>
+		<string>--manifest</string>
+		<string>{d}/fawkes.toml</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>{path}</string>
+		<key>FAWKES_HOME</key>
+		<string>{d}/fh</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>StandardErrorPath</key>
+	<string>{d}/s/daemon.log</string>
+</dict>
+</plist>
+"#,
+        binary.display()
+    );
+    assert_eq!(std::fs::read_to_string(&plist).unwrap(), expected);
+
+    // A bootout waits until launchd has let go of the service: the fake keeps it for one `print`.
+    let bootout = [
+        format!("bootout {target}"),
+        format!("print {target}"),
+        format!("print {target}"),
+    ];
+    let (exit, reinstalled, calls) = service(&h, &binary, "install");
+    assert_eq!(exit, 0, "{reinstalled}");
+    assert_eq!(reinstalled["replaced"], true);
+    assert_eq!(
+        calls,
+        [&bootout[..], std::slice::from_ref(&bootstrap)].concat()
+    );
+
+    let (exit, restarted, calls) = service(&h, &binary, "restart");
+    assert_eq!(exit, 0, "{restarted}");
+    assert_eq!(
+        restarted,
+        serde_json::json!({"label": "dev.fawkes.t", "plist": plist})
+    );
+    assert_eq!(calls, [&bootout[..], &[bootstrap]].concat());
+
+    let (exit, removed, calls) = service(&h, &binary, "uninstall");
+    assert_eq!(exit, 0, "{removed}");
+    assert_eq!(removed["removed"], true);
+    assert_eq!(calls, bootout);
+    assert!(!std::path::Path::new(&plist).exists());
+    assert!(h.dir.join("s").exists());
+    let (exit, removed, _) = service(&h, &binary, "uninstall");
+    assert_eq!((exit, &removed["removed"]), (0, &Value::Bool(false)));
+
+    let (exit, missing, calls) = service(&h, &binary, "restart");
+    assert_eq!((exit, missing["code"].as_str()), (1, Some("not_found")));
+    assert_eq!(calls, Vec::<String>::new());
+}

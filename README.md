@@ -82,6 +82,33 @@ Every command takes `--json` and answers with readable errors and stable error c
 commands are available over the daemon's Unix socket, with a live event stream for in-app UIs.
 [DESIGN.md](DESIGN.md) is the full contract: manifest, CLI, socket protocol, on-disk layout and state machine.
 
+## On a server
+
+On a desktop, run `fawkes daemon` in a terminal as above. That stays the normal way, and nothing else is needed. On a
+Mac that must keep the app up without a terminal (a Mac mini for remote development), run the same daemon under
+launchd, installed with one command:
+
+```sh
+fawkes service install --manifest fawkes.toml     # write the agent's plist and load it
+fawkes service restart --manifest fawkes.toml     # stop the daemon and start it again
+fawkes service uninstall --manifest fawkes.toml   # unload it and remove the plist
+```
+
+`install` writes `~/Library/LaunchAgents/dev.fawkes.<name>.plist` and loads it with `launchctl bootstrap
+gui/$UID`. The plist runs the `fawkes` you ran it with as `fawkes daemon --manifest <absolute path>`, with the
+installing shell's `PATH` (and `FAWKES_HOME`, when set), at login (`RunAtLoad`) and again whenever the daemon fails
+(`KeepAlive` with `SuccessfulExit = false`; a daemon stopped on purpose stays stopped). Its stderr goes to
+`<state_dir>/daemon.log`, which the daemon keeps under 10 MiB. Run `install` from the installed copy (it refuses a
+binary in cargo's `target/`), and again after an update to load the new binary and `PATH`. A daemon restart rolls a
+pending switch back, as every daemon start does. The daemon cannot tell it runs under launchd: every other command
+talks to it over its socket as before. It is a LaunchAgent, so it runs while you are logged in: give a headless Mac
+automatic login. macOS only; DESIGN.md → Service has the details.
+
+**Reaching it when the app is down.** An app's own way in is gone when the app is what broke. Ultimate's door, its
+Tailscale extension, lives inside Ultimate's core, so when the core is down so is the door, and `pnpm cli` (or
+`fawkes status`, `fawkes rollback`) can only be reached over a path of its own: turn on SSH on the server (Remote
+Login, reachable over the tailnet or your network) before you depend on it.
+
 ## Status
 
 A working prototype. Everything in [DESIGN.md](DESIGN.md) is built except its **Later** section: the transaction

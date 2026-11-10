@@ -5,7 +5,7 @@
 //! the app-log cap) bound the sleep. An idle daemon without an app wakes for nothing.
 
 use super::transactions::{check_abandon, check_prune, check_rollback, check_switch, check_test};
-use super::{APP_LOG_BYTES, App, Daemon, Inner, Live, Slot, Why, tenths};
+use super::{App, Daemon, Inner, LOG_BYTES, Live, Slot, Why, tenths};
 use crate::process;
 use crate::protocol::{
     ErrorCode, EventKind, History, HistoryEntry, LastExit, Out, Process, ProcessState, R, Status,
@@ -69,7 +69,7 @@ fn outcome(failed_starts: u32, pending: bool, max_failed_starts: u32) -> Outcome
 
 // ------------------------------------------------ timers
 
-/// How often the live generation's `logs/app.log` is measured against `APP_LOG_BYTES`.
+/// How often the live generation's `logs/app.log` is measured against `LOG_BYTES`.
 const CAP_EVERY: Duration = Duration::from_secs(10);
 
 /// The pause after a pass that acted, before the next pass looks again. It bounds a step that keeps failing (a
@@ -239,7 +239,7 @@ impl Daemon {
         }
     }
 
-    /// Keep the live generation's `logs/app.log` under `APP_LOG_BYTES`: copy it to `app.log.1` and truncate it. The
+    /// Keep the live generation's `logs/app.log` under `LOG_BYTES`: copy it to `app.log.1` and truncate it. The
     /// app's descriptor appends, so its next write lands at the new end; what it writes during the copy is lost, the
     /// price of capping a log the daemon does not sit between.
     pub(super) fn cap_app_log(&self) {
@@ -247,7 +247,7 @@ impl Daemon {
             return;
         };
         let log = self.paths.app_log(&id);
-        if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > APP_LOG_BYTES) {
+        if std::fs::metadata(&log).is_ok_and(|meta| meta.len() > LOG_BYTES) {
             let old = with_suffix(&log, ".1");
             let capped = std::fs::copy(&log, &old)
                 .and_then(|_| OpenOptions::new().write(true).open(&log))
@@ -1017,13 +1017,13 @@ mod tests {
         let daemon = scratch_daemon(temp.path());
         let log = daemon.paths.app_log("g1");
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-        let full = "x".repeat(usize::try_from(APP_LOG_BYTES).unwrap());
+        let full = "x".repeat(usize::try_from(LOG_BYTES).unwrap());
 
         std::fs::write(&log, format!("{full}y")).unwrap();
         daemon.cap_app_log();
         assert_eq!(
             std::fs::metadata(&log).unwrap().len(),
-            APP_LOG_BYTES + 1,
+            LOG_BYTES + 1,
             "nothing is live: nothing is capped"
         );
 
