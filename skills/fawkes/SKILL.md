@@ -25,11 +25,11 @@ ignore the ones you do not know. `fawkes skill` prints this file as built into t
 ## Which app does a command reach?
 
 The first of: `--socket PATH`; `--manifest APP`; `$FAWKES_SOCKET`; `$FAWKES_MANIFEST`; the nearest `fawkes.toml`
-from the current directory up to the repository root (the first directory with a `.git`); the manifest in
-`~/.fawkes` (`$FAWKES_HOME`) whose `repo` holds the current directory. `APP` is a path when it has a `/` or ends in
-`.toml`, else an app name: `--manifest xana` means `~/.fawkes/xana.toml`, whose `name` must be `xana`. When several apps match, or none does, the
-command fails with `usage` and names the apps; pass `--manifest <name>`. Nothing is guessed: a daemon is never
-picked because it is the only one running.
+from the current directory up to the repository root (the first directory with a `.git`), never inside
+`~/.fawkes`; the manifest in `~/.fawkes` (`$FAWKES_HOME`) whose `repo` holds the current directory. `APP` is a path
+when it has a `/` or ends in `.toml`, else an app name: `--manifest xana` means `~/.fawkes/xana.toml`, whose `name`
+must be `xana`. When several apps match, or none does, the command fails with `usage` and names the apps; pass
+`--manifest <name>`. Nothing is guessed: a daemon is never picked because it is the only one running.
 
 ## Do I run under Fawkes?
 

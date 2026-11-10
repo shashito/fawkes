@@ -98,13 +98,26 @@ impl Given {
         }
         let home = self.fawkes_home.as_ref()?;
         let mut matches = registry(home, cwd);
+        let walked = top.map_or_else(
+            || {
+                format!(
+                    "the search for a {MARKER} does not enter {}",
+                    home.display()
+                )
+            },
+            |top| {
+                format!(
+                    "there is no {MARKER} in it or above it up to {}",
+                    top.display()
+                )
+            },
+        );
         match matches.len() {
             1 => Ok(matches.remove(0).1),
             0 => Err(format!(
-                "no app found for {}: there is no {MARKER} in it or above it up to {}, and no manifest in {} has \
-                 its repo here; pass --manifest with an app name or a path{}",
+                "no app found for {}: {walked}, and no manifest in {} has its repo here; pass --manifest with an \
+                 app name or a path{}",
                 cwd.display(),
-                top.display(),
                 home.display(),
                 listed(home)
             )),
@@ -142,17 +155,17 @@ impl Given {
 }
 
 /// The nearest `fawkes.toml` from `cwd` up, stopping at the first directory with a `.git` (the repository root), so
-/// a project inside another never takes the outer one's manifest; and the last directory looked in. `fawkes_home`
-/// ends the walk before it is read: its `fawkes.toml` is the app named `fawkes`, not the manifest of the state
-/// directories below it.
-fn walk_up<'a>(cwd: &'a Path, fawkes_home: Option<&Path>) -> (Option<PathBuf>, &'a Path) {
+/// a project inside another never takes the outer one's manifest; and the last directory looked in, none when `cwd`
+/// is `fawkes_home`. `fawkes_home` ends the walk before it is read: its `fawkes.toml` is the app named `fawkes`, not
+/// the manifest of the state directories below it.
+fn walk_up<'a>(cwd: &'a Path, fawkes_home: Option<&Path>) -> (Option<PathBuf>, Option<&'a Path>) {
     let fawkes_home = fawkes_home.and_then(|home| home.canonicalize().ok());
-    let mut top = cwd;
+    let mut top = None;
     for dir in cwd.ancestors() {
         if fawkes_home.is_some() && dir.canonicalize().ok() == fawkes_home {
             break;
         }
-        top = dir;
+        top = Some(dir);
         let file = dir.join(MARKER);
         if file.is_file() {
             return (Some(file), top);

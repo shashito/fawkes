@@ -133,9 +133,10 @@ daemon start runs the permanent generation.
 `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE`). An app confirms only when `FAWKES_PHASE` is
 `live`, and names itself: `"$FAWKES_BIN" confirm "$FAWKES_GENERATION"`. Its test run gets the same variables, with
 `FAWKES_PHASE=test`, while another generation may be pending. Without `<gen>` the CLI sends `$FAWKES_GENERATION`
-when it is set and the daemon it reaches is the one `$FAWKES_SOCKET` names (the same socket file, however the command
-found it; a `--socket` or `--manifest` of another app gets none), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
-an app, a bare `confirm` confirms whichever generation is pending. The `confirmed` event says whether the confirm
+when it is set and the daemon it reaches is the one `$FAWKES_SOCKET` names (the same socket file, however the
+command found it; a `--socket` or `--manifest` of another app gets none), so a process Fawkes started (or one it left
+behind) can only ever confirm its own generation; outside an app, a bare `confirm` confirms whichever generation is
+pending. The `confirmed` event says whether the confirm
 named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
 deadline is cleared. Confirming a generation that is not pending is `invalid_state`, except the permanent one:
 `confirm <gen>` naming the permanent generation is ok with its record and changes nothing (no event, no write),
@@ -526,8 +527,8 @@ follows every daemon (see Watch).
 This order puts the flags before the environment, which **changes the earlier contract**, where `$FAWKES_SOCKET`
 beat `--manifest` and only `./fawkes.toml` was read: an app Fawkes runs that names another app's manifest now
 reaches that app's daemon, and its bare `confirm` sends `$FAWKES_GENERATION` only when that is its own daemon
-(Confirm). An app that names
-nothing still reaches its own daemon, since `$FAWKES_SOCKET` comes before every discovered manifest.
+(Confirm). An app that names nothing still reaches its own daemon, since `$FAWKES_SOCKET` comes before every
+discovered manifest.
 
 `--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped (for
 `up`, nothing is staged either).

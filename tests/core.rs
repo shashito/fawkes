@@ -2190,7 +2190,15 @@ fn the_client_finds_the_app_from_where_it_runs() {
     std::fs::copy(h.manifest(), registry.join("t.toml")).unwrap();
     assert!(found(status(&repo, &[], None)));
     // FAWKES_HOME ends the walk, and its repo is not this one: only the name finds the app.
-    assert_eq!(status(&registry, &[], None).0, 2);
+    let (code, error) = status(&registry, &[], None);
+    assert_eq!(code, 2, "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("the search for a fawkes.toml does not enter "),
+        "{error}"
+    );
     assert!(found(status(&registry, &["--manifest", "t"], None)));
 
     let gone = h.dir.join("gone.sock");
