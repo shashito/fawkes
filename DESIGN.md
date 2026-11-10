@@ -354,6 +354,9 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
 - `install_timeout`, `stop_timeout`, `min_uptime`, `health.interval`, `health.timeout` or `hooks.timeout` is not a
   number of seconds above 0 and at most 86400;
 - `max_failed_starts` or `keep` is 0;
+- it lies in `<fawkes_home>` under another file name than `<name>.toml`: `--manifest <name>` finds an app there by
+  its file name, and everything else (`status`, `watch`, the state directory, the service label) shows its `name`,
+  so the error says to rename the file;
 - `[health]` does not have exactly one of `url` and `command`, or `url` is not `http://` with an explicit port
   after the host (`:{port}`, or a number from 1 to 65535);
 - `port` or the first of `spare_ports` is 0;
@@ -509,9 +512,9 @@ A client command reaches its daemon by the first of:
 4. `$FAWKES_MANIFEST`, read like `--manifest`;
 5. the nearest `fawkes.toml`, from the current directory up, stopping at the first directory that holds a `.git` (the
    repository root, so a project inside another never takes the outer one's manifest);
-6. the manifest in `<fawkes_home>` (`*.toml`, the app named by the file name) whose `repo` is the current directory
-   or one of its parents. When more than one does, the command is refused (`usage`) with their names and asks for
-   `--manifest <name>`; when none does, the error names the apps there are.
+6. the manifest in `<fawkes_home>` (`*.toml`, each named after its app, see Validation) whose `repo` is the current
+   directory or one of its parents. When more than one does, the command is refused (`usage`) with their names and
+   asks for `--manifest <name>`; when none does, the error names the apps there are.
 
 `APP`, for `--manifest` and `$FAWKES_MANIFEST`, is a path when it has a `/` or ends in `.toml`, and otherwise an app
 name: `<fawkes_home>/<APP>.toml`, which must exist. An empty variable counts as unset. There is no guess beyond this:
@@ -626,6 +629,10 @@ launchd reads afresh. Without a plist it fails with `not_found`: `install` first
 a pending switch is rolled back (see Daemon start). Result: `{"label", "plist"}`.
 
 `launchctl` runs through `run_bounded` with `ExitTimeOut` plus 30 s.
+
+A client command that finds no daemon answering (`daemon_unreachable`) for an app whose plist exists says to start
+it again with `fawkes service restart --manifest …` rather than `fawkes daemon`, which would only contend with the
+agent's daemon for the state lock.
 
 ## Socket protocol
 

@@ -15,6 +15,19 @@ pub enum Action {
     Restart,
 }
 
+/// `$HOME/Library/LaunchAgents/dev.fawkes.<name>.plist`, where `install` writes the agent of the app `name`; none
+/// without an absolute `HOME`, or off macOS, where there is no service.
+pub fn plist(name: &str) -> Option<std::path::PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    home.is_absolute().then(|| {
+        home.join("Library/LaunchAgents")
+            .join(format!("dev.fawkes.{name}.plist"))
+    })
+}
+
 /// Do `action` for the app of the manifest at `manifest_path`: the JSON result, and its text for a person.
 #[cfg(not(target_os = "macos"))]
 pub fn run(
@@ -73,19 +86,13 @@ mod launchd {
     impl Service {
         fn new(manifest_path: &Path) -> R<Service> {
             let manifest = Manifest::load(manifest_path).map_err(|e| err(ErrorCode::Usage, e))?;
-            let home = std::env::var("HOME")
-                .ok()
-                .filter(|home| Path::new(home).is_absolute())
-                .ok_or_else(|| {
-                    err(
-                        ErrorCode::Usage,
-                        "HOME must be set to an absolute path: the plist goes to $HOME/Library/LaunchAgents",
-                    )
-                })?;
+            let plist = super::plist(&manifest.name).ok_or_else(|| {
+                err(
+                    ErrorCode::Usage,
+                    "HOME must be set to an absolute path: the plist goes to $HOME/Library/LaunchAgents",
+                )
+            })?;
             let label = format!("dev.fawkes.{}", manifest.name);
-            let plist = Path::new(&home)
-                .join("Library/LaunchAgents")
-                .join(format!("{label}.plist"));
             let domain = format!("gui/{}", rustix::process::getuid().as_raw());
             Ok(Service {
                 manifest,

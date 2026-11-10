@@ -27,7 +27,7 @@ ignore the ones you do not know. `fawkes skill` prints this file as built into t
 The first of: `--socket PATH`; `--manifest APP`; `$FAWKES_SOCKET`; `$FAWKES_MANIFEST`; the nearest `fawkes.toml`
 from the current directory up to the repository root (the first directory with a `.git`); the manifest in
 `~/.fawkes` (`$FAWKES_HOME`) whose `repo` holds the current directory. `APP` is a path when it has a `/` or ends in
-`.toml`, else an app name: `--manifest xana` means `~/.fawkes/xana.toml`. When several apps match, or none does, the
+`.toml`, else an app name: `--manifest xana` means `~/.fawkes/xana.toml`, whose `name` must be `xana`. When several apps match, or none does, the
 command fails with `usage` and names the apps; pass `--manifest <name>`. Nothing is guessed: a daemon is never
 picked because it is the only one running.
 
@@ -136,7 +136,7 @@ failed install's log (that stage's generation is removed). `fawkes log -n 50 --j
 | `start_failed` | The process could not be started, or no spare port was free for a test. A switch whose target cannot start is rolled back at once. | Check the `start` command and the spare ports. |
 | `port_in_use` | Another process took the test's spare port. The generation is unchanged. | `test` again. |
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
-| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Start one: `fawkes daemon --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a service. |
+| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes daemon --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a launchd agent. |
 | `no_answer` | The daemon took a quick request and did not answer within 30 s. Produced by the client. | Check `fawkes status`; the daemon may be stuck. |
 | `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; from a shell outside the app, `fawkes service install` again replaces the plist and reloads it. |
 

@@ -188,7 +188,8 @@ impl Harness {
             .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
         std::fs::create_dir(dir.join("repo")).unwrap();
         let h = Harness {
-            manifest: dir.join("fawkes.toml"),
+            // `dir` is the daemon's FAWKES_HOME too, where a manifest must be named after its app.
+            manifest: dir.join("t.toml"),
             fawkes_home: dir.clone(),
             dir,
             port,
@@ -227,6 +228,11 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
         )
         .unwrap();
         h
+    }
+
+    /// The manifest's path.
+    pub fn manifest(&self) -> &Path {
+        &self.manifest
     }
 
     /// Replace `from`, which must occur in the manifest, with `to`.

@@ -343,8 +343,9 @@ fn main() -> ExitCode {
 /// The daemon a client command talks to.
 struct Endpoint {
     socket: PathBuf,
-    /// The manifest it was found by, for the message that says how to start it; none for a socket named outright.
-    manifest: Option<PathBuf>,
+    /// The manifest it was found by and the app's name, for the message that says how to start it; none for a socket
+    /// named outright.
+    manifest: Option<(PathBuf, String)>,
     /// The socket is `FAWKES_SOCKET`: the daemon that started the caller.
     own: bool,
 }
@@ -360,24 +361,37 @@ impl Endpoint {
             },
             Target::Manifest(path) => {
                 let manifest = Manifest::load(&path).map_err(|e| {
-                    format!("{e}; pass --manifest or --socket to say which daemon to talk to")
+                    // A manifest that is there but invalid, or writable by others, is fixed in the manifest.
+                    if path.exists() {
+                        e
+                    } else {
+                        format!("{e}; pass --manifest or --socket to say which daemon to talk to")
+                    }
                 })?;
                 Endpoint {
                     socket: manifest.paths().socket(),
-                    manifest: Some(path),
+                    manifest: Some((path, manifest.name)),
                     own: false,
                 }
             }
         })
     }
 
-    /// How to start the daemon that does not answer.
+    /// How to start the daemon that does not answer: its launchd agent's when one is installed, which a daemon started
+    /// from a terminal would only contend with for the state lock.
     fn start_hint(&self) -> String {
-        let manifest = self
-            .manifest
-            .as_ref()
-            .map_or_else(|| "<app>".into(), |path| path.display().to_string());
-        format!("start one with `fawkes daemon --manifest {manifest}`")
+        let Some((path, name)) = &self.manifest else {
+            return "start one with `fawkes daemon --manifest <app>`".into();
+        };
+        let path = path.display();
+        if service::plist(name).is_some_and(|plist| plist.exists()) {
+            format!(
+                "it is installed as a launchd agent; from outside the app, `fawkes service restart --manifest {path}` \
+                 starts it again"
+            )
+        } else {
+            format!("start one with `fawkes daemon --manifest {path}`")
+        }
     }
 }
 
@@ -1248,6 +1262,40 @@ mod tests {
             &unknown,
         );
         assert_eq!(text, unknown.to_string());
+    }
+
+    /// Only a manifest that is not there asks for another one: an invalid one, or one others can write, is fixed in
+    /// the file itself.
+    #[test]
+    fn the_hint_to_name_another_daemon_comes_only_without_a_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let find = |manifest: &Path| {
+            let given = Given {
+                socket: None,
+                manifest: Some(manifest.into()),
+                socket_env: None,
+                manifest_env: None,
+                cwd: Ok(temp.path().into()),
+                fawkes_home: Ok(temp.path().into()),
+            };
+            Endpoint::find(&given).err().unwrap()
+        };
+        let hint = "; pass --manifest or --socket to say which daemon to talk to";
+        let invalid = temp.path().join("invalid.toml");
+        std::fs::write(&invalid, "name = 1").unwrap();
+        let writable = temp.path().join("writable.toml");
+        std::fs::write(&writable, "").unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o666)).unwrap();
+        for (path, says) in [(&invalid, "invalid manifest"), (&writable, "o-w")] {
+            let err = find(path);
+            assert!(err.contains(says) && !err.contains(hint), "{err}");
+        }
+        let err = find(&temp.path().join("gone.toml"));
+        assert!(
+            err.starts_with("cannot read manifest") && err.ends_with(hint),
+            "{err}"
+        );
     }
 
     fn endpoint(socket: &Path) -> Endpoint {

@@ -2177,6 +2177,7 @@ fn the_client_finds_the_app_from_where_it_runs() {
     let found = |(code, json): (i32, Value)| code == 0 && json["name"] == "t";
 
     // `/tmp/fk<port>/fawkes.toml`, two levels up.
+    std::fs::copy(h.manifest(), h.dir.join("fawkes.toml")).unwrap();
     assert!(found(status(&below, &[], None)));
     // The repository's `.git` ends the walk before it, and the registry has nothing yet.
     let repo = h.dir.join("repo");
@@ -2186,7 +2187,7 @@ fn the_client_finds_the_app_from_where_it_runs() {
         (2, &Value::from("usage")),
         "{error}"
     );
-    std::fs::copy(h.dir.join("fawkes.toml"), registry.join("t.toml")).unwrap();
+    std::fs::copy(h.manifest(), registry.join("t.toml")).unwrap();
     assert!(found(status(&repo, &[], None)));
     assert!(found(status(&h.dir, &["--manifest", "t"], None)));
 
@@ -2199,6 +2200,41 @@ fn the_client_finds_the_app_from_where_it_runs() {
         "{error}"
     );
     assert!(found(status(&below, &["--manifest", "t"], Some(gone))));
+
+    // A manifest there answers only to its own name.
+    std::fs::copy(h.manifest(), registry.join("xana.toml")).unwrap();
+    let (code, error) = status(&h.dir, &["--manifest", "xana"], None);
+    let message = error["message"].as_str().unwrap();
+    assert_eq!(code, 2, "{error}");
+    assert!(
+        message.contains("names the app t") && message.contains("rename it to "),
+        "{message}"
+    );
+}
+
+/// A daemon that does not answer but has a launchd agent installed is started again through the service, not from a
+/// terminal, where it would contend with the agent for the state lock.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unreachable_daemon_with_an_installed_agent_points_at_the_service() {
+    let h = Harness::new("");
+    let home = h.dir.join("user");
+    let hint = || {
+        let output = h.cli().arg("status").env("HOME", &home).output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+        error["message"].as_str().unwrap().to_string()
+    };
+    assert!(hint().contains("start one with `fawkes daemon --manifest "));
+    let agents = home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("dev.fawkes.t.plist"), "").unwrap();
+    let message = hint();
+    assert!(
+        message.contains("`fawkes service restart --manifest ")
+            && !message.contains("fawkes daemon"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -2494,8 +2530,10 @@ fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_dir
 
     // Another state_dir, the same name and the same fawkes_home: the run link already answers.
     let d = h.dir.display();
-    let manifest = std::fs::read_to_string(h.dir.join("fawkes.toml")).unwrap();
-    let other = h.dir.join("other.toml");
+    let manifest = std::fs::read_to_string(h.manifest()).unwrap();
+    // Beside the first, in the daemons' FAWKES_HOME, it would be refused for not being `t.toml`.
+    std::fs::create_dir(h.dir.join("other")).unwrap();
+    let other = h.dir.join("other/t.toml");
     std::fs::write(
         &other,
         manifest
@@ -2510,7 +2548,7 @@ fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_dir
     );
     // Another name and state_dir, but the first daemon's socket (`--socket`): never taken over.
     let namesake = std::fs::read_to_string(&other).unwrap();
-    let third = h.dir.join("third.toml");
+    let third = h.dir.join("u.toml");
     std::fs::write(
         &third,
         namesake
@@ -2633,7 +2671,7 @@ fn json_output_is_one_document_on_stdout_and_progress_lines_on_stderr() {
 
     let output = common::fawkes()
         .arg("--manifest")
-        .arg(h.dir.join("fawkes.toml"))
+        .arg(h.manifest())
         .arg("status")
         .output()
         .unwrap();
@@ -2862,7 +2900,7 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 		<string>{}</string>
 		<string>daemon</string>
 		<string>--manifest</string>
-		<string>{d}/fawkes.toml</string>
+		<string>{d}/t.toml</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
