@@ -37,6 +37,26 @@ fn fawkes_home_from(
     }
 }
 
+/// A manifest in `home` must be `<name>.toml`: `--manifest <name>` finds an app there by its file name, and
+/// everything else (`watch`, `status`, the state directory, the service label) shows its `name`, so the two must agree.
+fn named_after_its_file(path: &Path, name: &str, home: &Path) -> Result<(), String> {
+    let (Some(dir), Ok(home)) = (path.parent(), home.canonicalize()) else {
+        return Ok(());
+    };
+    if dir.canonicalize().is_ok_and(|dir| dir == home)
+        && path.file_name() != Some(format!("{name}.toml").as_ref())
+    {
+        return Err(format!(
+            "the manifest {} names the app {name}, but its file name says otherwise; rename it to {}, since \
+             `--manifest <name>` finds an app in {} by its file name",
+            path.display(),
+            home.join(format!("{name}.toml")).display(),
+            home.display()
+        ));
+    }
+    Ok(())
+}
+
 /// `<fawkes_home>/run`, where every daemon links its socket as `<name>.sock` for `fawkes watch` to find.
 pub fn run_dir() -> Result<PathBuf, String> {
     Ok(fawkes_home()?.join("run"))
@@ -336,6 +356,10 @@ impl Manifest {
             ));
         };
         let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+        // Without a fawkes_home there is no app name to look up, so no name to disagree with.
+        if let Ok(home) = fawkes_home() {
+            named_after_its_file(&absolute, &written.name, &home)?;
+        }
         let base = absolute.parent().unwrap_or(Path::new("/")).to_path_buf();
         let state_dir = match &written.state_dir {
             Some(dir) => base.join(dir),
@@ -901,6 +925,24 @@ test_copy = "store save {home} {test_home}"
                 .unwrap_or_else(|e| panic!("{source}: {e}"));
             assert!(manifest.home.is_absolute(), "{source}");
         }
+    }
+
+    #[test]
+    fn a_manifest_in_fawkes_home_is_named_after_its_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let file = home.join("xana.toml");
+        assert_eq!(named_after_its_file(&file, "xana", &home), Ok(()));
+        let err = named_after_its_file(&file, "ultimate-xana", &home).unwrap_err();
+        assert!(
+            err.contains("names the app ultimate-xana") && err.contains("rename it to "),
+            "{err}"
+        );
+        assert!(err.contains("ultimate-xana.toml, since"), "{err}");
+        // Elsewhere a manifest's file name is its own business.
+        let elsewhere = temp.path().join("fawkes.toml");
+        assert_eq!(named_after_its_file(&elsewhere, "xana", &home), Ok(()));
     }
 
     #[test]

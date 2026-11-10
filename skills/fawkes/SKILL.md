@@ -19,7 +19,17 @@ is what you need to act.
 
 Every command but `daemon` takes `--json`. Then stdout is exactly one JSON document, the result or an error object
 `{"code": "...", "message": "..."}`, and progress lines go to stderr. Read the `code`, never parse the message.
-Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers.
+Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers. A result only ever gains fields:
+ignore the ones you do not know. `fawkes skill` prints this file as built into the binary you run.
+
+## Which app does a command reach?
+
+The first of: `--socket PATH`; `--manifest APP`; `$FAWKES_SOCKET`; `$FAWKES_MANIFEST`; the nearest `fawkes.toml`
+from the current directory up to the repository root (the first directory with a `.git`), never inside
+`~/.fawkes`; the manifest in `~/.fawkes` (`$FAWKES_HOME`) whose `repo` holds the current directory. `APP` is a path
+when it has a `/` or ends in `.toml`, else an app name: `--manifest xana` means `~/.fawkes/xana.toml`, whose `name`
+must be `xana`. When several apps match, or none does, the command fails with `usage` and names the apps; pass
+`--manifest <name>`. Nothing is guessed: a daemon is never picked because it is the only one running.
 
 ## Do I run under Fawkes?
 
@@ -30,9 +40,9 @@ Fawkes starts your process with these variables:
 | `FAWKES_PHASE` | `live`: you are the app on its live port. `test`: you are a test run on a spare port, with a test home of your own. |
 | `FAWKES_GENERATION` | Your generation, `g7`. |
 | `FAWKES_BIN` | The `fawkes` binary that runs you. Call it by this path. |
-| `FAWKES_SOCKET` | Your daemon's socket. The CLI finds it from this variable, so you need no `--manifest`. |
+| `FAWKES_SOCKET` | Your daemon's socket. The CLI finds it from this variable, so you need no `--manifest`; a `--manifest` or `--socket` you pass reaches that other daemon instead. |
 
-None of them set: Fawkes does not run you. Pass `--manifest FILE` or `--socket PATH` to reach a daemon.
+None of them set: Fawkes does not run you. Run from the app's repository, or pass `--manifest <name>`.
 
 In the `test` phase your home is a copy of the live storage (or empty), and the live app may be running beside you.
 Serve your health check and nothing else: no confirm, no upgrade, no work with effects outside your home (messages
@@ -46,8 +56,8 @@ Only in the `live` phase, and only once you know you work (your own checks pass,
 "$FAWKES_BIN" confirm "$FAWKES_GENERATION"
 ```
 
-Always name yourself. A bare `confirm` sends your `FAWKES_GENERATION` only while no `--socket` is given; with one, or
-from anywhere outside an app, it confirms whatever is pending, which may not be you. Confirm before the
+Always name yourself. A bare `confirm` sends your `FAWKES_GENERATION` only to the daemon `FAWKES_SOCKET` names; to
+another app's, or from anywhere outside an app, it confirms whatever is pending, which may not be you. Confirm before the
 deadline the switch set (`status` → `pending.deadline`); after it you are rolled back. A confirm is safe to retry: once
 you are permanent, confirming yourself again answers ok with your record. Being restarted (a crash restart, `fawkes
 restart`) as the permanent generation needs no confirm.
@@ -126,7 +136,7 @@ failed install's log (that stage's generation is removed). `fawkes log -n 50 --j
 | `start_failed` | The process could not be started, or no spare port was free for a test. A switch whose target cannot start is rolled back at once. | Check the `start` command and the spare ports. |
 | `port_in_use` | Another process took the test's spare port. The generation is unchanged. | `test` again. |
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
-| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Start one: `fawkes daemon --manifest FILE`, or, from a shell outside the app, `fawkes service restart` when it runs as a service. |
+| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes daemon --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a launchd agent. |
 | `no_answer` | The daemon took a quick request and did not answer within 30 s. Produced by the client. | Check `fawkes status`; the daemon may be stuck. |
 | `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; from a shell outside the app, `fawkes service install` again replaces the plist and reloads it. |
 

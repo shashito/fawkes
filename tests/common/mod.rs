@@ -31,9 +31,10 @@ const BIN: &str = env!("CARGO_BIN_EXE_fawkes");
 
 /// The variables Fawkes gives the processes it starts. A suite run under a supervised app (a lander's `cargo test`
 /// inside an app Fawkes runs) inherits them, and the CLI would then talk to that app's live daemon (`FAWKES_SOCKET`)
-/// or confirm as its generation (`FAWKES_GENERATION`).
-const INHERITED: [&str; 5] = [
+/// or confirm as its generation (`FAWKES_GENERATION`). `FAWKES_MANIFEST` is a person's, and would name their app.
+const INHERITED: [&str; 6] = [
     "FAWKES_SOCKET",
+    "FAWKES_MANIFEST",
     "FAWKES_GENERATION",
     "FAWKES_PHASE",
     "FAWKES_BIN",
@@ -187,7 +188,8 @@ impl Harness {
             .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
         std::fs::create_dir(dir.join("repo")).unwrap();
         let h = Harness {
-            manifest: dir.join("fawkes.toml"),
+            // `dir` is the daemon's FAWKES_HOME too, where a manifest must be named after its app.
+            manifest: dir.join("t.toml"),
             fawkes_home: dir.clone(),
             dir,
             port,
@@ -226,6 +228,11 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
         )
         .unwrap();
         h
+    }
+
+    /// The manifest's path.
+    pub fn manifest(&self) -> &Path {
+        &self.manifest
     }
 
     /// Replace `from`, which must occur in the manifest, with `to`.

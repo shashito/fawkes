@@ -511,7 +511,12 @@ fn staging_a_commit_twice_returns_the_first_build_until_it_is_rolled_back() {
         "a tested one is reused too"
     );
 
-    // The permanent generation is never reused, and confirming it again is a true answer that changes nothing.
+    // The permanent generation is never reused, and confirming it again is a true answer that changes nothing. The
+    // live health check logs `healthy` from a thread of its own, which on a loaded machine comes after the confirm:
+    // the snapshot of the log waits for it.
+    h.wait("g1's live health check to be logged", 15, || {
+        !messages(&h, "healthy").is_empty()
+    });
     let events = h.ok(&["log", "-n", "1000"]);
     let confirmed = h.ok(&["confirm", "g1"]);
     assert_eq!(
@@ -2143,6 +2148,140 @@ fn a_usage_error_exits_2_and_help_exits_0() {
     }
 }
 
+/// Without `--manifest` or `--socket` the client finds the app from where it runs: the nearest `fawkes.toml` above
+/// it, else the manifest in `FAWKES_HOME` whose repo holds it; `--manifest` takes that manifest's name too, and beats an
+/// inherited `FAWKES_SOCKET`, which beats what is found.
+#[test]
+fn the_client_finds_the_app_from_where_it_runs() {
+    let mut h = Harness::new("");
+    h.start_daemon();
+    let registry = h.dir.join("registry");
+    let below = h.dir.join("below/deeper");
+    std::fs::create_dir_all(&below).unwrap();
+    std::fs::create_dir(&registry).unwrap();
+    let status = |cwd: &std::path::Path, args: &[&str], socket: Option<&str>| {
+        let mut command = common::fawkes();
+        command
+            .args(["--json", "status"])
+            .args(args)
+            .current_dir(cwd)
+            .env("FAWKES_HOME", &registry);
+        if let Some(socket) = socket {
+            command.env("FAWKES_SOCKET", socket);
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let json: Value = serde_json::from_str(&stdout).expect(&stdout);
+        (output.status.code().unwrap(), json)
+    };
+    let found = |(code, json): (i32, Value)| code == 0 && json["name"] == "t";
+
+    // `/tmp/fk<port>/fawkes.toml`, two levels up.
+    std::fs::copy(h.manifest(), h.dir.join("fawkes.toml")).unwrap();
+    assert!(found(status(&below, &[], None)));
+    // The repository's `.git` ends the walk before it, and the registry has nothing yet.
+    let repo = h.dir.join("repo");
+    let (code, error) = status(&repo, &[], None);
+    assert_eq!(
+        (code, &error["code"]),
+        (2, &Value::from("usage")),
+        "{error}"
+    );
+    std::fs::copy(h.manifest(), registry.join("t.toml")).unwrap();
+    assert!(found(status(&repo, &[], None)));
+    // FAWKES_HOME ends the walk, and its repo is not this one: only the name finds the app.
+    let (code, error) = status(&registry, &[], None);
+    assert_eq!(code, 2, "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("the search for a fawkes.toml does not enter "),
+        "{error}"
+    );
+    assert!(found(status(&registry, &["--manifest", "t"], None)));
+
+    let gone = h.dir.join("gone.sock");
+    let gone = gone.to_str().unwrap();
+    let (code, error) = status(&below, &[], Some(gone));
+    assert_eq!(
+        (code, &error["code"]),
+        (3, &Value::from("daemon_unreachable")),
+        "{error}"
+    );
+    assert!(found(status(&below, &["--manifest", "t"], Some(gone))));
+
+    // A bare confirm names the caller's FAWKES_GENERATION to its own daemon, the one FAWKES_SOCKET names, however
+    // the command reached it; to any other it names none.
+    let confirm = |socket: &std::path::Path| {
+        let output = h
+            .cli()
+            .arg("confirm")
+            .env("FAWKES_SOCKET", socket)
+            .env("FAWKES_GENERATION", "g9")
+            .output()
+            .unwrap();
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+        error["message"].as_str().unwrap().to_string()
+    };
+    let own = confirm(&h.dir.join("s/fawkes.sock"));
+    assert!(own.contains("there is no generation g9"), "{own}");
+    let other = confirm(std::path::Path::new(gone));
+    assert!(other.contains("no switch is pending"), "{other}");
+
+    // A manifest there answers only to its own name.
+    std::fs::copy(h.manifest(), registry.join("xana.toml")).unwrap();
+    let (code, error) = status(&h.dir, &["--manifest", "xana"], None);
+    let message = error["message"].as_str().unwrap();
+    assert_eq!(code, 2, "{error}");
+    assert!(
+        message.contains("names the app t") && message.contains("rename it to "),
+        "{message}"
+    );
+}
+
+/// A daemon that does not answer but has a launchd agent installed is started again through the service, not from a
+/// terminal, where it would contend with the agent for the state lock.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unreachable_daemon_with_an_installed_agent_points_at_the_service() {
+    let h = Harness::new("");
+    let home = h.dir.join("user");
+    let hint = || {
+        let output = h.cli().arg("status").env("HOME", &home).output().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+        error["message"].as_str().unwrap().to_string()
+    };
+    assert!(hint().contains("start one with `fawkes daemon --manifest "));
+    let agents = home.join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("dev.fawkes.t.plist"), "").unwrap();
+    let message = hint();
+    assert!(
+        message.contains("`fawkes service restart --manifest ")
+            && !message.contains("fawkes daemon"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_binary_prints_its_version_and_its_skill() {
+    let run = |args: &[&str]| {
+        let output = common::fawkes().args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        run(&["--version"]),
+        format!("fawkes {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    let skill = std::fs::read_to_string("skills/fawkes/SKILL.md").unwrap();
+    assert_eq!(run(&["skill"]), skill);
+    let json: Value = serde_json::from_str(&run(&["skill", "--json"])).unwrap();
+    assert_eq!(json, serde_json::json!({ "skill": skill }));
+}
+
 // ------------------------------------------------ failing tests, health commands, retired generations, startup
 
 /// Ends, when dropped, the process whose pid is in the file, if it wrote one: a listener in a session of its own,
@@ -2419,8 +2558,10 @@ fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_dir
 
     // Another state_dir, the same name and the same fawkes_home: the run link already answers.
     let d = h.dir.display();
-    let manifest = std::fs::read_to_string(h.dir.join("fawkes.toml")).unwrap();
-    let other = h.dir.join("other.toml");
+    let manifest = std::fs::read_to_string(h.manifest()).unwrap();
+    // Beside the first, in the daemons' FAWKES_HOME, it would be refused for not being `t.toml`.
+    std::fs::create_dir(h.dir.join("other")).unwrap();
+    let other = h.dir.join("other/t.toml");
     std::fs::write(
         &other,
         manifest
@@ -2435,7 +2576,7 @@ fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_dir
     );
     // Another name and state_dir, but the first daemon's socket (`--socket`): never taken over.
     let namesake = std::fs::read_to_string(&other).unwrap();
-    let third = h.dir.join("third.toml");
+    let third = h.dir.join("u.toml");
     std::fs::write(
         &third,
         namesake
@@ -2558,7 +2699,7 @@ fn json_output_is_one_document_on_stdout_and_progress_lines_on_stderr() {
 
     let output = common::fawkes()
         .arg("--manifest")
-        .arg(h.dir.join("fawkes.toml"))
+        .arg(h.manifest())
         .arg("status")
         .output()
         .unwrap();
@@ -2787,7 +2928,7 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 		<string>{}</string>
 		<string>daemon</string>
 		<string>--manifest</string>
-		<string>{d}/fawkes.toml</string>
+		<string>{d}/t.toml</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

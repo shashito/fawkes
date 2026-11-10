@@ -33,10 +33,10 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   or `Harness::fk`. They drop the `FAWKES_*` variables a suite inherits when it runs inside an app Fawkes supervises,
   which would otherwise send the test's requests to that app's live daemon.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `manifest.rs`,
-  `process.rs`, `protocol.rs`, `main.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`, `daemon/transactions.rs`,
-  `watch.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is the pure
-  `after_exit` in `daemon/supervisor.rs`: test a change to it there, in milliseconds, and keep the integration tests
-  as end-to-end smoke tests.
+  `process.rs`, `protocol.rs`, `main.rs`, `discovery.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`,
+  `daemon/transactions.rs`, `watch.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is
+  the pure `after_exit` in `daemon/supervisor.rs`: test a change to it there, in milliseconds, and keep the
+  integration tests as end-to-end smoke tests.
 - To fix a bug, first write a test that reproduces it.
 - Never point a test or a manual run at a live app or a real `~/.fawkes`. Use a temp directory and a manifest in it.
 
@@ -72,7 +72,8 @@ not built yet. Don't start one unless asked.
 ## Dependencies
 
 The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rustix, signal-hook,
-jiff and libc, and tempfile for the tests. The HTTP health check and the thread-based concurrency are
+jiff and libc, strsim through clap's `suggestions` (the "similar command" tip, instead of a hand-written edit
+distance), and tempfile for the tests. The HTTP health check and the thread-based concurrency are
 hand-written on purpose, and errors stay `protocol::Error` and `String`, without anyhow or thiserror.
 
 A well-known crate is preferred over hand-written code when it removes a meaningful amount of code or `unsafe`, but
