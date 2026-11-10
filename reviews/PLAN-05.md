@@ -115,12 +115,12 @@ busy-steps test holds its test run on a marker file instead of a 6 s timer, whic
 ## Phase 12: server, as an option
 
 **Done:** 12.1 to 12.3. Where the build differs from the rows: `install` refuses a binary with a `CACHEDIR.TAG` in an
-ancestor (cargo's `target/`), and with no plist yet a daemon that already answers on the socket; an existing plist is
+ancestor (cargo's `target/`), and a daemon that already answers on the socket (unless it was the loaded agent's); an existing plist is
 replaced and reloaded, so `install` again after an update is how a new binary or `PATH` is picked up. `--json` applies
 to all three, and a failing `launchctl` is a new client-only code, `service_failed`. `uninstall` is idempotent;
 `restart` is a bootout and a bootstrap (a graceful SIGTERM, and the plist read afresh), `not_found` without a plist.
-The plist also carries `ExitTimeOut` (`stop_timeout` rounded up plus 10 s, since launchd's 20 s would SIGKILL a daemon
-still stopping a slower app) and `FAWKES_HOME` when set; `install` creates `state_dir`, which launchd needs for
+The plist also carries `ExitTimeOut` (`3 × stop_timeout + 5` rounded up plus 10 s, the daemon's longest shutdown, which
+launchd's 20 s would cut short) and `FAWKES_HOME` when set; `install` creates `state_dir`, which launchd needs for
 `daemon.log`. A bootout waits until `launchctl print` no longer finds the agent: checked by hand against launchd (a
 throwaway label, `HOME` in `/tmp`), a bootstrap right after a bootout fails with `5: Input/output error`. The same
 check saw `RunAtLoad`, a restart after `kill -9` and a clean SIGTERM on restart and uninstall. Tests reach a fake

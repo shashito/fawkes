@@ -104,15 +104,21 @@ mod launchd {
                     format!("cannot resolve {}: {e}", manifest_path.display()),
                 )
             })?;
+            // The plist names the binary as it was run, not its resolved path: a symlinked install (Homebrew's
+            // `bin/fawkes` into a versioned `Cellar/`) keeps working after an upgrade removes the old version. The
+            // build directory check looks at where it really is.
+            let found = |e: std::io::Error| {
+                err(
+                    ErrorCode::ServiceFailed,
+                    format!("cannot find the running fawkes binary: {e}"),
+                )
+            };
             let binary = std::env::current_exe()
-                .and_then(|path| path.canonicalize())
-                .map_err(|e| {
-                    err(
-                        ErrorCode::ServiceFailed,
-                        format!("cannot find the running fawkes binary: {e}"),
-                    )
-                })?;
+                .and_then(std::path::absolute)
+                .map_err(found)?;
             if let Some(build) = binary
+                .canonicalize()
+                .map_err(found)?
                 .ancestors()
                 .skip(1)
                 .find(|dir| dir.join("CACHEDIR.TAG").is_file())
@@ -159,9 +165,12 @@ mod launchd {
             );
 
             let replaced = self.plist.exists();
-            // With a plist, an answering daemon is the service's own, and the bootout below stops it.
+            // A loaded agent's daemon is the one that answered, and the bootout has stopped it. Any other daemon that
+            // answers (one started from a terminal) holds the state lock, so the agent's would fail at every start and
+            // launchd would retry it for ever.
+            let loaded = replaced && self.bootout()?;
             let socket = self.manifest.paths().socket();
-            if !replaced && UnixStream::connect(&socket).is_ok() {
+            if !loaded && UnixStream::connect(&socket).is_ok() {
                 return Err(invalid_state(format!(
                     "a daemon for {} already runs on {} (started from a terminal?); stop it, then install the service",
                     self.manifest.name,
@@ -170,9 +179,6 @@ mod launchd {
             }
             if let Some(dir) = self.plist.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| failed_to("create", dir, &e))?;
-            }
-            if replaced {
-                self.bootout()?;
             }
             // launchd opens `StandardErrorPath` before the daemon exists to create the directory.
             let state_dir = &self.manifest.paths().root;
@@ -238,10 +244,11 @@ mod launchd {
 
         // ------------------------------------------------ launchctl
 
-        /// launchd's `ExitTimeOut`: its default of 20 s would SIGKILL a daemon that is still stopping an app with a
-        /// longer `stop_timeout`.
+        /// launchd's `ExitTimeOut`, the longest a daemon's shutdown takes (`Daemon::shutdown`): twice `stop_timeout`
+        /// and 5 s for a switch or rollback in flight to finish, then `stop_timeout` of grace for the app, plus a
+        /// margin. launchd's default of 20 s would SIGKILL it partway, and the next start would have to recover.
         fn exit_timeout(&self) -> u64 {
-            let stop = Duration::from_secs_f64(self.manifest.stop_timeout);
+            let stop = Duration::from_secs_f64(3.0 * self.manifest.stop_timeout + 5.0);
             stop.as_secs() + u64::from(stop.subsec_nanos() > 0) + EXIT_MARGIN
         }
 

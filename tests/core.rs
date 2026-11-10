@@ -2738,7 +2738,6 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     );
     let state_dir = std::fs::metadata(h.dir.join("s")).unwrap();
     assert_eq!(state_dir.permissions().mode() & 0o777, 0o700);
-    let binary = binary.canonicalize().unwrap();
     let path = format!(
         "{d}/fakebin:{}",
         std::env::var("PATH").unwrap().replace('&', "&amp;")
@@ -2772,7 +2771,7 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 		<false/>
 	</dict>
 	<key>ExitTimeOut</key>
-	<integer>15</integer>
+	<integer>30</integer>
 	<key>StandardErrorPath</key>
 	<string>{d}/s/daemon.log</string>
 </dict>

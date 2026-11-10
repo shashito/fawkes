@@ -555,18 +555,25 @@ which `launchctl` runs. The plist holds:
   `run/` links. The paths and variables must be UTF-8.
 - `RunAtLoad` and `KeepAlive { SuccessfulExit = false }`: the daemon starts at login and again after a failed exit, and
   stays down after a clean one (a SIGTERM).
-- `ExitTimeOut`: `stop_timeout` rounded up, plus 10 s. launchd's default of 20 s would SIGKILL a daemon that is still
-  stopping an app with a longer `stop_timeout`.
+- `ExitTimeOut`: `3 × stop_timeout + 5`, rounded up, plus 10 s: the longest a daemon's shutdown takes (it waits up
+  to `2 × stop_timeout + 5` s for a switch or rollback in flight, then stops the app with `stop_timeout` of grace).
+  launchd's default of 20 s would SIGKILL it partway, and the next daemon start would have to recover. A changed
+  `stop_timeout` reaches the plist with the next `install`.
 - `StandardErrorPath`: `<state_dir>/daemon.log`, where the daemon's stderr goes. `install` creates `state_dir` (mode
-  `0700`) when it is missing, because launchd opens that file before the daemon exists to create the directory.
+  `0700`) when it is missing, because launchd opens that file before the daemon exists to create the directory. The
+  daemon caps it at 10 MiB (Process model), but only the lines its own writer writes: a daemon that fails before it
+  gets that far (an invalid manifest) adds its error at every start launchd retries, about every 10 s, uncapped.
+- The binary is named as it was run, not resolved, so a symlinked install (Homebrew's `bin/fawkes`) keeps working
+  after an upgrade removes the version it pointed at; a binary that moved needs `install` again.
 
 **install** refuses a binary with a `CACHEDIR.TAG` in any ancestor directory (`usage`): cargo writes one at the top of
 every target directory, and the next `cargo build` replaces the binary under the running daemon. Install a copy
-(`cargo install --path . --locked`) and run `fawkes service install` from it. With no plist yet, it also refuses
-(`invalid_state`) when a daemon already answers on the manifest's socket (started from a terminal): stop it first. With a
-plist, `install` replaces it: it boots the old agent out and waits until `launchctl print` no longer finds it (launchd
-answers a bootout before it has let go of the service, and a bootstrap until then fails), writes the new plist beside it
-and renames it into place, then bootstraps. A failing `launchctl` is `service_failed` with its message; after a failed
+(`cargo install --path . --locked`) and run `fawkes service install` from it. With a plist, `install` replaces it: it
+boots the old agent out and waits until `launchctl print` no longer finds it (launchd answers a bootout before it has
+let go of the service, and a bootstrap until then fails), writes the new plist beside it and renames it into place,
+then bootstraps. Unless a loaded agent was just booted out, it refuses (`invalid_state`) when a daemon already answers
+on the manifest's socket (one started from a terminal): it holds the state lock, so the agent's daemon would fail at
+every start. Stop it first. A failing `launchctl` is `service_failed` with its message; after a failed
 bootstrap the plist stays, and running `install` again or `uninstall` cleans up. Result:
 `{"label", "plist", "log", "replaced"}` (`replaced`: the plist existed before).
 
