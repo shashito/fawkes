@@ -150,9 +150,14 @@ pub enum Request {
     },
     Status,
     History,
+    /// Read the manifest again, as SIGHUP does, and answer what changed.
+    Reload,
     Log {
-        /// How many of the newest events; 20 when absent.
+        /// How many events: the newest ones, 20 when absent and no `since` is given.
         limit: Option<u64>,
+        /// The events after this `seq` that the daemon still keeps, as `Subscribe` replays them; ignored when the log
+        /// started over and no event can reach it.
+        since: Option<u64>,
         follow: bool,
     },
     Subscribe {
@@ -201,8 +206,10 @@ impl Request {
             },
             "status" => Request::Status,
             "history" => Request::History,
+            "reload" => Request::Reload,
             "log" => Request::Log {
                 limit: optional_count(&args, "limit")?,
+                since: optional_count(&args, "since")?,
                 follow: optional_bool(&args, "follow")?,
             },
             "subscribe" => Request::Subscribe {
@@ -229,6 +236,7 @@ impl Request {
             Request::Rollback { .. } => "rollback",
             Request::Status => "status",
             Request::History => "history",
+            Request::Reload => "reload",
             Request::Log { .. } => "log",
             Request::Subscribe { .. } => "subscribe",
         }
@@ -245,6 +253,7 @@ impl Request {
                 | Request::Confirm { .. }
                 | Request::Status
                 | Request::History
+                | Request::Reload
                 | Request::Log { follow: false, .. }
         )
     }
@@ -267,14 +276,19 @@ impl Serialize for Request {
             } => json!({ "generation": generation, "deadline": deadline }),
             Request::Confirm { generation } => json!({ "generation": generation }),
             Request::Rollback { keep_storage } => json!({ "keep_storage": keep_storage }),
-            Request::Log { limit, follow } => json!({ "limit": limit, "follow": follow }),
+            Request::Log {
+                limit,
+                since,
+                follow,
+            } => json!({ "limit": limit, "since": since, "follow": follow }),
             Request::Subscribe { limit, since } => json!({ "limit": limit, "since": since }),
             Request::Start
             | Request::Stop
             | Request::Restart
             | Request::Prune
             | Request::Status
-            | Request::History => json!({}),
+            | Request::History
+            | Request::Reload => json!({}),
         };
         let mut envelope = serializer.serialize_struct("Request", 2)?;
         envelope.serialize_field("command", self.command())?;
@@ -730,6 +744,18 @@ pub struct Process {
 pub struct Status {
     pub name: String,
     pub daemon_pid: u32,
+    /// The daemon's version. Absent from an older daemon's status, as are the three fields after it.
+    #[serde(default)]
+    pub version: String,
+    /// The manifest the daemon loaded, as an absolute path.
+    #[serde(default)]
+    pub manifest: PathBuf,
+    /// The state directory, resolved.
+    #[serde(default)]
+    pub state_dir: PathBuf,
+    /// The socket the daemon listens on.
+    #[serde(default)]
+    pub socket: PathBuf,
     pub permanent: Option<String>,
     pub current: Option<String>,
     /// The live switch, also while it is rolled back or its restore failed: read `step` to tell which.
@@ -789,6 +815,12 @@ pub struct History {
     pub failed_install_tail: Option<String>,
 }
 
+/// The result of `reload`: the manifest fields that changed, empty when the file says what the daemon already runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReloadResult {
+    pub changed: Vec<String>,
+}
+
 /// The result of `log`. Oldest first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Events {
@@ -835,6 +867,7 @@ pub enum Reply {
     Status(Status),
     History(History),
     Events(Events),
+    Reload(ReloadResult),
     /// A stream (`log --follow`, `subscribe`) has ended: its result is null.
     Streamed,
 }
@@ -859,6 +892,7 @@ reply_from!(
     Status(Status),
     History(History),
     Events(Events),
+    Reload(ReloadResult),
 );
 
 /// One line of a response. The daemon writes it with `T` the `Reply`; a client reads it with `T` a `Value` and
@@ -1144,7 +1178,11 @@ mod tests {
         ] {
             assert_eq!(
                 parse(&format!(r#"{{"command":"log","args":{args}}}"#)).unwrap(),
-                Request::Log { limit, follow }
+                Request::Log {
+                    limit,
+                    since: None,
+                    follow
+                }
             );
         }
         assert_eq!(
@@ -1244,9 +1282,19 @@ mod tests {
             Request::parse(r#"{"command":"log","args":{"limit":null,"follow":null}}"#).unwrap(),
             Request::Log {
                 limit: None,
+                since: None,
                 follow: false
             }
         );
+        assert_eq!(
+            parse(r#"{"command":"log","args":{"since":42,"limit":1}}"#).unwrap(),
+            Request::Log {
+                limit: Some(1),
+                since: Some(42),
+                follow: false
+            }
+        );
+        assert_eq!(parse(r#"{"command":"reload"}"#).unwrap(), Request::Reload);
     }
 
     #[test]
@@ -1269,10 +1317,12 @@ mod tests {
         assert_eq!(
             wire(Request::Log {
                 limit: Some(5),
+                since: Some(40),
                 follow: false
             }),
-            r#"{"command":"log","args":{"follow":false,"limit":5}}"#
+            r#"{"command":"log","args":{"follow":false,"limit":5,"since":40}}"#
         );
+        assert_eq!(wire(Request::Reload), r#"{"command":"reload","args":{}}"#);
         // What is written is read back as the same request.
         for request in [
             Request::Confirm { generation: None },
@@ -1398,6 +1448,10 @@ mod tests {
         let status = Status {
             name: "sample".into(),
             daemon_pid: 812,
+            version: "0.3.0".into(),
+            manifest: "/apps/sample/fawkes.toml".into(),
+            state_dir: "/apps/sample/state".into(),
+            socket: "/apps/sample/state/fawkes.sock".into(),
             permanent: Some("g2".into()),
             current: Some("g3".into()),
             pending: Some(Pending {
@@ -1431,7 +1485,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            r#"{"status":{"name":"sample","daemon_pid":812,"permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
+            r#"{"status":{"name":"sample","daemon_pid":812,"version":"0.3.0","manifest":"/apps/sample/fawkes.toml","state_dir":"/apps/sample/state","socket":"/apps/sample/state/fawkes.sock","permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
         );
         let Line::Status { status } = serde_json::from_str::<Line>(&text).unwrap() else {
             panic!("a status line reads as one");

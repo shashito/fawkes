@@ -361,7 +361,10 @@ impl Daemon {
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
     pub(super) fn start_live(self: &Arc<Self>, inner: &mut Inner, id: &str, why: Why) -> R<()> {
         if self.shutting_down() {
-            return Err(err(ErrorCode::StartFailed, "the daemon is shutting down"));
+            return Err(err(
+                ErrorCode::Busy,
+                "the daemon is shutting down; try again once a daemon has started",
+            ));
         }
         let m = self.manifest();
         let g = inner
@@ -612,6 +615,10 @@ impl Daemon {
         Status {
             name: self.manifest().name.clone(),
             daemon_pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            manifest: self.manifest_path.clone(),
+            state_dir: self.paths.root.clone(),
+            socket: self.socket.clone(),
             permanent: inner.store.state().permanent.clone(),
             current: inner.store.state().current().map(String::from),
             pending: inner.store.state().pending().cloned(),

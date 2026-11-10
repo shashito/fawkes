@@ -33,10 +33,11 @@ impl Daemon {
     pub(super) fn check_start(inner: &Inner) -> R<String> {
         let id = Self::current_generation(inner)?;
         if let Some(app) = inner.running() {
-            return Err(
-                invalid_state(format!("{id} is already running (pid {})", app.child.id()))
-                    .about(&id),
-            );
+            return Err(invalid_state(format!(
+                "{id} is already running (pid {}); `fawkes restart` restarts it",
+                app.child.id()
+            ))
+            .about(&id));
         }
         Ok(id)
     }

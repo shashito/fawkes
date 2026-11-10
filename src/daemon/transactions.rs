@@ -93,8 +93,11 @@ pub(super) fn check_abandon(state: &State) -> R<(Pending, String, Option<Rollbac
             cause,
             restore_failed: true,
         }) => Ok((pending.clone(), reason.clone(), *cause)),
+        _ if check_rollback(state).is_ok() => Err(invalid_state(
+            "--keep-storage only gives up a restore that failed, and none has; `fawkes rollback` rolls the pending switch back first",
+        )),
         _ => Err(invalid_state(
-            "--keep-storage only gives up a restore that failed, and none has; `fawkes rollback` first",
+            "--keep-storage only gives up a restore that failed, and none has: no switch is pending, so there is nothing to roll back",
         )),
     }
 }
@@ -168,7 +171,7 @@ impl Daemon {
             err(
                 ErrorCode::GitFailed,
                 format!(
-                    "`{git_ref}` is not a commit, branch or tag in {}{}",
+                    "`{git_ref}` is not a commit, branch or tag in {}{}; push or fetch it into that repository",
                     m.repo.display(),
                     if e.is_empty() {
                         String::new()

@@ -29,6 +29,16 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     let status = h.status();
     assert_eq!(status["process"]["state"], "stopped");
     assert_eq!(status["permanent"], Value::Null);
+    // The status says which daemon answered: its build, its manifest as given (absolute), and the resolved state
+    // directory with the socket in it.
+    let state_dir = std::fs::canonicalize(h.dir.join("s")).unwrap();
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(status["manifest"], h.manifest().to_str().unwrap());
+    assert_eq!(status["state_dir"], state_dir.to_str().unwrap());
+    assert_eq!(
+        status["socket"],
+        state_dir.join("fawkes.sock").to_str().unwrap()
+    );
 
     // stage → test → switch → the app confirms itself.
     let g1 = h.ok(&["stage", "v1"]);
@@ -1997,6 +2007,122 @@ fn sighup_reloads_hot_fields_and_refuses_a_manifest_that_changes_a_fixed_one() {
         messages_starting(&h, "daemon", "manifest reloaded").len(),
         1
     );
+}
+
+/// `fawkes reload` runs what SIGHUP runs and answers it: what changed, or why the daemon kept the manifest it had.
+#[test]
+fn reload_answers_what_changed_and_why_a_manifest_was_refused() {
+    let mut h = Harness::new("");
+    h.start_daemon();
+    let socket = h.status()["socket"].as_str().unwrap().to_string();
+
+    h.edit_manifest("interval = 0.1", "interval = 0.2");
+    h.edit_manifest(
+        r#"APP_PORT = "{port}""#,
+        "APP_PORT = \"{port}\"\nMARK = \"one\"",
+    );
+    assert_eq!(
+        h.ok(&["reload"])["changed"],
+        serde_json::json!(["health", "env"])
+    );
+    assert_eq!(h.ok(&["reload"])["changed"], serde_json::json!([]));
+
+    // A field fixed for the daemon's lifetime: `invalid_state`, the message says what to do, and the manifest the
+    // daemon has stays whole (the hot field edited along with it is not applied).
+    h.edit_manifest("/home\"", "/elsewhere\"");
+    h.edit_manifest(r#"MARK = "one""#, r#"MARK = "two""#);
+    let (code, refused) = h.fk(&["reload"]);
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (1, Some("invalid_state")),
+        "{refused}"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("home can only change with a daemon restart"),
+        "{refused}"
+    );
+    let logged = h.ok(&["log", "-n", "1"])["events"][0].clone();
+    assert_eq!(
+        (logged["kind"].as_str(), logged["error_code"].as_str()),
+        (Some("error"), Some("invalid_state")),
+        "{logged}"
+    );
+    h.edit_manifest("/elsewhere\"", "/home\"");
+    assert_eq!(h.ok(&["reload"])["changed"], serde_json::json!(["env"]));
+
+    // Each success is logged as the daemon event SIGHUP logs, the one that changed nothing too.
+    assert_eq!(
+        messages(&h, "daemon")
+            .iter()
+            .filter(|message| message.starts_with("manifest reloaded"))
+            .count(),
+        3
+    );
+
+    // An invalid manifest is `usage`. The client names the daemon by its socket: with the manifest it would load the
+    // file itself and refuse before the daemon saw it.
+    std::fs::write(h.manifest(), "not a manifest").unwrap();
+    let (code, refused) = h.fk(&["--socket", &socket, "reload"]);
+    assert_eq!(
+        (code, refused["code"].as_str()),
+        (2, Some("usage")),
+        "{refused}"
+    );
+    assert_eq!(
+        h.ok(&["--socket", &socket, "log", "-n", "1"])["events"][0]["error_code"],
+        "usage"
+    );
+}
+
+/// `log --since N` is the events after `seq` N, as `subscribe` replays them: the newest `--limit` of them when given,
+/// and a `since` the log cannot reach (it started over) is ignored.
+#[test]
+fn log_since_returns_the_events_after_a_seq() {
+    let mut h = Harness::new("");
+    h.start_daemon();
+    for _ in 0..4 {
+        h.ok(&["reload"]);
+    }
+    let seqs = |args: &[&str]| -> Vec<u64> {
+        let mut command = vec!["log"];
+        command.extend(args);
+        h.ok(&command)["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["seq"].as_u64().unwrap())
+            .collect()
+    };
+    let all = seqs(&["-n", "1000"]);
+    assert!(all.len() >= 5, "{all:?}");
+    let since = all[1].to_string();
+
+    assert_eq!(seqs(&["--since", &since]), all[2..]);
+    // With a limit, the newest of them: the end of the log, as `subscribe` keeps it.
+    assert_eq!(
+        seqs(&["--since", &since, "--limit", "1"]),
+        all[all.len() - 1..]
+    );
+    assert_eq!(seqs(&["--since", &since, "-n", "0"]), Vec::<u64>::new());
+    // Past the end of the log, nothing comes after it.
+    let last = all[all.len() - 1].to_string();
+    assert_eq!(seqs(&["--since", &last]), Vec::<u64>::new());
+    // A `since` no event can reach is ignored, so `--limit` applies as it would without it.
+    assert_eq!(
+        seqs(&["--since", "999999", "--limit", "2"]),
+        all[all.len() - 2..]
+    );
+
+    // Followed, the replay is the same, and the stream goes on.
+    let mut follow = h.follow(&["--since", &since]);
+    assert_eq!(follow.next(Duration::from_secs(10)).unwrap()["seq"], all[2]);
+    h.ok(&["reload"]);
+    follow.until("the reload after the replay", 10, |e| {
+        e["seq"].as_u64() > last.parse::<u64>().ok()
+    });
 }
 
 /// A reload cannot move `port` in the window of a switch between stopping the old app and starting the new one, when

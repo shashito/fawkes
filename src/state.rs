@@ -684,7 +684,7 @@ impl EventLog {
             .collect()
     }
 
-    /// What a `subscribe` or `log --follow` client gets before the live events. With `since`, the events after it that
+    /// What a `subscribe` or `log` client gets before the live events. With `since`, the events after it that
     /// are still in memory (the newest `limit` of them). A `since` that no event can reach, because the log started
     /// over, is ignored: the client would wait for a number that never comes. Without `since`, the last `limit`
     /// events, or none without a limit.

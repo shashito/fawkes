@@ -236,17 +236,25 @@ impl Daemon {
             }
             Request::Status => Ok(self.status().into()),
             Request::History => Ok(self.history().into()),
-            Request::Log { limit, follow } => {
-                let limit = limit.map_or(20, |n| usize::try_from(n).unwrap_or(usize::MAX));
+            Request::Log {
+                limit,
+                since,
+                follow,
+            } => {
+                // Without `since`, the last 20 events; with it, all that come after it.
+                let limit = limit
+                    .or_else(|| since.is_none().then_some(20))
+                    .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                 if follow {
-                    self.stream(out, None, Some(limit), false);
+                    self.stream(out, since, limit, false);
                     return Ok(Reply::Streamed);
                 }
                 Ok(Events {
-                    events: lock(&self.log).tail(limit),
+                    events: lock(&self.log).replay(since, limit),
                 }
                 .into())
             }
+            Request::Reload => self.reload_manifest().map(Reply::from),
             Request::Subscribe { limit, since } => {
                 let limit = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                 self.stream(out, since, limit, true);
