@@ -11,9 +11,12 @@ import type { UpError, UpResult } from './types.ts'
 
 export class UpFailure extends Error {
   readonly error: UpError
-  constructor(error: UpError) {
+  /** The signal that ended `up` before it answered: in the live app, the switch stopping its process group. */
+  readonly signal?: string
+  constructor(error: UpError, signal?: string) {
     super(error.message)
     this.error = error
+    this.signal = signal
   }
 }
 
@@ -55,7 +58,9 @@ export function up(bin: string, socket: string, ref: string, timeout = 3_600_000
       } catch {
         const how = signal ? `was ended by ${signal}` : `exited ${code}`
         const tail = stderr.trim().split('\n').at(-1)
-        return reject(new UpFailure({ message: `${bin} up ${how} without an answer${tail ? `: ${tail}` : ''}` }))
+        return reject(
+          new UpFailure({ message: `${bin} up ${how} without an answer${tail ? `: ${tail}` : ''}` }, signal ?? undefined),
+        )
       }
       if (code === 0) resolve(answer as UpResult)
       else reject(new UpFailure(answer as UpError))

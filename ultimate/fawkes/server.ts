@@ -208,10 +208,9 @@ function upgrade(host: ExtensionHost, socket: string, ref: string) {
     try {
       set({ state: 'switched', result: await up(bin, socket, ref) })
     } catch (error) {
-      const failure = error instanceof UpFailure ? error.error : { message: String(error) }
       // The switch stopped this process's group and `up` with it, before its answer: no failure, this process ends too.
-      if (!failure.code && switching(s.status)) return
-      set({ state: 'failed', error: failure })
+      if (error instanceof UpFailure && error.signal && switching(s.status)) return
+      set({ state: 'failed', error: error instanceof UpFailure ? error.error : { message: String(error) } })
     }
   })().finally(() => (s.upgradeRun = undefined))
 }
@@ -307,7 +306,7 @@ async function attentionNote(host: ExtensionHost, tx: Tx, conversationId: Conver
         model: [
           {
             role: 'user' as const,
-            content: now ? `Fawkes: ${now}` : `Fawkes: ${running} runs and nothing awaits a confirm.`,
+            content: now ? `Fawkes: ${now}` : `Fawkes: ${running} runs; nothing needs attention.`,
             timestamp: Date.now(),
           },
         ],

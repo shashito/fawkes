@@ -67,6 +67,13 @@ test("an upgrade runs fawkes up once and keeps the fields of its result and of i
     assert.equal(crashed.code, undefined)
     const missing = await failure(up(join(dir, 'no-such-fawkes'), '/s', 'main'))
     assert.match(missing.message, /cannot run .*no-such-fawkes/)
+
+    // A daemon that hangs: the extension stops waiting, and says the step carries on in the daemon.
+    const hung = join(dir, 'fawkes-hung')
+    writeFileSync(hung, '#!/bin/sh\nexec sleep 30\n')
+    chmodSync(hung, 0o755)
+    const late = await failure(up(hung, '/s', 'main', 100))
+    assert.match(late.message, /did not answer within .*`fawkes status` shows it/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
