@@ -85,7 +85,8 @@ effects.
 ## Upgrade
 
 ```sh
-fawkes up <ref> [--deadline SECS] --json && fawkes wait --json
+fawkes up <ref> [--deadline SECS] --json     # → {"generation": "g8", "previous": "g7", "deadline": …}
+fawkes wait g8 --json                        # → exit 0 once g8 is permanent, 1 if it rolled back
 ```
 
 `up` stages the ref, tests it and switches to it, streaming each step's progress on stderr; it ends with the result
@@ -96,8 +97,9 @@ which, and nothing is switched. `up` never confirms: the new generation confirms
 `up` returns as soon as the new generation is live. `fawkes wait [<gen>]` (default: the pending generation) then
 waits for the outcome: exit `0` with the record once it is permanent, or exit `1` with `rolled_back` (its `cause`
 says why) or, when the rollback could not restore the storage, `storage_failed`. It is bounded by the confirm
-deadline, answers at once for a generation already decided, so it is safe to retry, and fails `invalid_state` when
-nothing is pending. Upgrading an app other than yourself, always follow `up` with `wait`.
+deadline, answers at once for a generation already decided, so it is safe to retry. Name the generation `up`
+answered with: an app that confirms quickly is permanent before a bare `wait` starts, and a bare `wait` with nothing
+pending fails `invalid_state`. Upgrading an app other than yourself, always follow `up` with `wait`.
 
 If you run `up` on yourself (you are the live app upgrading your own code), the switch stops you, and your `up`
 client with you, so there is no `wait` for you. That is expected: the daemon finishes the switch without you, and the

@@ -54,6 +54,10 @@ pub enum ErrorCode {
     /// Produced by the client only: `fawkes service` could not run `launchctl` or write the plist, or `launchctl`
     /// refused.
     ServiceFailed,
+    /// Produced by `fawkes wait` only: the generation it waited for was rolled back; `cause` says why.
+    RolledBack,
+    /// Produced by the client only: a test run (`FAWKES_PHASE=test`) tried a command that changes the app.
+    TestPhase,
     /// A code a newer daemon sent that this client does not know; the command failed all the same.
     #[serde(other)]
     Unknown,
@@ -70,6 +74,32 @@ pub struct Error {
     /// The absolute path of the log that explains the failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<PathBuf>,
+    /// Why the generation was rolled back, as a code: set by `rolled_back`, and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<RollbackCause>,
+    /// The step of `up` that failed (`stage`, `test` or `switch`); set by `up` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<UpStep>,
+}
+
+/// A step of `fawkes up`, for the error of the one that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpStep {
+    Stage,
+    Test,
+    Switch,
+}
+
+impl UpStep {
+    /// The name on the wire, for messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpStep::Stage => "stage",
+            UpStep::Test => "test",
+            UpStep::Switch => "switch",
+        }
+    }
 }
 
 impl Error {
@@ -96,6 +126,19 @@ impl Error {
             ..self
         }
     }
+
+    /// The same error, saying the rollback it reports was decided for `cause`.
+    pub fn because(self, cause: Option<RollbackCause>) -> Error {
+        Error { cause, ..self }
+    }
+
+    /// The same error, saying it ended the step `step` of `up`.
+    pub fn in_step(self, step: UpStep) -> Error {
+        Error {
+            step: Some(step),
+            ..self
+        }
+    }
 }
 
 pub type R<T> = Result<T, Error>;
@@ -106,6 +149,8 @@ pub fn err(code: ErrorCode, message: impl Into<String>) -> Error {
         message: message.into(),
         generation: None,
         log: None,
+        cause: None,
+        step: None,
     }
 }
 
@@ -835,6 +880,17 @@ pub struct SwitchResult {
     pub deadline: String,
 }
 
+/// The result of `up`: the switch's, and what the steps before it learned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpResult {
+    #[serde(flatten)]
+    pub switch: SwitchResult,
+    /// The stage's flag: true when the commit already had a generation and nothing was built.
+    pub existing: bool,
+    /// The outcome of the test step, the `test` of the generation record `test` answered with.
+    pub test: Option<TestInfo>,
+}
+
 /// The result of `rollback`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RollbackResult {
@@ -1049,6 +1105,8 @@ mod tests {
         DaemonUnreachable => "daemon_unreachable",
         NoAnswer => "no_answer",
         ServiceFailed => "service_failed",
+        RolledBack => "rolled_back",
+        TestPhase => "test_phase",
         Unknown => "unknown",
     });
 
@@ -1417,6 +1475,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(detailed).unwrap(),
             json!({"code": "health_failed", "message": "m; fix it", "generation": "g2", "log": "/s/g2/logs/app.log"})
+        );
+        let rolled_back = err(ErrorCode::RolledBack, "m")
+            .because(Some(RollbackCause::Deadline))
+            .in_step(UpStep::Switch);
+        assert_eq!(
+            serde_json::to_value(rolled_back).unwrap(),
+            json!({"code": "rolled_back", "message": "m", "cause": "deadline", "step": "switch"})
         );
     }
 
