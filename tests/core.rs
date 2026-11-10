@@ -511,7 +511,12 @@ fn staging_a_commit_twice_returns_the_first_build_until_it_is_rolled_back() {
         "a tested one is reused too"
     );
 
-    // The permanent generation is never reused, and confirming it again is a true answer that changes nothing.
+    // The permanent generation is never reused, and confirming it again is a true answer that changes nothing. The
+    // live health check logs `healthy` from a thread of its own, which on a loaded machine comes after the confirm:
+    // the snapshot of the log waits for it.
+    h.wait("g1's live health check to be logged", 15, || {
+        !messages(&h, "healthy").is_empty()
+    });
     let events = h.ok(&["log", "-n", "1000"]);
     let confirmed = h.ok(&["confirm", "g1"]);
     assert_eq!(
