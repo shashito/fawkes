@@ -2189,7 +2189,9 @@ fn the_client_finds_the_app_from_where_it_runs() {
     );
     std::fs::copy(h.manifest(), registry.join("t.toml")).unwrap();
     assert!(found(status(&repo, &[], None)));
-    assert!(found(status(&h.dir, &["--manifest", "t"], None)));
+    // FAWKES_HOME ends the walk, and its repo is not this one: only the name finds the app.
+    assert_eq!(status(&registry, &[], None).0, 2);
+    assert!(found(status(&registry, &["--manifest", "t"], None)));
 
     let gone = h.dir.join("gone.sock");
     let gone = gone.to_str().unwrap();
@@ -2200,6 +2202,24 @@ fn the_client_finds_the_app_from_where_it_runs() {
         "{error}"
     );
     assert!(found(status(&below, &["--manifest", "t"], Some(gone))));
+
+    // A bare confirm names the caller's FAWKES_GENERATION to its own daemon, the one FAWKES_SOCKET names, however
+    // the command reached it; to any other it names none.
+    let confirm = |socket: &std::path::Path| {
+        let output = h
+            .cli()
+            .arg("confirm")
+            .env("FAWKES_SOCKET", socket)
+            .env("FAWKES_GENERATION", "g9")
+            .output()
+            .unwrap();
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+        error["message"].as_str().unwrap().to_string()
+    };
+    let own = confirm(&h.dir.join("s/fawkes.sock"));
+    assert!(own.contains("there is no generation g9"), "{own}");
+    let other = confirm(std::path::Path::new(gone));
+    assert!(other.contains("no switch is pending"), "{other}");
 
     // A manifest there answers only to its own name.
     std::fs::copy(h.manifest(), registry.join("xana.toml")).unwrap();

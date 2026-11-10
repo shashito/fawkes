@@ -92,7 +92,7 @@ impl Given {
             return self.named(name, "FAWKES_MANIFEST");
         }
         let cwd = self.cwd.as_ref()?;
-        let (found, top) = walk_up(cwd);
+        let (found, top) = walk_up(cwd, self.fawkes_home.as_deref().ok());
         if let Some(path) = found {
             return Ok(path);
         }
@@ -142,10 +142,16 @@ impl Given {
 }
 
 /// The nearest `fawkes.toml` from `cwd` up, stopping at the first directory with a `.git` (the repository root), so
-/// a project inside another never takes the outer one's manifest; and the last directory looked in.
-fn walk_up(cwd: &Path) -> (Option<PathBuf>, &Path) {
+/// a project inside another never takes the outer one's manifest; and the last directory looked in. `fawkes_home`
+/// ends the walk before it is read: its `fawkes.toml` is the app named `fawkes`, not the manifest of the state
+/// directories below it.
+fn walk_up<'a>(cwd: &'a Path, fawkes_home: Option<&Path>) -> (Option<PathBuf>, &'a Path) {
+    let fawkes_home = fawkes_home.and_then(|home| home.canonicalize().ok());
     let mut top = cwd;
     for dir in cwd.ancestors() {
+        if fawkes_home.is_some() && dir.canonicalize().ok() == fawkes_home {
+            break;
+        }
         top = dir;
         let file = dir.join(MARKER);
         if file.is_file() {
@@ -342,6 +348,14 @@ mod tests {
         assert_eq!(
             w.given("outer/tree/sub").target(),
             manifest(w.root.join("outer/tree").join(MARKER))
+        );
+        // fawkes_home ends it too: its fawkes.toml is the app `fawkes`, not that of a state directory below it.
+        w.app("fawkes", &w.root.join("elsewhere"));
+        std::fs::create_dir_all(w.home.join("xana/snapshots")).unwrap();
+        let err = w.given("home/xana/snapshots").target().unwrap_err();
+        assert!(
+            err.contains(&format!("up to {}", w.home.join("xana").display())),
+            "{err}"
         );
     }
 

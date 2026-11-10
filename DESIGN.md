@@ -133,8 +133,8 @@ daemon start runs the permanent generation.
 `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE`). An app confirms only when `FAWKES_PHASE` is
 `live`, and names itself: `"$FAWKES_BIN" confirm "$FAWKES_GENERATION"`. Its test run gets the same variables, with
 `FAWKES_PHASE=test`, while another generation may be pending. Without `<gen>` the CLI sends `$FAWKES_GENERATION`
-when it is set and the daemon was found through `$FAWKES_SOCKET` (no `--socket` or `--manifest` points it at another
-daemon), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
+when it is set and the daemon it reaches is the one `$FAWKES_SOCKET` names (the same socket file, however the command
+found it; a `--socket` or `--manifest` of another app gets none), so a process Fawkes started (or one it left behind) can only ever confirm its own generation; outside
 an app, a bare `confirm` confirms whichever generation is pending. The `confirmed` event says whether the confirm
 named the generation. The pending generation becomes `permanent`, the previous permanent becomes `retired`, the
 deadline is cleared. Confirming a generation that is not pending is `invalid_state`, except the permanent one:
@@ -511,7 +511,8 @@ A client command reaches its daemon by the first of:
 3. `$FAWKES_SOCKET`, which Fawkes sets for every process it starts, so an app reaches its own daemon without a word;
 4. `$FAWKES_MANIFEST`, read like `--manifest`;
 5. the nearest `fawkes.toml`, from the current directory up, stopping at the first directory that holds a `.git` (the
-   repository root, so a project inside another never takes the outer one's manifest);
+   repository root, so a project inside another never takes the outer one's manifest), and before `<fawkes_home>`,
+   whose `fawkes.toml` is the app named `fawkes`, not the manifest of the state directories below it;
 6. the manifest in `<fawkes_home>` (`*.toml`, each named after its app, see Validation) whose `repo` is the current
    directory or one of its parents. When more than one does, the command is refused (`usage`) with their names and
    asks for `--manifest <name>`; when none does, the error names the apps there are.
@@ -524,7 +525,8 @@ follows every daemon (see Watch).
 
 This order puts the flags before the environment, which **changes the earlier contract**, where `$FAWKES_SOCKET`
 beat `--manifest` and only `./fawkes.toml` was read: an app Fawkes runs that names another app's manifest now
-reaches that app's daemon, and its bare `confirm` then sends no `$FAWKES_GENERATION` (Confirm). An app that names
+reaches that app's daemon, and its bare `confirm` sends `$FAWKES_GENERATION` only when that is its own daemon
+(Confirm). An app that names
 nothing still reaches its own daemon, since `$FAWKES_SOCKET` comes before every discovered manifest.
 
 `--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped (for

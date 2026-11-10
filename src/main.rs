@@ -22,8 +22,9 @@ use serde_json::Value;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -146,7 +147,8 @@ enum Command {
     Confirm {
         #[arg(
             value_name = "GEN",
-            help = "The generation that vouches for itself [default: $FAWKES_GENERATION, else the pending one]"
+            help = "The generation that vouches for itself [default: $FAWKES_GENERATION towards the daemon \
+                    $FAWKES_SOCKET names, else the pending one]"
         )]
         generation: Option<String>,
     },
@@ -353,6 +355,17 @@ struct Endpoint {
 impl Endpoint {
     /// The daemon `given` names (`discovery`): a socket as given, or the socket of the manifest found.
     fn find(given: &Given) -> Result<Endpoint, String> {
+        let mut endpoint = Self::found(given)?;
+        // However it was found, the daemon is the caller's own when its socket is the file `FAWKES_SOCKET` names.
+        endpoint.own = endpoint.own
+            || given
+                .socket_env
+                .as_ref()
+                .is_some_and(|own| same_file(&endpoint.socket, Path::new(own)));
+        Ok(endpoint)
+    }
+
+    fn found(given: &Given) -> Result<Endpoint, String> {
         Ok(match given.target()? {
             Target::Socket { path, inherited } => Endpoint {
                 socket: path,
@@ -392,6 +405,14 @@ impl Endpoint {
         } else {
             format!("start one with `fawkes daemon --manifest {path}`")
         }
+    }
+}
+
+/// Whether two paths name one file (device and inode); false when either is missing.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
     }
 }
 
@@ -906,7 +927,6 @@ mod tests {
     use super::*;
     use protocol::Pending;
     use std::os::unix::net::UnixListener;
-    use std::path::Path;
     use std::time::Instant;
 
     fn parse(args: &str) -> Cli {
@@ -1296,6 +1316,37 @@ mod tests {
             err.starts_with("cannot read manifest") && err.ends_with(hint),
             "{err}"
         );
+    }
+
+    /// A daemon named by another path to `FAWKES_SOCKET`'s file (`--manifest` of the app's own manifest, a symlink)
+    /// is still the caller's own.
+    #[test]
+    fn the_own_daemon_is_known_by_its_file_not_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("fawkes.sock");
+        std::fs::write(&socket, "").unwrap();
+        let link = temp.path().join("link.sock");
+        std::os::unix::fs::symlink(&socket, &link).unwrap();
+        let other = temp.path().join("other.sock");
+        std::fs::write(&other, "").unwrap();
+        let own = |flag: &Path, env: Option<&Path>| {
+            let given = Given {
+                socket: Some(flag.into()),
+                manifest: None,
+                socket_env: env.map(Into::into),
+                manifest_env: None,
+                cwd: Ok(temp.path().into()),
+                fawkes_home: Ok(temp.path().into()),
+            };
+            Endpoint::find(&given).ok().unwrap().own
+        };
+        assert!(own(&link, Some(&socket)));
+        assert!(!own(&other, Some(&socket)));
+        assert!(!own(&socket, None));
+        assert!(!own(
+            &temp.path().join("gone.sock"),
+            Some(&temp.path().join("gone.sock"))
+        ));
     }
 
     fn endpoint(socket: &Path) -> Endpoint {

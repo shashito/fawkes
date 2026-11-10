@@ -56,8 +56,8 @@ Only in the `live` phase, and only once you know you work (your own checks pass,
 "$FAWKES_BIN" confirm "$FAWKES_GENERATION"
 ```
 
-Always name yourself. A bare `confirm` sends your `FAWKES_GENERATION` only while no `--socket` or `--manifest` is
-given; with one, or from anywhere outside an app, it confirms whatever is pending, which may not be you. Confirm before the
+Always name yourself. A bare `confirm` sends your `FAWKES_GENERATION` only to the daemon `FAWKES_SOCKET` names; to
+another app's, or from anywhere outside an app, it confirms whatever is pending, which may not be you. Confirm before the
 deadline the switch set (`status` → `pending.deadline`); after it you are rolled back. A confirm is safe to retry: once
 you are permanent, confirming yourself again answers ok with your record. Being restarted (a crash restart, `fawkes
 restart`) as the permanent generation needs no confirm.
