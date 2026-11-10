@@ -508,6 +508,7 @@ fawkes stage    <ref>
 fawkes test     <gen>
 fawkes switch   <gen> [--deadline SECS]
 fawkes up       <ref> [--deadline SECS]
+fawkes wait     [<gen>]
 fawkes confirm  [<gen>]
 fawkes rollback [--keep-storage]
 fawkes prune
@@ -525,6 +526,9 @@ after it. `-h` prints a command's usage and `--help` its long help (details, exa
 command, and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`. A mistyped command is a
 usage error that names the similar commands (`tip: a similar subcommand exists: 'log'`), never one run in its place.
 `fawkes --version` (or `-V`) prints `fawkes <version>` and exits 0.
+
+`fawkes tui` is a hidden tombstone for the removed terminal UI: a usage error (exit 2), "the TUI was removed; `fawkes
+watch` prints every app's events", as an error object under `--json`.
 
 `fawkes skill` prints `skills/fawkes/SKILL.md` as it was when the binary was built, so the skill an agent installs
 (`fawkes skill > .agents/skills/fawkes/SKILL.md`) always matches the binary. Under `--json`: `{"skill": "<text>"}`.
@@ -562,7 +566,7 @@ discovered manifest.
 generation then runs on storage that the failed generation may already have migrated.
 
 Commands that agents retry are idempotent: `stage <ref>` of a commit that already has a `staged`, `tested`,
-`test_failed` or `retired` generation answers with it (`existing: true`; the text form says "already staged") instead
+`test_failed` or `retired` generation answers with it (`existing: true`; the text form says "already staged", and, as for a new generation, names `fawkes test <gen>`) instead
 of building another, so to rebuild the same commit after the install environment changed, `prune` it first. `confirm
 <gen>` of the permanent generation is ok. `test <gen>` of a `tested` generation tests it again.
 
@@ -570,22 +574,61 @@ of building another, so to rebuild the same commit after the install environment
 no request of its own: it sends the three requests in turn (the generation `stage` answers with is the one it tests
 and switches to), so each step keeps its own slots, refusals and progress lines and the daemon's transaction code is
 unchanged. Their progress goes to stderr as for the single commands (in text mode, plus a line saying `g4` was staged or
-was already staged), and the output is the `switch` result alone, in text or `--json`. A step that fails ends the
-command with that step's error and exit code, printed as that command prints it, and nothing after it runs (`busy`
-too: a stage, test or switch in progress is the same refusal as for the single command). `up` never confirms: the new
+was already staged, and one saying it passed its test). The output is the `switch` result in text. Under `--json` it
+is the `switch` result plus what the steps before it learned: `existing` (the stage's flag: true when nothing was
+built) and `test` (the `test` of the record the test step answered with: port, outcome, duration). A step that fails
+ends the command with that step's error and exit code, printed as that command prints it, and nothing after it runs
+(`busy` too: a stage, test or switch in progress is the same refusal as for the single command); under `--json` the
+error object also has `step`, `stage`, `test` or `switch`, which says which of them it was. `up` never confirms: the new
 generation does, as after `switch`, and the deadline still rolls it back. A client that dies midway leaves a `staged`
 or `tested` generation, which running `up` again picks up, because `stage` of the same commit answers with the
 existing generation. A client that dies once the switch has begun leaves a pending generation instead: `up` again
 then stages a new generation and its switch is refused (`invalid_state`) until that one is confirmed or rolled back,
-so a retry reads `status` first. Run from inside the app it upgrades, the switch stops the old generation's process group, the
+so a retry reads `status` first. `up` and `switch` end once the target is live; `fawkes wait` reports whether it
+confirmed or rolled back (below). Run from inside the app it upgrades, the switch stops the old generation's process group, the
 client's included, so it gets no answer; that is expected, the daemon finishes the switch anyway and the new
 generation reads the outcome from `status` or `history`.
+
+`wait [<gen>]` ends when a generation is decided, so an agent learns the outcome of an upgrade without polling. It is
+client-side, on one `subscribe` stream: it decides from the `status` and `history` lines (the first picture, then after
+every change), never from the text of a message. Without `<gen>` it waits for the pending generation, the one in
+`status.pending` (also while it is rolled back or its restore failed); with nothing pending it fails `invalid_state`
+("nothing is pending: no switch awaits a confirm; `fawkes wait <gen>` waits for a given one"), so a generation
+that confirmed before `wait` started is waited for by name. The outcomes:
+
+| The generation | `wait` |
+|---|---|
+| `permanent`, or `retired` (it was confirmed) | exit 0; its record under `--json`, else one line (`g4 is permanent (confirmed at …)`) |
+| `rolled_back`, and its rollback has finished | exit 1, `rolled_back`: the error has `generation`, `cause` (see Rollback) and the readable reason in its message ("g4 was rolled back (missed confirm deadline); g1 runs; `fawkes history` has its log tail") |
+| `rolled_back`, its restore failed (`step` is `restore_failed`) | exit 1, `storage_failed`, with `generation`; the message names `fawkes rollback` and `rollback --keep-storage` |
+| in a rollback (`step` is `rolling_back`) | keeps waiting for it to finish |
+| `current` | keeps waiting |
+| `staged`, `tested` or `test_failed`, with no switch to it starting | exit 1, `invalid_state` ("g4 is tested; it is not switched to, so nothing will decide it") |
+
+A generation that is already decided answers at once, so `wait` is safe to retry. It is bounded by the deadline the
+switch set: a generation still `current` more than 30 seconds past `pending.deadline` (the supervisor rolls a missed
+deadline back within a second; the rest is slack for a slow machine) fails `no_answer` ("the daemon did not decide g4
+by its deadline …; check `fawkes status`"). Once the rollback is decided, `wait` waits for it to finish, which the
+manifest's timeouts bound. A stream that ends (a daemon restart rolls a pending switch back) is opened again every
+second, as `watch` does; a daemon that stays away for 30 seconds after the later of the loss and the deadline fails
+`daemon_unreachable`, and one that does not answer the first connection fails it at once. In text mode one line on
+stderr says what it waits for (`waiting for g4: confirm due by …`); under `--json` stdout is the one result or error
+object and stderr stays quiet. `wait` only reads, so it is the same in a test run.
+
+**Refusals, before a request is sent** (a change of the earlier contract, which let a test run call every command): with
+`FAWKES_PHASE=test` in the environment, `stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop` and
+`restart` fail `test_phase` (exit 1) whatever daemon they would reach: a test run serves its health check and nothing
+else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) and `confirm`, which `FAWKES_GENERATION`
+gates (Confirm), still run. `fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value)
+and `FAWKES_SOCKET` naming the socket file of the manifest they would act on fail `invalid_state`: they stop that
+daemon and its app, the caller with it, so they are run from a shell outside the app.
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
 That holds for every failure of the client itself too: it prints the same `{"code", "message"}` object (arguments it cannot
 parse and a manifest that cannot be read are `usage`, no daemon on the socket, a connection that breaks or closes without an answer is
-`daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`). The exceptions are the
+`daemon_unreachable`, a daemon that does not answer a quick command in time is `no_answer`, a change command in a test
+run is `test_phase`). The exceptions are the
 streams. `log --follow`: stdout carries one event document per line, as they happen, and nothing else when the
 daemon ends the stream (in text mode too). `watch` (see Watch): one `{"name", "event"}` document per event, for as
 long as it runs. `--json` does not apply to `daemon`, which prints text only.
@@ -604,6 +647,7 @@ Errors read as a sentence that says what to do next, for example:
 
 ```
 error: g4 was rolled back at 2026-11-03T14:02:11Z (missed confirm deadline); stage the ref again for a new generation
+error: g4 was rolled back (missed confirm deadline); g1 runs; `fawkes history` has its log tail
 error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with `fawkes daemon --manifest fawkes.toml`
 ```
 
@@ -615,7 +659,9 @@ daemon cannot tell it was started this way (it has no code for it). macOS only; 
 (run `fawkes daemon --manifest …` under the init system; systemd user units are **Later**). The manifest is found as
 for `daemon` (Finding the app); `--socket` is a usage error, since the service runs the daemon on the manifest's own
 socket.
-`--json` applies to all three: one result object, or the usual error object, with the usual exit codes.
+`--json` applies to all three: one result object, or the usual error object, with the usual exit codes. Run with
+`FAWKES_PHASE` set and `FAWKES_SOCKET` naming this manifest's socket, which is the case from inside the app, they are
+refused before `launchctl` runs (`invalid_state`, see CLI).
 
 The label is `dev.fawkes.<name>` and the plist `$HOME/Library/LaunchAgents/<label>.plist` (`HOME` must be set and
 absolute; the directory is created), loaded in the domain `gui/<uid>`. `HOME` and `PATH` decide where the plist goes and
@@ -698,12 +744,15 @@ failed install carries `log` (`<state_dir>/install-failed.log`) and no `generati
 removed. `health_failed` of a test and a start that fails carry `generation` and `log` (the generation's
 `logs/app.log`); `storage_failed` of a hook carries `generation` and `log` (its `logs/hooks.log`); an `invalid_state`
 about one generation (a refused switch, test or confirm, a rollback in the way) carries `generation`. The message
-says the same in words.
+says the same in words. The client's own errors add two more optional fields: `cause`, the rollback's cause as a code,
+on `rolled_back`, and `step` (`stage`, `test` or `switch`) on a failure of `up`.
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable`, `no_answer` and `service_failed` are
-produced by the client only: no daemon answers, or it closed the connection without an answer; the daemon accepted a
-quick request and did not answer in time; `fawkes service` could not write its plist or `launchctl` refused.)
+`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable`, `no_answer`, `service_failed`,
+`rolled_back` and `test_phase` are produced by the client only: no daemon answers, or it closed the connection without an answer; the daemon accepted a
+quick request and did not answer in time; `fawkes service` could not write its plist or `launchctl` refused. `rolled_back`
+is produced by `fawkes wait` alone, `test_phase` by the refusal of a change command in a test run; both are described
+under CLI.)
 A client treats a code it does not know as a failed command.
 
 The same goes for the other enumerations a newer daemon may extend: a client reads an event `kind`, a generation
@@ -879,7 +928,9 @@ does not, `watch` fails with `daemon_unreachable` (exit 3).
 **Discovery:** each daemon links its socket as `<fawkes_home>/run/<name>.sock` when it starts and removes the link
 when it stops (a daemon with a custom `state_dir` is found the same way). `fawkes_home` is `$FAWKES_HOME`, default
 `~/.fawkes`. `watch` lists that folder every 3 s, so daemons started later are followed too, and retries a link nobody
-answers on (a daemon that stopped or crashed) quietly every second. Two daemons with the same `name` are refused at
+answers on (a daemon that stopped or crashed) quietly every second. While it finds no daemon at all it says so once on
+stderr, `no daemon runs yet; waiting for one in <fawkes_home>/run`, so silence is not mistaken for a hang; stdout stays
+empty. Two daemons with the same `name` are refused at
 start (the link already answers).
 
 **Lines:** in text, the app's name and the event as `log` prints it. Under `--json`, the `subscribe` event line with

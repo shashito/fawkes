@@ -13,9 +13,9 @@ use clap::{Parser, Subcommand};
 use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
-    ErrorCode, Event, Events, Generation, History, Line, Process, ProcessState, PruneResult,
-    REQUEST_TIMEOUT, Request, RollbackResult, StageResult, Status, Step, SwitchResult, err,
-    timed_out,
+    ErrorCode, Event, Events, GenState, Generation, History, Line, Process, ProcessState,
+    PruneResult, REQUEST_TIMEOUT, Request, RollbackResult, StageResult, Status, Step, SwitchResult,
+    UpResult, UpStep, err, timed_out,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -53,6 +53,7 @@ line, `watch` one {\"name\", \"event\"} document per event. `daemon` prints text
 
 Examples:
   fawkes up main                     stage, test and switch main; the new generation confirms itself
+  fawkes wait                        until the pending switch is confirmed or rolled back
   fawkes status --json               what runs, what is pending, and the commands accepted now
   fawkes rollback                    undo the pending switch
   fawkes --manifest xana log -n 20   the last 20 events of the app xana, from anywhere
@@ -118,6 +119,9 @@ enum Command {
         generation: String,
     },
     /// Go live; roll back unless confirmed in time
+    ///
+    /// The command returns once the generation is live. Whether it then confirmed or rolled back is what `fawkes wait`
+    /// reports.
     Switch {
         /// A generation id, as `history` shows it (g4)
         #[arg(value_name = "GEN")]
@@ -129,7 +133,9 @@ enum Command {
     /// Stage, test and switch a git ref in one call
     ///
     /// Confirming stays the new generation's own step: it runs `fawkes confirm` once it works, and the deadline rolls
-    /// it back otherwise. A failed step ends the command with that step's error, and nothing after it runs.
+    /// it back otherwise. A failed step ends the command with that step's error (under --json, its `step` says which),
+    /// and nothing after it runs. The command exits once the generation is live; `fawkes wait` reports whether it
+    /// confirmed or rolled back.
     #[command(after_long_help = "Examples:\n  \
                                  fawkes up main\n  \
                                  fawkes up v1.4 --deadline 300 --json")]
@@ -140,6 +146,23 @@ enum Command {
         /// Seconds to confirm in, 1 to 604800 [default: the manifest's `deadline`]
         #[arg(long, value_name = "SECS")]
         deadline: Option<u64>,
+    },
+    /// Wait until a generation is confirmed or rolled back
+    ///
+    /// Follows the daemon until the generation is decided, and answers at once when it already is. Exit 0 and its record
+    /// when it became permanent; exit 1 with the code `rolled_back` (and its `cause`) when it was rolled back, or
+    /// `storage_failed` when the restore of that rollback failed. A generation that is not switched to cannot be
+    /// decided (`invalid_state`). It gives up with `no_answer` when the daemon has not decided by the confirm deadline
+    /// and a short grace after it.
+    #[command(after_long_help = "Examples:\n  \
+                                 fawkes wait\n  \
+                                 fawkes wait g4 --json")]
+    Wait {
+        #[arg(
+            value_name = "GEN",
+            help = "A generation id, as `history` shows it (g4) [default: the pending one]"
+        )]
+        generation: Option<String>,
     },
     /// Make the pending generation permanent
     #[command(after_long_help = "Example, from the app once it knows it works:\n  \
@@ -199,11 +222,14 @@ enum Command {
     /// --json it is the string of {"skill"}.
     #[command(after_long_help = "Example:\n  fawkes skill > .agents/skills/fawkes/SKILL.md")]
     Skill,
+    /// Removed: `fawkes watch` replaced it
+    #[command(hide = true)]
+    Tui,
 }
 
 impl Command {
-    /// The request this command sends to the daemon; `daemon`, `watch`, `service`, `skill` and `up` (three requests)
-    /// send none.
+    /// The request this command sends to the daemon; `daemon`, `watch`, `wait`, `service`, `skill`, `tui` and `up` (three
+    /// requests) send none.
     /// `own_generation` is `$FAWKES_GENERATION`, the generation a process Fawkes started runs as: a bare `confirm` from
     /// it names that generation, so an app's test run (or anything it left behind) cannot confirm another generation
     /// that happens to be pending.
@@ -212,7 +238,9 @@ impl Command {
             Command::Daemon
             | Command::Watch { .. }
             | Command::Service { .. }
+            | Command::Wait { .. }
             | Command::Skill
+            | Command::Tui
             | Command::Up { .. } => return None,
             Command::Start => Request::Start,
             Command::Stop => Request::Stop,
@@ -250,6 +278,35 @@ impl Command {
     }
 }
 
+impl Command {
+    /// The name of a command that changes the app or its daemon, which a test run (`FAWKES_PHASE=test`) may not run:
+    /// it serves its health check and nothing else. Every command is listed, so a new one must say which it is.
+    fn changes_the_app(&self) -> Option<&'static str> {
+        match self {
+            Command::Start => Some("start"),
+            Command::Stop => Some("stop"),
+            Command::Restart => Some("restart"),
+            Command::Stage { .. } => Some("stage"),
+            Command::Test { .. } => Some("test"),
+            Command::Switch { .. } => Some("switch"),
+            Command::Up { .. } => Some("up"),
+            Command::Rollback { .. } => Some("rollback"),
+            Command::Prune => Some("prune"),
+            // `confirm` is gated by `FAWKES_GENERATION`, which names the one generation it may confirm.
+            Command::Daemon
+            | Command::Confirm { .. }
+            | Command::Status
+            | Command::History
+            | Command::Log { .. }
+            | Command::Watch { .. }
+            | Command::Wait { .. }
+            | Command::Service { .. }
+            | Command::Skill
+            | Command::Tui => None,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -275,6 +332,15 @@ fn main() -> ExitCode {
             };
         }
     };
+    if matches!(cli.command, Command::Tui) {
+        let message = "the TUI was removed; `fawkes watch` prints every app's events".into();
+        return ExitCode::from(fail(
+            cli.json,
+            &mut std::io::stdout(),
+            ErrorCode::Usage,
+            message,
+        ));
+    }
     let given = Given::new(cli.socket.clone(), cli.manifest.clone());
     if matches!(cli.command, Command::Daemon) {
         // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of
@@ -299,6 +365,16 @@ fn main() -> ExitCode {
         };
     }
     let mut stdout = std::io::stdout().lock();
+    // Whichever daemon it targets: a test run serves its health check and nothing else.
+    if let Some(name) = cli.command.changes_the_app()
+        && std::env::var("FAWKES_PHASE").is_ok_and(|phase| phase == "test")
+    {
+        let message = format!(
+            "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {name}`; the live app \
+             or a shell outside the app does"
+        );
+        return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::TestPhase, message));
+    }
     if matches!(cli.command, Command::Skill) {
         if cli.json {
             say(&mut stdout, serde_json::json!({ "skill": SKILL }));
@@ -328,7 +404,15 @@ fn main() -> ExitCode {
     if let Command::Up { git_ref, deadline } = &cli.command {
         return ExitCode::from(run_up(&cli, git_ref, *deadline, &endpoint, &mut stdout));
     }
-    // `daemon`, `watch`, `service`, `skill` and `up` returned above, so every command left sends a request.
+    if let Command::Wait { generation } = &cli.command {
+        return ExitCode::from(run_wait(
+            &cli,
+            generation.as_deref(),
+            &endpoint,
+            &mut stdout,
+        ));
+    }
+    // `daemon`, `watch`, `wait`, `service`, `skill`, `tui` and `up` returned above, so every command left sends a request.
     let Some(request) = cli.command.request(own_generation.as_deref()) else {
         let message = "this command sends no request to a daemon".to_string();
         return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::Usage, message));
@@ -463,6 +547,23 @@ fn run_service(cli: &Cli, given: &Given, action: service::Action, out: &mut dyn 
         Ok(path) => path,
         Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
     };
+    // `restart` stops the daemon and its app, this process with them; `install` and `uninstall` act on the same agent.
+    if std::env::var_os("FAWKES_PHASE").is_some()
+        && let Some(own) = &given.socket_env
+        && let Ok(manifest) = Manifest::load(&manifest_path)
+        && same_file(&manifest.paths().socket(), Path::new(own))
+    {
+        let name = match action {
+            service::Action::Install => "install",
+            service::Action::Uninstall => "uninstall",
+            service::Action::Restart => "restart",
+        };
+        let message = format!(
+            "`fawkes service {name}` stops this daemon and its app, this process with it; run it from a shell \
+             outside the app"
+        );
+        return fail(cli.json, out, ErrorCode::InvalidState, message);
+    }
     match service::run(action, &manifest_path) {
         Ok((result, text)) => {
             if cli.json {
@@ -516,11 +617,26 @@ struct Failure {
 impl Failure {
     /// A failure of the client itself.
     fn new(code: ErrorCode, message: String) -> Failure {
-        let error = err(code, message);
+        Failure::of(err(code, message))
+    }
+
+    /// A failure of the client itself, with the facts `error` carries.
+    fn of(error: protocol::Error) -> Failure {
         Failure {
             raw: serde_json::to_value(&error).unwrap_or_default(),
+            exit: exit_code(error.code),
             error,
-            exit: exit_code(code),
+        }
+    }
+
+    /// The same failure, saying it ended the step `step` of `up`, in the object `--json` prints as well.
+    fn in_step(self, step: UpStep) -> Failure {
+        let mut raw = self.raw;
+        raw["step"] = step.as_str().into();
+        Failure {
+            raw,
+            error: self.error.in_step(step),
+            exit: self.exit,
         }
     }
 
@@ -566,7 +682,8 @@ fn client(
 }
 
 /// `fawkes up`: `stage`, `test` and `switch` in turn, each as its own request, and the first failure is the
-/// command's. The result is the switch's. Returns the exit code.
+/// command's, with the step that failed. The result is the switch's, with what the stage and the test learned.
+/// Returns the exit code.
 fn run_up(
     cli: &Cli,
     git_ref: &str,
@@ -580,21 +697,43 @@ fn run_up(
     {
         return fail(cli.json, out, error.code, error.message);
     }
-    let mut step = |request: &Request| exchange(cli, request, endpoint, REQUEST_TIMEOUT, out);
+    match up(cli, git_ref, deadline, endpoint, out) {
+        Ok(result) => {
+            if cli.json {
+                say(out, serde_json::to_string(&result).unwrap_or_default());
+            } else {
+                say(out, render_switch(&result.switch));
+            }
+            0
+        }
+        Err(failure) => failure.report(cli.json, out),
+    }
+}
+
+/// The three steps of `up`; what each answered is read as its command's result.
+fn up(
+    cli: &Cli,
+    git_ref: &str,
+    deadline: Option<u64>,
+    endpoint: &Endpoint,
+    out: &mut dyn Write,
+) -> Result<UpResult, Failure> {
+    fn read<T: serde::de::DeserializeOwned>(result: &Value, step: UpStep) -> Result<T, Failure> {
+        T::deserialize(result).map_err(|e| {
+            let message = format!(
+                "the daemon's {} result could not be read: {e}",
+                step.as_str()
+            );
+            Failure::new(ErrorCode::Internal, message).in_step(step)
+        })
+    }
+    let mut step = |name: UpStep, request: &Request| {
+        exchange(cli, request, endpoint, REQUEST_TIMEOUT, out).map_err(|f| f.in_step(name))
+    };
     let stage = Request::Stage {
         git_ref: git_ref.into(),
     };
-    let staged = match step(&stage).and_then(|result| {
-        StageResult::deserialize(&result).map_err(|e| {
-            Failure::new(
-                ErrorCode::Internal,
-                format!("the daemon's stage result could not be read: {e}"),
-            )
-        })
-    }) {
-        Ok(staged) => staged,
-        Err(failure) => return failure.report(cli.json, out),
-    };
+    let staged: StageResult = read(&step(UpStep::Stage, &stage)?, UpStep::Stage)?;
     let id = staged.generation.id;
     if !cli.json {
         warn(if staged.existing {
@@ -603,20 +742,50 @@ fn run_up(
             format!("staged {id}")
         });
     }
-    let switch = Request::Switch {
+    let test = Request::Test {
         generation: id.clone(),
+    };
+    let tested: Generation = read(&step(UpStep::Test, &test)?, UpStep::Test)?;
+    if !cli.json {
+        warn(format!("{id} passed its test"));
+    }
+    let switch = Request::Switch {
+        generation: id,
         deadline,
     };
-    match step(&Request::Test { generation: id }).and_then(|_| step(&switch)) {
-        Ok(result) => {
+    Ok(UpResult {
+        switch: read(&step(UpStep::Switch, &switch)?, UpStep::Switch)?,
+        existing: staged.existing,
+        test: tested.test,
+    })
+}
+
+/// `fawkes wait`: until the generation is confirmed (its record) or decided otherwise (the error says how). Returns
+/// the exit code.
+fn run_wait(cli: &Cli, id: Option<&str>, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
+    // One line on stderr when it starts to wait; under `--json` stdout is the answer and stderr stays quiet.
+    let mut progress = |line: String| {
+        if !cli.json {
+            warn(line);
+        }
+    };
+    match watch::wait(&endpoint.socket, id, &mut progress) {
+        Ok(generation) => {
             if cli.json {
-                say(out, result);
+                say(out, serde_json::to_string(&generation).unwrap_or_default());
             } else {
-                say(out, render_result(&switch, &result));
+                say(out, render_decided(&generation));
             }
             0
         }
-        Err(failure) => failure.report(cli.json, out),
+        Err(error) => {
+            let error = if error.code == ErrorCode::DaemonUnreachable {
+                error.with_hint(endpoint.start_hint())
+            } else {
+                error
+            };
+            Failure::of(error).report(cli.json, out)
+        }
     }
 }
 
@@ -826,6 +995,25 @@ fn render_status(s: &Status) -> String {
     )
 }
 
+fn render_switch(r: &SwitchResult) -> String {
+    format!(
+        "switched to {} (previous: {}); confirm before {} or it rolls back",
+        r.generation,
+        or_dash(r.previous.as_deref()),
+        r.deadline
+    )
+}
+
+/// What `fawkes wait` prints for a generation that was confirmed: still permanent, or retired by a later one.
+fn render_decided(g: &Generation) -> String {
+    let at = or_dash(g.confirmed_at.as_deref());
+    if g.state == GenState::Retired {
+        format!("{} was confirmed at {at} and has been retired since", g.id)
+    } else {
+        format!("{} is permanent (confirmed at {at})", g.id)
+    }
+}
+
 /// The answer to `request` as text. A result this client cannot read (a newer daemon's) is shown as the JSON it is.
 fn render_result(request: &Request, result: &Value) -> String {
     fn typed<T: serde::de::DeserializeOwned>(
@@ -837,15 +1025,21 @@ fn render_result(request: &Request, result: &Value) -> String {
     match request {
         Request::Stage { .. } => typed(result, |r: StageResult| {
             let g = &r.generation;
+            let hint = format!("`fawkes test {}` tests it", g.id);
             if r.existing {
                 format!(
-                    "{} is already staged as {} ({}); nothing was built",
+                    "{} is already staged as {} ({}); nothing was built; {hint}",
                     g.short_commit(),
                     g.id,
                     g.git_ref
                 )
             } else {
-                format!("staged {} ({} @ {})", g.id, g.git_ref, g.short_commit())
+                format!(
+                    "staged {} ({} @ {}); {hint}",
+                    g.id,
+                    g.git_ref,
+                    g.short_commit()
+                )
             }
         }),
         Request::Test { .. } => typed(result, |g: Generation| {
@@ -857,14 +1051,7 @@ fn render_result(request: &Request, result: &Value) -> String {
                 g.id
             )
         }),
-        Request::Switch { .. } => typed(result, |r: SwitchResult| {
-            format!(
-                "switched to {} (previous: {}); confirm before {} or it rolls back",
-                r.generation,
-                or_dash(r.previous),
-                r.deadline
-            )
-        }),
+        Request::Switch { .. } => typed(result, |r: SwitchResult| render_switch(&r)),
         Request::Confirm { .. } => {
             typed(result, |g: Generation| format!("{} is now permanent", g.id))
         }
@@ -1151,7 +1338,7 @@ mod tests {
             (
                 Request::Stage { git_ref: g("main") },
                 generation("g3", "staged", None),
-                vec!["staged g3", "main @ 01234567"],
+                vec!["staged g3", "main @ 01234567", "`fawkes test g3` tests it"],
             ),
             (
                 Request::Test {
@@ -1253,7 +1440,9 @@ mod tests {
             &existing,
         );
         assert!(
-            text.contains("01234567 is already staged as g3") && text.contains("nothing was built"),
+            text.contains("01234567 is already staged as g3")
+                && text.contains("nothing was built")
+                && text.contains("`fawkes test g3` tests it"),
             "{text}"
         );
 

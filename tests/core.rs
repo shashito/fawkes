@@ -1806,6 +1806,17 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     assert_eq!(h.status()["process"]["state"], "failed");
     assert_eq!(h.get(), None);
 
+    // `wait` ends at once with the failed restore, and names the two ways out.
+    let (exit, error) = h.fk(&["wait"]);
+    assert_eq!((exit, error["code"].as_str()), (1, Some("storage_failed")));
+    assert_eq!(error["generation"], "g2");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("`fawkes rollback` retries")
+            && message.contains("`fawkes rollback --keep-storage` starts g1"),
+        "{message}"
+    );
+
     let rolled = h.ok(&["rollback", "--keep-storage"]);
     assert_eq!(
         (
@@ -1832,6 +1843,12 @@ fn rollback_keep_storage_gives_up_a_restore_that_failed() {
     );
     // Nothing is pending any more.
     refused(&h, &["rollback"], "invalid_state", "nothing to roll back");
+    let (_, error) = h.fk(&["wait", "g2"]);
+    assert_eq!(
+        (error["code"].as_str(), error["cause"].as_str()),
+        (Some("rolled_back"), Some("requested")),
+        "{error}"
+    );
 }
 
 /// The messages of the events of `kind`, oldest first, that start with `prefix`.
@@ -2823,6 +2840,10 @@ fn up_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
     assert_eq!(result["generation"], "g1");
     assert_eq!(result["previous"], Value::Null);
     assert!(result["deadline"].is_string(), "{result}");
+    // What the steps learned: nothing was staged before, and the test passed on a spare port.
+    assert_eq!(result["existing"], false, "{result}");
+    assert_eq!(result["test"]["passed"], true, "{result}");
+    assert!(result["test"]["port"].is_number(), "{result}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     let progress: Vec<Value> = stderr
         .lines()
@@ -2851,6 +2872,7 @@ fn up_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
     let (exit, result) = h.fk(&["up", "v2"]);
     assert_eq!((exit, result["generation"].as_str()), (0, Some("g2")));
     assert_eq!(result["previous"], "g1");
+    assert_eq!(result["existing"], true, "{result}");
     h.wait("g2 to confirm itself", 15, || {
         h.status()["permanent"] == "g2"
     });
@@ -2859,6 +2881,173 @@ fn up_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
         h.ok(&["history"])["generations"].as_array().unwrap().len(),
         2
     );
+}
+
+/// `wait` reports a switch's outcome from the daemon's own stream: confirmed (the record), or rolled back (the code, the
+/// cause and the reason), and answers at once about a generation that is already decided.
+#[test]
+fn wait_reports_whether_a_switch_was_confirmed_or_rolled_back() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+
+    // Nothing is pending, so there is nothing to wait for without naming a generation.
+    let (exit, error) = h.fk(&["wait"]);
+    assert_eq!((exit, error["code"].as_str()), (1, Some("invalid_state")));
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing is pending"),
+        "{error}"
+    );
+
+    h.ok(&["stage", "v1"]);
+    h.ok(&["test", "g1"]);
+    h.ok(&["switch", "g1"]);
+    let (exit, record) = h.fk(&["wait", "g1"]);
+    assert_eq!(
+        (exit, record["state"].as_str()),
+        (0, Some("permanent")),
+        "{record}"
+    );
+    assert_eq!(record["id"], "g1");
+    assert!(record["confirmed_at"].is_string(), "{record}");
+    // Already decided: it answers at once, and again.
+    assert_eq!(h.fk(&["wait", "g1"]).1, record);
+
+    // A generation that is not switched to is decided by nothing; one that does not exist is not found.
+    h.ok(&["stage", "v2"]);
+    let (exit, error) = h.fk(&["wait", "g2"]);
+    assert_eq!((exit, error["code"].as_str()), (1, Some("invalid_state")));
+    assert_eq!(error["generation"], "g2");
+    assert!(
+        error["message"].as_str().unwrap().contains("g2 is staged"),
+        "{error}"
+    );
+    let (exit, error) = h.fk(&["wait", "g9"]);
+    assert_eq!((exit, error["code"].as_str()), (1, Some("not_found")));
+
+    // A generation that never confirms: its deadline rolls it back, and `wait` says so. In text, it says what it waits
+    // for on stderr as it starts.
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "3"]);
+    let output = common::fawkes()
+        .arg("--manifest")
+        .arg(h.manifest())
+        .arg("wait")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let mut lines = stderr.lines();
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with("waiting for g2: confirm due by "),
+        "{stderr}"
+    );
+    let failure = lines.next().unwrap();
+    assert!(
+        failure.starts_with("error: g2 was rolled back (") && failure.contains("g1 runs"),
+        "{stderr}"
+    );
+    assert_eq!(lines.next(), None, "{stderr}");
+
+    let (exit, error) = h.fk(&["wait", "g2"]);
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (1, Some("rolled_back")),
+        "{error}"
+    );
+    assert_eq!(error["generation"], "g2");
+    assert_eq!(error["cause"], "deadline", "{error}");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("g2 was rolled back (") && message.contains("deadline"),
+        "{message}"
+    );
+    // Nothing is pending any more.
+    assert_eq!(h.fk(&["wait"]).1["code"], "invalid_state");
+}
+
+/// `FAWKES_PHASE=test` refuses every command that changes the app, before a request is sent, and leaves the commands
+/// that only read.
+#[test]
+fn a_test_run_may_not_change_the_app() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    let events = h.ok(&["log", "-n", "50"])["events"]
+        .as_array()
+        .unwrap()
+        .len();
+
+    for args in [
+        &["stage", "v1"][..],
+        &["test", "g1"],
+        &["switch", "g1"],
+        &["up", "v1"],
+        &["rollback"],
+        &["prune"],
+        &["start"],
+        &["stop"],
+        &["restart"],
+    ] {
+        let output = h
+            .cli()
+            .env("FAWKES_PHASE", "test")
+            .args(args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let error: Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_eq!(
+            (output.status.code(), error["code"].as_str()),
+            (Some(1), Some("test_phase")),
+            "{args:?}: {error}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("does not `fawkes {}`", args[0])),
+            "{error}"
+        );
+    }
+    // The daemon heard nothing of it.
+    assert_eq!(
+        h.ok(&["log", "-n", "50"])["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        events
+    );
+    assert_eq!(h.ok(&["history"])["generations"], serde_json::json!([]));
+
+    // What only reads, and `confirm` (which `FAWKES_GENERATION` gates), still work.
+    for args in [&["status"][..], &["history"], &["log"], &["confirm"]] {
+        let output = h
+            .cli()
+            .env("FAWKES_PHASE", "test")
+            .args(args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let answer: Value = serde_json::from_str(&stdout).expect(&stdout);
+        assert_ne!(answer["code"], "test_phase", "{args:?}: {answer}");
+    }
+    // Any other phase changes the app as usual.
+    let output = h
+        .cli()
+        .env("FAWKES_PHASE", "live")
+        .args(["stage", "v1"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
 }
 
 /// A step that fails is the whole command's failure, as its own command prints it, and nothing after it runs: a
@@ -2880,6 +3069,7 @@ fn up_stops_at_a_failing_test_and_switches_nothing() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let error: Value = serde_json::from_str(&stdout).expect(&stdout);
     assert_eq!(error["code"], "health_failed", "{error}");
+    assert_eq!(error["step"], "test", "{error}");
     assert!(
         error["message"]
             .as_str()
@@ -2897,6 +3087,15 @@ fn up_stops_at_a_failing_test_and_switches_nothing() {
     // The deadline is checked before anything is staged.
     let (exit, error) = h.fk(&["up", "v1", "--deadline", "0"]);
     assert_eq!((exit, error["code"].as_str()), (2, Some("usage")));
+    assert_eq!(error["step"], Value::Null, "{error}");
+
+    // A ref that is no commit fails at the stage, and says so.
+    let (exit, error) = h.fk(&["up", "no-such-ref"]);
+    assert_eq!(
+        (exit, error["step"].as_str()),
+        (1, Some("stage")),
+        "{error}"
+    );
 }
 
 /// A fake `launchctl` in `<dir>/fakebin` that appends its arguments to `<dir>/calls` and keeps `<dir>/loaded` as the
