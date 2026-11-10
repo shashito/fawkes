@@ -602,10 +602,12 @@ impl EventLog {
         let mut recent = VecDeque::with_capacity(RECENT_EVENTS);
         let mut last_seq = 0;
         for file in [rotated_path(&path), path.clone()] {
-            let text = std::fs::read_to_string(file).unwrap_or_default();
-            for event in text
-                .lines()
-                .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+            // Read as bytes and line by line: a line that is not UTF-8 (a torn write) is skipped like any unreadable
+            // one, where reading the file as text would lose all of it, and `seq` would start over.
+            let bytes = std::fs::read(file).unwrap_or_default();
+            for event in bytes
+                .split(|byte| *byte == b'\n')
+                .filter_map(|l| serde_json::from_slice::<Event>(l).ok())
             {
                 last_seq = last_seq.max(event.seq);
                 // A kind from a newer fawkes would be replayed as `unknown`, its real kind lost; its `seq` still
@@ -850,6 +852,27 @@ mod tests {
         let kinds: Vec<EventKind> = log.tail(10).iter().map(|e| e.kind).collect();
         assert_eq!(kinds, [EventKind::Daemon]);
         assert_eq!(log.append(event(0)).seq, 3);
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf_8_costs_only_itself() {
+        // A torn or corrupted write leaves one bad line; the rest of the log, and the numbering after it, stay.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let mut text = Vec::new();
+        text.extend_from_slice(
+            br#"{"seq":1,"at":"2026-11-03T14:00:01Z","kind":"daemon","generation":null,"message":"a"}"#,
+        );
+        text.extend_from_slice(b"\n{\"seq\":2,\"message\":\"\xff\"}\n");
+        text.extend_from_slice(
+            br#"{"seq":3,"at":"2026-11-03T14:00:03Z","kind":"daemon","generation":null,"message":"c"}"#,
+        );
+        text.push(b'\n');
+        std::fs::write(&path, text).unwrap();
+        let mut log = EventLog::with_limit(path, 4096).unwrap();
+        let seqs: Vec<u64> = log.tail(10).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 3]);
+        assert_eq!(log.append(event(0)).seq, 4);
     }
 
     #[test]
