@@ -76,13 +76,13 @@ pub struct Finished {
 
 /// Run `command` in its own process group with stdin closed, for at most `timeout`: the one runner for every child
 /// that must end by itself (install, the storage hooks, git, cp and health commands). On every way out its whole
-/// group is ended (SIGTERM, SIGKILL after `grace` seconds), so neither a child that hangs nor what a finished one left
+/// group is ended (SIGTERM, SIGKILL after `grace`), so neither a child that hangs nor what a finished one left
 /// running outlives it. `spawned` gets the group's id as soon as it exists, for a caller that must be able to kill it
 /// from elsewhere (a daemon shutting down). `what` names the child in the errors.
 pub fn run_bounded(
     command: &mut Command,
     timeout: Duration,
-    grace: f64,
+    grace: Duration,
     what: &str,
     spawned: impl FnOnce(u32),
 ) -> Result<Finished, String> {
@@ -353,14 +353,18 @@ pub fn kill_group(pgid: u32) {
 /// (uninterruptible sleep) outlives even SIGKILL for as long as it is stuck.
 const KILL_WAIT: Duration = Duration::from_secs(2);
 
-/// SIGTERM the group `pgid`, wait up to `timeout` seconds for all of it to end, then SIGKILL it and wait until it is
+/// SIGTERM the group `pgid`, wait up to `timeout` for all of it to end, then SIGKILL it and wait until it is
 /// gone, so a caller that snapshots or restores storage, or starts the next process, never races a straggler.
 /// With the group leader as `leader` (our child) its exit status is returned; a leftover group of an earlier
 /// daemon has no leader to reap and gives `None`.
-pub fn stop_group(pgid: u32, timeout: f64, mut leader: Option<&mut Child>) -> Option<ExitStatus> {
+pub fn stop_group(
+    pgid: u32,
+    timeout: Duration,
+    mut leader: Option<&mut Child>,
+) -> Option<ExitStatus> {
     signal_group(pgid, Signal::TERM);
     let mut status = None;
-    let until = Instant::now() + Duration::from_secs_f64(timeout);
+    let until = Instant::now() + timeout;
     if wait_group(pgid, leader.as_deref_mut(), &mut status, until) {
         return status;
     }
@@ -397,18 +401,17 @@ fn wait_group(
     }
 }
 
-/// Try the health check every `interval` seconds until it passes, the app stops being alive, or `timeout` seconds
-/// pass. The app's exit (`exited`, from `exited`) ends the wait between two tries at once.
+/// Try the health check every `interval` until it passes, the app stops being alive, or `timeout` passes. The app's exit (`exited`, from `exited`) ends the wait between two tries at once.
 pub fn wait_healthy(
     check: &Check,
     cwd: &Path,
     env: &Env,
-    interval: f64,
-    timeout: f64,
+    interval: Duration,
+    timeout: Duration,
     mut alive: impl FnMut() -> bool,
     exited: &Receiver<()>,
 ) -> Result<(), String> {
-    let give_up = Instant::now() + Duration::from_secs_f64(timeout);
+    let give_up = Instant::now() + timeout;
     let gone = || Err("the app exited before it became healthy".into());
     loop {
         if !alive() {
@@ -421,12 +424,11 @@ pub fn wait_healthy(
         match last {
             Ok(()) => return Ok(()),
             Err(e) if Instant::now() >= give_up => {
-                return Err(format!("not healthy after {timeout}s: {e}"));
+                return Err(format!("not healthy after {}s: {e}", timeout.as_secs_f64()));
             }
             Err(_) => {
                 // Never past `give_up`: with `interval` longer than `timeout` the last try would come late.
-                let wait = Duration::from_secs_f64(interval)
-                    .min(give_up.saturating_duration_since(Instant::now()));
+                let wait = interval.min(give_up.saturating_duration_since(Instant::now()));
                 if !matches!(
                     exited.recv_timeout(wait),
                     Err(mpsc::RecvTimeoutError::Timeout)
@@ -452,7 +454,13 @@ fn run_check(command: &str, cwd: &Path, env: &Env, timeout: Duration) -> Result<
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let finished = run_bounded(&mut shell, timeout, 0.0, "health command", |_| {})?;
+    let finished = run_bounded(
+        &mut shell,
+        timeout,
+        Duration::ZERO,
+        "health command",
+        |_| {},
+    )?;
     if finished.status.success() {
         Ok(())
     } else {
@@ -607,7 +615,7 @@ mod tests {
         assert!(group_alive(pgid), "the member outlives its leader");
         assert_eq!(leftover(&pid_file), Some(pgid));
 
-        stop_group(pgid, 1.0, None);
+        stop_group(pgid, Duration::from_secs(1), None);
         assert_eq!(leftover(&pid_file), None, "the group is gone");
     }
 
@@ -659,7 +667,7 @@ mod tests {
         let _cleanup = (KillGroup(leader.id()), KillGroup(other.id()));
 
         let started = Instant::now();
-        let status = stop_group(other.id(), 0.2, Some(&mut leader));
+        let status = stop_group(other.id(), Duration::from_millis(200), Some(&mut leader));
         let waited = started.elapsed();
 
         kill_group(leader.id());
@@ -691,7 +699,7 @@ mod tests {
         let result = run_bounded(
             &mut command,
             Duration::from_secs(1),
-            0.5,
+            Duration::from_millis(500),
             "sleeper",
             |pgid| {
                 spawned = Some(pgid);
@@ -801,8 +809,8 @@ mod tests {
             &Check::Command("exit 1".into()),
             temp.path(),
             &[],
-            30.0,
-            1.0,
+            Duration::from_secs(30),
+            Duration::from_secs(1),
             || true,
             &exited,
         );

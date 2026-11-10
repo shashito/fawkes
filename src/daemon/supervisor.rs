@@ -33,16 +33,16 @@ enum Outcome {
     GiveUp,
 }
 
-/// The crash count after an exit and what to do about it. A run of at least `min_uptime` seconds resets the count, so
+/// The crash count after an exit and what to do about it. A run of at least `min_uptime` resets the count, so
 /// a crash after a long run is a first failure again. Pure: the caller keeps the saving, the events and the clock.
 fn after_exit(
     failed_starts: u32,
     ran: Duration,
     pending: bool,
-    min_uptime: f64,
+    min_uptime: Duration,
     max_failed_starts: u32,
 ) -> (u32, Outcome) {
-    let failed_starts = if ran.as_secs_f64() < min_uptime {
+    let failed_starts = if ran < min_uptime {
         failed_starts + 1
     } else {
         0
@@ -172,7 +172,7 @@ impl Daemon {
         // The leader is gone; end the rest of its group too, so nothing of it lives on unsupervised or keeps the
         // storage open while a rollback restores it.
         if let Some(pgid) = stragglers {
-            process::stop_group(pgid, 1.0, None);
+            process::stop_group(pgid, Duration::from_secs(1), None);
             self.forget_pid_file();
         }
         if let Some(reason) = rollback {
@@ -740,7 +740,7 @@ mod tests {
     use crate::protocol::{GenState, Generation, Pending, Step};
     use std::path::PathBuf;
 
-    const MIN_UPTIME: f64 = 10.0;
+    const MIN_UPTIME: Duration = Duration::from_secs(10);
     const SHORT: Duration = Duration::from_secs(1);
 
     fn restart(seconds: u64) -> Outcome {
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn a_long_run_resets_the_count_and_waits_one_second() {
-        let ran = Duration::from_secs_f64(MIN_UPTIME);
+        let ran = MIN_UPTIME;
         assert_eq!(after_exit(4, ran, false, MIN_UPTIME, 5), (0, restart(1)));
     }
 

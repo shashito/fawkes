@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 /// `$FAWKES_HOME`, else `~/.fawkes`: default state directories and the `run/` links `watch` discovers.
 pub fn fawkes_home() -> Result<PathBuf, String> {
@@ -73,14 +74,14 @@ pub struct Manifest {
     pub port: u16,
     pub spare_ports: [u16; 2],
     pub install: Option<String>,
-    pub install_timeout: f64,
+    pub install_timeout: Duration,
     pub reuse: Vec<String>,
     /// How many generations `prune` keeps; without it nothing is pruned.
     pub keep: Option<u32>,
     pub start: String,
     pub deadline: u64,
-    pub stop_timeout: f64,
-    pub min_uptime: f64,
+    pub stop_timeout: Duration,
+    pub min_uptime: Duration,
     pub max_failed_starts: u32,
     /// Roll a pending generation back as soon as its health check gives up, instead of at the deadline.
     pub rollback_on_unhealthy: bool,
@@ -91,8 +92,8 @@ pub struct Manifest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Health {
     pub check: Check,
-    pub interval: f64,
-    pub timeout: f64,
+    pub interval: Duration,
+    pub timeout: Duration,
 }
 
 /// The commands that carry the app's storage through a switch, a rollback and a test (DESIGN.md → Hooks). Without
@@ -102,7 +103,7 @@ pub struct Hooks {
     pub snapshot: Option<String>,
     pub restore: Option<String>,
     pub test_copy: Option<String>,
-    pub timeout: f64,
+    pub timeout: Duration,
 }
 
 // ------------------------------------------------ reading the file
@@ -149,6 +150,22 @@ impl Section {
                 self.problems.push(problem);
             })
             .ok()
+    }
+
+    /// A duration in seconds, `default` when absent. One that is not above 0 and at most `MAX_SECONDS` is a problem:
+    /// `Duration::from_secs_f64` and `Instant + Duration` panic on huge values, so the bound keeps every later use of
+    /// it safe.
+    fn seconds(&mut self, key: &'static str, default: f64) -> Duration {
+        let seconds = self.take(key).unwrap_or(default);
+        if seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS {
+            Duration::from_secs_f64(seconds)
+        } else {
+            self.problems.push(format!(
+                "{} {seconds} must be a number of seconds above 0 and at most {MAX_SECONDS}",
+                self.full(key)
+            ));
+            Duration::ZERO
+        }
     }
 
     /// The value of a key the manifest cannot do without: absent is a problem too.
@@ -199,19 +216,19 @@ struct Written {
     port: Option<u16>,
     spare_ports: Option<[u16; 2]>,
     install: Option<String>,
-    install_timeout: f64,
+    install_timeout: Duration,
     reuse: Vec<String>,
     keep: Option<u32>,
     start: Option<String>,
     deadline: u64,
-    stop_timeout: f64,
-    min_uptime: f64,
+    stop_timeout: Duration,
+    min_uptime: Duration,
     max_failed_starts: u32,
     rollback_on_unhealthy: bool,
     /// Without a `url` or a `command` in `[health]`, the default url; None when both are given.
     check: Option<Check>,
-    health_interval: f64,
-    health_timeout: f64,
+    health_interval: Duration,
+    health_timeout: Duration,
     env: BTreeMap<String, String>,
     /// Whether the file has `storage`, which `[hooks]` replaced.
     has_storage: bool,
@@ -228,21 +245,21 @@ impl Written {
         let port: Option<u16> = top.require("port");
         let spare_ports = Self::read_spare_ports(&mut top, port);
         let install = top.take("install");
-        let install_timeout = top.take("install_timeout");
+        let install_timeout = top.seconds("install_timeout", 1800.0);
         let reuse = top.take("reuse");
         let keep = top.take("keep");
         let start = top.require("start");
         let deadline = top.take("deadline");
-        let stop_timeout = top.take("stop_timeout");
-        let min_uptime = top.take("min_uptime");
+        let stop_timeout = top.seconds("stop_timeout", 10.0);
+        let min_uptime = top.seconds("min_uptime", 10.0);
         let max_failed_starts = top.take("max_failed_starts");
         let rollback_on_unhealthy = top.take("rollback_on_unhealthy");
 
         let mut health = top.section("health");
         let url = health.take("url");
         let command = health.take("command");
-        let interval = health.take("interval");
-        let health_timeout = health.take("timeout");
+        let interval = health.seconds("interval", 0.5);
+        let health_timeout = health.seconds("timeout", 60.0);
         let check = match (url, command) {
             (Some(url), None) => Some(Check::Url(url)),
             (None, Some(command)) => Some(Check::Command(command)),
@@ -255,7 +272,7 @@ impl Written {
             snapshot: hooks.take("snapshot"),
             restore: hooks.take("restore"),
             test_copy: hooks.take("test_copy"),
-            timeout: hooks.take("timeout").unwrap_or_else(default_hook_timeout),
+            timeout: hooks.seconds("timeout", 600.0),
         };
 
         let mut env = BTreeMap::new();
@@ -286,18 +303,18 @@ impl Written {
             port,
             spare_ports,
             install,
-            install_timeout: install_timeout.unwrap_or_else(default_install_timeout),
+            install_timeout,
             reuse: reuse.unwrap_or_default(),
             keep,
             start,
             deadline: deadline.unwrap_or_else(default_deadline),
-            stop_timeout: stop_timeout.unwrap_or_else(default_stop_timeout),
-            min_uptime: min_uptime.unwrap_or_else(default_min_uptime),
+            stop_timeout,
+            min_uptime,
             max_failed_starts: max_failed_starts.unwrap_or_else(default_max_failed_starts),
             rollback_on_unhealthy: rollback_on_unhealthy.unwrap_or(false),
             check,
-            health_interval: interval.unwrap_or_else(default_interval),
-            health_timeout: health_timeout.unwrap_or_else(default_health_timeout),
+            health_interval: interval,
+            health_timeout,
             env,
             has_storage,
         };
@@ -343,33 +360,14 @@ const DEFAULT_HEALTH_URL: &str = "http://127.0.0.1:{port}/";
 /// so a typo cannot leave a generation unconfirmed (and its predecessor not rolled back to) for weeks.
 pub const MAX_DEADLINE: u64 = 7 * 86_400;
 
-/// The longest any manifest duration may be, in seconds. `Duration::from_secs_f64` and `Instant + Duration` panic on
-/// huge values, so the bound is what keeps those calls safe.
+/// The longest any manifest duration may be, in seconds (`Section::seconds`).
 const MAX_SECONDS: f64 = 86_400.0;
 
 fn default_deadline() -> u64 {
     120
 }
-fn default_install_timeout() -> f64 {
-    1800.0
-}
-fn default_stop_timeout() -> f64 {
-    10.0
-}
-fn default_min_uptime() -> f64 {
-    10.0
-}
 fn default_max_failed_starts() -> u32 {
     3
-}
-fn default_interval() -> f64 {
-    0.5
-}
-fn default_health_timeout() -> f64 {
-    60.0
-}
-fn default_hook_timeout() -> f64 {
-    600.0
 }
 
 /// What a health check does: the URL to fetch or the command to run, as written in the manifest (templates are
@@ -588,10 +586,6 @@ impl Manifest {
     /// Decide whether `new` may replace `self` while the daemon runs. Ok: the TOML names of the changed fields,
     /// possibly none. Err: a message naming every refused field and what to do instead. Both manifests are the loaded
     /// ones, so paths are compared after resolution.
-    #[expect(
-        clippy::float_cmp,
-        reason = "the timeouts are copied from the manifest text, never computed: any difference is a change the user wrote"
-    )]
     pub fn reload(&self, new: &Manifest, app_running: bool) -> Result<Vec<&'static str>, String> {
         // Every field is named, so a new one fails to compile until it is named here, and is an unused variable until
         // one of the two lists below compares it.
@@ -666,6 +660,13 @@ impl Manifest {
         Ok(differing(&reloadable))
     }
 
+    /// How long a daemon shutting down waits for a switch, rollback or restart in flight to finish (`Daemon::shutdown`):
+    /// one that stops the app and starts another takes up to twice `stop_timeout`, and 5 s for the rest of its steps.
+    /// launchd's `ExitTimeOut` is derived from it, so the two cannot drift apart.
+    pub fn shutdown_wait(&self) -> Duration {
+        self.stop_timeout * 2 + Duration::from_secs(5)
+    }
+
     /// The files of `state_dir`.
     pub fn paths(&self) -> Paths {
         Paths {
@@ -736,20 +737,6 @@ impl Written {
         }
         if self.keep == Some(0) {
             problems.push("keep must be at least 1 (leave it out to keep every generation)".into());
-        }
-        for (field, seconds) in [
-            ("install_timeout", self.install_timeout),
-            ("stop_timeout", self.stop_timeout),
-            ("min_uptime", self.min_uptime),
-            ("health.interval", self.health_interval),
-            ("health.timeout", self.health_timeout),
-            ("hooks.timeout", self.hooks.timeout),
-        ] {
-            if !(seconds.is_finite() && seconds > 0.0 && seconds <= MAX_SECONDS) {
-                problems.push(format!(
-                    "{field} {seconds} must be a number of seconds above 0 and at most {MAX_SECONDS}"
-                ));
-            }
         }
         for entry in &self.reuse {
             if !is_inside(entry) {
@@ -1140,7 +1127,10 @@ A = 1
             m.health.check,
             Check::Url("http://127.0.0.1:{port}/".to_string())
         );
-        assert_eq!((m.health.interval, m.health.timeout), (0.5, 60.0));
+        assert_eq!(
+            (m.health.interval, m.health.timeout),
+            (Duration::from_millis(500), Duration::from_secs(60))
+        );
     }
 
     #[test]

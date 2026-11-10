@@ -731,8 +731,7 @@ impl Daemon {
         self.wake.notify();
         // A switch, rollback or restart in flight finishes first (start_live refuses from now on), so no app it
         // starts outlives the daemon. Its end frees the live slot, which moves `wake`.
-        let give_up =
-            Instant::now() + Duration::from_secs_f64(2.0 * self.manifest().stop_timeout + 5.0);
+        let give_up = Instant::now() + self.manifest().shutdown_wait();
         loop {
             let seen = self.wake.seen();
             let left = give_up.saturating_duration_since(Instant::now());

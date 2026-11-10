@@ -144,7 +144,7 @@ fn git_within(repo: &Path, args: &[&str], timeout: Duration) -> Result<String, S
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let finished = process::run_bounded(&mut command, timeout, 0.0, "git", |_| {})?;
+    let finished = process::run_bounded(&mut command, timeout, Duration::ZERO, "git", |_| {})?;
     if finished.status.success() {
         Ok(finished.stdout.trim().to_string())
     } else {
@@ -313,7 +313,6 @@ impl Daemon {
             ),
         );
         let code_arg = code.to_string_lossy().into_owned();
-        let install_timeout = Duration::from_secs_f64(m.install_timeout);
         // The repository's hooks never run here: the generation's own install is the place for setup, and a
         // hanging `post-checkout` would hold the step slot.
         git_within(
@@ -327,7 +326,7 @@ impl Daemon {
                 &code_arg,
                 commit,
             ],
-            install_timeout,
+            m.install_timeout,
         )
         .map_err(|e| {
             err(
@@ -344,7 +343,7 @@ impl Daemon {
                     id,
                     format!("cloning {dir} from {}", reuse_from.display()),
                 );
-                if let Err(e) = clone_directory(&from, &to, install_timeout) {
+                if let Err(e) = clone_directory(&from, &to, m.install_timeout) {
                     self.say(
                         out,
                         id,
@@ -370,7 +369,7 @@ impl Daemon {
             &[],
             &self.paths.install_log(id),
             &self.paths.step_pid(),
-            Duration::from_secs_f64(m.install_timeout),
+            m.install_timeout,
         )
         .map_err(|e| {
             err(
@@ -462,7 +461,7 @@ impl Daemon {
             &env,
             &log,
             &pid_file,
-            Duration::from_secs_f64(m.hooks.timeout),
+            m.hooks.timeout,
         )
         .map_err(|e| {
             err(
@@ -514,7 +513,7 @@ impl Daemon {
     }
 
     /// End the test `child` together with everything left in its group, and forget it.
-    fn end_step(&self, child: &mut Child, stop_timeout: f64) {
+    fn end_step(&self, child: &mut Child, stop_timeout: Duration) {
         let pgid = child.id();
         process::stop_group(pgid, stop_timeout, Some(child));
         self.forget_step_pid_file();
@@ -1320,7 +1319,7 @@ fn clone_directory(from: &Path, to: &Path, timeout: Duration) -> Result<(), Stri
         .arg(to)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let finished = process::run_bounded(&mut command, timeout, 0.0, "cp", |_| {})?;
+    let finished = process::run_bounded(&mut command, timeout, Duration::ZERO, "cp", |_| {})?;
     if finished.status.success() {
         Ok(())
     } else {

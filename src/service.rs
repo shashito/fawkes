@@ -251,11 +251,11 @@ mod launchd {
 
         // ------------------------------------------------ launchctl
 
-        /// launchd's `ExitTimeOut`, the longest a daemon's shutdown takes (`Daemon::shutdown`): twice `stop_timeout`
-        /// and 5 s for a switch or rollback in flight to finish, then `stop_timeout` of grace for the app, plus a
-        /// margin. launchd's default of 20 s would SIGKILL it partway, and the next start would have to recover.
+        /// launchd's `ExitTimeOut`, the longest a daemon's shutdown takes (`Daemon::shutdown`): its wait for a switch
+        /// or rollback in flight, then `stop_timeout` of grace for the app, plus a margin. launchd's default of 20 s
+        /// would SIGKILL it partway, and the next start would have to recover.
         fn exit_timeout(&self) -> u64 {
-            let stop = Duration::from_secs_f64(3.0 * self.manifest.stop_timeout + 5.0);
+            let stop = self.manifest.shutdown_wait() + self.manifest.stop_timeout;
             stop.as_secs() + u64::from(stop.subsec_nanos() > 0) + EXIT_MARGIN
         }
 
@@ -312,8 +312,14 @@ mod launchd {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             let bound = Duration::from_secs(self.exit_timeout() + LAUNCHCTL_SLACK);
-            run_bounded(&mut command, bound, 2.0, "launchctl", |_| {})
-                .map_err(|e| err(ErrorCode::ServiceFailed, e))
+            run_bounded(
+                &mut command,
+                bound,
+                Duration::from_secs(2),
+                "launchctl",
+                |_| {},
+            )
+            .map_err(|e| err(ErrorCode::ServiceFailed, e))
         }
     }
 
