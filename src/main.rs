@@ -308,8 +308,8 @@ impl Command {
             Command::Rollback { .. } => Some("rollback"),
             Command::Prune => Some("prune"),
             Command::Reload => Some("reload"),
-            // A bare `confirm` sends `FAWKES_GENERATION`, the test run's own generation, which is never pending; one
-            // that names another generation is not refused (DESIGN.md, Refusals).
+            // A test run may confirm its own generation, which is never pending; `main` refuses the rest once it knows
+            // which daemon the confirm reaches (DESIGN.md, Refusals).
             Command::Daemon
             | Command::Confirm { .. }
             | Command::Status
@@ -382,9 +382,10 @@ fn main() -> ExitCode {
         };
     }
     let mut stdout = std::io::stdout().lock();
+    let test_run = std::env::var("FAWKES_PHASE").is_ok_and(|phase| phase == "test");
     // Whichever daemon it targets: a test run serves its health check and nothing else.
     if let Some(name) = cli.command.changes_the_app()
-        && std::env::var("FAWKES_PHASE").is_ok_and(|phase| phase == "test")
+        && test_run
     {
         let message = format!(
             "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {name}`; the live app \
@@ -418,6 +419,25 @@ fn main() -> ExitCode {
     let own_generation = std::env::var("FAWKES_GENERATION")
         .ok()
         .filter(|_| endpoint.own);
+    // A test run confirms its own generation towards its own daemon, or nothing: a generation it names, or a bare
+    // confirm towards another daemon (which would send none and so confirm whatever is pending there), is another's.
+    if let Command::Confirm { generation } = &cli.command
+        && test_run
+        && own_generation
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .is_none_or(|own| generation.as_deref().unwrap_or(own) != own)
+    {
+        let named = generation
+            .as_deref()
+            .map_or_else(String::new, |id| format!(" {id}"));
+        let message = format!(
+            "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes confirm{named}`, which \
+             names a generation other than its own $FAWKES_GENERATION or a daemon other than $FAWKES_SOCKET; the live \
+             app or a shell outside the app does"
+        );
+        return ExitCode::from(fail(cli.json, &mut stdout, ErrorCode::TestPhase, message));
+    }
     if let Command::Up { git_ref, deadline } = &cli.command {
         return ExitCode::from(run_up(&cli, git_ref, *deadline, &endpoint, &mut stdout));
     }

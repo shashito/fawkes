@@ -61,8 +61,8 @@ In the `test` phase your home is a copy of the live storage (or empty), and the 
 Serve your health check and nothing else: no confirm, no upgrade, no work with effects outside your home (messages
 sent, jobs run, remote writes), since your code is not trusted yet. Fawkes enforces part of it: with `FAWKES_PHASE=test`
 every command that changes something (`stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop`,
-`restart`, `reload`) fails with `test_phase`, whichever app it names. `status`, `history`, `log`, `wait` and `watch`
-still work.
+`restart`, `reload`) fails with `test_phase`, whichever app it names, and so does a `confirm` of any generation but your
+own `$FAWKES_GENERATION` towards your own daemon. `status`, `history`, `log`, `wait` and `watch` still work.
 
 ## Confirm yourself
 

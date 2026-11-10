@@ -419,6 +419,62 @@ fn a_bare_confirm_from_a_test_run_cannot_confirm_another_pending_generation() {
     );
 }
 
+/// A test run confirms only its own `FAWKES_GENERATION`, towards the daemon its `FAWKES_SOCKET` names: a `confirm`
+/// that names another generation, or a bare one that would reach another daemon and so name none, fails
+/// `test_phase` before a request is sent.
+#[test]
+fn a_test_run_may_not_confirm_another_generation() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+
+    let own = h.dir.join("s/fawkes.sock");
+    let other = h.dir.join("gone.sock");
+    let confirm = |socket: &std::path::Path, args: &[&str]| {
+        let output = h
+            .cli()
+            .arg("confirm")
+            .args(args)
+            .env("FAWKES_PHASE", "test")
+            .env("FAWKES_GENERATION", "g3")
+            .env("FAWKES_SOCKET", socket)
+            .output()
+            .unwrap();
+        let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code(), answer)
+    };
+    for (socket, args) in [(&own, &["g2"][..]), (&other, &["g2"]), (&other, &[])] {
+        let (code, error) = confirm(socket, args);
+        assert_eq!(
+            (code, error["code"].as_str()),
+            (Some(1), Some("test_phase")),
+            "{args:?}: {error}"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not `fawkes confirm"),
+            "{error}"
+        );
+    }
+    // Its own generation, named or not, reaches the daemon, which has no g3 to confirm.
+    for args in [&["g3"][..], &[]] {
+        let (code, error) = confirm(&own, args);
+        assert_eq!(
+            (code, error["code"].as_str()),
+            (Some(1), Some("not_found")),
+            "{args:?}: {error}"
+        );
+    }
+    assert_eq!(h.status()["pending"]["generation"], "g2");
+}
+
 /// With `rollback_on_unhealthy`, a pending generation whose health check gives up rolls back at once, long before
 /// its confirm deadline.
 #[test]
@@ -3160,8 +3216,8 @@ fn a_test_run_may_not_change_the_app() {
     );
     assert_eq!(h.ok(&["history"])["generations"], serde_json::json!([]));
 
-    // What only reads, and `confirm` (which `FAWKES_GENERATION` gates), still work.
-    for args in [&["status"][..], &["history"], &["log"], &["confirm"]] {
+    // What only reads still works.
+    for args in [&["status"][..], &["history"], &["log"]] {
         let output = h
             .cli()
             .env("FAWKES_PHASE", "test")

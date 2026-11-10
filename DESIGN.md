@@ -135,7 +135,7 @@ daemon start runs the permanent generation.
 `fawkes confirm [<gen>]`, normally called by the new generation itself once it knows it is healthy (Fawkes gives it
 `FAWKES_BIN`, `FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE`). An app confirms only when `FAWKES_PHASE` is
 `live`, and names itself: `"$FAWKES_BIN" confirm "$FAWKES_GENERATION"`. Its test run gets the same variables, with
-`FAWKES_PHASE=test`, while another generation may be pending. Without `<gen>` the CLI sends `$FAWKES_GENERATION`
+`FAWKES_PHASE=test`, while another generation may be pending, and may confirm nothing but itself (Refusals). Without `<gen>` the CLI sends `$FAWKES_GENERATION`
 when it is set and the daemon it reaches is the one `$FAWKES_SOCKET` names (the same socket file, however the
 command found it; a `--socket` or `--manifest` of another app gets none), so a process Fawkes started (or one it left
 behind) can only ever confirm its own generation; outside an app, a bare `confirm` confirms whichever generation is
@@ -626,9 +626,10 @@ object and stderr stays quiet. `wait` only reads, so it is the same in a test ru
 **Refusals, before a request is sent** (a change of the earlier contract, which let a test run call every command): with
 `FAWKES_PHASE=test` in the environment, `stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop`,
 `restart` and `reload` fail `test_phase` (exit 1) whatever daemon they would reach: a test run serves its health check and nothing
-else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) and `confirm` still run: a bare
-`confirm` sends the test run's own `FAWKES_GENERATION`, which is never the pending one (Confirm), but a `confirm` that
-names another generation is not refused. `fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value)
+else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) still run. `confirm` runs only for the
+test run's own `FAWKES_GENERATION` towards the daemon `FAWKES_SOCKET` names (bare, or naming that generation), which is
+never the pending one (Confirm); a `confirm <gen>` naming another generation, and a bare `confirm` that would send no
+generation (another daemon, or `FAWKES_GENERATION` unset), fail `test_phase` too. `fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value)
 and `FAWKES_SOCKET` naming the socket file of the manifest they would act on fail `invalid_state`: they stop that
 daemon and its app, the caller with it, so they are run from a shell outside the app.
 
