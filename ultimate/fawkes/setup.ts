@@ -90,18 +90,25 @@ export function spareBlock(others: ManifestFacts[], port: number): [number, numb
 }
 
 /**
- * The manifest in `manifests` that already sets this host up: the file the new manifest would be written to, one whose
- * `project` is this project, or one whose `home` is this host's home (a hand-written manifest has no `project`).
+ * The manifest in `manifests` that already sets this host up: one whose `project` is this project, or one whose `home`
+ * is this host's home (a hand-written manifest has no `project`). A file of the same name alone is another app's.
  */
 export function findExisting(
   manifests: ManifestFile[],
-  host: { file: string; project: string; home: string },
+  host: { project: string; home: string },
 ): ManifestFile | undefined {
-  return manifests.find(({ file, text }) => {
-    if (file === host.file) return true
+  return manifests.find(({ text }) => {
     const facts = readManifest(text)
     return facts.project === host.project || facts.home === host.home
   })
+}
+
+/** `name`, or `name-2`, `name-3`, … when another app's manifest already has that file name. */
+export function freeName(manifests: ManifestFile[], name: string): string {
+  const taken = new Set(manifests.map(({ file }) => file))
+  let candidate = name
+  for (let n = 2; taken.has(`${candidate}.toml`); n++) candidate = `${name}-${n}`
+  return candidate
 }
 
 /** The manifest text for a host. */

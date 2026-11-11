@@ -24,7 +24,7 @@ import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { HELD_MARKER, role } from './role.ts'
-import { buildManifest, findExisting, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
+import { buildManifest, findExisting, freeName, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
 import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import type {
   Confirming,
@@ -379,20 +379,28 @@ function publicPort(home: string) {
 /** The manifests of the Fawkes home, and the one among them that already sets this host up. Writes nothing. */
 function existingFor(host: ExtensionHost) {
   const directory = process.env.FAWKES_HOME || join(host.userHome, '.fawkes')
-  const name = manifestName(host.projectRoot)
-  const file = `${name}.toml`
+  const read = (entry: string) => {
+    try {
+      return [{ file: entry, text: readFileSync(join(directory, entry), 'utf8') }]
+    } catch {
+      // As Fawkes's own discovery does: an entry that cannot be read (a folder named x.toml) sets nothing up.
+      return []
+    }
+  }
   const manifests = (() => {
     try {
       return readdirSync(directory)
         .filter((entry) => entry.endsWith('.toml'))
         .toSorted()
-        .map((entry) => ({ file: entry, text: readFileSync(join(directory, entry), 'utf8') }))
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-      throw error
+        .flatMap(read)
+    } catch {
+      // No Fawkes home yet, or one this process cannot list: setup writes into it or reports why it cannot.
+      return []
     }
   })()
-  const found = findExisting(manifests, { file, project: host.projectRoot, home: host.home })
+  const name = freeName(manifests, manifestName(host.projectRoot))
+  const file = `${name}.toml`
+  const found = findExisting(manifests, { project: host.projectRoot, home: host.home })
   const existing = found && { file: join(directory, found.file), text: found.text }
   return { directory, name, file, manifests, existing }
 }

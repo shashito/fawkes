@@ -849,8 +849,11 @@ impl Daemon {
     pub(super) fn adopt(self: &Arc<Self>) -> R<()> {
         let m = self.manifest();
         // The app runs outside Fawkes on the live port until now, and a start beside it would only crash-loop.
-        if !port_free(m.port) {
-            return Err(err(
+        let live_port_free = |m: &Manifest| {
+            if port_free(m.port) {
+                return Ok(());
+            }
+            Err(err(
                 ErrorCode::PortInUse,
                 format!(
                     "port {} is in use: stop the app running there first (fawkes tests HEAD of {} and then starts it \
@@ -858,8 +861,9 @@ impl Daemon {
                     m.port,
                     m.repo.display()
                 ),
-            ));
-        }
+            ))
+        };
+        live_port_free(&m)?;
         self.event_with(
             EventKind::Daemon,
             None,
@@ -876,6 +880,14 @@ impl Daemon {
         let id = self.stage(&mut out, "HEAD")?.generation.id;
         self.test(&mut out, &id).map_err(|e| {
             // The test's own hint (stage again, `fawkes test`) needs a daemon, and this one is about to end.
+            if e.code == ErrorCode::PortInUse {
+                return Error {
+                    message: format!(
+                        "another process took the spare port during the test of {id}; {id} is unchanged"
+                    ),
+                    ..e
+                };
+            }
             if e.code != ErrorCode::HealthFailed {
                 return e;
             }
@@ -895,6 +907,11 @@ impl Daemon {
                 ..e
             }
         })?;
+        // A reload during the adoption may have moved the live port.
+        let now = self.manifest();
+        if now.port != m.port {
+            live_port_free(&now)?;
+        }
         let mut inner = self.inner();
         // Written before anything starts, so a daemon that dies from here on runs it as the permanent generation at its
         // next start. A switch a client began meanwhile refuses it: exactly one generation is permanent.
@@ -1380,8 +1397,8 @@ fn left_to_next_start(id: &str, permanent: &str) -> Error {
 /// What a daemon whose adoption failed says on its way out, its last line on stderr: what failed, that nothing was
 /// started, and how to go on.
 pub(super) fn not_adopted(e: &Error) -> String {
-    // A taken port says what to do in its own message.
-    let next = if e.code == ErrorCode::PortInUse {
+    // A taken live port says what to do in its own message; it is the only failure about no generation.
+    let next = if e.code == ErrorCode::PortInUse && e.generation.is_none() {
         ""
     } else {
         "; start the app as before, or fix it and run `fawkes daemon` again"

@@ -12,7 +12,8 @@ To move an Ultimate host under Fawkes for the first time:
    (`~/.fawkes` by default; `<name>` is the project folder's name reduced to letters, digits, `_` and `-`), with the
    project, the clone the host runs from, its home, the port it serves on now (the one recorded in `<home>/ultimate.lock`,
    which is the port you open) and the first free block of ten spare ports from 4790 up. A manifest that already sets
-   the host up (same file name, same `project`, or the same `home`) is shown as it is and never overwritten.
+   the host up (the same `project`, or the same `home`) is shown as it is and never overwritten; another app's manifest of
+   the same file name gives this one the next free name (`<name>-2`).
 3. **Update turns off.** The card also turns the built-in `update` extension off for this project, through Ultimate's
    onboarding actions; if the project's Ultimate setup is still undecided, clicking Set up trusts it. A project that
    declined its setup keeps `update` on, and the card says so.

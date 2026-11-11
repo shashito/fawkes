@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildManifest, findExisting, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
+import { buildManifest, findExisting, freeName, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
 import type { SetupInput } from './setup.ts'
 
 const host: SetupInput = {
@@ -97,7 +97,7 @@ name = "other"
   assert.deepEqual(facts, { name: 'xana', home: '/h/xana', port: 4749, spare: [4790, 4799] })
 })
 
-test('an existing manifest is found by its file name, its project or its home', () => {
+test('an existing manifest is found by its project or its home, never by its file name alone', () => {
   const xana = { file: 'xana.toml', text: buildManifest(host) }
   // Hand-written: no `project`, only a home.
   const byHand = { file: 'ultimate.toml', text: `name = "ultimate"\nhome = "${host.home}"\nport = 4750\n` }
@@ -105,11 +105,15 @@ test('an existing manifest is found by its file name, its project or its home', 
     file: 'other.toml',
     text: 'name = "other"\nproject = "/Users/me/Code/other"\nhome = "/Users/me/.ultimate/projects/other-1"\nport = 4751\n',
   }
-  const me = { file: 'xana.toml', project: host.project, home: host.home }
+  const me = { project: host.project, home: host.home }
   assert.equal(findExisting([other], me), undefined)
   assert.equal(findExisting([other, xana], me), xana)
-  // Same file name, whatever it holds.
-  assert.equal(findExisting([other, { file: 'xana.toml', text: 'name = "x"' }], me)?.file, 'xana.toml')
+  // Another project of the same folder name: its manifest is not this host's, and this one gets the next free name.
+  const namesake = [{ file: 'xana.toml', text: 'name = "xana"\nproject = "/Users/me/play/xana"\n' }]
+  assert.equal(findExisting(namesake, me), undefined)
+  assert.equal(freeName(namesake, 'xana'), 'xana-2')
+  assert.equal(freeName([...namesake, { file: 'xana-2.toml', text: '' }], 'xana'), 'xana-3')
+  assert.equal(freeName(namesake, 'other'), 'other')
   // Same project under another file name.
   assert.equal(findExisting([other, { file: 'x2.toml', text: xana.text }], me)?.file, 'x2.toml')
   // Same home, no project.
