@@ -165,15 +165,16 @@ pub struct State {
     pub txn: Option<Txn>,
 }
 
-/// The edges of the generation diagram (DESIGN.md → Generations and states). A stage that fails and `prune` remove
-/// the record instead, which is not a transition; nothing leaves `rolled_back`, and nothing returns to `staging`.
+/// The edges of the generation diagram (DESIGN.md → Generations and states); `tested` to `permanent` is the adoption
+/// at a first daemon start. A stage that fails and `prune` remove the record instead, which is not a transition;
+/// nothing leaves `rolled_back`, and nothing returns to `staging`.
 pub fn allowed(from: GenState, to: GenState) -> bool {
     use GenState::{Current, Permanent, Retired, RolledBack, Staged, Staging, TestFailed, Tested};
     matches!(
         (from, to),
         (Staging, Staged)
             | (Staged | TestFailed | Tested | Retired, Tested | TestFailed)
-            | (Tested, Current)
+            | (Tested, Current | Permanent)
             | (Current, Permanent | RolledBack)
             | (Permanent, Retired)
     )
@@ -900,6 +901,7 @@ mod tests {
             (Retired, Tested),
             (Retired, TestFailed),
             (Tested, Current),
+            (Tested, Permanent),
             (Current, Permanent),
             (Current, RolledBack),
             (Permanent, Retired),

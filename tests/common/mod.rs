@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
@@ -265,13 +265,19 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
     }
 
     pub fn start_daemon(&mut self) {
+        self.spawn_daemon();
+        self.wait("the daemon to answer", 10, || self.fk(&["status"]).0 == 0);
+    }
+
+    /// Start the daemon without waiting for it to answer, for a test that expects it to end by itself.
+    pub fn spawn_daemon(&mut self) {
         // Appended, so a test that restarts the daemon keeps the log of each one.
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.dir.join("daemon.log"))
             .unwrap();
-        self.start_daemon_with_stderr(log);
+        self.daemon = Some(self.daemon_command().stderr(log).spawn().unwrap());
     }
 
     /// `start_daemon` with the daemon's stderr going to `stderr` instead of `daemon.log`.
@@ -299,16 +305,23 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
 
     /// Wait up to `within` for the daemon to exit by itself (after a SIGTERM); whether it did.
     pub fn daemon_exits_within(&mut self, within: Duration) -> bool {
+        self.daemon_exit_within(within).is_some()
+    }
+
+    /// Wait up to `within` for the daemon to exit by itself; how it exited, None while it still runs.
+    pub fn daemon_exit_within(&mut self, within: Duration) -> Option<ExitStatus> {
         let daemon = self.daemon.as_mut().expect("the daemon was started");
         let give_up = Instant::now() + within;
-        while daemon.try_wait().unwrap().is_none() {
+        loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                self.daemon = None;
+                return Some(status);
+            }
             if Instant::now() >= give_up {
-                return false;
+                return None;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        self.daemon = None;
-        true
     }
 
     /// A connection to the daemon's socket, for a test that decides when its request goes out.

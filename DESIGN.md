@@ -58,6 +58,9 @@ has no one to answer, so `SIGHUP` only logs:
 - Everything else (`start`, `env`, `health`, `hooks`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`,
   `spare_ports`, `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch, rollback
   or start on. An invalid manifest is not reloaded.
+- `adopt` and `project` take effect at the next daemon start: only a daemon start adopts, and the daemon never reads
+  `project`, which is for the commands that find the app (Finding the app; they read it from the file each time). A
+  reload takes a change of either, and lists `adopt` among the changed fields.
 
 Change `home` only while no switch is pending: a daemon start rolls a pending switch back into the `home` of the
 manifest it reads. The same goes for a `restore` hook that cannot read what the `snapshot` hook before it wrote, since
@@ -75,6 +78,8 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
    │           ▲  ◀─fails─┘ (test_failed,                  │
    │           │            retestable)                      └──missed deadline / exit / rollback──▶ rolled_back
    └──fails──▶ removed
+
+tested ──adopt (a first daemon start, `adopt = true`)──▶ permanent
 ```
 
 - **staging:** recorded before the worktree is created and the install runs, and the record (with the id it spends)
@@ -95,8 +100,10 @@ staging ──▶ staged ──test──▶ tested ──switch──▶ curren
   `127.0.0.1` and `0.0.0.0`; a test that fails while another process holds its port afterwards is `port_in_use` and
   leaves the generation as it was. Only a tested generation can be switched to.
 - **current:** live, not yet confirmed. A confirm deadline runs (Junos `commit confirmed`).
-- **permanent:** confirmed by the app (RAUC/Mender mark-good). Exactly one generation is permanent at a time. A cold
-  start of the daemon always runs the permanent generation (Erlang/OTP release handler).
+- **permanent:** confirmed by the app (RAUC/Mender mark-good), or adopted: a first daemon start with `adopt = true`
+  makes its tested HEAD permanent without a switch (Adopt), and its `confirmed_at` is the time of that. Exactly one
+  generation is permanent at a time. A cold start of the daemon always runs the permanent generation (Erlang/OTP
+  release handler).
 - **retired:** was permanent, superseded by a newer confirm. Its worktree stays until `prune` removes it; `switch` to it
   again is allowed (after a new `test`), which is how an agent goes back to an older version on purpose.
 - **rolled_back:** final. A rolled-back generation is never started again, so a broken rollback cannot loop, and
@@ -287,13 +294,39 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 6. Remove what a daemon that died mid-stage left behind: `staging` generations, generation directories no record
    owns, and the worktrees git still lists for them (`git worktree prune`).
 7. Act on the step `state.json` says was in flight (`txn`):
-   - none: start the permanent generation, if there is one;
+   - none: start the permanent generation, if there is one; without one, with `adopt = true` in the manifest, adopt
+     HEAD once the socket serves (Adopt, below);
    - `switching`: the target never ran (the last daemon was killed, or stopped by `SIGTERM` while the switch stopped
      the old generation). Log that the switch to it was cut short (it stays `tested`), clear the step and start the
      permanent generation;
    - `pending`: roll the switch back (reason `daemon_restart`, cause `daemon_restart`); a pending switch is never resumed;
    - `rolling_back`: retry the rollback with its recorded reason and cause (a `restore` hook is safe to run again, see
      Hooks), then start the permanent generation.
+
+### Adopt
+
+An app that ran before Fawkes supervised it has no generation, so its first upgrade would have nothing to roll back
+to. With `adopt = true`, a daemon start that finds no step in flight and no permanent generation adopts the version
+at HEAD of `repo` instead of starting nothing. It runs once the socket serves, on a thread of its own, so the test
+run, `status` and `watch` reach the daemon meanwhile (`busy` names the stage, then the test):
+
+1. Refuse when the live `port` is taken (`port_in_use`, "port N is in use: stop the app running there first"): the
+   app still runs outside Fawkes, and a start beside it would crash-loop.
+2. Log a `daemon` event (`action` `adopting`), then stage `HEAD` and test it as `stage` and `test` do: a `staged`,
+   `tested` or `test_failed` generation of that commit is reused, and the test runs on a spare port with a copy of
+   the storage (Hooks), never on the live home.
+3. On a pass, mark the generation `permanent` and write `state.json` before anything starts: no switch, so no
+   snapshot, no deadline and no confirm. Log `adopted`, then start it as a cold start does.
+
+A failure of any of them (the port, the stage, the test) is logged as an `error` event and starts nothing. The
+daemon then ends through its ordinary shutdown, as after a `SIGTERM` (the socket and its `run/` link removed),
+with exit code 1 and a last line on stderr that says what failed, that nothing was started and the home is
+untouched, and to start the app as before, or fix it and run `fawkes daemon` again; a failed test names its log. The
+generation stays as the step left it (`test_failed` after a failed test), so the next start tests the same one again
+while HEAD has not moved. Under `fawkes service` launchd starts a daemon that failed again (`KeepAlive`), so the
+adoption is retried about every 10 s until it passes. A `SIGTERM` during the adoption ends it like any stage or test
+and the daemon exits as usual; the next start adopts again. A daemon that dies once `permanent` is written runs the
+adopted generation at its next start, like any permanent one.
 
 ## Manifest
 
@@ -327,6 +360,7 @@ working for paths without special characters, so commands use the bare template,
 ```toml
 name = "sample"                # used in messages and the default state_dir
 repo = "../sample-repo"        # git repository generations are cut from
+# project = "../sample"       # the app's project: commands run in it find this app (Finding the app); optional
 # state_dir = "state"         # default <fawkes_home>/<name>, fawkes_home = $FAWKES_HOME or ~/.fawkes (absolute)
 home = "sample-home"           # the app's own state directory; no default
 port = 4790                    # live port
@@ -341,6 +375,7 @@ stop_timeout = 10              # seconds between SIGTERM and SIGKILL
 min_uptime = 10                # seconds a start must survive to not count as failed
 max_failed_starts = 3
 rollback_on_unhealthy = false  # roll a pending switch back as soon as its health check gives up
+adopt = false                  # a daemon start without a permanent generation tests HEAD and makes it permanent
 
 [health]                       # optional; at most one of url or command, and without either the url below
 # url = "http://127.0.0.1:{port}/"   # the default; healthy on a 2xx or 3xx answer
@@ -431,11 +466,14 @@ Ultimate preview (README there), and its `storage.ts` is the three hooks for Ult
 `trace.sqlite`. Fawkes restores storage on a rollback, but not what the app did outside it, so the
 extension holds Ultimate's task scheduler in a test run and in a new live generation until that generation has
 confirmed itself: no agent work runs on code that may still roll back. Its `health.command` passes a test run only
-once that hold is in place.
+once that hold is in place. Its `project` is the project the host serves, so `fawkes daemon` run there finds the
+manifest, and `adopt` makes the Ultimate that already runs its first generation.
 
 ```toml
 name = "ultimate"
 repo = "/path/to/ultimate"
+project = "/path/to/my-app"
+adopt = true
 home = "/path/to/.ultimate/projects/my-app-<hash>"
 port = 4747
 spare_ports = [4790, 4799]
@@ -544,9 +582,11 @@ A client command reaches its daemon by the first of:
 5. the nearest `fawkes.toml`, from the current directory up, stopping at the first directory that holds a `.git` (the
    repository root, so a project inside another never takes the outer one's manifest), and before `<fawkes_home>`,
    whose `fawkes.toml` is the app named `fawkes`, not the manifest of the state directories below it;
-6. the manifest in `<fawkes_home>` (`*.toml`, each named after its app, see Validation) whose `repo` is the current
-   directory or one of its parents. When more than one does, the command is refused (`usage`) with their names and
-   asks for `--manifest <name>`; when none does, the error names the apps there are.
+6. the manifest in `<fawkes_home>` (`*.toml`, each named after its app, see Validation) whose `project` is the
+   current directory or one of its parents, or, for a manifest without `project`, whose `repo` is. A manifest with a
+   `project` never matches by its `repo`: apps that run from one repository (every Ultimate host runs from the
+   Ultimate clone) are told apart by their projects. When more than one does, the command is refused (`usage`) with
+   their names and asks for `--manifest <name>`; when none does, the error names the apps there are.
 
 `APP`, for `--manifest` and `$FAWKES_MANIFEST`, is a path when it has a `/` or ends in `.toml`, and otherwise an app
 name: `<fawkes_home>/<APP>.toml`, which must exist. An empty variable counts as unset. There is no guess beyond this:
@@ -803,7 +843,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 
 | Kind | Logged when | `generation` |
 |---|---|---|
-| `daemon` | the daemon starts (`started, pid …`) or ends (`stopped`); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down | the generation concerned, else `null` |
+| `daemon` | the daemon starts (`started, pid …`) or ends (`stopped`); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down; a first start begins to adopt HEAD (Adopt) | the generation concerned, else `null` |
 | `progress` | a step narrates itself to the client waiting for it (stage, test, switch, rollback, prune, stop, restart); it does not mark a change of state | the generation the line is about |
 | `started` | the live app's process has been spawned, with its pid and port (a `test` run does not log it) | the generation started |
 | `healthy` | the live app's health check passed | the generation checked |
@@ -816,13 +856,14 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `test_failed` | `test` ran and the health check failed (a spare port taken by another process is an `error`, not this) | the generation tested |
 | `switched` | `switch` started the target on the live port; the confirm deadline runs | the target |
 | `confirmed` | `confirm` made a generation permanent | the generation confirmed |
+| `adopted` | a first daemon start made its tested HEAD permanent without a switch (Adopt) | the generation adopted |
 | `rolled_back` | a rollback ended: normally, or with its restore failed, with `state.json` unwritable, or with the restore given up by `--keep-storage`; the message says which | the generation rolled back (not the one that runs now) |
 | `pruned` | `prune` removed at least one generation; the message lists them | `null` |
-| `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a panic | the generation concerned, else `null` |
+| `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a failed adoption (the daemon then exits), a panic | the generation concerned, else `null` |
 
 | Kind | Fields |
 |---|---|
-| `daemon` | `action`: `started`, `stopped`, `reloaded`, `cleaned_up` (a leftover app, step or hook stopped, a cut-short stage or a stray directory removed), `switch_cut_short`, `deferred` (a start left to the next daemon). `started` adds `pid` and `version`; `reloaded` adds `changed`, the manifest fields that changed (empty when none); `cleaned_up` adds `pid` when it stopped a process |
+| `daemon` | `action`: `started`, `stopped`, `reloaded`, `cleaned_up` (a leftover app, step or hook stopped, a cut-short stage or a stray directory removed), `switch_cut_short`, `deferred` (a start left to the next daemon), `adopting` (a first start stages and tests HEAD to adopt it). `started` adds `pid` and `version`; `reloaded` adds `changed`, the manifest fields that changed (empty when none); `cleaned_up` adds `pid` when it stopped a process |
 | `started` | `pid`, `port` |
 | `exited` | `code` (exit status) or `signal`, as in `last_exit`; `restart_at` (UTC time) when a restart is scheduled |
 | `tested`, `test_failed` | `port` (the spare port), `seconds` |
@@ -830,8 +871,8 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `confirmed` | `named`: `true` when the confirm named the generation (an app confirms itself that way), `false` when it did not |
 | `rolled_back` | `to` (the permanent generation it returns to, absent when none), `reason` (the readable text), `cause` (see Rollback), `storage`: `restored`, `kept` (`--keep-storage`), `restore_failed`, or `none` (no `restore` hook: a code-only rollback) |
 | `pruned` | `removed`: the ids |
-| `error` | `error_code`: the error code of the failure, when it has one (a failed stage, a lost spare port, a failed prune). Not `code`, which is the exit status of `exited` |
-| `progress`, `healthy`, `unhealthy`, `failed`, `stopped`, `staged` | none |
+| `error` | `error_code`: the error code of the failure, when it has one (a failed stage, a lost spare port, a failed prune, a failed adoption). Not `code`, which is the exit status of `exited` |
+| `progress`, `healthy`, `unhealthy`, `failed`, `stopped`, `staged`, `adopted` | none |
 
 A client reads an `action`, `storage` or `cause` it does not know as `unknown`, like the other enumerations.
 

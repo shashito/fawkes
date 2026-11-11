@@ -28,9 +28,10 @@ they run. Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no da
   path of the log that explains it: read that file).
 - An event has `kind`, `generation` and `message`, plus the facts of its kind: `started` has `pid` and `port`;
   `switched` has `previous` and `deadline`; `exited` has `code`, `signal` and `restart_at`; `tested` and
-  `test_failed` have `port` and `seconds`; `confirmed` has `named`; `rolled_back` has `to`, `reason`, `cause` and
+  `test_failed` have `port` and `seconds`; `confirmed` has `named`; `adopted` (a first daemon start made its tested
+  HEAD permanent, with no switch and no confirm) has none; `rolled_back` has `to`, `reason`, `cause` and
   `storage` (`restored`, `kept`, `restore_failed`, `none`); `pruned` has `removed`; `error` has `error_code`; `daemon`
-  has `action` (`started`, `stopped`, `reloaded`, `cleaned_up`, `switch_cut_short`, `deferred`).
+  has `action` (`started`, `stopped`, `reloaded`, `cleaned_up`, `switch_cut_short`, `deferred`, `adopting`).
 
 A result only ever gains fields, and an enumeration may gain values: ignore the fields you do not know, and treat a
 value you do not know as "something else happened". `fawkes skill` prints this file as built into the binary you run.
@@ -39,7 +40,8 @@ value you do not know as "something else happened". `fawkes skill` prints this f
 
 The first of: `--socket PATH`; `--manifest APP`; `$FAWKES_SOCKET`; `$FAWKES_MANIFEST`; the nearest `fawkes.toml`
 from the current directory up to the repository root (the first directory with a `.git`), never inside
-`~/.fawkes`; the manifest in `~/.fawkes` (`$FAWKES_HOME`) whose `repo` holds the current directory. `APP` is a path
+`~/.fawkes`; the manifest in `~/.fawkes` (`$FAWKES_HOME`) whose `project` holds the current directory, or, for one
+without a `project`, whose `repo` does. `APP` is a path
 when it has a `/` or ends in `.toml`, else an app name: `--manifest xana` means `~/.fawkes/xana.toml`, whose `name`
 must be `xana`. When several apps match, or none does, the command fails with `usage` and names the apps; pass
 `--manifest <name>`. Nothing is guessed: a daemon is never picked because it is the only one running.

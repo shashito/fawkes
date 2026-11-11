@@ -565,8 +565,17 @@ impl Daemon {
 
         // What the last daemon was doing when it ended, from the step it saved before each side effect. A
         // pending switch is never resumed: it rolls back, and so does a rollback that was under way.
-        let txn = daemon.inner().store.state().txn.clone();
+        let (txn, adopt) = {
+            let inner = daemon.inner();
+            let state = inner.store.state();
+            (
+                state.txn.clone(),
+                state.txn.is_none() && state.permanent.is_none() && daemon.manifest().adopt,
+            )
+        };
         match txn {
+            // Adopted below, once the socket serves.
+            None if adopt => {}
             None => daemon.start_permanent(),
             Some(Txn::Switching { generation, .. }) => {
                 daemon.event_with(
@@ -594,9 +603,49 @@ impl Daemon {
         let watcher = daemon.clone();
         thread::spawn(move || watcher.watch());
 
+        let not_adopted = Arc::new(Mutex::new(None));
+        if adopt {
+            daemon.adopt_beside_serve(signalled, not_adopted.clone());
+        }
+
         daemon.serve(&listener, signals)?;
         daemon.shutdown();
-        Ok(())
+        match lock(&not_adopted).take() {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
+    }
+
+    /// Adopt HEAD on a thread of its own, while `serve` answers the test run and clients. A failure is logged and put
+    /// in `failure` before it ends the daemon the way a SIGTERM does, the flag and then a byte on `signals` that wakes
+    /// `serve`, so the shutdown and the cleanup on the way out of `run` are those of any other end.
+    fn adopt_beside_serve(
+        self: &Arc<Self>,
+        signals: UnixStream,
+        failure: Arc<Mutex<Option<String>>>,
+    ) {
+        let daemon = self.clone();
+        thread::spawn(move || {
+            // An adoption a SIGTERM cut short is an ordinary end of the daemon: the next start adopts again.
+            if let Err(e) = daemon.adopt()
+                && !daemon.shutting_down()
+            {
+                let message = transactions::not_adopted(&e);
+                daemon.event_with(
+                    EventKind::Error,
+                    e.generation.as_deref(),
+                    &message,
+                    Facts {
+                        error_code: Some(e.code),
+                        ..Facts::default()
+                    },
+                );
+                *lock(&failure) = Some(message);
+                daemon.shutdown.store(true, Ordering::SeqCst);
+                // A pipe too full to take the byte holds others that wake `serve` as well.
+                let _ = (&signals).write_all(&[0]);
+            }
+        });
     }
 
     /// Accept clients and act on SIGHUP until SIGTERM or SIGINT, asleep in `poll` in between.

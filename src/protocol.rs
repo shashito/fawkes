@@ -617,6 +617,8 @@ pub enum EventKind {
     TestFailed,
     Switched,
     Confirmed,
+    /// A first daemon start made its tested HEAD permanent, without a switch or a confirm.
+    Adopted,
     RolledBack,
     Pruned,
     Error,
@@ -643,6 +645,7 @@ impl EventKind {
             EventKind::TestFailed => "test_failed",
             EventKind::Switched => "switched",
             EventKind::Confirmed => "confirmed",
+            EventKind::Adopted => "adopted",
             EventKind::RolledBack => "rolled_back",
             EventKind::Pruned => "pruned",
             EventKind::Error => "error",
@@ -699,6 +702,8 @@ pub enum DaemonAction {
     SwitchCutShort,
     /// A start was left to the next daemon because this one shuts down.
     Deferred,
+    /// A first daemon start stages and tests HEAD to adopt it (`adopt` in the manifest).
+    Adopting,
     /// An action a newer daemon logs that this client does not know. Decode-only.
     #[serde(other)]
     Unknown,
@@ -1216,6 +1221,7 @@ mod tests {
         TestFailed => "test_failed",
         Switched => "switched",
         Confirmed => "confirmed",
+        Adopted => "adopted",
         RolledBack => "rolled_back",
         Pruned => "pruned",
         Error => "error",

@@ -85,6 +85,9 @@ pub struct Manifest {
     pub max_failed_starts: u32,
     /// Roll a pending generation back as soon as its health check gives up, instead of at the deadline.
     pub rollback_on_unhealthy: bool,
+    /// At a daemon start without a permanent generation, test HEAD of `repo` and make it permanent (DESIGN.md →
+    /// Adopt), so the version that already runs has a generation to roll back to.
+    pub adopt: bool,
     pub health: Health,
     pub env: BTreeMap<String, String>,
 }
@@ -225,6 +228,7 @@ struct Written {
     min_uptime: Duration,
     max_failed_starts: u32,
     rollback_on_unhealthy: bool,
+    adopt: bool,
     /// Without a `url` or a `command` in `[health]`, the default url; None when both are given.
     check: Option<Check>,
     health_interval: Duration,
@@ -238,6 +242,9 @@ impl Written {
         let mut top = Section::new("", table);
         let name = top.require("name");
         let repo = top.require("repo");
+        // Read by the commands that find the app (`discovery`), never by the daemon; taken here so that it is a known
+        // key and a value of the wrong type is named.
+        let _project: Option<PathBuf> = top.take("project");
         let state_dir = top.take("state_dir");
         let home = top.require("home");
         let port: Option<u16> = top.require("port");
@@ -252,6 +259,7 @@ impl Written {
         let min_uptime = top.seconds("min_uptime", 10.0);
         let max_failed_starts = top.take("max_failed_starts");
         let rollback_on_unhealthy = top.take("rollback_on_unhealthy");
+        let adopt = top.take("adopt");
 
         let mut health = top.section("health");
         let url = health.take("url");
@@ -308,6 +316,7 @@ impl Written {
             min_uptime,
             max_failed_starts: max_failed_starts.unwrap_or(3),
             rollback_on_unhealthy: rollback_on_unhealthy.unwrap_or(false),
+            adopt: adopt.unwrap_or(false),
             check,
             health_interval: interval,
             health_timeout,
@@ -567,6 +576,7 @@ impl Manifest {
             min_uptime: written.min_uptime,
             max_failed_starts: written.max_failed_starts,
             rollback_on_unhealthy: written.rollback_on_unhealthy,
+            adopt: written.adopt,
             health: Health {
                 check,
                 interval: written.health_interval,
@@ -600,6 +610,7 @@ impl Manifest {
             min_uptime,
             max_failed_starts,
             rollback_on_unhealthy,
+            adopt,
             health,
             env,
         } = self;
@@ -646,6 +657,8 @@ impl Manifest {
                 "rollback_on_unhealthy",
                 *rollback_on_unhealthy != new.rollback_on_unhealthy,
             ),
+            // Only a daemon start reads it, so the change waits for the next one.
+            ("adopt", *adopt != new.adopt),
             ("health", *health != new.health),
             ("hooks", *hooks != new.hooks),
             ("env", *env != new.env),

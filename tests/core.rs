@@ -241,6 +241,113 @@ fn a_daemon_killed_during_a_pending_switch_rolls_it_back_at_its_next_start() {
     );
 }
 
+/// With `adopt = true`, the first daemon start tests HEAD and makes it permanent directly, so the version that ran
+/// before Fawkes has a generation to roll back to. No switch: no deadline and no confirm (this version never sends
+/// one). The next daemon start runs it like any permanent generation and adopts nothing.
+#[test]
+fn a_first_daemon_start_adopts_head_once_its_test_passes() {
+    let mut h = Harness::new("adopt = true");
+    h.commit("v1", "never");
+    h.start_daemon();
+    h.wait("the adopted v1 to serve", 30, || {
+        h.get().as_deref() == Some("v1")
+    });
+    let status = h.status();
+    assert_eq!(
+        (
+            status["permanent"].as_str(),
+            status["process"]["generation"].as_str(),
+            status["step"].clone(),
+            status["pending"].clone()
+        ),
+        (Some("g1"), Some("g1"), Value::Null, Value::Null)
+    );
+    let g1 = h.generation("g1");
+    assert_eq!(
+        (
+            g1["state"].as_str(),
+            g1["ref"].as_str(),
+            g1["test"]["passed"].as_bool()
+        ),
+        (Some("permanent"), Some("HEAD"), Some(true)),
+        "{g1}"
+    );
+    assert_eq!(g1["switched_at"], Value::Null);
+    let adopted = event_of(&h, "adopted", "g1");
+    assert!(
+        adopted["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("g1 is permanent")),
+        "{adopted}"
+    );
+    assert_eq!(messages(&h, "confirmed"), Vec::<String>::new());
+    assert_eq!(messages(&h, "switched"), Vec::<String>::new());
+
+    h.signal_daemon(Signal::TERM);
+    assert!(h.daemon_exits_within(Duration::from_secs(15)));
+    h.start_daemon();
+    h.wait("g1 to serve again", 20, || h.get().as_deref() == Some("v1"));
+    assert_eq!(
+        h.ok(&["history"])["generations"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(messages_starting(&h, "daemon", "adopting HEAD").len(), 1);
+}
+
+/// An adoption whose test fails ends the daemon with exit 1, through its ordinary shutdown, and starts nothing: the
+/// live port stays free, the home stays as it was, and the generation stays `test_failed` for the next start to test
+/// again.
+#[test]
+fn a_failed_adoption_ends_the_daemon_and_starts_nothing() {
+    let mut h = Harness::new("adopt = true");
+    h.commit("v1", "crash");
+    std::fs::create_dir(h.dir.join("home")).unwrap();
+    std::fs::write(h.dir.join("home/keep"), "as it was").unwrap();
+    h.spawn_daemon();
+    let exit = h
+        .daemon_exit_within(Duration::from_secs(30))
+        .unwrap_or_else(|| panic!("the daemon outlived a failed adoption:\n{}", h.daemon_log()));
+    let stderr = h.daemon_log();
+    assert_eq!(exit.code(), Some(1), "{stderr}");
+    let app_log = state_path(&h, "generations/g1/logs/app.log");
+    let last = stderr.lines().last().unwrap_or_default();
+    assert!(
+        last.starts_with("error: not adopted: g1 failed its test")
+            && last.contains(&format!("see {app_log}"))
+            && last.ends_with(
+                "nothing was started and the home is untouched; start the app as before, or fix it and run \
+                 `fawkes daemon` again"
+            ),
+        "{stderr}"
+    );
+    assert!(stderr.contains(" daemon - stopped"), "{stderr}");
+
+    assert!(h.get().is_none(), "something serves the live port");
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.dir.join("s/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["permanent"], Value::Null);
+    assert_eq!(
+        (
+            state["generations"][0]["id"].as_str(),
+            state["generations"][0]["state"].as_str()
+        ),
+        (Some("g1"), Some("test_failed"))
+    );
+    let home: Vec<_> = std::fs::read_dir(h.dir.join("home"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(home, ["keep"]);
+    assert_eq!(
+        std::fs::read_to_string(h.dir.join("home/keep")).unwrap(),
+        "as it was"
+    );
+    // The way out of `run` removed the socket and its link, as after a SIGTERM.
+    assert!(!h.dir.join("s/fawkes.sock").exists());
+    assert!(!h.dir.join("run/t.sock").exists());
+}
+
 /// The new generation's first process starts only once state.json says the switch is pending, and it is on record
 /// before it runs, so a daemon that dies right after spawning it still stops it and rolls the switch back at its next
 /// start.

@@ -56,9 +56,9 @@ impl Given {
     }
 
     /// The daemon a client command talks to: `--socket`, `--manifest`, `FAWKES_SOCKET`, `FAWKES_MANIFEST`, the
-    /// nearest `fawkes.toml`, then the manifest in `<fawkes_home>` whose `repo` holds the current directory. The flags
-    /// come before the environment, so an app Fawkes runs (which inherits `FAWKES_SOCKET`) reaches another app's
-    /// daemon by naming it, and its own without a word.
+    /// nearest `fawkes.toml`, then the manifest in `<fawkes_home>` whose project or repo holds the current directory.
+    /// The flags come before the environment, so an app Fawkes runs (which inherits `FAWKES_SOCKET`) reaches another
+    /// app's daemon by naming it, and its own without a word.
     pub fn target(&self) -> Result<Target, String> {
         if let Some(path) = &self.socket {
             return Ok(Target::Socket {
@@ -115,14 +115,14 @@ impl Given {
         match matches.len() {
             1 => Ok(matches.remove(0).1),
             0 => Err(format!(
-                "no app found for {}: {walked}, and no manifest in {} has its repo here; pass --manifest with an \
-                 app name or a path{}",
+                "no app found for {}: {walked}, and no manifest in {} has its project or repo here; pass --manifest \
+                 with an app name or a path{}",
                 cwd.display(),
                 home.display(),
                 listed(home)
             )),
             _ => Err(format!(
-                "{} is in the repo of more than one app in {}: {}; pass --manifest with the name of one",
+                "{} is in the project or repo of more than one app in {}: {}; pass --manifest with the name of one",
                 cwd.display(),
                 home.display(),
                 matches
@@ -179,12 +179,15 @@ fn walk_up<'a>(cwd: &'a Path, fawkes_home: Option<&Path>) -> (Option<PathBuf>, O
 
 /// The part of a manifest that matching reads: the loading that follows checks the rest.
 #[derive(Deserialize)]
-struct Repo {
+struct Place {
     repo: PathBuf,
+    project: Option<PathBuf>,
 }
 
-/// The apps of `<fawkes_home>/*.toml` whose `repo` is `cwd` or one of its parents, by name, sorted. A manifest that
-/// cannot be read or names no repository that exists matches nothing.
+/// The apps of `<fawkes_home>/*.toml` whose `project`, or `repo` when it names no project, is `cwd` or one of its
+/// parents, by name, sorted. A manifest with a `project` never matches by its `repo`: apps that share one repository
+/// (every Ultimate host runs from the Ultimate clone) are told apart by their project. A manifest that cannot be read
+/// or names no directory that exists matches nothing.
 fn registry(home: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
     let Ok(cwd) = cwd.canonicalize() else {
         return Vec::new();
@@ -195,13 +198,13 @@ fn registry(home: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
             let Ok(text) = std::fs::read_to_string(path) else {
                 return false;
             };
-            let Ok(Repo { repo }) = toml::from_str(&text) else {
+            let Ok(Place { repo, project }) = toml::from_str(&text) else {
                 return false;
             };
-            // As `Manifest::load` resolves it: against the manifest's directory.
-            home.join(repo)
+            // Either resolves as `Manifest::load` resolves `repo`: against the manifest's directory.
+            home.join(project.unwrap_or(repo))
                 .canonicalize()
-                .is_ok_and(|repo| cwd.starts_with(repo))
+                .is_ok_and(|dir| cwd.starts_with(dir))
         })
         .collect()
 }
@@ -395,6 +398,35 @@ mod tests {
         let err = w.given("lone").target().unwrap_err();
         assert!(err.starts_with("no app found for"), "{err}");
         assert!(err.contains(": blog, broken, fawkes, xana)"), "{err}");
+    }
+
+    #[test]
+    fn a_manifest_with_a_project_matches_by_it_and_never_by_its_repo() {
+        let w = World::new();
+        let work = w.root.join("outer/work");
+        std::fs::create_dir_all(w.root.join("xana/.git")).unwrap();
+        std::fs::create_dir_all(w.root.join("xana/deep")).unwrap();
+        std::fs::create_dir_all(w.root.join("blog/.git")).unwrap();
+        // Two hosts of one repository, told apart by their projects; `xana`'s is relative to the manifest's directory.
+        let project = |name: &str, project: &str| {
+            let path = w.home.join(format!("{name}.toml"));
+            std::fs::write(
+                &path,
+                format!("name = \"{name}\"\nrepo = {work:?}\nproject = {project:?}\n"),
+            )
+            .unwrap();
+            path
+        };
+        let xana = project("xana", "../xana");
+        let blog = project("blog", &w.root.join("blog").to_string_lossy());
+        let fawkes = w.app("fawkes", &work);
+        assert_eq!(w.given("xana/deep").target(), manifest(&xana));
+        assert_eq!(w.given("blog").target(), manifest(&blog));
+        // In the shared repository only the app without a project matches.
+        assert_eq!(w.given("outer/work/deep").target(), manifest(&fawkes));
+        std::fs::remove_file(&fawkes).unwrap();
+        let err = w.given("outer/work/deep").target().unwrap_err();
+        assert!(err.contains("has its project or repo here"), "{err}");
     }
 
     #[test]

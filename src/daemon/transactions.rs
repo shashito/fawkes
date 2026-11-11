@@ -841,6 +841,92 @@ impl Daemon {
         })
     }
 
+    /// Adopt the version the app already runs (`adopt` in the manifest), at a daemon start that found no step in
+    /// flight and no permanent generation: stage HEAD of the repository, test it, and make it permanent without a
+    /// switch, so the next upgrade has a generation to roll back to. It runs beside the socket, so the test run and
+    /// clients reach the daemon, and through `stage` and `test`, which reuse a generation of the same commit and take
+    /// the step slot. An error leaves the generation as they left it, and nothing is started.
+    pub(super) fn adopt(self: &Arc<Self>) -> R<()> {
+        let m = self.manifest();
+        // The app runs outside Fawkes on the live port until now, and a start beside it would only crash-loop.
+        if !port_free(m.port) {
+            return Err(err(
+                ErrorCode::PortInUse,
+                format!(
+                    "port {} is in use: stop the app running there first (fawkes tests HEAD of {} and then starts it \
+                     on that port), then run `fawkes daemon` again",
+                    m.port,
+                    m.repo.display()
+                ),
+            ));
+        }
+        self.event_with(
+            EventKind::Daemon,
+            None,
+            format!(
+                "adopting HEAD of {}: it becomes the permanent generation once its test passes",
+                m.repo.display()
+            ),
+            Facts {
+                action: Some(DaemonAction::Adopting),
+                ..Facts::default()
+            },
+        );
+        let mut out = Out::none();
+        let id = self.stage(&mut out, "HEAD")?.generation.id;
+        self.test(&mut out, &id).map_err(|e| {
+            // The test's own hint (stage again, `fawkes test`) needs a daemon, and this one is about to end.
+            if e.code != ErrorCode::HealthFailed {
+                return e;
+            }
+            let inner = self.inner();
+            let reason = inner
+                .store
+                .state()
+                .find(&id)
+                .and_then(|g| g.test.as_ref())
+                .map_or_else(String::new, |test| format!(": {}", test.message));
+            let log = e
+                .log
+                .as_ref()
+                .map_or_else(String::new, |log| format!("; see {}", log.display()));
+            Error {
+                message: format!("{id} failed its test{reason}{log}"),
+                ..e
+            }
+        })?;
+        let mut inner = self.inner();
+        // Written before anything starts, so a daemon that dies from here on runs it as the permanent generation at its
+        // next start. A switch a client began meanwhile refuses it: exactly one generation is permanent.
+        let record = self.modify(&mut inner.store, |state| {
+            if let Some(txn) = &state.txn {
+                return Err(invalid_state(format!(
+                    "a switch to {} began during the adoption",
+                    txn.generation()
+                )));
+            }
+            if let Some(permanent) = &state.permanent {
+                return Err(invalid_state(format!(
+                    "{permanent} became permanent during the adoption"
+                )));
+            }
+            // Only from `tested`: with no switch in flight, no generation is `current`.
+            let record = state.transition(&id, GenState::Permanent)?.clone();
+            state.permanent = Some(id.clone());
+            Ok(record)
+        })?;
+        self.event(
+            EventKind::Adopted,
+            Some(&id),
+            format!(
+                "{id} is permanent: HEAD at {} passed its test and was adopted",
+                record.short_commit()
+            ),
+        );
+        self.start_or_give_up(&mut inner, &id, Why::Fresh);
+        Ok(())
+    }
+
     /// What `confirm` needs of the state, once the generation is not permanent already: a pending switch that is
     /// `id` (any when none is named), within its deadline, whose process runs and has not exited. Gives the switch.
     /// It logs nothing, since `status` runs it for every subscriber's snapshot: an unreadable deadline counts as
@@ -1289,6 +1375,21 @@ fn left_to_next_start(id: &str, permanent: &str) -> Error {
         ),
     )
     .about(id)
+}
+
+/// What a daemon whose adoption failed says on its way out, its last line on stderr: what failed, that nothing was
+/// started, and how to go on.
+pub(super) fn not_adopted(e: &Error) -> String {
+    // A taken port says what to do in its own message.
+    let next = if e.code == ErrorCode::PortInUse {
+        ""
+    } else {
+        "; start the app as before, or fix it and run `fawkes daemon` again"
+    };
+    format!(
+        "not adopted: {}; nothing was started and the home is untouched{next}",
+        e.message
+    )
 }
 
 /// Whether nothing listens on `port`, on the loopback address or on all addresses: an app may bind either.
