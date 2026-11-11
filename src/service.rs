@@ -36,7 +36,7 @@ pub fn run(
 ) -> crate::protocol::R<(serde_json::Value, String)> {
     Err(crate::protocol::err(
         crate::protocol::ErrorCode::Usage,
-        "fawkes service needs launchd, so it runs on macOS only; elsewhere run `fawkes daemon --manifest …` under \
+        "fawkes service needs launchd, so it runs on macOS only; elsewhere run `fawkes up --manifest …` under \
          your init system (systemd user units are Later)",
     ))
 }
@@ -159,7 +159,7 @@ mod launchd {
                 &self.label,
                 &[
                     utf8(&binary, "the fawkes binary")?,
-                    "daemon",
+                    "up",
                     "--manifest",
                     utf8(&manifest_file, "the manifest path")?,
                 ],
@@ -176,7 +176,7 @@ mod launchd {
             let socket = paths.socket();
             if !loaded && UnixStream::connect(&socket).is_ok() {
                 return Err(invalid_state(format!(
-                    "a daemon for {} already runs on {} (started from a terminal?); stop it, then install the service",
+                    "a daemon for {} already runs on {} (started from a terminal?); stop it with `fawkes down`, then install the service",
                     self.manifest.name,
                     socket.display()
                 )));

@@ -2,8 +2,8 @@
 //! functions from the typed records of `protocol` to strings; `--json` prints the daemon's own documents instead.
 
 use crate::protocol::{
-    Event, Events, GenState, Generation, History, Process, ProcessState, PruneResult, ReloadResult,
-    Request, RollbackResult, StageResult, Status, Step, SwitchResult,
+    DownResult, Event, Events, GenState, Generation, History, Process, ProcessState, PruneResult,
+    ReloadResult, Request, RollbackResult, StageResult, Status, Step, SwitchResult,
 };
 use serde_json::Value;
 
@@ -238,6 +238,15 @@ pub fn render_result(request: &Request, result: &Value) -> String {
                 format!("reloaded the manifest; changed: {}", r.changed.join(", "))
             }
         }),
+        Request::Down => typed(result, |r: DownResult| {
+            let stopped = r
+                .stopped
+                .map_or_else(String::new, |id| format!("{id} and "));
+            format!(
+                "stopped {stopped}the daemon of {} (pid {}); `fawkes up` starts it again",
+                r.name, r.daemon_pid
+            )
+        }),
         Request::Subscribe { .. } => result.to_string(),
     }
 }
@@ -356,6 +365,7 @@ mod tests {
             Request::Log { .. } => 11,
             Request::Subscribe { .. } => 12,
             Request::Reload => 13,
+            Request::Down => 14,
         }
     }
 
@@ -473,6 +483,14 @@ mod tests {
                 Request::Reload,
                 serde_json::json!({"changed": ["port", "env"]}),
                 vec!["reloaded the manifest; changed: port, env"],
+            ),
+            (
+                Request::Down,
+                serde_json::json!({"name": "sample", "daemon_pid": 99, "stopped": "g3"}),
+                vec![
+                    "stopped g3 and the daemon of sample (pid 99)",
+                    "`fawkes up` starts it again",
+                ],
             ),
             (
                 Request::Subscribe {

@@ -81,27 +81,27 @@ pub struct Error {
     /// Why the generation was rolled back, as a code: set by `rolled_back`, and nowhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<RollbackCause>,
-    /// The step of `up` that failed (`stage`, `test` or `switch`); set by `up` alone.
+    /// The step of `upgrade` that failed (`stage`, `test` or `switch`); set by `upgrade` alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step: Option<UpStep>,
+    pub step: Option<UpgradeStep>,
 }
 
-/// A step of `fawkes up`, for the error of the one that failed.
+/// A step of `fawkes upgrade`, for the error of the one that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum UpStep {
+pub enum UpgradeStep {
     Stage,
     Test,
     Switch,
 }
 
-impl UpStep {
+impl UpgradeStep {
     /// The name on the wire, for messages.
     pub fn as_str(self) -> &'static str {
         match self {
-            UpStep::Stage => "stage",
-            UpStep::Test => "test",
-            UpStep::Switch => "switch",
+            UpgradeStep::Stage => "stage",
+            UpgradeStep::Test => "test",
+            UpgradeStep::Switch => "switch",
         }
     }
 }
@@ -136,8 +136,8 @@ impl Error {
         Error { cause, ..self }
     }
 
-    /// The same error, saying it ended the step `step` of `up`.
-    pub fn in_step(self, step: UpStep) -> Error {
+    /// The same error, saying it ended the step `step` of `upgrade`.
+    pub fn in_step(self, step: UpgradeStep) -> Error {
         Error {
             step: Some(step),
             ..self
@@ -215,6 +215,9 @@ pub enum Request {
         /// Replay the events after this `seq` instead of the last `limit`.
         since: Option<u64>,
     },
+    /// Stop the app and end the daemon, as SIGTERM does; answered once the daemon has let go of its socket and state
+    /// lock.
+    Down,
 }
 
 /// What a client sends, before its arguments are checked.
@@ -265,6 +268,7 @@ impl Request {
                 limit: optional_limit(&args)?,
                 since: optional_count(&args, "since")?,
             },
+            "down" => Request::Down,
             other => {
                 return Err(err(ErrorCode::Usage, format!("unknown command `{other}`")));
             }
@@ -288,6 +292,7 @@ impl Request {
             Request::Reload => "reload",
             Request::Log { .. } => "log",
             Request::Subscribe { .. } => "subscribe",
+            Request::Down => "down",
         }
     }
 
@@ -345,7 +350,8 @@ impl Serialize for Request {
             | Request::Prune
             | Request::Status
             | Request::History
-            | Request::Reload => json!({}),
+            | Request::Reload
+            | Request::Down => json!({}),
         };
         let mut envelope = serializer.serialize_struct("Request", 2)?;
         envelope.serialize_field("command", self.command())?;
@@ -411,7 +417,7 @@ fn deadline_arg(args: &Value) -> R<Option<u64>> {
     }
 }
 
-/// A deadline in `1..=MAX_DEADLINE`; the client checks it too, before `up` stages anything.
+/// A deadline in `1..=MAX_DEADLINE`; the client checks it too, before `upgrade` stages anything.
 pub fn check_deadline(seconds: u64) -> R<u64> {
     if (1..=MAX_DEADLINE).contains(&seconds) {
         Ok(seconds)
@@ -957,9 +963,9 @@ pub struct Events {
 /// The result of `switch`: the pending switch it started.
 pub type SwitchResult = Pending;
 
-/// The result of `up`: the switch's, and what the steps before it learned.
+/// The result of `upgrade`: the switch's, and what the steps before it learned.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpResult {
+pub struct UpgradeResult {
     #[serde(flatten)]
     pub switch: SwitchResult,
     /// The stage's flag: true when the commit already had a generation and nothing was built.
@@ -978,6 +984,15 @@ pub struct RollbackResult {
     /// never recorded.
     #[serde(default)]
     pub cause: Option<RollbackCause>,
+}
+
+/// The result of `down`: the app whose daemon ended, and the generation whose process it stopped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownResult {
+    pub name: String,
+    pub daemon_pid: u32,
+    /// Null when no app ran.
+    pub stopped: Option<String>,
 }
 
 /// The result of `prune`: the generation ids removed (oldest first) and those kept.
@@ -1001,6 +1016,7 @@ pub enum Reply {
     History(History),
     Events(Events),
     Reload(ReloadResult),
+    Down(DownResult),
     /// A stream (`log --follow`, `subscribe`) has ended: its result is null.
     Streamed,
 }
@@ -1026,6 +1042,7 @@ reply_from!(
     History(History),
     Events(Events),
     Reload(ReloadResult),
+    Down(DownResult),
 );
 
 /// One line of a response. The daemon writes it with `T` the `Reply`; a client reads it with `T` a `Value` and
@@ -1253,6 +1270,7 @@ mod tests {
             ("prune", Request::Prune),
             ("status", Request::Status),
             ("history", Request::History),
+            ("down", Request::Down),
         ] {
             for args in ["", r#","args":null"#, r#","args":{}"#, r#","args":{"x":1}"#] {
                 let line = format!(r#"{{"command":"{name}"{args}}}"#);
@@ -1467,6 +1485,7 @@ mod tests {
             r#"{"command":"log","args":{"follow":false,"limit":5,"since":40}}"#
         );
         assert_eq!(wire(Request::Reload), r#"{"command":"reload","args":{}}"#);
+        assert_eq!(wire(Request::Down), r#"{"command":"down","args":{}}"#);
         // What is written is read back as the same request.
         for request in [
             Request::Confirm { generation: None },
@@ -1564,7 +1583,7 @@ mod tests {
         );
         let rolled_back = err(ErrorCode::RolledBack, "m")
             .because(Some(RollbackCause::Deadline))
-            .in_step(UpStep::Switch);
+            .in_step(UpgradeStep::Switch);
         assert_eq!(
             serde_json::to_value(rolled_back).unwrap(),
             json!({"code": "rolled_back", "message": "m", "cause": "deadline", "step": "switch"})

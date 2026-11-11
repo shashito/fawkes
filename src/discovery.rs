@@ -78,7 +78,7 @@ impl Given {
         self.unflagged_manifest().map(Target::Manifest)
     }
 
-    /// The manifest of a command that needs one (`daemon`, `service`): the same order without the two sockets.
+    /// The manifest of a command that needs one (`up`, `service`): the same order without the two sockets.
     pub fn manifest(&self) -> Result<PathBuf, String> {
         match &self.manifest {
             Some(name) => self.named(name, "--manifest"),

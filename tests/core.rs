@@ -316,7 +316,7 @@ fn a_failed_adoption_ends_the_daemon_and_starts_nothing() {
             && last.contains(&format!("see {app_log}"))
             && last.ends_with(
                 "nothing was started and the home is untouched; start the app as before, or fix it and run \
-                 `fawkes daemon` again"
+                 `fawkes up` again"
             ),
         "{stderr}"
     );
@@ -992,7 +992,7 @@ fn a_symlinked_state_dir_is_refused() {
     );
 }
 
-/// A daemon whose stderr reader has gone (`fawkes daemon 2>&1 | tee log`, then `tee` dies) supervises on: stderr is
+/// A daemon whose stderr reader has gone (`fawkes up 2>&1 | tee log`, then `tee` dies) supervises on: stderr is
 /// only a copy of the event log.
 #[test]
 fn a_daemon_whose_stderr_is_gone_keeps_supervising() {
@@ -1415,6 +1415,78 @@ fn an_idle_daemon_wakes_at_once_for_a_crash_a_reload_and_a_shutdown() {
     let stopped = signalled.elapsed();
     assert!(stopped < Duration::from_secs(4), "SIGTERM took {stopped:?}");
     assert!(!group_alive(app), "the app outlived the daemon");
+}
+
+/// `fawkes down` stops the app and its daemon, and answers only once the daemon has let go of its socket and state
+/// lock, so a `fawkes up` right after it starts at once. The daemon exits 0, which a launchd agent leaves down.
+#[test]
+fn down_stops_the_app_and_its_daemon_and_answers_once_they_are_free() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    h.ok(&["upgrade", "v1"]);
+    h.wait("g1 to confirm itself", 15, || {
+        h.status()["permanent"] == "g1"
+    });
+    let status = h.status();
+    let pid = status["process"]["pid"].as_i64().unwrap();
+    let app = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+
+    let down = h.ok(&["down"]);
+    assert_eq!(
+        down,
+        serde_json::json!({"name": "t", "daemon_pid": status["daemon_pid"], "stopped": "g1"})
+    );
+    // Free the moment `down` answers, before the daemon's process has exited.
+    assert!(!h.dir.join("s/fawkes.sock").exists());
+    assert!(!h.dir.join("run/t.sock").exists());
+    let lock = std::fs::File::open(h.dir.join("s/lock")).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("the state lock is still held after `down` answered");
+    drop(lock);
+    assert!(!group_alive(app), "the app outlived `down`");
+    let exit = h
+        .daemon_exit_within(Duration::from_secs(5))
+        .expect("the daemon outlived `down`");
+    assert_eq!(exit.code(), Some(0), "{}", h.daemon_log());
+
+    let (exit, error) = h.fk(&["down"]);
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (3, Some("daemon_unreachable")),
+        "{error}"
+    );
+    h.start_daemon();
+    h.wait("g1 to serve again", 20, || h.get().as_deref() == Some("v1"));
+    // From inside the app it would end the caller with nothing left to start it again.
+    let output = h
+        .cli()
+        .arg("down")
+        .env("FAWKES_PHASE", "live")
+        .env("FAWKES_SOCKET", h.dir.join("s/fawkes.sock"))
+        .output()
+        .unwrap();
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        (output.status.code(), error["code"].as_str()),
+        (Some(1), Some("invalid_state")),
+        "{error}"
+    );
+    // In text, it names what it stopped and what starts it again.
+    let output = common::fawkes()
+        .arg("--manifest")
+        .arg(h.manifest())
+        .arg("down")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with("stopped g1 and the daemon of t (pid ")
+            && text.ends_with("; `fawkes up` starts it again\n"),
+        "{text}"
+    );
+    assert!(h.daemon_exits_within(Duration::from_secs(5)));
 }
 
 /// The permanent generation crash-loops: a crash after a long run restarts it in 1 s, each failed start in a row then
@@ -2647,14 +2719,13 @@ fn an_unreachable_daemon_with_an_installed_agent_points_at_the_service() {
         let error: Value = serde_json::from_slice(&output.stdout).unwrap();
         error["message"].as_str().unwrap().to_string()
     };
-    assert!(hint().contains("start one with `fawkes daemon --manifest "));
+    assert!(hint().contains("start one with `fawkes up --manifest "));
     let agents = home.join("Library/LaunchAgents");
     std::fs::create_dir_all(&agents).unwrap();
     std::fs::write(agents.join("dev.fawkes.t.plist"), "").unwrap();
     let message = hint();
     assert!(
-        message.contains("`fawkes service restart --manifest ")
-            && !message.contains("fawkes daemon"),
+        message.contains("`fawkes service restart --manifest ") && !message.contains("fawkes up"),
         "{message}"
     );
 }
@@ -2695,7 +2766,7 @@ impl Drop for EndListener {
     }
 }
 
-/// Run `fawkes daemon` for `manifest` (with `--socket`, if given), which must refuse to start: exit 1 within 10 s.
+/// Run `fawkes up` for `manifest` (with `--socket`, if given), which must refuse to start: exit 1 within 10 s.
 /// Its stderr. One that starts after all is killed, so the test fails rather than hangs.
 fn refused_daemon(
     h: &Harness,
@@ -2707,7 +2778,7 @@ fn refused_daemon(
         command.arg("--socket").arg(socket);
     }
     let mut daemon = command
-        .args(["daemon", "--manifest"])
+        .args(["up", "--manifest"])
         .arg(manifest)
         .env("FAWKES_HOME", &h.dir)
         .stderr(std::process::Stdio::piped())
@@ -3132,15 +3203,15 @@ fn json_output_is_one_document_on_stdout_and_progress_lines_on_stderr() {
     }
 }
 
-/// `fawkes up` stages, tests and switches in one call: stdout is the switch result alone, the progress of all three
-/// steps is on stderr, and it does not confirm (the app does). A commit already staged is reused, not built again.
+/// `fawkes upgrade` stages, tests and switches in one call: stdout is the switch result alone, the progress of all
+/// three steps is on stderr, and it does not confirm (the app does). A commit already staged is reused, not built again.
 #[test]
-fn up_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
+fn upgrade_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
     let mut h = Harness::new("");
     h.commit("v1", "confirm");
     h.start_daemon();
 
-    let output = h.cli().args(["up", "v1"]).output().unwrap();
+    let output = h.cli().args(["upgrade", "v1"]).output().unwrap();
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let result: Value = serde_json::from_str(&stdout).expect(&stdout);
@@ -3173,10 +3244,10 @@ fn up_stages_tests_and_switches_and_leaves_the_confirm_to_the_app() {
     });
     h.wait("v1 to serve", 5, || h.get().as_deref() == Some("v1"));
 
-    // A staged commit is picked up by `up`, which then switches to the same generation.
+    // A staged commit is picked up by `upgrade`, which then switches to the same generation.
     h.commit("v2", "confirm");
     assert_eq!(h.ok(&["stage", "v2"])["id"], "g2");
-    let (exit, result) = h.fk(&["up", "v2"]);
+    let (exit, result) = h.fk(&["upgrade", "v2"]);
     assert_eq!((exit, result["generation"].as_str()), (0, Some("g2")));
     assert_eq!(result["previous"], "g1");
     assert_eq!(result["existing"], true, "{result}");
@@ -3289,7 +3360,9 @@ fn a_test_run_may_not_change_the_app() {
         &["stage", "v1"][..],
         &["test", "g1"],
         &["switch", "g1"],
-        &["up", "v1"],
+        &["upgrade", "v1"],
+        &["up"],
+        &["down"],
         &["rollback"],
         &["prune"],
         &["start"],
@@ -3353,18 +3426,18 @@ fn a_test_run_may_not_change_the_app() {
 /// A step that fails is the whole command's failure, as its own command prints it, and nothing after it runs: a
 /// generation whose test fails is not switched to.
 #[test]
-fn up_stops_at_a_failing_test_and_switches_nothing() {
+fn upgrade_stops_at_a_failing_test_and_switches_nothing() {
     let mut h = Harness::new("");
     crash_while_marked(&h);
     h.commit("v1", "confirm");
     h.start_daemon();
-    h.ok(&["up", "v1"]);
+    h.ok(&["upgrade", "v1"]);
     h.wait("g1 to confirm itself", 15, || {
         h.status()["permanent"] == "g1"
     });
 
     h.commit("v2", "crash");
-    let (exit, error) = h.fk(&["up", "v2"]);
+    let (exit, error) = h.fk(&["upgrade", "v2"]);
     assert_eq!(exit, 1);
     assert_eq!(error["code"], "health_failed", "{error}");
     assert_eq!(error["step"], "test", "{error}");
@@ -3383,12 +3456,12 @@ fn up_stops_at_a_failing_test_and_switches_nothing() {
     assert_eq!(h.get().as_deref(), Some("v1"));
 
     // The deadline is checked before anything is staged.
-    let (exit, error) = h.fk(&["up", "v1", "--deadline", "0"]);
+    let (exit, error) = h.fk(&["upgrade", "v1", "--deadline", "0"]);
     assert_eq!((exit, error["code"].as_str()), (2, Some("usage")));
     assert_eq!(error["step"], Value::Null, "{error}");
 
     // A ref that is no commit fails at the stage, and says so.
-    let (exit, error) = h.fk(&["up", "no-such-ref"]);
+    let (exit, error) = h.fk(&["upgrade", "no-such-ref"]);
     assert_eq!(
         (exit, error["step"].as_str()),
         (1, Some("stage")),
@@ -3594,7 +3667,7 @@ fn service_is_refused_without_launchd() {
         );
         let message = error["message"].as_str().unwrap();
         assert!(
-            message.contains("macOS only") && message.contains("fawkes daemon --manifest"),
+            message.contains("macOS only") && message.contains("fawkes up --manifest"),
             "{message}"
         );
     }

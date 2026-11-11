@@ -357,7 +357,7 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
         Follow::spawn(command)
     }
 
-    /// Run `fawkes daemon` for this manifest in the foreground; its exit code and stderr.
+    /// Run `fawkes up` for this manifest in the foreground; its exit code and stderr.
     pub fn run_second_daemon(&self) -> (i32, String) {
         let output = self.daemon_command().output().unwrap();
         (
@@ -366,11 +366,11 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
         )
     }
 
-    /// `fawkes daemon` for this manifest, with its `run/` links kept inside the test directory.
+    /// `fawkes up` for this manifest, with its `run/` links kept inside the test directory.
     fn daemon_command(&self) -> Command {
         let mut command = fawkes();
         command
-            .args(["daemon", "--manifest"])
+            .args(["up", "--manifest"])
             .arg(&self.manifest)
             .env("FAWKES_HOME", &self.fawkes_home);
         // The daemon runs git for its worktrees and snapshots.

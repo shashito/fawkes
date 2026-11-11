@@ -257,6 +257,11 @@ impl Daemon {
                 self.stream(out, since, limit, true);
                 Ok(Reply::Streamed)
             }
+            // Answered by `run`, on the connection `down` took: what is finished here goes nowhere.
+            Request::Down => {
+                self.down(out);
+                Ok(Reply::Streamed)
+            }
         }
     }
 

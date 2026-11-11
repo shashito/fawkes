@@ -2,8 +2,8 @@
 //!
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
-//! Lock order is `inner` before `manifest` before `log` before `hub` and `echo` (`step_pgids` is only ever taken
-//! alone, and `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding
+//! Lock order is `inner` before `manifest` before `log` before `hub` and `echo` (`step_pgids` and `downs` are only
+//! ever taken alone, and `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding
 //! one. Events go to the hub and to stderr's queue while `log` is held, so every subscriber sees them once and in
 //! `seq` order. No thread that may hold a lock writes stderr: a thread of its own does (`Echo`).
 //!
@@ -24,7 +24,7 @@ use server::{Admission, bind, refuse, register};
 use crate::manifest::{Manifest, Vars};
 use crate::process;
 use crate::protocol::{
-    DaemonAction, Error, ErrorCode, Event, EventKind, Facts, LastExit, Out, Pending, R,
+    DaemonAction, DownResult, Error, ErrorCode, Event, EventKind, Facts, LastExit, Out, Pending, R,
     ReloadResult, RollbackCause, err,
 };
 use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time, with_suffix};
@@ -402,6 +402,10 @@ pub struct Daemon {
     step_pgids: Mutex<Vec<u32>>,
     /// Taken at the end of `run` (`Flush`), so stderr's writer finishes what is queued and ends.
     echo: Mutex<Option<Echo>>,
+    /// The write end of the signal pipe `serve` sleeps on: a byte ends its `poll`, as a signal's does.
+    signalled: UnixStream,
+    /// The connections of `down` requests, answered at the end of `run`.
+    downs: Mutex<Vec<Out>>,
 }
 
 /// How long the accept loop pauses after a failed `accept` or `poll`, so an error that persists does not spin.
@@ -472,7 +476,7 @@ impl Daemon {
         let mut paths = manifest.paths();
         paths.root = private_state_dir(&paths.root, owner)?;
         owned_dir(&manifest.home, "home", owner)?;
-        let _lock = lock_state_dir(&paths)?;
+        let state_lock = lock_state_dir(&paths)?;
         let log = EventLog::open(paths.events())
             .map_err(|e| format!("cannot open the event log: {e}"))?;
         log_panics(paths.events(), log.sequence());
@@ -503,8 +507,10 @@ impl Daemon {
             wake: Wake::new(),
             step_pgids: Mutex::new(Vec::new()),
             echo: Mutex::new(Some(echo)),
+            signalled,
+            downs: Mutex::new(Vec::new()),
         });
-        let _flush = Flush {
+        let flush = Flush {
             daemon: daemon.clone(),
             finished: echo_finished,
         };
@@ -605,25 +611,42 @@ impl Daemon {
 
         let not_adopted = Arc::new(Mutex::new(None));
         if adopt {
-            daemon.adopt_beside_serve(signalled, not_adopted.clone());
+            daemon.adopt_beside_serve(not_adopted.clone());
         }
 
         daemon.serve(&listener, signals)?;
-        daemon.shutdown();
+        let down = daemon.shutdown();
+        let downs = std::mem::take(&mut *lock(&daemon.downs));
+        // `down` is answered once stderr has its last lines and the socket, its run link and the state lock are let
+        // go, so a `fawkes up` right after it finds them free.
+        drop((flush, listener, published, state_lock));
+        for mut out in downs {
+            out.finish(Ok(down.clone().into()));
+        }
         match lock(&not_adopted).take() {
             Some(message) => Err(message),
             None => Ok(()),
         }
     }
 
+    /// End the daemon the way a SIGTERM does: the flag, then a byte on the signal pipe that wakes `serve`, so the
+    /// shutdown and the cleanup on the way out of `run` are those of any other end.
+    fn end(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        // A pipe too full to take the byte holds others that wake `serve` as well.
+        let _ = (&self.signalled).write_all(&[0]);
+    }
+
+    /// `fawkes down`: keep the connection for the answer `run` sends once the daemon has let go of everything, and
+    /// end the daemon.
+    fn down(&self, out: &mut Out) {
+        lock(&self.downs).push(std::mem::replace(out, Out::none()));
+        self.end();
+    }
+
     /// Adopt HEAD on a thread of its own, while `serve` answers the test run and clients. A failure is logged and put
-    /// in `failure` before it ends the daemon the way a SIGTERM does, the flag and then a byte on `signals` that wakes
-    /// `serve`, so the shutdown and the cleanup on the way out of `run` are those of any other end.
-    fn adopt_beside_serve(
-        self: &Arc<Self>,
-        signals: UnixStream,
-        failure: Arc<Mutex<Option<String>>>,
-    ) {
+    /// in `failure` before it ends the daemon (`end`).
+    fn adopt_beside_serve(self: &Arc<Self>, failure: Arc<Mutex<Option<String>>>) {
         let daemon = self.clone();
         thread::spawn(move || {
             // An adoption a SIGTERM cut short is an ordinary end of the daemon: the next start adopts again.
@@ -641,9 +664,7 @@ impl Daemon {
                     },
                 );
                 *lock(&failure) = Some(message);
-                daemon.shutdown.store(true, Ordering::SeqCst);
-                // A pipe too full to take the byte holds others that wake `serve` as well.
-                let _ = (&signals).write_all(&[0]);
+                daemon.end();
             }
         });
     }
@@ -780,8 +801,8 @@ impl Daemon {
         Ok(ReloadResult { changed })
     }
 
-    /// Stop the live app and any test and clean up; the generations keep their state.
-    fn shutdown(&self) {
+    /// Stop the live app and any test and clean up; the generations keep their state. Gives what `down` answers.
+    fn shutdown(&self) -> DownResult {
         // The supervisor and every other waiter on `wake` see the flag now.
         self.wake.notify();
         // A switch, rollback or restart in flight finishes first (start_live refuses from now on), so no app it
@@ -796,6 +817,7 @@ impl Daemon {
             self.wake.wait(seen, Some(left));
         }
         let app = self.inner().take_running();
+        let stopped = app.as_ref().map(|app| app.generation.clone());
         if let Some(app) = app {
             self.stop_app(app);
         }
@@ -811,6 +833,11 @@ impl Daemon {
                 ..Facts::default()
             },
         );
+        DownResult {
+            name: self.manifest().name.clone(),
+            daemon_pid: std::process::id(),
+            stopped,
+        }
     }
 }
 
@@ -1164,6 +1191,8 @@ mod tests {
             wake: Wake::new(),
             step_pgids: Mutex::new(Vec::new()),
             echo: Mutex::new(None),
+            signalled: UnixStream::pair().unwrap().0,
+            downs: Mutex::new(Vec::new()),
         }
     }
 

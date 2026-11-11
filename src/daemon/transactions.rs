@@ -857,7 +857,7 @@ impl Daemon {
                 ErrorCode::PortInUse,
                 format!(
                     "port {} is in use: stop the app running there first (fawkes tests HEAD of {} and then starts it \
-                     on that port), then run `fawkes daemon` again",
+                     on that port), then run `fawkes up` again",
                     m.port,
                     m.repo.display()
                 ),
@@ -1401,7 +1401,7 @@ pub(super) fn not_adopted(e: &Error) -> String {
     let next = if e.code == ErrorCode::PortInUse && e.generation.is_none() {
         ""
     } else {
-        "; start the app as before, or fix it and run `fawkes daemon` again"
+        "; start the app as before, or fix it and run `fawkes up` again"
     };
     format!(
         "not adopted: {}; nothing was started and the home is untouched{next}",

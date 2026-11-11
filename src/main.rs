@@ -1,4 +1,4 @@
-//! `fawkes`: the daemon (`fawkes daemon`) and the thin command-line client of its socket.
+//! `fawkes`: the daemon (`fawkes up`) and the thin command-line client of its socket.
 
 mod daemon;
 mod discovery;
@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand};
 use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
-    ErrorCode, Generation, Line, REQUEST_TIMEOUT, Request, StageResult, UpResult, UpStep, err,
-    read_line, timed_out,
+    ErrorCode, Generation, Line, REQUEST_TIMEOUT, Request, StageResult, UpgradeResult, UpgradeStep,
+    err, read_line, timed_out,
 };
 use render::{render_decided, render_event, render_progress, render_result, render_switch};
 use serde::Serialize;
@@ -50,14 +50,16 @@ directory; when several do, name one. --manifest and $FAWKES_MANIFEST take a pat
 
 JSON: stdout carries one document, the result or the error object {\"code\", \"message\"}, and progress goes to
 stderr as JSON lines. A result only ever gains fields. The streams differ: `log --follow` prints one event per
-line, `watch` one {\"name\", \"event\"} document per event. `daemon` prints text only.
+line, `watch` one {\"name\", \"event\"} document per event. `up` prints text only.
 
 Examples:
-  fawkes up main                     stage, test and switch main; the new generation confirms itself
+  fawkes up                          supervise the app of this project, in the foreground
+  fawkes upgrade main                stage, test and switch main; the new generation confirms itself
   fawkes wait                        until the pending switch is confirmed or rolled back
   fawkes status --json               what runs, what is pending, and the commands accepted now
   fawkes rollback                    undo the pending switch
   fawkes --manifest xana log -n 20   the last 20 events of the app xana, from anywhere
+  fawkes down                        stop the app and its supervisor
   fawkes skill                       how an agent uses Fawkes, for this version
 
 Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers.";
@@ -96,8 +98,20 @@ struct Cli {
 /// What the command line asks for: one of the two local programs, or a request to a daemon.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the supervisor of one app in the foreground
-    Daemon,
+    /// Run the app under supervision, in the foreground
+    ///
+    /// The supervisor (the app's daemon) starts the app, serves every other command on its socket and prints its
+    /// events on stderr, text only. It runs until `fawkes down`, SIGTERM or Ctrl-C, and stops the app on its way out.
+    #[command(after_long_help = "Examples:\n  \
+                                 fawkes up\n  \
+                                 fawkes up --manifest xana")]
+    Up,
+    /// Stop the app and its supervisor
+    ///
+    /// Answers once the daemon has let go of its socket and state lock, so `fawkes up` can follow at once. A daemon
+    /// run by `fawkes service` stays down until the next login or `fawkes service restart`. Run it from a shell
+    /// outside the app: from inside, it would end the caller and leave nothing to bring the app back.
+    Down,
     /// Run the current generation (pending, else permanent)
     Start,
     /// Stop the app
@@ -138,9 +152,9 @@ enum Command {
     /// and nothing after it runs. The command exits once the generation is live; `fawkes wait` reports whether it
     /// confirmed or rolled back.
     #[command(after_long_help = "Examples:\n  \
-                                 fawkes up main\n  \
-                                 fawkes up v1.4 --deadline 300 --json")]
-    Up {
+                                 fawkes upgrade main\n  \
+                                 fawkes upgrade v1.4 --deadline 300 --json")]
+    Upgrade {
         /// A git branch, tag or commit
         #[arg(value_name = "REF")]
         git_ref: String,
@@ -245,14 +259,15 @@ impl Command {
             Command::Stage { .. } => Some("stage"),
             Command::Test { .. } => Some("test"),
             Command::Switch { .. } => Some("switch"),
-            Command::Up { .. } => Some("up"),
+            Command::Upgrade { .. } => Some("upgrade"),
             Command::Rollback { .. } => Some("rollback"),
             Command::Prune => Some("prune"),
             Command::Reload => Some("reload"),
+            Command::Up => Some("up"),
+            Command::Down => Some("down"),
             // A test run may confirm its own generation, which is never pending; `run_confirm` refuses the rest once it
             // knows which daemon the confirm reaches (DESIGN.md, Refusals).
-            Command::Daemon
-            | Command::Confirm { .. }
+            Command::Confirm { .. }
             | Command::Status
             | Command::History
             | Command::Log { .. }
@@ -320,12 +335,17 @@ fn main() -> ExitCode {
         })
     };
     let code = match &cli.command {
-        Command::Daemon => run_daemon(&given, cli.socket.clone()),
+        Command::Up => run_up(&given, cli.socket.clone()),
         Command::Skill => run_skill(&cli, out),
         Command::Watch { since } => run_watch(&cli, &given, *since, out),
         Command::Service { action } => run_service(&cli, &given, *action, out),
-        Command::Up { git_ref, deadline } => with_endpoint(&cli, &given, out, |endpoint, out| {
-            run_up(&cli, git_ref, *deadline, &endpoint, out)
+        Command::Upgrade { git_ref, deadline } => {
+            with_endpoint(&cli, &given, out, |endpoint, out| {
+                run_upgrade(&cli, git_ref, *deadline, &endpoint, out)
+            })
+        }
+        Command::Down => with_endpoint(&cli, &given, out, |endpoint, out| {
+            run_down(&cli, &endpoint, out)
         }),
         Command::Wait { generation } => with_endpoint(&cli, &given, out, |endpoint, out| {
             run_wait(&cli, generation.as_deref(), &endpoint, out)
@@ -369,8 +389,8 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// `fawkes daemon`: the supervisor of one app, in the foreground. Returns the exit code.
-fn run_daemon(given: &Given, socket: Option<PathBuf>) -> u8 {
+/// `fawkes up`: the supervisor of one app, in the foreground. Returns the exit code.
+fn run_up(given: &Given, socket: Option<PathBuf>) -> u8 {
     // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of the
     // daemon's startup failures are not.
     let manifest_path = match given.manifest() {
@@ -391,6 +411,19 @@ fn run_daemon(given: &Given, socket: Option<PathBuf>) -> u8 {
             EXIT_FAILED
         }
     }
+}
+
+/// `fawkes down`: the app and its daemon, which answers once it has let go of its socket and state lock. Returns the
+/// exit code.
+fn run_down(cli: &Cli, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
+    // From inside the app it ends, the caller goes with it, and no supervisor is left to start the app again.
+    if endpoint.own && std::env::var_os("FAWKES_PHASE").is_some() {
+        let message = "`fawkes down` stops this daemon and its app, this process with it, and nothing would start \
+                       them again; run it from a shell outside the app"
+            .into();
+        return fail(cli.json, out, ErrorCode::InvalidState, message);
+    }
+    client(cli, &Request::Down, endpoint, REQUEST_TIMEOUT, out)
 }
 
 /// `fawkes skill`: the agent skill built into this binary. Returns the exit code.
@@ -524,7 +557,7 @@ impl Endpoint {
     /// from a terminal would only contend with for the state lock.
     fn start_hint(&self) -> String {
         let Some((path, name)) = &self.manifest else {
-            return "start one with `fawkes daemon --manifest <app>`".into();
+            return "start one with `fawkes up --manifest <app>`".into();
         };
         let path = path.display();
         if service::plist(name).is_some_and(|plist| plist.exists()) {
@@ -533,7 +566,7 @@ impl Endpoint {
                  starts it again"
             )
         } else {
-            format!("start one with `fawkes daemon --manifest {path}`")
+            format!("start one with `fawkes up --manifest {path}`")
         }
     }
 }
@@ -568,7 +601,7 @@ fn run_watch(cli: &Cli, given: &Given, since: Option<u64>, out: &mut dyn Write) 
         Ok(()) => 0,
         Err(why) => {
             let hint = endpoint.map_or_else(
-                || "start one with `fawkes daemon --manifest <app>`".into(),
+                || "start one with `fawkes up --manifest <app>`".into(),
                 |endpoint| endpoint.start_hint(),
             );
             fail(
@@ -675,8 +708,8 @@ impl Failure {
         }
     }
 
-    /// The same failure, saying it ended the step `step` of `up`, in the object `--json` prints as well.
-    fn in_step(self, step: UpStep) -> Failure {
+    /// The same failure, saying it ended the step `step` of `upgrade`, in the object `--json` prints as well.
+    fn in_step(self, step: UpgradeStep) -> Failure {
         let mut raw = self.raw;
         raw["step"] = step.as_str().into();
         Failure {
@@ -746,10 +779,10 @@ fn client(
     }
 }
 
-/// `fawkes up`: `stage`, `test` and `switch` in turn, each as its own request, and the first failure is the
+/// `fawkes upgrade`: `stage`, `test` and `switch` in turn, each as its own request, and the first failure is the
 /// command's, with the step that failed. The result is the switch's, with what the stage and the test learned.
 /// Returns the exit code.
-fn run_up(
+fn run_upgrade(
     cli: &Cli,
     git_ref: &str,
     deadline: Option<u64>,
@@ -762,22 +795,25 @@ fn run_up(
     {
         return fail(cli.json, out, error.code, error.message);
     }
-    let outcome = up(cli, git_ref, deadline, endpoint, out).map(|result| {
+    let outcome = upgrade(cli, git_ref, deadline, endpoint, out).map(|result| {
         let text = render_switch(&result.switch);
         (result, text)
     });
     finish(cli, out, outcome)
 }
 
-/// The three steps of `up`; what each answered is read as its command's result.
-fn up(
+/// The three steps of `upgrade`; what each answered is read as its command's result.
+fn upgrade(
     cli: &Cli,
     git_ref: &str,
     deadline: Option<u64>,
     endpoint: &Endpoint,
     out: &mut dyn Write,
-) -> Result<UpResult, Failure> {
-    fn read<T: serde::de::DeserializeOwned>(result: &Value, step: UpStep) -> Result<T, Failure> {
+) -> Result<UpgradeResult, Failure> {
+    fn read<T: serde::de::DeserializeOwned>(
+        result: &Value,
+        step: UpgradeStep,
+    ) -> Result<T, Failure> {
         T::deserialize(result).map_err(|e| {
             let message = format!(
                 "the daemon's {} result could not be read: {e}",
@@ -786,13 +822,13 @@ fn up(
             Failure::new(ErrorCode::Internal, message).in_step(step)
         })
     }
-    let mut step = |name: UpStep, request: &Request| {
+    let mut step = |name: UpgradeStep, request: &Request| {
         exchange(cli, request, endpoint, REQUEST_TIMEOUT, out).map_err(|f| f.in_step(name))
     };
     let stage = Request::Stage {
         git_ref: git_ref.into(),
     };
-    let staged: StageResult = read(&step(UpStep::Stage, &stage)?, UpStep::Stage)?;
+    let staged: StageResult = read(&step(UpgradeStep::Stage, &stage)?, UpgradeStep::Stage)?;
     let id = staged.generation.id;
     if !cli.json {
         warn(if staged.existing {
@@ -804,7 +840,7 @@ fn up(
     let test = Request::Test {
         generation: id.clone(),
     };
-    let tested: Generation = read(&step(UpStep::Test, &test)?, UpStep::Test)?;
+    let tested: Generation = read(&step(UpgradeStep::Test, &test)?, UpgradeStep::Test)?;
     if !cli.json {
         warn(format!("{id} passed its test"));
     }
@@ -812,8 +848,8 @@ fn up(
         generation: id,
         deadline,
     };
-    Ok(UpResult {
-        switch: read(&step(UpStep::Switch, &switch)?, UpStep::Switch)?,
+    Ok(UpgradeResult {
+        switch: read(&step(UpgradeStep::Switch, &switch)?, UpgradeStep::Switch)?,
         existing: staged.existing,
         test: tested.test,
     })
@@ -986,13 +1022,19 @@ mod tests {
             assert_eq!(cli.socket, Some("s.sock".into()), "{args}");
             assert!(matches!(cli.command, Command::Status), "{args}");
         }
-        let daemon = parse("daemon --manifest f.toml");
-        assert!(matches!(daemon.command, Command::Daemon));
-        assert_eq!(daemon.manifest, Some("f.toml".into()));
-        let up = parse("up main --deadline 60");
+        let up = parse("up --manifest f.toml");
+        assert!(matches!(up.command, Command::Up));
+        assert_eq!(up.manifest, Some("f.toml".into()));
+        let upgrade = parse("upgrade main --deadline 60");
         assert!(
-            matches!(&up.command, Command::Up { git_ref, deadline: Some(60) } if git_ref == "main")
+            matches!(&upgrade.command, Command::Upgrade { git_ref, deadline: Some(60) } if git_ref == "main")
         );
+        assert!(matches!(parse("down --json").command, Command::Down));
+        // The old names are gone, not aliased: `daemon` is no command, and `up` takes no ref.
+        for args in ["daemon", "up main"] {
+            let words = ["fawkes"].into_iter().chain(args.split_whitespace());
+            assert!(Cli::try_parse_from(words).is_err(), "{args}");
+        }
     }
 
     #[test]
