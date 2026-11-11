@@ -3,7 +3,7 @@
 use super::{Daemon, MAX_REQUEST, Msg, Slot, lock};
 use crate::protocol::{
     DEFAULT_LOG_EVENTS, ErrorCode, EventKind, Events, Line, Out, R, Reply, Request, RollbackCause,
-    err,
+    err, timed_out,
 };
 use rustix::fs::Mode;
 use std::io::{ErrorKind, Read};
@@ -151,14 +151,7 @@ fn read_request(stream: &UnixStream, until: Instant, limit: u64) -> R<String> {
         let n = match reader.read(&mut chunk) {
             Ok(n) => n,
             // A timeout, or a signal: the deadline above decides whether to go on.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) =>
-            {
-                continue;
-            }
+            Err(e) if timed_out(&e) || e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
                 return Err(err(
                     ErrorCode::Usage,
@@ -205,10 +198,7 @@ impl Daemon {
             .and_then(|line| Request::parse(&line))
             .and_then(|request| {
                 // Streams last as long as their client listens, by design, so they do not count against the cap.
-                if matches!(
-                    request,
-                    Request::Subscribe { .. } | Request::Log { follow: true, .. }
-                ) {
+                if request.is_stream() {
                     admitted.release();
                 }
                 self.dispatch(&mut out, request)

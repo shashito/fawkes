@@ -309,10 +309,7 @@ fn main() -> ExitCode {
     if let Some(name) = cli.command.changes_the_app()
         && in_test_run()
     {
-        let message = format!(
-            "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {name}`; the live app \
-             or a shell outside the app does"
-        );
+        let message = test_run_message(name, "");
         return ExitCode::from(fail(cli.json, out, ErrorCode::TestPhase, message));
     }
     // One request to the daemon, for the commands that send exactly one.
@@ -435,17 +432,23 @@ fn run_confirm(
     if in_test_run()
         && let Some(why) = test_run_refusal(generation, own_generation.as_deref(), endpoint.own)
     {
-        let named = generation.map_or_else(String::new, |id| format!(" {id}"));
-        let message = format!(
-            "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes confirm{named}` \
-             {why}; the live app or a shell outside the app does"
-        );
+        let named = generation.map_or_else(|| "confirm".into(), |id| format!("confirm {id}"));
+        let message = test_run_message(&named, &format!(" {why}"));
         return fail(cli.json, out, ErrorCode::TestPhase, message);
     }
     let request = Request::Confirm {
         generation: confirm_generation(generation, own_generation.as_deref()),
     };
     client(cli, &request, endpoint, REQUEST_TIMEOUT, out)
+}
+
+/// The refusal of `fawkes {command}` in a test run, which serves its health check and nothing else; `why`, when not
+/// empty, follows the command.
+fn test_run_message(command: &str, why: &str) -> String {
+    format!(
+        "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {command}`{why}; the live \
+         app or a shell outside the app does"
+    )
 }
 
 /// Why a test run may not `confirm`, completing "it does not `fawkes confirm` …"; none when it may. A test run confirms
@@ -652,11 +655,10 @@ fn exit_code(code: ErrorCode) -> u8 {
 }
 
 /// Why a command failed: the `{"code", "message"}` object as it goes out under `--json` (the daemon's own, as it
-/// sent it), and the exit code.
+/// sent it), and the error whose code gives the exit code.
 struct Failure {
     raw: Value,
     error: protocol::Error,
-    exit: u8,
 }
 
 impl Failure {
@@ -669,7 +671,6 @@ impl Failure {
     fn of(error: protocol::Error) -> Failure {
         Failure {
             raw: serde_json::to_value(&error).unwrap_or_default(),
-            exit: exit_code(error.code),
             error,
         }
     }
@@ -681,7 +682,6 @@ impl Failure {
         Failure {
             raw,
             error: self.error.in_step(step),
-            exit: self.exit,
         }
     }
 
@@ -693,7 +693,7 @@ impl Failure {
         } else {
             warn(format!("error: {}", self.error.message));
         }
-        self.exit
+        exit_code(self.error.code)
     }
 }
 
@@ -734,7 +734,7 @@ fn client(
 ) -> u8 {
     match exchange(cli, request, endpoint, timeout, out) {
         // A followed log printed its events as they came; there is no result to show.
-        Ok(_) if matches!(request, Request::Log { follow: true, .. }) => 0,
+        Ok(_) if request.is_stream() => 0,
         outcome => finish(
             cli,
             out,
@@ -864,7 +864,7 @@ fn exchange(
     // A daemon with no place for another connection answers `busy` and closes without reading, which can fail the
     // write: its answer is still there to be read.
     let sent = request.write_to(&mut stream).is_ok();
-    let follow = matches!(request, Request::Log { follow: true, .. });
+    let follow = request.is_stream();
     // A daemon that accepts and then never answers must not hang a quick command (`Request::is_quick`). On macOS the
     // timeout cannot be set (EINVAL) once the daemon has closed its end, which a quick answer or a refusal does at
     // once; reading what it left needs no timeout then, so the failure is ignored.
@@ -910,17 +910,11 @@ fn exchange(
             // A followed log ends with a null result when the daemon ends the stream; the events were the output.
             Line::Done { .. } if follow => return Ok(Value::Null),
             Line::Done { result, .. } => return Ok(result),
+            // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
             Line::Failed { error, .. } => {
-                // The daemon checks some arguments itself (a `--deadline` out of range): still a usage error.
-                let exit = if error.code == ErrorCode::Usage {
-                    EXIT_USAGE
-                } else {
-                    EXIT_FAILED
-                };
                 return Err(Failure {
                     raw: raw["error"].clone(),
                     error,
-                    exit,
                 });
             }
         }

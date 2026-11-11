@@ -307,6 +307,14 @@ impl Request {
         )
     }
 
+    /// Whether the answer is a stream, which lasts as long as its client listens: `subscribe` and a followed log.
+    pub fn is_stream(&self) -> bool {
+        matches!(
+            self,
+            Request::Subscribe { .. } | Request::Log { follow: true, .. }
+        )
+    }
+
     /// Send the request as one line.
     pub fn write_to(&self, stream: &mut impl Write) -> std::io::Result<()> {
         let line = serde_json::to_string(self)?;
