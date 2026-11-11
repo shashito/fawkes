@@ -1,0 +1,75 @@
+#!/bin/sh
+# Run the lander's checks, in the lander's order, and print one line per step.
+#
+#   scripts/check                   fmt, deny, clippy, test
+#   scripts/check --only <test>     fmt, clippy, and only the tests matching <test>
+#
+# A failing step prints only its relevant output (for the tests, the failing tests and their panics) and the
+# script exits with that step's exit code, so nothing needs to be piped through grep or tail.
+#
+# The tests run with TMPDIR set to a short directory under /tmp: a test that binds a Unix socket under a long
+# TMPDIR exceeds the socket path limit (104 bytes on macOS).
+
+set -eu
+# shellcheck disable=SC3040 # pipefail only where the shell has it
+if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+
+usage() {
+	echo "usage: scripts/check [--only <test-name>]" >&2
+	exit 2
+}
+
+only=
+case $# in
+0) ;;
+2) [ "$1" = --only ] || usage; only=$2 ;;
+*) usage ;;
+esac
+
+cd "$(dirname "$0")/.."
+scratch=$(mktemp -d /tmp/fkl.XXXXXX)
+trap 'rm -rf "$scratch"' EXIT
+out=$scratch/out
+
+# Cargo's progress lines, which say nothing about a failure.
+progress='^ *(Compiling|Checking|Finished|Running|Doc-tests|Blocking|Locking|Updating|Downloading|Downloaded) '
+
+# The relevant part of a failed step's output in $out.
+explain() {
+	if [ "$1" = test ] && grep -q '^failures:$' "$out"; then
+		# Each failing test's captured output and panic, the list of failures and the result line, then
+		# cargo's note on which binary failed. Other lines are left out: tests' child processes write to
+		# stderr uncaptured, passing tests included.
+		awk '/^---- .* ----$/ || /^failures:$/ { show = 1 }
+			show { print }
+			/^test result: / { show = 0 }
+			/^error: test failed/ { print }' "$out"
+	else
+		grep -Ev "$progress" "$out" || true
+	fi
+}
+
+# Run one step: its name, then its command.
+step() {
+	name=$1
+	shift
+	start=$(date +%s)
+	if "$@" >"$out" 2>&1; then status=0; else status=$?; fi
+	seconds=$(($(date +%s) - start))
+	if [ "$status" -eq 0 ]; then
+		printf '%-7s ok      %4ss\n' "$name" "$seconds"
+		return
+	fi
+	printf '%-7s FAILED  %4ss  (exit %s)\n' "$name" "$seconds" "$status"
+	explain "$name"
+	exit "$status"
+}
+
+step fmt cargo fmt --check -- --color=never
+[ -n "$only" ] || step deny cargo deny check
+step clippy cargo clippy --all-targets -- -D warnings
+if [ -n "$only" ]; then
+	step test env TMPDIR="$scratch" cargo test "$only"
+else
+	step test env TMPDIR="$scratch" cargo test
+fi
