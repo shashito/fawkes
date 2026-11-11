@@ -1,4 +1,4 @@
-Runs Ultimate's upgrades through the Fawkes supervisor: stage, test and switch a ref, and the new generation confirms itself once it works, or Fawkes rolls back code and storage.
+Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes up` stages, tests and switches a ref, and the new generation confirms itself once it works, or Fawkes rolls back code and storage.
 
 ## Where it runs
 
@@ -58,45 +58,67 @@ which a copied storage carries into a test run) would end this hold too. So whil
 every other `release()` of the harness aside; its own release then lets the scheduler run unless the user's pause
 still holds it. A counted hold in Ultimate would make that wrapper unnecessary.
 
+## The upgrade
+
+An upgrade fetches the ref in the clone, then runs `"$FAWKES_BIN" up --json --socket "$FAWKES_SOCKET" -- <ref>` as a
+child (`up.ts`): one call, so the composition of stage, test and switch, its retry-safe stage and its refusals stay
+Fawkes's own. Its stdout is the result (`generation`, `previous`, `deadline`, `existing`, `test`) or the error object
+(`code`, `step`, `generation`, `log`), which the popover and the tool show as they are. Its progress lines are not
+read from the child: the daemon sends every event to every subscriber, and the step in progress is `status.busy`.
+
+In the live app the switch stops this process, the `up` child with it, so nobody here could run `fawkes wait`. The
+generation that runs next learns the outcome instead, from the same `status` and `history` pictures `wait` decides
+from, on the subscribe stream it already holds (`facts.ts`, `outcome`): `permanent`, `rolled_back` with its
+`rollback_cause`, `storage_failed` while the restore failed, or still waiting. The new generation confirms itself; if
+it is rolled back, the permanent generation starts again and shows why ("g8 rolled back: missed its confirm deadline").
+
 ## Status line
 
 One `subscribe` connection to the daemon (reconnecting with `since`, so no event is lost) keeps the generations,
-the status and the latest events. The item shows:
+the status and the latest events. Everything shown is read from fields (`status.step`, `status.actions`,
+`rollback_cause`, the facts of each event), never from the text of a message. The item shows:
 
 - `✓ g7` (muted) while the running generation is current;
 - `↓ 3 new · upgrade` when the upgrade ref (`origin/main`) has commits the generation lacks (checked every 5
   minutes from the clone, fetched by Check now or an upgrade);
-- `installing g8`, `testing g8`, `switching` during an upgrade;
+- the step in progress during an upgrade, or any other client's step (`stage`, `test g8`, `switch g8`, from
+  `status.busy`);
 - `⏱ confirming 01:42` while the new generation awaits its confirm, with the reason in the popover when its checks
   fail;
-- `rolling back g8` while a rollback runs, and `restore failed` in red when its storage restore failed (the popover
-  offers Roll back, which retries it);
-- `g8 rolled back` or `upgrade failed`, in red, for an hour after it happened.
+- `rolling back g8` while a rollback runs, and `restore failed` in red when its storage restore failed;
+- `g8 rolled back` or `upgrade failed`, in red, for an hour after it happened;
+- `fawkes too old` when the daemon's status has no `version`: it predates the fields this extension reads. The
+  generation still holds the scheduler and confirms itself, but upgrades are off until Fawkes is upgraded.
 
-The popover lists the newest generations with their state and the reason of a rollback, and offers Check now and
-Upgrade, or Confirm and Roll back while a switch awaits its confirm (the daemon's `status.step` says so: `pending`
-stays set while a switch is rolled back).
+The popover says how the latest switch ended (its cause in words, where it went back to and what became of the
+storage), lists the newest generations with the cause of each rollback and the latest events, and offers only what
+`status.actions` allows: Confirm (`confirm gN`), Roll back (`rollback`, which also retries a failed restore), and
+Upgrade when the ref has new commits, `stage` is allowed and no switch is in flight. Check now is there unless a
+switch awaits its confirm. An older daemon sends no `actions`: its pending switch still offers Confirm and Roll back.
 
 ## Actions
 
 - `state` (no arguments): what the status line shows.
 - `check` (no arguments): fetch the clone and count what an upgrade would bring.
-- `upgrade` `{ ref? }` (user-only): stage, test and switch `ref` (default `origin/main`) in the background.
+- `upgrade` `{ ref? }` (user-only): `fawkes up` `ref` (default `origin/main`) in the background.
 - `confirm` (user-only): confirm the pending generation now, without its own checks.
 - `rollback` (user-only): roll the pending generation back now.
 
 ## For agents
 
 A live generation adds a prompt section (the generation's folder is the running host and is never edited; landed
-changes go live only through an upgrade; `restart` reboots the same generation) and the `fawkes` tool: `status`, or
-`upgrade {ref?}`.
+changes go live only through an upgrade; `restart` reboots the same generation), which never changes between turns
+so the prompt stays cached, and the `fawkes` tool: `status` (the generations, how the latest switch ended, what
+`status.actions` allows, recent events), or `upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
+rollback of the last hour with its cause, a daemon that is too old) comes as a note with its next input, only when it
+changed since that conversation last heard, and once more when it no longer applies.
 
 ## Checks
 
-`ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases) and `test-env.test.ts` (the test run's
-environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it) and
-type-checks both facets against the clone in `$ULTIMATE`
-(default `~/Code/ultimate`).
+`ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases), `test-env.test.ts` (the test run's
+environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it),
+`up.test.ts` (the `fawkes up` call and its result and error fields), `facts.test.ts` (outcomes and words from fields)
+and the rest, and type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
 
 ## Storage hooks
 

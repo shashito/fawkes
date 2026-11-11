@@ -3,16 +3,19 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { obj, oneOf, opt, str } from '@earendil-works/pi-schema'
-import { defineExtension, defineTool, section } from '@earendil-works/pi-durable'
+import { defineDoc, defineExtension, defineTool, GenerationTask, hook, section } from '@earendil-works/pi-durable'
+import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 // Types only: at runtime this folder must not load code from a clone other than the generation it runs in.
 import type { ExtensionHost } from 'ultimate/server/extensions.ts'
 import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
 import { request, subscribe } from './client.ts'
 import { mayConfirm } from './confirm.ts'
+import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { HELD_MARKER, role } from './role.ts'
-import { awaitingConfirm, restoreFailed, rollbackNote } from './step.ts'
+import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import type { Confirming, FawkesEvent, FawkesState, Generation, Status, Upgrade } from './types.ts'
+import { up, UpFailure } from './up.ts'
 
 const run = promisify(execFile)
 /** The pause extension's service, looked up by its name like any `want`. */
@@ -180,54 +183,136 @@ async function check(host: ExtensionHost, fetch: boolean, ref = DEFAULT_REF) {
   }
 }
 
-/** Stage, test and switch `ref`; the new generation confirms itself after its boot. Runs in the background. */
+/**
+ * Fetch `ref`, then `fawkes up` it: one call that stages, tests and switches. Runs in the background. In the live app
+ * the switch stops this process, and the new generation confirms itself after its boot or is rolled back.
+ */
 function upgrade(host: ExtensionHost, socket: string, ref: string) {
   const s = shared(host)
   if (s.upgradeRun) throw new Error(`An upgrade to ${s.upgrade?.ref} is already running`)
-  if (s.status?.pending)
-    throw new Error(rollbackNote(s.status) ?? `${s.status.pending.generation} still awaits its confirm`)
-  if (s.status?.busy) throw new Error(`Fawkes is busy: ${s.status.busy}`)
-  const step = (next: Partial<Upgrade>) => {
-    s.upgrade = { ...(s.upgrade ?? { ref, step: 'fetching' }), ...next, at: Date.now() }
-  }
-  const progress = (event: FawkesEvent) => step({ progress: event.message })
-  s.upgrade = { ref, step: 'fetching', at: Date.now() }
+  const refusal = upgradeRefusal(s.status)
+  if (refusal) throw new Error(refusal)
+  const bin = process.env.FAWKES_BIN
+  if (!bin) throw new Error('FAWKES_BIN is not set, though Fawkes sets it for every app it starts')
+  const upgrade: Upgrade = { ref, state: 'fetching', since: s.events.at(-1)?.seq ?? 0, at: Date.now() }
+  const set = (next: Partial<Upgrade>) => (s.upgrade = Object.assign(upgrade, next, { at: Date.now() }))
+  s.upgrade = upgrade
   s.upgradeRun = (async () => {
     try {
       await check(host, true, ref)
-      step({ step: 'staging', progress: undefined })
-      // An install reports while it runs; silence for 10 minutes means it hangs.
-      const staged = await request<Generation>(socket, 'stage', { ref }, { progress, timeout: 600_000 })
-      step({ step: 'testing', generation: staged.id, progress: undefined })
-      await request<Generation>(socket, 'test', { generation: staged.id }, { progress, timeout: 600_000 })
-      step({ step: 'switching', progress: undefined })
-      // The switch stops this process: its answer may never arrive. The new generation reports from here on.
-      await request(socket, 'switch', { generation: staged.id }, { progress, timeout: 600_000 })
-      step({ step: 'done' })
     } catch (error) {
-      step({ step: 'failed', error: (error as Error).message })
-    } finally {
-      s.upgradeRun = undefined
+      set({ state: 'failed', error: { message: `cannot check ${ref}: ${(error as Error).message.split('\n')[0]}` } })
+      return
     }
-  })()
+    set({ state: 'running' })
+    try {
+      set({ state: 'switched', result: await up(bin, socket, ref) })
+    } catch (error) {
+      // The switch stopped this process's group and `up` with it, before its answer: no failure, this process ends too.
+      if (error instanceof UpFailure && error.signal && switching(s.status)) return
+      set({ state: 'failed', error: error instanceof UpFailure ? error.error : { message: String(error) } })
+    }
+  })().finally(() => (s.upgradeRun = undefined))
 }
 
 const text = (value: string) => ({ output: [{ type: 'text' as const, text: value }] })
+
+/** The upgrade this process started, in one line. */
+function upgradeLine({ ref, state, result, error }: Upgrade, status: Status | undefined) {
+  if (state === 'fetching') return `Upgrade to ${ref}: fetching it.`
+  if (state === 'running') return `Upgrade to ${ref}: fawkes up runs${status?.busy ? ` (${status.busy})` : ''}.`
+  if (state === 'switched' && result)
+    return `Upgrade to ${ref}: switched to ${result.generation}${result.existing ? ' (already built)' : ''}; it confirms itself by ${result.deadline}.`
+  const at = error?.step ? ` at its ${error.step} step` : ''
+  return `Upgrade to ${ref} failed${at}: ${error?.code ? `${error.code}: ` : ''}${error?.message ?? 'no reason'}${error?.log ? ` (log: ${error.log})` : ''}`
+}
+
+/** How the latest switch ended, with where it went and what became of the storage when it rolled back. */
+function lastSwitchLine(state: Extract<FawkesState, { supervised: true }>) {
+  const target = lastSwitched(state.generations)
+  const decided = target && outcome(state.status, state.generations, target.id)
+  if (!decided || decided.state === 'waiting') return undefined
+  const event = rollbackEvent(state.events, decided.generation)
+  const more = [event?.to && `back to ${event.to}`, event?.storage && storageText(event.storage)].filter(Boolean)
+  return `Last switch: ${outcomeText(decided)}${more.length ? `; ${more.join('; ')}` : ''}.`
+}
 
 function describe(state: FawkesState) {
   if (!state.supervised) return 'This Ultimate does not run under Fawkes.'
   const { status, generations } = state
   if (!status) return `This Ultimate runs as ${state.generation}; the Fawkes daemon has not answered yet.`
   const pending = awaitingConfirm(status)
-  const rollback = rollbackNote(status)
   const lines = [
-    `Running ${state.generation} (permanent ${status.permanent ?? 'none'}${pending ? `, ${pending.generation} pending until ${pending.deadline}` : ''}${rollback ? `, ${rollback}` : ''}${status.busy ? `, busy: ${status.busy}` : ''}).`,
-  ]
+    `Running ${state.generation} (permanent ${status.permanent ?? 'none'}${status.version ? `, daemon ${status.version}` : ''}).`,
+    outdated(status),
+    pending && `${pending.generation} awaits its confirm by ${pending.deadline}, or rolls back to ${pending.previous ?? 'nothing'}.`,
+    rollbackNote(status),
+    status.busy && `In progress: ${status.busy}.`,
+    status.actions && `Fawkes accepts now: ${status.actions.join(', ') || 'nothing'}.`,
+    lastSwitchLine(state),
+    state.upgrade && upgradeLine(state.upgrade, status),
+  ].filter((line): line is string => !!line)
   for (const g of generations.slice(-6).reverse())
-    lines.push(`${g.id} ${g.ref}@${g.commit.slice(0, 8)} ${g.state}${g.rollback_reason ? ` (${g.rollback_reason})` : ''}`)
+    lines.push(
+      `${g.id} ${g.ref}@${g.commit.slice(0, 8)} ${g.state}${g.state === 'rolled_back' ? ` (${causeText(g.rollback_cause, g.rollback_reason)})` : ''}`,
+    )
+  const recent = state.events.filter((event) => event.kind !== 'progress').slice(-5)
+  if (recent.length) lines.push('Recent events:', ...recent.map((event) => `  ${event.at} ${eventLine(event)}`))
   if (state.behind) lines.push(`${state.behind.ref} has ${state.behind.count} commits this generation lacks.`)
-  if (state.upgrade) lines.push(`Upgrade to ${state.upgrade.ref}: ${state.upgrade.step}${state.upgrade.error ? `: ${state.upgrade.error}` : ''}`)
   return lines.join('\n')
+}
+
+/**
+ * What an agent must know right now: a pending confirm, a rollback of the last hour, an old daemon. Nothing otherwise.
+ */
+function attention(state: FawkesState) {
+  if (!state.supervised || !state.status) return undefined
+  const pending = awaitingConfirm(state.status)
+  if (pending) return `${pending.generation} awaits its confirm by ${pending.deadline}.`
+  const target = lastSwitched(state.generations)
+  const decided = target && outcome(state.status, state.generations, target.id)
+  const recent = Date.now() - Date.parse(target?.rolled_back_at ?? '') < 3_600_000
+  const failed = recent && (decided?.state === 'rolled_back' || decided?.state === 'storage_failed')
+  return outdated(state.status) ?? rollbackNote(state.status) ?? (failed ? lastSwitchLine(state) : undefined)
+}
+
+/** What a conversation last heard from `attention`, so a note comes only when it changed. */
+const Seen = defineDoc<{ text?: string }>({
+  kind: 'fawkes.seen',
+  checkpointWhen: () => false,
+  version: 1,
+  scope: 'conversation',
+  history: 'latest',
+  fork: 'initial',
+  initial: () => ({}),
+})
+
+/**
+ * A per-input note when what needs an agent's attention changed since its conversation last heard; a prompt section
+ * stays the same between turns, so the prompt stays cached. Once it no longer applies, one note says so.
+ */
+async function attentionNote(host: ExtensionHost, tx: Tx, conversationId: ConversationId) {
+  const current = state(host)
+  const now = attention(current) ?? ''
+  const seen = await tx.doc(Seen, conversationId)
+  if ((seen.text ?? '') === now) return undefined
+  seen.text = now
+  const running = current.supervised ? current.generation : 'this generation'
+  return {
+    entries: [
+      {
+        kind: 'fawkes.note',
+        data: {},
+        model: [
+          {
+            role: 'user' as const,
+            content: now ? `Fawkes: ${now}` : `Fawkes: ${running} runs; nothing needs attention.`,
+            timestamp: Date.now(),
+          },
+        ],
+      },
+    ],
+  }
 }
 
 /** The live generation's socket; every action that moves the app refuses elsewhere (a test run, an inert process). */
@@ -329,15 +414,20 @@ export default function fawkesExtension(host: ExtensionHost) {
       section(
         'fawkes',
         () =>
-          `This Ultimate runs under the Fawkes supervisor as a generation: a git worktree of the Ultimate clone at a fixed commit. Never edit the generation's folder (\`${host.ultimateRoot}\`); landed changes go live only through an upgrade (fawkes tool, action upgrade: stage, test, switch, then the new generation confirms itself, or Fawkes rolls back code and storage). \`restart\` reboots the same generation.`,
+          `This Ultimate runs under the Fawkes supervisor as a generation: a git worktree of the Ultimate clone at a fixed commit. Never edit the generation's folder (\`${host.ultimateRoot}\`); landed changes go live only through an upgrade (fawkes tool, action upgrade: \`fawkes up\` stages, tests and switches, then the new generation confirms itself, or Fawkes rolls back code and storage). \`restart\` reboots the same generation.`,
       ),
+    ],
+    hooks: [
+      hook(GenerationTask, {
+        beforeInput: async (_input, { tx, conversationId }) => attentionNote(host, tx, conversationId),
+      }),
     ],
     tools: [
       defineTool({
         name: 'fawkes',
         replay: 'unsafe',
         description:
-          'Ultimate under the Fawkes supervisor. status: this generation, the others and an upgrade in progress. upgrade {ref?}: stage, test and switch ref (default origin/main) in the background; the switch restarts this Ultimate and the new generation confirms itself.',
+          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. upgrade {ref?}: `fawkes up` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
         parameters: obj({
           action: oneOf(['status', 'upgrade']),
           ref: opt(str({ description: 'Git ref to upgrade to; default origin/main' })),
