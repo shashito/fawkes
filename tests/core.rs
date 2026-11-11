@@ -982,18 +982,11 @@ fn a_switch_that_fails_during_a_crash_backoff_keeps_the_restart() {
         backoff["restart_at"].is_string(),
         "no backoff to switch in: {backoff}"
     );
-    let (code, error) = h.fk(&["switch", "g2"]);
-    assert_eq!(
-        (code, error["code"].as_str()),
-        (1, Some("storage_failed")),
-        "{error}"
-    );
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .contains("the snapshot hook failed"),
-        "{error}"
+    refused(
+        &h,
+        &["switch", "g2"],
+        "storage_failed",
+        "the snapshot hook failed",
     );
     let backoff = h.status()["process"].clone();
     assert!(
@@ -2131,18 +2124,11 @@ fn reload_answers_what_changed_and_why_a_manifest_was_refused() {
     // daemon has stays whole (the hot field edited along with it is not applied).
     h.edit_manifest("/home\"", "/elsewhere\"");
     h.edit_manifest(r#"MARK = "one""#, r#"MARK = "two""#);
-    let (code, refused) = h.fk(&["reload"]);
-    assert_eq!(
-        (code, refused["code"].as_str()),
-        (1, Some("invalid_state")),
-        "{refused}"
-    );
-    assert!(
-        refused["message"]
-            .as_str()
-            .unwrap()
-            .contains("home can only change with a daemon restart"),
-        "{refused}"
+    refused(
+        &h,
+        &["reload"],
+        "invalid_state",
+        "home can only change with a daemon restart",
     );
     let logged = h.ok(&["log", "-n", "1"])["events"][0].clone();
     assert_eq!(
@@ -2302,15 +2288,13 @@ fn a_confirm_sent_at_the_unhealthy_event_finds_the_rollback_decided() {
     follow.until("g2's unhealthy event", 20, |e| {
         e["kind"] == "unhealthy" && e["generation"] == "g2"
     });
-    let mut raw = h.connect();
-    writeln!(
-        raw,
-        r#"{{"command": "confirm", "args": {{"generation": "g2"}}}}"#
-    )
-    .unwrap();
-    let mut answer = String::new();
-    BufReader::new(&raw).read_line(&mut answer).unwrap();
-    let answer: Value = serde_json::from_str(&answer).unwrap();
+    let answer = answer_to(&h, |raw| {
+        writeln!(
+            raw,
+            r#"{{"command": "confirm", "args": {{"generation": "g2"}}}}"#
+        )
+        .unwrap();
+    });
     assert_eq!(answer["ok"], false, "{answer}");
     assert_eq!(answer["error"]["code"], "invalid_state", "{answer}");
     let message = answer["error"]["message"].as_str().unwrap();
@@ -3109,15 +3093,7 @@ fn wait_reports_whether_a_switch_was_confirmed_or_rolled_back() {
     h.start_daemon();
 
     // Nothing is pending, so there is nothing to wait for without naming a generation.
-    let (exit, error) = h.fk(&["wait"]);
-    assert_eq!((exit, error["code"].as_str()), (1, Some("invalid_state")));
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .contains("nothing is pending"),
-        "{error}"
-    );
+    refused(&h, &["wait"], "invalid_state", "nothing is pending");
 
     h.ok(&["stage", "v1"]);
     h.ok(&["test", "g1"]);
@@ -3281,10 +3257,8 @@ fn up_stops_at_a_failing_test_and_switches_nothing() {
     });
 
     h.commit("v2", "crash");
-    let output = h.cli().args(["up", "v2"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let error: Value = serde_json::from_str(&stdout).expect(&stdout);
+    let (exit, error) = h.fk(&["up", "v2"]);
+    assert_eq!(exit, 1);
     assert_eq!(error["code"], "health_failed", "{error}");
     assert_eq!(error["step"], "test", "{error}");
     assert!(
