@@ -59,7 +59,8 @@ source=$(resolve "$home/Code/fawkes")
 open=$(mktemp)
 output=$(mktemp)
 freed=$(mktemp)
-trap 'rm -f "$open" "$output" "$freed"' EXIT
+failed=$(mktemp)
+trap 'rm -f "$open" "$output" "$freed" "$failed"' EXIT
 
 # Kilobytes taken by a path, 0 when it is gone.
 kilobytes() {
@@ -150,12 +151,15 @@ checkouts | while IFS= read -r checkout; do
 		echo "  skipped $checkout: no Cargo.toml"
 	else
 		before=$(kilobytes "$checkout/target")
-		# --target-dir pins what is removed: CARGO_TARGET_DIR or a cargo config could point elsewhere.
-		if (cd "$checkout" && cargo clean --manifest-path Cargo.toml --target-dir "$checkout/target") >"$output" 2>&1; then
+		# Both pin what cargo removes to this target: CARGO_TARGET_DIR, CARGO_BUILD_BUILD_DIR or a cargo config could
+		# point the target or build directory elsewhere, a folder other projects may share.
+		if (cd "$checkout" && CARGO_BUILD_BUILD_DIR="$checkout/target" cargo clean --manifest-path Cargo.toml \
+			--target-dir "$checkout/target") >"$output" 2>&1; then
 			gain=$((before - $(kilobytes "$checkout/target")))
 			echo "$gain" >>"$freed"
 			echo "  cleaned $checkout: $(human "$gain")"
 		else
+			echo "$checkout" >>"$failed"
 			echo "  failed to clean $checkout:"
 			sed 's/^/    /' "$output"
 		fi
@@ -165,3 +169,5 @@ done
 echo
 echo "Freed $(human "$(awk '{ total += $1 } END { print total + 0 }' "$freed")") (by du; APFS clones share blocks, so df shows the real gain)"
 df -h "$home"
+# A checkout that failed to clean fails the run, after the report.
+[ ! -s "$failed" ]

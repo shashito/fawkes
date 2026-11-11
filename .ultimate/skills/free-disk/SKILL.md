@@ -28,7 +28,9 @@ after every landing, not only when space runs out. `free-disk.sh` sits next to t
 
    Without `--clean` it only reports. With it, it runs `cargo clean` in every Fawkes worktree and lander checkout
    that is not skipped and that no process is inside (as working directory, executable or open file), and prints
-   what each freed and `df -h` afterwards.
+   what each freed and `df -h` afterwards. It exits 1 when a `cargo clean` failed, with cargo's message above.
+   The process check is a snapshot: a build that starts in a checkout right after it can lose its target and
+   fail, so the `--skip` list is what keeps busy branches safe.
 
 3. **Remove the stale test folders it lists.** Under "Stale test folders" it prints each `/tmp/fk*` folder that
    nothing changed within a day and no process has open, one path per line. Remove each with its own plain
