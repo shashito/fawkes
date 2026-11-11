@@ -11,11 +11,12 @@ implements all of it except where a section says **later**.
 
 ## Process model
 
-`fawkes daemon` is a long-running foreground process (launchd or systemd keeps it alive; on macOS `fawkes service
-install` sets up launchd, see Service). It is the parent of the app's live process and the only writer of the state
-directory. Every other command (`start`, `stop`, `restart`, `stage`, `test`, `switch`, `up`, `confirm`, `rollback`,
-`prune`, `status`, `log`, `history`, `reload`, `watch`) is a thin client that sends requests over the daemon's Unix socket and
-renders the answer. One daemon supervises one app; run one daemon per manifest.
+`fawkes up` brings the app up under supervision: the daemon, a long-running foreground process (launchd or systemd
+keeps it alive; on macOS `fawkes service install` sets up launchd, see Service). It is the parent of the app's live
+process and the only writer of the state directory. Every other command (`down`, `start`, `stop`, `restart`, `stage`,
+`test`, `switch`, `upgrade`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `reload`, `watch`) is a thin
+client that sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run
+one daemon per manifest.
 
 A step takes one or both of two slots. The *step* slot belongs to the transaction steps: `stage`, `test` and `prune`
 take it alone, `switch` and `rollback` take it together with the live slot, and a second step gets `busy`. The *live*
@@ -42,8 +43,8 @@ daemon, and lines it cannot take are dropped. `events.jsonl` is the record. When
 file to `daemon.log.1` (replacing the one before) and empties it, between two lines, so none is lost. Whoever starts
 the daemon decides where stderr goes; the daemon only looks at what it is.
 
-Signals are only for the daemon's lifecycle: `SIGTERM`/`SIGINT` stop the live app and exit (the generation keeps its
-state, so the next start resumes it), `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
+Signals are only for the daemon's lifecycle: `fawkes down`, `SIGTERM` and `SIGINT` stop the live app and exit 0 (the
+generation keeps its state, so the next start resumes it), `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
 is logged as a `daemon` event naming the changed fields, or an `error` event (with its `error_code`) saying why it was
 refused. `fawkes reload` also answers: the changed fields (`{"changed": ["port", "env"]}`, empty when nothing
 changed), or the refusal, `usage` for a manifest that is invalid and `invalid_state` for the two cases below. A signal
@@ -321,7 +322,7 @@ run, `status` and `watch` reach the daemon meanwhile (`busy` names the stage, th
 A failure of any of them (the port, the stage, the test) is logged as an `error` event and starts nothing. The
 daemon then ends through its ordinary shutdown, as after a `SIGTERM` (the socket and its `run/` link removed),
 with exit code 1 and a last line on stderr that says what failed, that nothing was started and the home is
-untouched, and to start the app as before, or fix it and run `fawkes daemon` again; a failed test names its log. The
+untouched, and to start the app as before, or fix it and run `fawkes up` again; a failed test names its log. The
 generation stays as the step left it (`test_failed` after a failed test), so the next start tests the same one again
 while HEAD has not moved. Under `fawkes service` launchd starts a daemon that failed again (`KeepAlive`), so the
 adoption is retried about every 10 s until it passes. A `SIGTERM` during the adoption ends it like any stage or test
@@ -466,7 +467,7 @@ Ultimate preview (README there), and its `storage.ts` is the three hooks for Ult
 `trace.sqlite`. Fawkes restores storage on a rollback, but not what the app did outside it, so the
 extension holds Ultimate's task scheduler in a test run and in a new live generation until that generation has
 confirmed itself: no agent work runs on code that may still roll back. Its `health.command` passes a test run only
-once that hold is in place. Its `project` is the project the host serves, so `fawkes daemon` run there finds the
+once that hold is in place. Its `project` is the project the host serves, so `fawkes up` run there finds the
 manifest, and `adopt` makes the Ultimate that already runs its first generation.
 
 ```toml
@@ -536,14 +537,15 @@ whose storage is worth a snapshot is never tested on an empty home.
 ## CLI
 
 ```
-fawkes daemon
+fawkes up
+fawkes down
 fawkes start
 fawkes stop
 fawkes restart
 fawkes stage    <ref>
 fawkes test     <gen>
 fawkes switch   <gen> [--deadline SECS]
-fawkes up       <ref> [--deadline SECS]
+fawkes upgrade  <ref> [--deadline SECS]
 fawkes wait     [<gen>]
 fawkes confirm  [<gen>]
 fawkes rollback [--keep-storage]
@@ -563,6 +565,13 @@ after it. `-h` prints a command's usage and `--help` its long help (details, exa
 command, and exits 0; `help` is not a command, so `fawkes stage help` stages the ref `help`. A mistyped command is a
 usage error that names the similar commands (`tip: a similar subcommand exists: 'log'`), never one run in its place.
 `fawkes --version` (or `-V`) prints `fawkes <version>` and exits 0.
+
+The two levels are the supervisor and the app's process. `up` brings the app up under supervision: it runs the daemon
+in the foreground, with its events on stderr, until `down`, `SIGTERM` or `SIGINT` (Process model, Daemon start). A
+second `up` of the same app is refused while the first holds the state lock. `down` stops the app and its daemon over
+the socket and answers once both are gone and the state lock is free, so `fawkes down && fawkes up` never finds the
+old daemon in the way. Its text names the generation it stopped and the daemon's pid, and ends with `fawkes up`,
+which starts both again. `start`, `stop` and `restart` act on the app's process and leave the supervisor running.
 
 In text, `log` and `history` print nothing, not a blank line, when there are no events or generations to show (`log -n 0`
 included); under `--json` the result is `{"events": []}` as ever. `log --since N` is how an agent asks for what came after
@@ -591,7 +600,7 @@ A client command reaches its daemon by the first of:
 `APP`, for `--manifest` and `$FAWKES_MANIFEST`, is a path when it has a `/` or ends in `.toml`, and otherwise an app
 name: `<fawkes_home>/<APP>.toml`, which must exist. An empty variable counts as unset. There is no guess beyond this:
 not finding the app is a `usage` error (exit 2), and a running daemon is never picked because it is the only one.
-`daemon` and `service`, which need a manifest, take steps 2, 4, 5 and 6; `watch` takes steps 1 to 4 and otherwise
+`up` and `service`, which need a manifest, take steps 2, 4, 5 and 6; `watch` takes steps 1 to 4 and otherwise
 follows every daemon (see Watch).
 
 This order puts the flags before the environment, which **changes the earlier contract**, where `$FAWKES_SOCKET`
@@ -601,7 +610,7 @@ reaches that app's daemon, and its bare `confirm` sends `$FAWKES_GENERATION` onl
 discovered manifest.
 
 `--deadline` is whole seconds from 1 to 604800 (a week); anything else is a usage error and nothing is stopped (for
-`up`, nothing is staged either).
+`upgrade`, nothing is staged either).
 `--keep-storage` belongs to `rollback` (a usage error elsewhere): it gives up a restore that failed, and the permanent
 generation then runs on storage that the failed generation may already have migrated.
 
@@ -610,7 +619,7 @@ Commands that agents retry are idempotent: `stage <ref>` of a commit that alread
 of building another, so to rebuild the same commit after the install environment changed, `prune` it first. `confirm
 <gen>` of the permanent generation is ok. `test <gen>` of a `tested` generation tests it again.
 
-`up <ref>` is `stage`, `test` and `switch` in one call, so an agent upgrades with one command. It is client-side, with
+`upgrade <ref>` is `stage`, `test` and `switch` in one call, so an agent upgrades with one command. It is client-side, with
 no request of its own: it sends the three requests in turn (the generation `stage` answers with is the one it tests
 and switches to), so each step keeps its own slots, refusals and progress lines and the daemon's transaction code is
 unchanged. Their progress goes to stderr as for the single commands (in text mode, plus a line saying `g4` was staged or
@@ -619,12 +628,12 @@ is the `switch` result plus what the steps before it learned: `existing` (the st
 built) and `test` (the `test` of the record the test step answered with: port, outcome, duration). A step that fails
 ends the command with that step's error and exit code, printed as that command prints it, and nothing after it runs
 (`busy` too: a stage, test or switch in progress is the same refusal as for the single command); under `--json` the
-error object also has `step`, `stage`, `test` or `switch`, which says which of them it was. `up` never confirms: the new
-generation does, as after `switch`, and the deadline still rolls it back. A client that dies midway leaves a `staged`
-or `tested` generation, which running `up` again picks up, because `stage` of the same commit answers with the
-existing generation. A client that dies once the switch has begun leaves a pending generation instead: `up` again
-then stages a new generation and its switch is refused (`invalid_state`) until that one is confirmed or rolled back,
-so a retry reads `status` first. `up` and `switch` end once the target is live; `fawkes wait` reports whether it
+error object also has `step`, `stage`, `test` or `switch`, which says which of them it was. `upgrade` never confirms:
+the new generation does, as after `switch`, and the deadline still rolls it back. A client that dies midway leaves a
+`staged` or `tested` generation, which running `upgrade` again picks up, because `stage` of the same commit answers
+with the existing generation. A client that dies once the switch has begun leaves a pending generation instead:
+`upgrade` again then stages a new generation and its switch is refused (`invalid_state`) until that one is confirmed
+or rolled back, so a retry reads `status` first. `upgrade` and `switch` end once the target is live; `fawkes wait` reports whether it
 confirmed or rolled back (below). Run from inside the app it upgrades, the switch stops the old generation's process group, the
 client's included, so it gets no answer; that is expected, the daemon finishes the switch anyway and the new
 generation reads the outcome from `status` or `history`.
@@ -656,14 +665,16 @@ stderr says what it waits for (`waiting for g4: confirm due by …`); under `--j
 object and stderr stays quiet. `wait` only reads, so it is the same in a test run.
 
 **Refusals, before a request is sent** (a change of the earlier contract, which let a test run call every command): with
-`FAWKES_PHASE=test` in the environment, `stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop`,
-`restart` and `reload` fail `test_phase` (exit 1) whatever daemon they would reach: a test run serves its health check
+`FAWKES_PHASE=test` in the environment, `up`, `down`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
+`start`, `stop`, `restart` and `reload` fail `test_phase` (exit 1) whatever daemon they would reach: a test run serves its health check
 and nothing else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) still run. `confirm` runs
 only for the test run's own `FAWKES_GENERATION` towards the daemon `FAWKES_SOCKET` names (bare, or naming that
 generation), which is never the pending one (Confirm); a `confirm <gen>` naming another generation, and a bare
 `confirm` that would send no generation (another daemon, or `FAWKES_GENERATION` unset), fail `test_phase` too.
 `fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value) and `FAWKES_SOCKET` naming the socket file of the manifest they would act on fail `invalid_state`: they stop that
-daemon and its app, the caller with it, so they are run from a shell outside the app.
+daemon and its app, the caller with it, so they are run from a shell outside the app. So does `down` towards the
+daemon `FAWKES_SOCKET` names with `FAWKES_PHASE` set (`invalid_state`), which would also leave nothing to start the
+app again.
 
 Output: readable text by default, progress lines on stderr while a step runs. With `--json`, stdout carries exactly one
 JSON document, the `result` or the `error` object of the response below, and progress goes to stderr as JSON lines.
@@ -673,11 +684,11 @@ parse and a manifest that cannot be read are `usage`, no daemon on the socket, a
 run is `test_phase`). The exceptions are the
 streams. `log --follow`: stdout carries one event document per line, as they happen, and nothing else when the
 daemon ends the stream (in text mode too). `watch` (see Watch): one `{"name", "event"}` document per event, for as
-long as it runs. `--json` does not apply to `daemon`, which prints text only.
+long as it runs. `--json` does not apply to `up`, which prints text only.
 **A `--json` result only ever gains fields:** a field is never removed, renamed or given another meaning, so a
 reader ignores the fields it does not know. Enumerations may gain values (see Socket protocol).
 Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
-for `daemon` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
+for `up` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
 cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
 decides, and `log --follow` ends with `0`.
 
@@ -690,7 +701,7 @@ Errors read as a sentence that says what to do next, for example:
 ```
 error: g4 was rolled back at 2026-11-03T14:02:11Z (missed confirm deadline); stage the ref again for a new generation
 error: g4 was rolled back (missed confirm deadline); g1 runs; `fawkes history` has its log tail
-error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with `fawkes daemon --manifest fawkes.toml`
+error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with `fawkes up --manifest fawkes.toml`
 ```
 
 ### Service
@@ -698,8 +709,8 @@ error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with
 `fawkes service install|uninstall|restart` runs the daemon under launchd as a user LaunchAgent, for a Mac that is a
 server. A desktop user never needs it. It is a client-side convenience: it writes a plist and calls `launchctl`, and the
 daemon cannot tell it was started this way (it has no code for it). macOS only; elsewhere each action is a `usage` error
-(run `fawkes daemon --manifest …` under the init system; systemd user units are **Later**). The manifest is found as
-for `daemon` (Finding the app); `--socket` is a usage error, since the service runs the daemon on the manifest's own
+(run `fawkes up --manifest …` under the init system; systemd user units are **Later**). The manifest is found as
+for `up` (Finding the app); `--socket` is a usage error, since the service runs the daemon on the manifest's own
 socket.
 `--json` applies to all three: one result object, or the usual error object, with the usual exit codes. Run with
 `FAWKES_PHASE` set and `FAWKES_SOCKET` naming this manifest's socket, which is the case from inside the app, they are
@@ -709,12 +720,13 @@ The label is `dev.fawkes.<name>` and the plist `$HOME/Library/LaunchAgents/<labe
 absolute; the directory is created), loaded in the domain `gui/<uid>`. `HOME` and `PATH` decide where the plist goes and
 which `launchctl` runs. The plist holds:
 
-- `ProgramArguments`: the canonical path of the running binary, `daemon --manifest <absolute manifest path>`.
+- `ProgramArguments`: the canonical path of the running binary, `up --manifest <absolute manifest path>`.
 - `EnvironmentVariables`: the installing process's `PATH` (launchd's own is minimal, and the app's commands need
   `node`, `git` and the rest), and `FAWKES_HOME` when it is set, because it decides the default `state_dir` and the
   `run/` links. The paths and variables must be UTF-8.
 - `RunAtLoad` and `KeepAlive { SuccessfulExit = false }`: the daemon starts at login and again after a failed exit, and
-  stays down after a clean one (a SIGTERM).
+  stays down after a clean one (`fawkes down` or a SIGTERM): the agent stays loaded with no daemon until the next
+  login or `fawkes service restart`, and `uninstall` removes it.
 - `ExitTimeOut`: `3 × stop_timeout + 5`, rounded up, plus 10 s: the longest a daemon's shutdown takes (it waits up
   to `2 × stop_timeout + 5` s for a switch or rollback in flight, then stops the app with `stop_timeout` of grace).
   launchd's default of 20 s would SIGKILL it partway, and the next daemon start would have to recover. A changed
@@ -748,7 +760,7 @@ a pending switch is rolled back (see Daemon start). Result: `{"label", "plist"}`
 `launchctl` runs through `run_bounded` with `ExitTimeOut` plus 30 s.
 
 A client command that finds no daemon answering (`daemon_unreachable`) for an app whose plist exists says to start
-it again with `fawkes service restart --manifest …` rather than `fawkes daemon`, which would only contend with the
+it again with `fawkes service restart --manifest …` rather than `fawkes up`, which would only contend with the
 agent's daemon for the state lock.
 
 ## Socket protocol
@@ -787,7 +799,7 @@ removed. `health_failed` of a test and a start that fails carry `generation` and
 `logs/app.log`); `storage_failed` of a hook carries `generation` and `log` (its `logs/hooks.log`); an `invalid_state`
 about one generation (a refused switch, test or confirm, a rollback in the way) carries `generation`. The message
 says the same in words. The client's own errors add two more optional fields: `cause`, the rollback's cause as a code,
-on `rolled_back`, and `step` (`stage`, `test` or `switch`) on a failure of `up`.
+on `rolled_back`, and `step` (`stage`, `test` or `switch`) on a failure of `upgrade`.
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
 `storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable`, `no_answer`, `service_failed`,
@@ -822,6 +834,7 @@ Results per command:
 | `history` | — | `generations`, oldest first, each the generation record plus `log_tail`; `failed_install_tail` |
 | `reload` | — | `changed`: the manifest fields that changed, empty when none; the manifest is read again as for `SIGHUP` (see Process model), and a refusal is `usage` (invalid manifest) or `invalid_state` (a field that cannot change now) |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
+| `down` | — | `name`, `daemon_pid`, `stopped` (the generation whose app it stopped, `null` when none ran); sent once the daemon has stopped the app as for `SIGTERM` and let go of its socket, `run/` link and state lock, just before it exits 0 |
 
 `subscribe` is the stream for live clients such as `watch`. With `limit` it first replays that many recent events as
 `{"event": …}` lines. With `since` (a `seq`) it instead replays the events after that number that are still in memory
@@ -843,7 +856,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 
 | Kind | Logged when | `generation` |
 |---|---|---|
-| `daemon` | the daemon starts (`started, pid …`) or ends (`stopped`); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down; a first start begins to adopt HEAD (Adopt) | the generation concerned, else `null` |
+| `daemon` | the daemon starts (`started, pid …`) or ends (`stopped`, after `down` or a signal); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down; a first start begins to adopt HEAD (Adopt) | the generation concerned, else `null` |
 | `progress` | a step narrates itself to the client waiting for it (stage, test, switch, rollback, prune, stop, restart); it does not mark a change of state | the generation the line is about |
 | `started` | the live app's process has been spawned, with its pid and port (a `test` run does not log it) | the generation started |
 | `healthy` | the live app's health check passed | the generation checked |
@@ -1091,3 +1104,15 @@ message. anyhow's context chains would have to be flattened into every one of th
 
 - `confirm = "health"` for apps that cannot call `confirm` themselves.
 - Falling back past the permanent generation when it crash-loops.
+- Generic apps (`reviews/api-review-3.md`, sections 2 and 4):
+  - `fawkes up <command> [args…]`: the supervised command as the target. The manifest is derived from it (`repo` from
+    the command resolved on `PATH`, `start` from its path in the generation's worktree, `name` from the command and
+    the project folder, a free `port`), written to `<fawkes_home>/<name>.toml` and read again by the next `up`.
+  - A defaults file for what cannot be derived (health check, install, `reuse`, hooks, `env`, port convention): a
+    `fawkes.toml` at the root of the command's repository, else `<fawkes_home>/apps/<command>.toml`, with `{project}`
+    in its templates.
+  - `fawkes init <command> [args…]`, which writes that manifest without starting anything, so `up <command>` is its
+    shorthand.
+  - A command outside a git checkout (an npm global install) is supervised without upgrades: `stage` and `upgrade`
+    refuse with `invalid_state`.
+  - An app that never confirms needs `confirm = "health"` (above).

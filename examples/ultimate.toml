@@ -5,7 +5,7 @@
 # confirms itself, and turn the built-in `update` extension off in that project.
 name = "ultimate"
 repo = "/path/to/ultimate"
-project = "/path/to/my-app"     # `fawkes daemon` run in the project finds this manifest; every host shares one repo
+project = "/path/to/my-app"     # `fawkes up` run in the project finds this manifest; every host shares one repo
 adopt = true                    # the first daemon start tests HEAD of repo and makes it permanent: a rollback target
 home = "/path/to/.ultimate/projects/my-app-<hash>"
 port = 4747

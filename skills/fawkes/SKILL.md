@@ -1,6 +1,6 @@
 ---
 name: fawkes
-description: Run under Fawkes, the transactional process supervisor, as an app or as an agent that drives it. Use when FAWKES_GENERATION or FAWKES_PHASE is set in your environment, when you upgrade an app Fawkes supervises (`fawkes up`, stage, test, switch), confirm or roll back a generation, or read `fawkes status`, `history` or an error code from it.
+description: Run under Fawkes, the transactional process supervisor, as an app or as an agent that drives it. Use when FAWKES_GENERATION or FAWKES_PHASE is set in your environment, when you upgrade an app Fawkes supervises (`fawkes upgrade`, stage, test, switch), confirm or roll back a generation, or read `fawkes status`, `history` or an error code from it.
 ---
 
 # Fawkes for agents
@@ -17,7 +17,7 @@ its confirm deadline, Fawkes rolls back to the permanent generation, code and st
 back at most once and is never started again. `DESIGN.md` in the Fawkes repository is the full contract; this file
 is what you need to act.
 
-Every command but `daemon` takes `--json`. Then stdout is one JSON document, the result or an error object
+Every command but `up` (the supervisor itself, in the foreground) takes `--json`. Then stdout is one JSON document, the result or an error object
 `{"code": "...", "message": "..."}`, and progress lines go to stderr. The two streams are the exception:
 `log --follow --json` prints one event per line, and `watch --json` one `{"name", "event"}` per line, for as long as
 they run. Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers.
@@ -62,8 +62,8 @@ None of them set: Fawkes does not run you. Run from the app's repository, or pas
 In the `test` phase your home is a copy of the live storage (or empty), and the live app may be running beside you.
 Serve your health check and nothing else: no confirm, no upgrade, no work with effects outside your home (messages
 sent, jobs run, remote writes), since your code is not trusted yet. Fawkes enforces part of it: with `FAWKES_PHASE=test`
-every command that changes something (`stage`, `test`, `switch`, `up`, `rollback`, `prune`, `start`, `stop`,
-`restart`, `reload`) fails with `test_phase`, whichever app it names, and so does a `confirm` of any generation but your
+every command that changes something (`up`, `down`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
+`start`, `stop`, `restart`, `reload`) fails with `test_phase`, whichever app it names, and so does a `confirm` of any generation but your
 own `$FAWKES_GENERATION` towards your own daemon. `status`, `history`, `log`, `wait` and `watch` still work.
 
 ## Confirm yourself
@@ -87,30 +87,30 @@ effects.
 ## Upgrade
 
 ```sh
-fawkes up <ref> [--deadline SECS] --json     # → {"generation": "g8", "previous": "g7", "deadline": …}
-fawkes wait g8 --json                        # → exit 0 once g8 is permanent, 1 if it rolled back
+fawkes upgrade <ref> [--deadline SECS] --json  # → {"generation": "g8", "previous": "g7", "deadline": …}
+fawkes wait g8 --json                          # → exit 0 once g8 is permanent, 1 if it rolled back
 ```
 
-`up` stages the ref, tests it and switches to it, streaming each step's progress on stderr; it ends with the result
+`upgrade` stages the ref, tests it and switches to it, streaming each step's progress on stderr; it ends with the result
 of the switch (`generation`, `previous`, `deadline`), plus `existing` (the stage found the commit already built) and
 `test` (the test's record). Any step's failure is that step's error, with `step` (`stage`, `test` or `switch`) saying
-which, and nothing is switched. `up` never confirms: the new generation confirms itself.
+which, and nothing is switched. `upgrade` never confirms: the new generation confirms itself.
 
-`up` returns as soon as the new generation is live. `fawkes wait [<gen>]` (default: the pending generation) then
+`upgrade` returns as soon as the new generation is live. `fawkes wait [<gen>]` (default: the pending generation) then
 waits for the outcome: exit `0` with the record once it is permanent, or exit `1` with `rolled_back` (its `cause`
 says why) or, when the rollback could not restore the storage, `storage_failed`. It is bounded by the confirm
-deadline, answers at once for a generation already decided, so it is safe to retry. Name the generation `up`
-answered with: an app that confirms quickly is permanent before a bare `wait` starts, and a bare `wait` with nothing
-pending fails `invalid_state`. Upgrading an app other than yourself, always follow `up` with `wait`.
+deadline, answers at once for a generation already decided, so it is safe to retry. Name the generation
+`upgrade` answered with: an app that confirms quickly is permanent before a bare `wait` starts, and a bare `wait`
+with nothing pending fails `invalid_state`. Upgrading an app other than yourself, always follow `upgrade` with `wait`.
 
-If you run `up` on yourself (you are the live app upgrading your own code), the switch stops you, and your `up`
-client with you, so there is no `wait` for you. That is expected: the daemon finishes the switch without you, and the
+If you run `upgrade` on yourself (you are the live app upgrading your own code), the switch stops you, and your
+`upgrade` client with you, so there is no `wait` for you. That is expected: the daemon finishes the switch without you, and the
 new generation reads the outcome. A failed stage or test still reaches you, since you are only stopped once the switch
 begins.
 
-Before retrying an `up` whose answer you never got, read `status`: if a switch is pending (`step` is `pending`), the
-last `up` got as far as the switch, and another one would only be refused at its switch. Otherwise `up` again is safe:
-it picks up the generation the last one staged.
+Before retrying an `upgrade` whose answer you never got, read `status`: if a switch is pending (`step` is `pending`),
+the last `upgrade` got as far as the switch, and another one would only be refused at its switch. Otherwise `upgrade`
+again is safe: it picks up the generation the last one staged.
 
 The steps one by one, when you need to look in between:
 
@@ -182,7 +182,7 @@ gives the events after the `seq` N you saw last.
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
 | `rolled_back` | `fawkes wait`: the generation rolled back. Produced by the client. | Read its `cause` and `fawkes history`. |
 | `test_phase` | A command that changes something, run with `FAWKES_PHASE=test`. Produced by the client. | Nothing: a test run serves its health check only. |
-| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes daemon --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a launchd agent. |
+| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes up --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a launchd agent. |
 | `no_answer` | The daemon took a quick request and did not answer within 30 s. Produced by the client. | Check `fawkes status`; the daemon may be stuck. |
 | `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; from a shell outside the app, `fawkes service install` again replaces the plist and reloads it. |
 
@@ -196,6 +196,13 @@ the same commands reach it over the same socket. `fawkes service` (`install`, `r
 the app it supervises is refused (`invalid_state`): each stops the daemon and the app, you with it, and a pending
 switch rolls back; a client that dies before its `bootstrap` leaves the agent unloaded until someone logs in. Ask a
 person to run it from a shell outside the app.
+
+## Up and down
+
+`fawkes up` runs the supervisor of one app in the foreground; `fawkes down` stops the app and its supervisor, and a
+launchd agent's daemon then stays down until the next login or `fawkes service restart`. People run them, from a
+shell outside the app: `down` from inside the app it supervises is refused (`invalid_state`), since it would stop you
+and leave nothing to start the app again. To restart only the app, `fawkes restart`.
 
 ## Storage rolls back only through the app's hooks
 

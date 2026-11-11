@@ -53,7 +53,7 @@ Several branches, workers and test suites share one Mac with little free disk.
 - **Short socket paths.** A unit test that binds a Unix socket makes its directory with
   `tempfile::Builder::new().tempdir_in("/tmp")`, not under `$TMPDIR`: the lander's `$TMPDIR` is long enough to
   exceed the socket path limit.
-- **Probes that stream** (`fawkes daemon`, `fawkes watch`, `log --follow`) run in the background with a bounded wait
+- **Probes that stream** (`fawkes up`, `fawkes watch`, `log --follow`) run in the background with a bounded wait
   and are stopped by pid, never in the foreground of a tool call.
 - **Keep cargo's exit code.** When you filter cargo's output (`| tail`, `| grep`), use `set -o pipefail`, or the
   filter's exit code hides a failure.
@@ -76,8 +76,8 @@ not built yet. Don't start one unless asked.
   daemon code paths, return `protocol::Error` with `?` and don't add `unwrap`/`expect`. They are fine in tests.
 - **A generation rolls back at most once.** Never add a path that rolls back a rolled-back generation.
 - **Locking** (see the header of `daemon/mod.rs`): never hold `inner` across a slow step (install, health check,
-  process stop). The lock order is `inner` → `manifest` → `log` → `hub` and `echo` (`step_pgids` is only ever taken
-  alone, and `wake` last, with nothing taken while it is held), and no thread waits on another while holding
+  process stop). The lock order is `inner` → `manifest` → `log` → `hub` and `echo` (`step_pgids` and `downs` are only
+  ever taken alone, and `wake` last, with nothing taken while it is held), and no thread waits on another while holding
   one. Nothing that may hold a lock writes stderr: event lines go to it through `Echo`'s thread.
 - **Processes:** the app runs in its own process group, and stopping or crash handling signals the whole group
   (`process::kill_group`, rustix's `kill_process_group`), never just the child pid. Every child that must end by
@@ -88,7 +88,7 @@ not built yet. Don't start one unless asked.
 - **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (the `ErrorCode` enum) and a
   readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon and the
   CLI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
-- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `daemon`
+- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `up`
   supports `--json`, and under it every failure, the client's own included, prints one error object.
 
 ## Dependencies

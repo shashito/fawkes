@@ -1,6 +1,6 @@
 # Try it: put app.js, hooks.js, a VERSION file and optionally a MODE file in a git repo at ../sample-repo, then
-#   fawkes daemon --manifest fawkes.toml &
-#   fawkes stage HEAD && fawkes test g1 && fawkes switch g1
+#   fawkes up --manifest fawkes.toml &
+#   fawkes upgrade HEAD          # stage, test and switch; `fawkes down` stops the app and the daemon
 name = "sample"
 repo = "../sample-repo"            # git repository generations are cut from
 # state_dir defaults to ~/.fawkes/sample; keep a custom one short, since the socket path is limited to about 100 bytes

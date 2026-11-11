@@ -3588,7 +3588,7 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 	<key>ProgramArguments</key>
 	<array>
 		<string>{}</string>
-		<string>daemon</string>
+		<string>up</string>
 		<string>--manifest</string>
 		<string>{d}/t.toml</string>
 	</array>

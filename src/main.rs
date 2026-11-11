@@ -111,6 +111,9 @@ enum Command {
     /// Answers once the daemon has let go of its socket and state lock, so `fawkes up` can follow at once. A daemon
     /// run by `fawkes service` stays down until the next login or `fawkes service restart`. Run it from a shell
     /// outside the app: from inside, it would end the caller and leave nothing to bring the app back.
+    #[command(after_long_help = "Examples:\n  \
+                                 fawkes down\n  \
+                                 fawkes down --manifest xana --json")]
     Down,
     /// Run the current generation (pending, else permanent)
     Start,

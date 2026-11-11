@@ -65,13 +65,14 @@ hooks that snapshot and restore its storage, its live port and a range of spare 
 [`examples/sample/fawkes.toml`](examples/sample/fawkes.toml) and [`examples/ultimate.toml`](examples/ultimate.toml).
 
 ```sh
-fawkes daemon                             # one daemon per app, in the foreground
+fawkes up                                 # bring the app up under supervision, in the foreground
 fawkes stage main                         # → g1
 fawkes test g1
 fawkes switch g1                          # the new generation then runs `fawkes confirm`
-fawkes up main                            # or all three in one call: stage, test and switch
+fawkes upgrade main                       # or all three in one call: stage, test and switch
 fawkes status
 fawkes watch                              # every supervised app's events, one line each
+fawkes down                               # stop the app and its supervisor
 ```
 
 Run from the app's repository, a command finds its `fawkes.toml`; from anywhere else, `--manifest <name>` names a
@@ -82,7 +83,7 @@ commands are available over the daemon's Unix socket, with a live event stream f
 
 ## On a server
 
-On a desktop, run `fawkes daemon` in a terminal as above. That stays the normal way, and nothing else is needed. On a
+On a desktop, run `fawkes up` in a terminal as above. That stays the normal way, and nothing else is needed. On a
 Mac that must keep the app up without a terminal (a Mac mini for remote development), run the same daemon under
 launchd, installed with one command:
 
@@ -93,9 +94,10 @@ fawkes service uninstall --manifest fawkes.toml   # unload it and remove the pli
 ```
 
 `install` writes `~/Library/LaunchAgents/dev.fawkes.<name>.plist` and loads it with `launchctl bootstrap
-gui/$UID`. The plist runs the `fawkes` you ran it with as `fawkes daemon --manifest <absolute path>`, with the
+gui/$UID`. The plist runs the `fawkes` you ran it with as `fawkes up --manifest <absolute path>`, with the
 installing shell's `PATH` (and `FAWKES_HOME`, when set), at login (`RunAtLoad`) and again whenever the daemon fails
-(`KeepAlive` with `SuccessfulExit = false`; a daemon stopped on purpose stays stopped). Its stderr goes to
+(`KeepAlive` with `SuccessfulExit = false`; a daemon stopped on purpose, by `fawkes down` or a SIGTERM, stays stopped
+until the next login or `fawkes service restart`). Its stderr goes to
 `<state_dir>/daemon.log`, which the daemon keeps under 10 MiB. Run `install` from the installed copy (it refuses a
 binary in cargo's `target/`), and again after an update to load the new binary and `PATH`. A daemon restart rolls a
 pending switch back, as every daemon start does. The daemon cannot tell it runs under launchd: every other command
