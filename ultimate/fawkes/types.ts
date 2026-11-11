@@ -149,8 +149,10 @@ export type SetupPreview = {
   /** The manifest that would be written, and where. */
   file?: string
   text?: string
-  /** A manifest in the Fawkes home that already sets this host up: shown as it is, never overwritten. */
+  /** A manifest in the Fawkes home that already sets this host up (`file` is its path): shown as it is, never overwritten. */
   existing?: { file: string; text: string }
+  /** With `existing`: what the user does in a terminal to finish. */
+  steps?: SetupStep[]
   /** Why no manifest can be previewed. */
   error?: string
 }
@@ -167,6 +169,8 @@ export type FawkesState =
       supervised: false
       /** The host is not under Fawkes and is a real host, not a preview or test server: the setup item shows. */
       setup: boolean
+      /** A manifest already sets this host up: what remains is starting `fawkes daemon`. */
+      ready: boolean
     }
   | {
       supervised: true

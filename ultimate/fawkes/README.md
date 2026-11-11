@@ -17,10 +17,11 @@ To move an Ultimate host under Fawkes for the first time:
    onboarding actions; if the project's Ultimate setup is still undecided, clicking Set up trusts it. A project that
    declined its setup keeps `update` on, and the card says so.
 4. **In a terminal:** stop this Ultimate, then run `fawkes daemon` in the project's folder (`cargo install --path
-   <this repository> --locked` first when no `fawkes` is on `PATH`; the card lists each step with a copy button).
+   <this repository> --locked` first when no `fawkes` is on `PATH`). From then on the item reads `fawkes · ready`, and
+   its card lists these steps, each with a copy button, until the host runs under Fawkes.
 
-The manifest has `adopt = true`: the first start does not stage anything, it adopts the version that was running. The
-daemon tests it on a spare port, then runs it and calls it permanent (an `adopted` event). If that test fails, nothing
+The manifest has `adopt = true`: the first start adopts the version that was running. The daemon stages the clone's
+`HEAD`, tests it on a spare port, then makes it permanent (an `adopted` event) and runs it. If that test fails, nothing
 changes: no generation goes live, and `ultimate` can be started as before. Setup is the user's action (`setup`); an
 agent may read the preview (`setupPreview`).
 
@@ -127,7 +128,8 @@ switch awaits its confirm. An older daemon sends no `actions`: its pending switc
 - `upgrade` `{ ref? }` (user-only): `fawkes up` `ref` (default `origin/main`) in the background.
 - `confirm` (user-only): confirm the pending generation now, without its own checks.
 - `setupPreview` (no arguments): the manifest first-time setup would write, or the one that already sets this host up.
-- `setup` (user-only): write the previewed manifest and return the terminal steps that remain.
+- `setup` (user-only): write the previewed manifest and return the terminal steps that remain (`setupPreview` returns
+  them too once a manifest sets the host up).
 - `rollback` (user-only): roll the pending generation back now.
 
 ## For agents

@@ -82,7 +82,8 @@ const shared = (host: ExtensionHost) =>
   host.resource<Shared>('fawkes.state', () => ({ connected: false, generations: [], events: [], holding: false }))
 
 function state(host: ExtensionHost): FawkesState {
-  if (fawkes.kind === 'inert') return { supervised: false, setup: canSetup }
+  if (fawkes.kind === 'inert')
+    return { supervised: false, setup: canSetup, ready: canSetup && Boolean(existingFor(host).existing) }
   const s = shared(host)
   return {
     supervised: true,
@@ -375,9 +376,8 @@ function publicPort(home: string) {
   return port
 }
 
-/** The manifest this host would get, or the one that already sets it up. Writes nothing. */
-function setupPlan(host: ExtensionHost) {
-  if (!canSetup) throw new Error('This Ultimate already runs under Fawkes, or is a preview or test server')
+/** The manifests of the Fawkes home, and the one among them that already sets this host up. Writes nothing. */
+function existingFor(host: ExtensionHost) {
   const directory = process.env.FAWKES_HOME || join(host.userHome, '.fawkes')
   const name = manifestName(host.projectRoot)
   const file = `${name}.toml`
@@ -392,11 +392,21 @@ function setupPlan(host: ExtensionHost) {
       throw error
     }
   })()
-  const existing = findExisting(manifests, { file, project: host.projectRoot, home: host.home })
-  if (existing) return { directory, existing }
+  const found = findExisting(manifests, { file, project: host.projectRoot, home: host.home })
+  const existing = found && { file: join(directory, found.file), text: found.text }
+  return { directory, name, file, manifests, existing }
+}
+
+/** The folder of this extension as Fawkes will run it: start.ts, health.ts and storage.ts live beside this file. */
+const extensionFolder = () => realpathSync(dirname(fileURLToPath(import.meta.url)))
+
+/** The manifest this host would get, or the one that already sets it up. Writes nothing. */
+function setupPlan(host: ExtensionHost) {
+  if (!canSetup) throw new Error('This Ultimate already runs under Fawkes, or is a preview or test server')
+  const { directory, name, file, manifests, existing } = existingFor(host)
+  const extension = extensionFolder()
+  if (existing) return { directory, existing, extension }
   const port = publicPort(host.home)
-  // The folder of this extension as Fawkes will run it: start.ts, health.ts and storage.ts live beside this file.
-  const extension = realpathSync(dirname(fileURLToPath(import.meta.url)))
   const text = buildManifest({
     name,
     project: host.projectRoot,
@@ -447,12 +457,15 @@ async function setupSteps(host: ExtensionHost, extension: string): Promise<Setup
 }
 
 export const actions = {
-  /** No arguments → the manifest setup would write, or the one that already sets this host up. */
+  /**
+   * No arguments → the manifest setup would write, or the one that already sets this host up with the terminal steps
+   * that finish it: the card reads them here again after any reload, so they are never only in a closed popover.
+   */
   async setupPreview(_args: unknown, { host }: { host: ExtensionHost }): Promise<SetupPreview> {
     try {
       const plan = setupPlan(host)
       return plan.existing
-        ? { existing: plan.existing }
+        ? { existing: plan.existing, steps: await setupSteps(host, plan.extension) }
         : { file: plan.path, text: plan.text }
     } catch (error) {
       return { error: (error as Error).message }
