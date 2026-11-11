@@ -40,6 +40,26 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
 - To fix a bug, first write a test that reproduces it.
 - Never point a test or a manual run at a live app or a real `~/.fawkes`. Use a temp directory and a manifest in it.
 
+## Working on this machine
+
+Several branches, workers and test suites share one Mac with little free disk.
+
+- **Kill only what you started.** Stop processes by the pid or process group your own run recorded. Never kill
+  machine-wide (`pkill -f`, `killall`): another suite's processes look the same as yours.
+- **Clean up before you finish.** Run `cargo clean` in your worktree and remove every `/tmp` folder you created
+  (sandboxes, VM images, scratch clones). A finished worktree's `target/` is about 2 GB.
+- **Short socket paths.** A unit test that binds a Unix socket makes its directory with
+  `tempfile::Builder::new().tempdir_in("/tmp")`, not under `$TMPDIR`: the lander's `$TMPDIR` is long enough to
+  exceed the socket path limit.
+- **Probes that stream** (`fawkes daemon`, `fawkes watch`, `log --follow`) run in the background with a bounded wait
+  and are stopped by pid, never in the foreground of a tool call.
+- **Keep cargo's exit code.** When you filter cargo's output (`| tail`, `| grep`), use `set -o pipefail`, or the
+  filter's exit code hides a failure.
+- **Never touch the live Ultimate** (`~/Code/ultimate`, `~/.ultimate`) or link into `~/.ultimate/extensions`. Check
+  the Ultimate extension against a sandboxed fresh clone under `/tmp`, started under `env -i`.
+- **Nobody runs Fawkes yet.** Remove old names, migrations and upgrade notes outright; don't keep aliases or
+  tombstones (this waives R31 in `docs/cli-style.md` until Fawkes has users).
+
 ## DESIGN.md is the contract
 
 `DESIGN.md` defines the manifest, CLI, socket protocol, on-disk layout and state machine. If a change alters any of
