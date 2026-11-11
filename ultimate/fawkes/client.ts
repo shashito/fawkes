@@ -1,7 +1,7 @@
 /**
  * A client of the Fawkes daemon's Unix socket (DESIGN.md, "Socket protocol"): newline-delimited JSON, one request per
  * connection. `request` answers one command; `subscribe` keeps the live stream and reconnects with `since`. An upgrade
- * runs `fawkes up` instead (`up.ts`), so its composition of stage, test and switch stays Fawkes's own.
+ * runs `fawkes upgrade` instead (`upgrade.ts`), so its composition of stage, test and switch stays Fawkes's own.
  */
 import { connect } from 'node:net'
 import type { Socket } from 'node:net'

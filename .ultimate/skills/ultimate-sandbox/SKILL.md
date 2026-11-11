@@ -34,7 +34,7 @@ the live host's `ULTIMATE_*` and `FAWKES_*` variables.
    ```
 
    Look at it with the screenshot and browser tools on `http://127.0.0.1:4870/`. The daemon, from the project
-   folder as a user would run it: `sandbox.sh start daemon fawkes daemon`; the CLI: `sandbox.sh run fawkes status`.
+   folder as a user would run it: `sandbox.sh start daemon fawkes up`; the CLI: `sandbox.sh run fawkes status`.
 4. **Moving a host under Fawkes**, as a user does it: open the host, the `fawkes · set up` item, Set up; stop the
    host (`sandbox.sh stop host`); start the daemon. With `adopt = true` it tests the clone's HEAD and makes it
    permanent, and the host comes back on the same port.

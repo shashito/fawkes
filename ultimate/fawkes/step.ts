@@ -34,7 +34,7 @@ export function outdated(status: Status | undefined) {
 
 /**
  * Whether a switch is under way: `busy` names it (`switch g3`) from its start, and `step` from when its intent is
- * saved. The switch stops the live app's process group, an `up` run from here with it.
+ * saved. The switch stops the live app's process group, an `upgrade` run from here with it.
  */
 export const switching = (status: Status | undefined) =>
   status?.step === 'switching' || !!status?.busy?.startsWith('switch ')
@@ -43,8 +43,8 @@ export const switching = (status: Status | undefined) =>
 export const allows = (status: Status | undefined, command: string) => !!status?.actions?.includes(command)
 
 /**
- * Why `fawkes up` cannot run now, or nothing. `actions` lists `stage` while a switch is pending, but that switch
- * refuses the next one, so an up would stage and test only to be refused at its end.
+ * Why `fawkes upgrade` cannot run now, or nothing. `actions` lists `stage` while a switch is pending, but that switch
+ * refuses the next one, so an upgrade would stage and test only to be refused at its end.
  */
 export function upgradeRefusal(status: Status | undefined) {
   if (!status) return 'The Fawkes daemon has not answered yet'

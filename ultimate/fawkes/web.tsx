@@ -22,7 +22,7 @@ type Supervised = Extract<FawkesState, { supervised: true }>
 const StateAction = actionRef<null, FawkesState>('fawkes', 'state')
 /** No arguments → fetch the clone and count what an upgrade would bring. */
 const CheckAction = actionRef<null, FawkesState>('fawkes', 'check')
-/** `{ ref? }` → start an upgrade (`fawkes up`). */
+/** `{ ref? }` → start an upgrade (`fawkes upgrade`). */
 const UpgradeAction = actionRef<{ ref?: string }, FawkesState>('fawkes', 'upgrade')
 /** No arguments → confirm the pending generation now. */
 const ConfirmAction = actionRef<null, FawkesState>('fawkes', 'confirm')
@@ -127,7 +127,7 @@ function Generations({ state }: { state: Supervised }) {
   )
 }
 
-/** The upgrade this process started: the step `fawkes up` is on (the daemon's `busy`), or how it failed. */
+/** The upgrade this process started: the step `fawkes upgrade` is on (the daemon's `busy`), or how it failed. */
 function UpgradeRow({ state }: { state: Supervised }) {
   const { upgrade, status } = state
   if (!upgrade) return null
@@ -518,7 +518,7 @@ function SetupCard({ onWritten }: { onWritten: () => void }) {
 
 /**
  * Muted, like the item of a current generation: a host not under Fawkes offers to be set up, and once a manifest sets it
- * up, says it is ready for `fawkes daemon`.
+ * up, says it is ready for `fawkes up`.
  */
 function SetupItem({ ready, onWritten }: { ready: boolean; onWritten: () => void }) {
   return (
@@ -529,7 +529,7 @@ function SetupItem({ ready, onWritten }: { ready: boolean; onWritten: () => void
           data-fawkes-setup
           title={
             ready
-              ? 'Set up for Fawkes: start `fawkes daemon` in a terminal to finish'
+              ? 'Set up for Fawkes: start `fawkes up` in a terminal to finish'
               : 'Run this Ultimate under the Fawkes supervisor'
           }
           type="button"

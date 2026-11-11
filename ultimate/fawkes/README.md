@@ -1,4 +1,4 @@
-Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes up` stages, tests and switches a ref, and the new generation confirms itself once it works, or Fawkes rolls back code and storage.
+Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes upgrade` stages, tests and switches a ref, and the new generation confirms itself once it works, or Fawkes rolls back code and storage.
 
 ## Setup
 
@@ -17,9 +17,10 @@ To move an Ultimate host under Fawkes for the first time:
 3. **Update turns off.** The card also turns the built-in `update` extension off for this project, through Ultimate's
    onboarding actions; if the project's Ultimate setup is still undecided, clicking Set up trusts it. A project that
    declined its setup keeps `update` on, and the card says so.
-4. **In a terminal:** stop this Ultimate, then run `fawkes daemon` in the project's folder (`cargo install --path
+4. **In a terminal:** stop this Ultimate, then run `fawkes up` in the project's folder (`cargo install --path
    <this repository> --locked` first when no `fawkes` is on `PATH`). From then on the item reads `fawkes · ready`, and
    its card lists these steps, each with a copy button, until the host runs under Fawkes.
+   `fawkes down`, from a shell outside the app, stops the host and its daemon.
 
 The manifest has `adopt = true`: the first start adopts the version that was running. The daemon stages the clone's
 `HEAD`, tests it on a spare port, then makes it permanent (an `adopted` event) and runs it. If that test fails, nothing
@@ -86,13 +87,13 @@ still holds it. A counted hold in Ultimate would make that wrapper unnecessary.
 
 ## The upgrade
 
-An upgrade fetches the ref in the clone, then runs `"$FAWKES_BIN" up --json --socket "$FAWKES_SOCKET" -- <ref>` as a
-child (`up.ts`): one call, so the composition of stage, test and switch, its retry-safe stage and its refusals stay
+An upgrade fetches the ref in the clone, then runs `"$FAWKES_BIN" upgrade --json --socket "$FAWKES_SOCKET" -- <ref>` as a
+child (`upgrade.ts`): one call, so the composition of stage, test and switch, its retry-safe stage and its refusals stay
 Fawkes's own. Its stdout is the result (`generation`, `previous`, `deadline`, `existing`, `test`) or the error object
 (`code`, `step`, `generation`, `log`), which the popover and the tool show as they are. Its progress lines are not
 read from the child: the daemon sends every event to every subscriber, and the step in progress is `status.busy`.
 
-In the live app the switch stops this process, the `up` child with it, so nobody here could run `fawkes wait`. The
+In the live app the switch stops this process, the `upgrade` child with it, so nobody here could run `fawkes wait`. The
 generation that runs next learns the outcome instead, from the same `status` and `history` pictures `wait` decides
 from, on the subscribe stream it already holds (`facts.ts`, `outcome`): `permanent`, `rolled_back` with its
 `rollback_cause`, `storage_failed` while the restore failed, or still waiting. The new generation confirms itself; if
@@ -126,7 +127,7 @@ switch awaits its confirm. An older daemon sends no `actions`: its pending switc
 
 - `state` (no arguments): what the status line shows.
 - `check` (no arguments): fetch the clone and count what an upgrade would bring.
-- `upgrade` `{ ref? }` (user-only): `fawkes up` `ref` (default `origin/main`) in the background.
+- `upgrade` `{ ref? }` (user-only): `fawkes upgrade` `ref` (default `origin/main`) in the background.
 - `confirm` (user-only): confirm the pending generation now, without its own checks.
 - `setupPreview` (no arguments): the manifest first-time setup would write, or the one that already sets this host up.
 - `setup` (user-only): write the previewed manifest and return the terminal steps that remain (`setupPreview` returns
@@ -146,7 +147,7 @@ changed since that conversation last heard, and once more when it no longer appl
 
 `ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases), `test-env.test.ts` (the test run's
 environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it),
-`up.test.ts` (the `fawkes up` call and its result and error fields), `facts.test.ts` (outcomes and words from fields)
+`upgrade.test.ts` (the `fawkes upgrade` call and its result and error fields), `facts.test.ts` (outcomes and words from fields)
 and the rest, and type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
 
 ## Storage hooks

@@ -45,7 +45,7 @@ up)
   cp "$binary" "$S/bin/fawkes"
   # A copy, not a link: a landing in the working tree must not change the extension under test.
   cp -R "$extension" "$S/ext"
-  # origin.git stands for GitHub: push to it from work/ to give `fawkes up origin/main` something new.
+  # origin.git stands for GitHub: push to it from work/ to give `fawkes upgrade origin/main` something new.
   git clone -q --bare "$live" "$S/origin.git"
   git clone -q "$S/origin.git" "$S/ultimate"
   git clone -q "$S/origin.git" "$S/work"

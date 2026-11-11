@@ -1,19 +1,19 @@
 /**
- * `fawkes up <ref> --json`: stage, test and switch in one call, as Fawkes composes them (retry-safe stage, each step's
+ * `fawkes upgrade <ref> --json`: stage, test and switch in one call, as Fawkes composes them (retry-safe stage, each step's
  * refusals, `existing`, `test`, and `step` on a failure). Its stdout is one JSON document, the result or the error
  * object. Its progress lines on stderr are not read: every subscriber of the daemon gets the same events.
  *
- * In the live app the switch stops this process's group, the `up` child with it, so a successful `up` answers only
+ * In the live app the switch stops this process's group, the `upgrade` child with it, so a successful `upgrade` answers only
  * when it runs outside the app; the generation that runs next reads the outcome from the daemon.
  */
 import { spawn } from 'node:child_process'
-import type { UpError, UpResult } from './types.ts'
+import type { UpgradeError, UpgradeResult } from './types.ts'
 
-export class UpFailure extends Error {
-  readonly error: UpError
-  /** The signal that ended `up` before it answered: in the live app, the switch stopping its process group. */
+export class UpgradeFailure extends Error {
+  readonly error: UpgradeError
+  /** The signal that ended `upgrade` before it answered: in the live app, the switch stopping its process group. */
   readonly signal?: string
-  constructor(error: UpError, signal?: string) {
+  constructor(error: UpgradeError, signal?: string) {
     super(error.message)
     this.error = error
     this.signal = signal
@@ -24,13 +24,13 @@ export class UpFailure extends Error {
 const TAIL = 2000
 
 /**
- * Run `bin up ref --json` against `socket`; the `up` result, or an `UpFailure` with its error object. The manifest's
+ * Run `bin upgrade ref --json` against `socket`; the `upgrade` result, or an `UpgradeFailure` with its error object. The manifest's
  * timeouts bound every step; `timeout` only frees the extension from a daemon that hangs, whose step carries on.
  */
-export function up(bin: string, socket: string, ref: string, timeout = 3_600_000): Promise<UpResult> {
+export function upgrade(bin: string, socket: string, ref: string, timeout = 3_600_000): Promise<UpgradeResult> {
   return new Promise((resolve, reject) => {
     // After `--`, a ref that starts with `-` is still the ref.
-    const child = spawn(bin, ['up', '--json', '--socket', socket, '--', ref], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(bin, ['upgrade', '--json', '--socket', socket, '--', ref], { stdio: ['ignore', 'pipe', 'pipe'] })
     let late = false
     const timer = setTimeout(() => {
       late = true
@@ -42,14 +42,14 @@ export function up(bin: string, socket: string, ref: string, timeout = 3_600_000
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr = (stderr + chunk).slice(-TAIL)))
     child.on('error', (error) => {
       clearTimeout(timer)
-      reject(new UpFailure({ message: `cannot run ${bin}: ${error.message}` }))
+      reject(new UpgradeFailure({ message: `cannot run ${bin}: ${error.message}` }))
     })
     child.on('close', (code, signal) => {
       clearTimeout(timer)
       if (late)
         return reject(
-          new UpFailure({
-            message: `${bin} up did not answer within ${Math.round(timeout / 60_000)} minutes; the daemon's step carries on, \`fawkes status\` shows it`,
+          new UpgradeFailure({
+            message: `${bin} upgrade did not answer within ${Math.round(timeout / 60_000)} minutes; the daemon's step carries on, \`fawkes status\` shows it`,
           }),
         )
       let answer: unknown
@@ -59,11 +59,11 @@ export function up(bin: string, socket: string, ref: string, timeout = 3_600_000
         const how = signal ? `was ended by ${signal}` : `exited ${code}`
         const tail = stderr.trim().split('\n').at(-1)
         return reject(
-          new UpFailure({ message: `${bin} up ${how} without an answer${tail ? `: ${tail}` : ''}` }, signal ?? undefined),
+          new UpgradeFailure({ message: `${bin} upgrade ${how} without an answer${tail ? `: ${tail}` : ''}` }, signal ?? undefined),
         )
       }
-      if (code === 0) resolve(answer as UpResult)
-      else reject(new UpFailure(answer as UpError))
+      if (code === 0) resolve(answer as UpgradeResult)
+      else reject(new UpgradeFailure(answer as UpgradeError))
     })
   })
 }

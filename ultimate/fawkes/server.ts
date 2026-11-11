@@ -37,7 +37,7 @@ import type {
   Status,
   Upgrade,
 } from './types.ts'
-import { up, UpFailure } from './up.ts'
+import { upgrade as runUpgrade, UpgradeFailure } from './upgrade.ts'
 
 const run = promisify(execFile)
 /** The pause extension's service, looked up by its name like any `want`. */
@@ -213,7 +213,7 @@ async function check(host: ExtensionHost, fetch: boolean, ref = DEFAULT_REF) {
 }
 
 /**
- * Fetch `ref`, then `fawkes up` it: one call that stages, tests and switches. Runs in the background. In the live app
+ * Fetch `ref`, then `fawkes upgrade` it: one call that stages, tests and switches. Runs in the background. In the live app
  * the switch stops this process, and the new generation confirms itself after its boot or is rolled back.
  */
 function upgrade(host: ExtensionHost, socket: string, ref: string) {
@@ -235,11 +235,11 @@ function upgrade(host: ExtensionHost, socket: string, ref: string) {
     }
     set({ state: 'running' })
     try {
-      set({ state: 'switched', result: await up(bin, socket, ref) })
+      set({ state: 'switched', result: await runUpgrade(bin, socket, ref) })
     } catch (error) {
-      // The switch stopped this process's group and `up` with it, before its answer: no failure, this process ends too.
-      if (error instanceof UpFailure && error.signal && switching(s.status)) return
-      set({ state: 'failed', error: error instanceof UpFailure ? error.error : { message: String(error) } })
+      // The switch stopped this process's group and `upgrade` with it, before its answer: no failure, this process ends too.
+      if (error instanceof UpgradeFailure && error.signal && switching(s.status)) return
+      set({ state: 'failed', error: error instanceof UpgradeFailure ? error.error : { message: String(error) } })
     }
   })().finally(() => (s.upgradeRun = undefined))
 }
@@ -249,7 +249,7 @@ const text = (value: string) => ({ output: [{ type: 'text' as const, text: value
 /** The upgrade this process started, in one line. */
 function upgradeLine({ ref, state, result, error }: Upgrade, status: Status | undefined) {
   if (state === 'fetching') return `Upgrade to ${ref}: fetching it.`
-  if (state === 'running') return `Upgrade to ${ref}: fawkes up runs${status?.busy ? ` (${status.busy})` : ''}.`
+  if (state === 'running') return `Upgrade to ${ref}: fawkes upgrade runs${status?.busy ? ` (${status.busy})` : ''}.`
   if (state === 'switched' && result)
     return `Upgrade to ${ref}: switched to ${result.generation}${result.existing ? ' (already built)' : ''}; it confirms itself by ${result.deadline}.`
   const at = error?.step ? ` at its ${error.step} step` : ''
@@ -459,7 +459,7 @@ async function setupSteps(host: ExtensionHost, extension: string): Promise<Setup
   }
   steps.push(
     { label: 'Stop this Ultimate (Ctrl-C in its terminal)' },
-    { label: 'Start Fawkes in the project', command: `cd ${shellWord(host.projectRoot)} && fawkes daemon` },
+    { label: 'Start Fawkes in the project', command: `cd ${shellWord(host.projectRoot)} && fawkes up` },
   )
   return steps
 }
@@ -582,7 +582,7 @@ export default function fawkesExtension(host: ExtensionHost) {
       section(
         'fawkes',
         () =>
-          `This Ultimate runs under the Fawkes supervisor as a generation: a git worktree of the Ultimate clone at a fixed commit. Never edit the generation's folder (\`${host.ultimateRoot}\`); landed changes go live only through an upgrade (fawkes tool, action upgrade: \`fawkes up\` stages, tests and switches, then the new generation confirms itself, or Fawkes rolls back code and storage). \`restart\` reboots the same generation.`,
+          `This Ultimate runs under the Fawkes supervisor as a generation: a git worktree of the Ultimate clone at a fixed commit. Never edit the generation's folder (\`${host.ultimateRoot}\`); landed changes go live only through an upgrade (fawkes tool, action upgrade: \`fawkes upgrade\` stages, tests and switches, then the new generation confirms itself, or Fawkes rolls back code and storage). \`restart\` reboots the same generation.`,
       ),
     ],
     hooks: [
@@ -595,7 +595,7 @@ export default function fawkesExtension(host: ExtensionHost) {
         name: 'fawkes',
         replay: 'unsafe',
         description:
-          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. upgrade {ref?}: `fawkes up` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
+          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. upgrade {ref?}: `fawkes upgrade` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
         parameters: obj({
           action: oneOf(['status', 'upgrade']),
           ref: opt(str({ description: 'Git ref to upgrade to; default origin/main' })),

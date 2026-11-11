@@ -94,8 +94,8 @@ export type FawkesEvent = {
   changed?: string[]
 }
 
-/** `fawkes up --json`: the switch's result, plus what the stage and the test learned. */
-export type UpResult = {
+/** `fawkes upgrade --json`: the switch's result, plus what the stage and the test learned. */
+export type UpgradeResult = {
   generation: string
   previous: string | null
   deadline: string
@@ -104,9 +104,9 @@ export type UpResult = {
   test: TestInfo | null
 }
 
-/** A failed upgrade: `fawkes up`'s error object, with `step` naming the step that failed. */
-export type UpError = {
-  /** Fawkes's error code; absent when the extension's own fetch of the ref failed, before `up` ran. */
+/** A failed upgrade: `fawkes upgrade`'s error object, with `step` naming the step that failed. */
+export type UpgradeError = {
+  /** Fawkes's error code; absent when the extension's own fetch of the ref failed, before `upgrade` ran. */
   code?: string
   message: string
   step?: 'stage' | 'test' | 'switch'
@@ -115,7 +115,7 @@ export type UpError = {
 }
 
 /**
- * The upgrade this Ultimate started: the fetch of its ref, then `fawkes up`, whose step the daemon's `status.busy` names
+ * The upgrade this Ultimate started: the fetch of its ref, then `fawkes upgrade`, whose step the daemon's `status.busy` names
  * while it runs. In the live app it ends with the switch, which stops this process; the generation that runs next reads
  * the outcome (`facts.ts`, `outcome`).
  */
@@ -124,8 +124,8 @@ export type Upgrade = {
   state: 'fetching' | 'running' | 'switched' | 'failed'
   /** The `seq` of the newest event when it started: the progress lines after it are this upgrade's. */
   since: number
-  result?: UpResult
-  error?: UpError
+  result?: UpgradeResult
+  error?: UpgradeError
   at: number
 }
 
@@ -169,7 +169,7 @@ export type FawkesState =
       supervised: false
       /** The host is not under Fawkes and is a real host, not a preview or test server: the setup item shows. */
       setup: boolean
-      /** A manifest already sets this host up: what remains is starting `fawkes daemon`. */
+      /** A manifest already sets this host up: what remains is starting `fawkes up`. */
       ready: boolean
     }
   | {
