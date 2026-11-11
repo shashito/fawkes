@@ -187,6 +187,9 @@ These problems were not in review 4, mostly in code added since:
 
 ## 4. Recommended: a cut-down quality phase
 
+**Done:** items 1–7 below and the clean cut of §8, as [PLAN-04.md](PLAN-04.md) phase 10 records, with where the
+build differs.
+
 The items are ranked by value over risk to the transactional core. Messages may get clearer, but error codes, exit
 codes, event kinds and fields, and the wire format stay unchanged. None of the items changes DESIGN.md's contract.
 

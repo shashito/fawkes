@@ -125,6 +125,16 @@ description), P9 (an exhaustive destructure in `Manifest::reload`), L49 (trim to
 (durations parsed once), L34 (`let _ =` that matters), L57–L61 (literals, stale comments, names), I23–I26, and the rest of P1–P24
 where they make the code simpler. The rest of L1–L3, L9–L12 and I1–I3 go in the phase that touches their file.
 
+**Done,** cut down as [quality-reassessment.md](quality-reassessment.md) §4 and the user's picks in its §8 say:
+items 1–7 there, and the clean cut of the compatibility paths (the hidden `fawkes tui`, the `storage` key's own
+message, the pre-`txn` `state.json` migration and the upgrade notes). L3 and the stale `app.pid` (L9) each came with
+a test that reproduced it first. Where the build differs from §4: a manifest duration is checked once as it is read
+(`Section::seconds`), so the validation loop went too; `Manifest::shutdown_wait` is the one function, which launchd's
+`ExitTimeOut` adds `stop_timeout` and a margin to; an `Err` from `try_wait` counts as running at all five exited
+checks (`App::exit_status`), `judge_unhealthy` included; and L34 (`point_current_link`) is left, since it would add
+an event. Left out on purpose, as §4 says: I23, I24, P22, P23, P15–P21, P24, L53, and L10–L12 and I2 on the record.
+`src/` went from 13347 to 13260 lines.
+
 ## Housekeeping (with phase 5)
 
 `.gitignore` gains editor swap files (`.*.swp`); the untracked `.README.md.swp` is removed. **Done** (the ignore
