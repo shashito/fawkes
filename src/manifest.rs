@@ -303,10 +303,10 @@ impl Written {
             reuse: reuse.unwrap_or_default(),
             keep,
             start,
-            deadline: deadline.unwrap_or_else(default_deadline),
+            deadline: deadline.unwrap_or(120),
             stop_timeout,
             min_uptime,
-            max_failed_starts: max_failed_starts.unwrap_or_else(default_max_failed_starts),
+            max_failed_starts: max_failed_starts.unwrap_or(3),
             rollback_on_unhealthy: rollback_on_unhealthy.unwrap_or(false),
             check,
             health_interval: interval,
@@ -360,13 +360,6 @@ pub const MAX_DEADLINE: u64 = 7 * 86_400;
 
 /// The longest any manifest duration may be, in seconds (`Section::seconds`).
 const MAX_SECONDS: f64 = 86_400.0;
-
-fn default_deadline() -> u64 {
-    120
-}
-fn default_max_failed_starts() -> u32 {
-    3
-}
 
 /// What a health check does: the URL to fetch or the command to run, as written in the manifest (templates are
 /// expanded by `health_check`).

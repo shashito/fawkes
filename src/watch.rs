@@ -9,7 +9,7 @@ use crate::protocol::{
     Error, ErrorCode, Event, GenState, Generation, History, Line, Request, Status, Step, err,
     invalid_state, not_found, read_line, timed_out,
 };
-use crate::state::{now_secs, parse_time};
+use crate::state::{Paths, now_secs, parse_time};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -508,7 +508,7 @@ fn decide(
             Err(if status.state_dir.as_os_str().is_empty() {
                 error
             } else {
-                error.with_log(status.state_dir.join("generations").join(id).join("logs/hooks.log"))
+                error.with_log(Paths { root: status.state_dir.clone() }.hook_log(id))
             })
         }
         // Still the live switch: the rollback is decided but not over (or the history is newer than the status of

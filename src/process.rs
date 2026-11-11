@@ -94,8 +94,8 @@ pub fn run_bounded(
         .map_err(|e| format!("cannot run {what}: {e}"))?;
     let pgid = child.id();
     spawned(pgid);
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
     let waited = wait_until(&mut child, Instant::now() + timeout);
     stop_group(pgid, grace, Some(&mut child));
     let status = match waited {
@@ -106,7 +106,9 @@ pub fn run_bounded(
         }
         Err(e) => return Err(format!("{what}: {e}")),
     };
-    let output = |reader: thread::JoinHandle<String>| reader.join().unwrap_or_default();
+    let output = |reader: Option<thread::JoinHandle<String>>| {
+        reader.map_or_else(String::new, |reader| reader.join().unwrap_or_default())
+    };
     Ok(Finished {
         status,
         stdout: output(stdout),
@@ -116,13 +118,11 @@ pub fn run_bounded(
 
 /// Read `pipe` to its end on a thread: a child that writes more than a pipe holds would otherwise wait for a reader
 /// that only reads once it has exited.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
+fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<String> {
     thread::spawn(move || {
         let mut text = Vec::new();
-        if let Some(mut pipe) = pipe {
-            // A read error ends the capture; what came before is still the useful part.
-            let _ = pipe.read_to_end(&mut text);
-        }
+        // A read error ends the capture; what came before is still the useful part.
+        let _ = pipe.read_to_end(&mut text);
         String::from_utf8_lossy(&text).into_owned()
     })
 }

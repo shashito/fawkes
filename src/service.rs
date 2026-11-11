@@ -141,7 +141,8 @@ mod launchd {
                     ),
                 ));
             }
-            let log = self.manifest.paths().daemon_log();
+            let paths = self.manifest.paths();
+            let log = paths.daemon_log();
             let mut variables = Vec::new();
             for name in ["PATH", "FAWKES_HOME"] {
                 if let Some(value) = std::env::var_os(name) {
@@ -154,10 +155,6 @@ mod launchd {
                     variables.push((name, value));
                 }
             }
-            let environment: Vec<(&str, &str)> = variables
-                .iter()
-                .map(|(name, value)| (*name, value.as_str()))
-                .collect();
             let plist = render_plist(
                 &self.label,
                 &[
@@ -166,7 +163,7 @@ mod launchd {
                     "--manifest",
                     utf8(&manifest_file, "the manifest path")?,
                 ],
-                &environment,
+                &variables,
                 self.exit_timeout(),
                 utf8(&log, "the state directory")?,
             );
@@ -176,7 +173,7 @@ mod launchd {
             // answers (one started from a terminal) holds the state lock, so the agent's would fail at every start and
             // launchd would retry it for ever.
             let loaded = replaced && self.bootout()?;
-            let socket = self.manifest.paths().socket();
+            let socket = paths.socket();
             if !loaded && UnixStream::connect(&socket).is_ok() {
                 return Err(invalid_state(format!(
                     "a daemon for {} already runs on {} (started from a terminal?); stop it, then install the service",
@@ -188,7 +185,7 @@ mod launchd {
                 std::fs::create_dir_all(dir).map_err(|e| failed_to("create", dir, &e))?;
             }
             // launchd opens `StandardErrorPath` before the daemon exists to create the directory.
-            let state_dir = &self.manifest.paths().root;
+            let state_dir = &paths.root;
             DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -370,7 +367,7 @@ mod launchd {
     fn render_plist(
         label: &str,
         arguments: &[&str],
-        environment: &[(&str, &str)],
+        environment: &[(&str, String)],
         exit_timeout: u64,
         log: &str,
     ) -> String {

@@ -34,7 +34,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
@@ -683,15 +683,7 @@ impl Daemon {
     /// manifest whole. Either way the outcome is logged; the answer is for the client that asked, if any.
     fn reload_manifest(&self) -> R<ReloadResult> {
         let refuse = |code, message: String| {
-            self.event_with(
-                EventKind::Error,
-                None,
-                format!("manifest not reloaded: {message}"),
-                Facts {
-                    error_code: Some(code),
-                    ..Facts::default()
-                },
-            );
+            self.error_event(&err(code, format!("manifest not reloaded: {message}")));
             Err(err(code, message))
         };
         let new = match Manifest::load(&self.manifest_path) {
@@ -778,7 +770,6 @@ impl Daemon {
 /// `owner`'s (`owned_dir`), before anything changes its mode. The result is the resolved path, so every later use
 /// reaches this directory even if a component of the manifest's path is swapped for a symlink meanwhile.
 fn private_state_dir(dir: &Path, owner: u32) -> Result<PathBuf, String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let opened = owned_dir(dir, "state_dir", owner)?;
     opened
         .set_permissions(std::fs::Permissions::from_mode(0o700))
@@ -804,7 +795,6 @@ fn private_state_dir(dir: &Path, owner: u32) -> Result<PathBuf, String> {
 /// another user owns: whoever owns it, or can point the link elsewhere, could run code as the daemon's user from it or
 /// read the app's storage. `what` names it in the messages (`state_dir`, `home`).
 fn owned_dir(dir: &Path, what: &str, owner: u32) -> Result<File, String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!(
             "{what} {} is a symbolic link, which fawkes never follows; set {what} to the directory it points at",

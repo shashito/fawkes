@@ -664,9 +664,7 @@ impl Daemon {
             );
         }
         // Confirm of the permanent generation answers ok and changes nothing: not an action.
-        if let Some(Txn::Pending(pending)) = inner.store.state().txn.clone()
-            && Self::check_confirm(inner, None).is_ok()
-        {
+        if let Ok(pending) = Self::check_confirm(inner, None) {
             actions.push(format!("confirm {}", pending.generation));
         }
         if free(inner, Slot::Both) {
