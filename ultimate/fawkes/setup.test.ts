@@ -20,7 +20,7 @@ const host: SetupInput = {
 test('the manifest of a sample host has every field, absolute paths and bare templates', () => {
   assert.equal(
     buildManifest(host),
-    `# xana's Ultimate host under Fawkes, written by the setup card of the Ultimate extension (ultimate/fawkes/README.md).
+    `# xana's Ultimate host under Fawkes, written by init.ts of the Ultimate extension (ultimate/fawkes/README.md).
 name = "xana"
 project = "/Users/me/Code/xana"
 repo = "/Users/me/Code/ultimate"

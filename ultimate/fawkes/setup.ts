@@ -1,7 +1,7 @@
 /**
- * First-time setup: the Fawkes manifest for an Ultimate host that does not run under Fawkes yet, from facts the server
- * facet reads (the project, the home, the public port, the manifests already in the Fawkes home). Pure and browser-safe:
- * nothing here reads a file, so the text a card previews is the text it writes. The manifest follows
+ * First-time setup: the Fawkes manifest for an Ultimate host that does not run under Fawkes yet, from facts `init.ts`
+ * reads (the project, the home, the port, the manifests already in the Fawkes home). Pure and browser-safe: nothing
+ * here reads a file. The manifest follows
  * `examples/ultimate.toml`; DESIGN.md, "Manifest", is the contract.
  */
 
@@ -73,15 +73,24 @@ export function readManifest(text: string): ManifestFacts {
 }
 
 /**
+ * The inclusive ranges the manifests hold: each `port`, and its `spare_ports`, which default to the ten ports after
+ * `port` as the daemon defaults them. A manifest without a port holds nothing.
+ */
+export function claimedPorts(manifests: ManifestFacts[]): [number, number][] {
+  const taken: [number, number][] = []
+  for (const { port, spare } of manifests) {
+    if (port === undefined) continue
+    taken.push([port, port], spare ?? [port + 1, port + SPARE_SIZE])
+  }
+  return taken
+}
+
+/**
  * The first block of ten ports from 4790 up that overlaps no `port` or `spare_ports` of the other manifests and does not
- * hold `port`. A manifest without `spare_ports` owns the ten ports after its `port`, as the daemon defaults them.
+ * hold `port`.
  */
 export function spareBlock(others: ManifestFacts[], port: number): [number, number] {
-  const taken: [number, number][] = [[port, port]]
-  for (const other of others) {
-    if (other.port === undefined) continue
-    taken.push([other.port, other.port], other.spare ?? [other.port + 1, other.port + SPARE_SIZE])
-  }
+  const taken: [number, number][] = [[port, port], ...claimedPorts(others)]
   for (let low = SPARE_FROM; low + SPARE_SIZE - 1 <= 65535; low += SPARE_SIZE) {
     const high = low + SPARE_SIZE - 1
     if (!taken.some(([from, to]) => low <= to && high >= from)) return [low, high]
@@ -117,7 +126,7 @@ export function buildManifest(input: SetupInput): string {
   const command = (script: string, ...args: string[]) =>
     quote(['node', shellWord(`${extension}/${script}`), ...args].join(' '))
   return [
-    `# ${name}'s Ultimate host under Fawkes, written by the setup card of the Ultimate extension (ultimate/fawkes/README.md).`,
+    `# ${name}'s Ultimate host under Fawkes, written by init.ts of the Ultimate extension (ultimate/fawkes/README.md).`,
     `name = ${quote(name)}`,
     `project = ${quote(project)}`,
     `repo = ${quote(repo)}`,

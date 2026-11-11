@@ -2,40 +2,59 @@ Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes upgrade` stages,
 
 ## Setup
 
-To move an Ultimate host under Fawkes for the first time:
+One path for every project, including one that never ran Ultimate. Once, then start Fawkes:
 
-1. **Link this folder** into `~/.ultimate/extensions/fawkes` (every host loads it, and it stays inert outside Fawkes
-   except for the setup item below), or into `<project>/.ultimate/extensions/fawkes` (that project only; it needs the
-   project's Ultimate setup trusted).
-2. **Open the host.** A host that does not run under Fawkes shows a muted `fawkes · set up` item in its status line (not
-   a preview or a test server). Its card previews the manifest and writes it to `$FAWKES_HOME/<name>.toml`
-   (`~/.fawkes` by default; `<name>` is the project folder's name reduced to letters, digits, `_` and `-`), with the
-   project, the clone the host runs from, its home, the port it serves on now (the one recorded in `<home>/ultimate.lock`,
-   which is the port you open) and the first free block of ten spare ports from 4790 up. A manifest that already sets
-   the host up (the same `project`, or the same `home`) is shown as it is and never overwritten; another app's manifest of
-   the same file name gives this one the next free name (`<name>-2`).
-3. **Update turns off.** The card also turns the built-in `update` extension off for this project, through Ultimate's
-   onboarding actions; if the project's Ultimate setup is still undecided, clicking Set up trusts it. A project that
-   declined its setup keeps `update` on, and the card says so.
-4. **In a terminal:** stop this Ultimate, then run `fawkes up` in the project's folder (`cargo install --path
-   <this repository> --locked` first when no `fawkes` is on `PATH`). From then on the item reads `fawkes · ready`, and
-   its card lists these steps, each with a copy button, until the host runs under Fawkes. `fawkes down`, from a shell
-   outside the app, stops the host and its daemon.
+```sh
+node <this folder>/init.ts [--ultimate <clone>] [--port <n>] <project>
+cd <project> && fawkes up        # install fawkes first with `cargo install --path <this repository> --locked`
+```
+
+`init.ts` first looks at four pieces and writes nothing; if one is refused it exits 1 with the reasons and still writes
+nothing. Otherwise it writes the missing ones, prints `wrote …` or `already …` for each, and the terminal steps left.
+Run again, it changes nothing. Exit codes: 0 done, 1 failed or refused, 2 usage.
+
+1. **The manifest** `$FAWKES_HOME/<name>.toml` (`~/.fawkes` by default; `<name>` is the project folder's name reduced to
+   letters, digits, `_` and `-`), with the project, the clone, its home (Ultimate's own `projectHome`), the port
+   and the first free block of ten spare ports from 4790 up. A manifest that already sets the project up (the same
+   `project`, or the same `home`) is left exactly as it is; another app's manifest of the same file name gives this
+   one the next free name (`<name>-2`). The port is the one `<home>/ultimate.lock` records while its Ultimate lives (the
+   port you open); otherwise the lowest from 4747 that no manifest claims (its `port` and `spare_ports`), no
+   `~/.ultimate/projects/*/ultimate.lock` has recorded and nothing listens on. `--port` overrides it.
+2. **The link** `<project>/.ultimate/extensions/fawkes` to this folder, so the project's Ultimate loads the extension.
+   A link elsewhere, or a real folder, is refused and never replaced.
+3. **`update` off** in `<project>/.ultimate/settings.json` (`extensions.disable`; it leaves `extensions.enable`, and every
+   other key stays): the built-in `update` would move a clone Fawkes runs generations from.
+4. **Trust** of the project's Ultimate setup, which Ultimate needs to load the link and the settings. It trusts the whole
+   `<project>/.ultimate/` (agents, skills, settings). A project that declined its setup (`~/.ultimate/trust.json`) is
+   refused: init never overrides that decision.
+
+Ultimate decides where a project's home is, whose trust a worktree shares and how settings are saved, so `init.ts`
+loads those helpers from the clone at run time. The clone is `--ultimate`, else `$ULTIMATE`, else the clone behind
+`ultimate` on `PATH` (a link to `<clone>/bin/ultimate.ts`, or a pnpm shim naming it), else `~/Code/ultimate`: the first
+that names something is used, and it must have `bin/ultimate.ts` and `node_modules`. `FAWKES_HOME` and
+`ULTIMATE_USER_HOME` (default: the home directory) move the Fawkes home and the user's `.ultimate/`.
+
+A host that does not run under Fawkes shows a muted `fawkes · set up` item in its status line (not a preview or a test
+server). Its card writes nothing: it shows the same steps with a copy button each (the `init.ts` command, with
+`--ultimate` only where a terminal would not find this host's clone itself; `cargo install` when no `fawkes` is on
+`PATH`; stop this Ultimate; `fawkes up`), and the manifest that already sets the host up. Once all four pieces are there the
+item reads `fawkes · ready`. `fawkes down`, from a shell outside the app, stops the host and its daemon.
 
 The manifest has `adopt = true`: the first start adopts the version that was running. The daemon stages the clone's
 `HEAD`, tests it on a spare port, then makes it permanent (an `adopted` event) and runs it. If that test fails, nothing
-changes: no generation goes live, and `ultimate` can be started as before. Setup is the user's action (`setup`); an
-agent may read the preview (`setupPreview`).
+changes: no generation goes live, and `ultimate` can be started as before. An agent may read the steps
+(`setupPreview`); nothing in the extension writes the setup but `init.ts`.
 
 ## Where it runs
 
-A user extension, linked as above. Without a Fawkes daemon around it (`FAWKES_SOCKET`, `FAWKES_GENERATION` and
+A user extension, linked into the project by `init.ts` (or by hand into `~/.ultimate/extensions/fawkes`, which every host
+loads). Without a Fawkes daemon around it (`FAWKES_SOCKET`, `FAWKES_GENERATION` and
 `FAWKES_PHASE` unset) it has no tool and no hold, and its status-line item is the setup item.
 
 Under a daemon, Ultimate runs from a generation (a git worktree of the clone at one commit), not from the clone
 itself, so a landing or a merge in the clone no longer goes live before it is installed and tested. Turn the built-in
-`update` extension off in that host (`"extensions": { "disable": ["update"] }`): it would move a clone the host does
-not run from.
+`update` extension off in that host (`"extensions": { "disable": ["update"] }`, which `init.ts` writes): it would move a
+clone the host does not run from.
 
 ## The manifest
 
@@ -129,9 +148,8 @@ switch awaits its confirm. An older daemon sends no `actions`: its pending switc
 - `check` (no arguments): fetch the clone and count what an upgrade would bring.
 - `upgrade` `{ ref? }` (user-only): `fawkes upgrade` `ref` (default `origin/main`) in the background.
 - `confirm` (user-only): confirm the pending generation now, without its own checks.
-- `setupPreview` (no arguments): the manifest first-time setup would write, or the one that already sets this host up.
-- `setup` (user-only): write the previewed manifest and return the terminal steps that remain (`setupPreview` returns
-  them too once a manifest sets the host up).
+- `setupPreview` (no arguments): the terminal steps that set this host up (the `init.ts` command while a piece is
+  missing), the reasons `init.ts` would refuse, and the manifest that already sets the host up.
 - `rollback` (user-only): roll the pending generation back now.
 
 ## For agents
