@@ -22,17 +22,18 @@ Run again, it changes nothing. Exit codes: 0 done, 1 failed or refused, 2 usage.
    `~/.ultimate/projects/*/ultimate.lock` has recorded and nothing listens on. `--port` overrides it.
 2. **The link** `<project>/.ultimate/extensions/fawkes` to this folder, so the project's Ultimate loads the extension.
    A link elsewhere, or a real folder, is refused and never replaced.
-3. **`update` off** in `<project>/.ultimate/settings.json` (`extensions.disable`; it leaves `extensions.enable`, and every
-   other key stays): the built-in `update` would move a clone Fawkes runs generations from.
+3. **`update` off** in `<project>/.ultimate/settings.json` (added to `extensions.disable` and removed from
+   `extensions.enable`; every other key stays): the built-in `update` would move a clone Fawkes runs generations from.
 4. **Trust** of the project's Ultimate setup, which Ultimate needs to load the link and the settings. It trusts the whole
    `<project>/.ultimate/` (agents, skills, settings). A project that declined its setup (`~/.ultimate/trust.json`) is
-   refused: init never overrides that decision.
+   refused: init never overrides that decision. So is a `trust.json` that cannot be read.
 
 Ultimate decides where a project's home is, whose trust a worktree shares and how settings are saved, so `init.ts`
 loads those helpers from the clone at run time. The clone is `--ultimate`, else `$ULTIMATE`, else the clone behind
 `ultimate` on `PATH` (a link to `<clone>/bin/ultimate.ts`, or a pnpm shim naming it), else `~/Code/ultimate`: the first
-that names something is used, and it must have `bin/ultimate.ts` and `node_modules`. `FAWKES_HOME` and
-`ULTIMATE_USER_HOME` (default: the home directory) move the Fawkes home and the user's `.ultimate/`.
+that names something is used, and it must have `bin/ultimate.ts` and `node_modules`. `FAWKES_HOME` (default
+`$HOME/.fawkes`, where `fawkes` looks) and `ULTIMATE_USER_HOME` (default: the home directory) move the Fawkes home and
+the user's `.ultimate/`.
 
 A host that does not run under Fawkes shows a muted `fawkes · set up` item in its status line (not a preview or a test
 server). Its card writes nothing: it shows the same steps with a copy button each (the `init.ts` command, with

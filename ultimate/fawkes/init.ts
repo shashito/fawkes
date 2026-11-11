@@ -94,6 +94,7 @@ type Helpers = {
   projectHome: typeof Project.projectHome
   decisionRoot: typeof ProjectSetup.decisionRoot
   projectDecision: typeof ProjectSetup.projectDecision
+  projectDiagnostics: typeof ProjectSetup.projectDiagnostics
   readSettings: typeof Settings.readSettings
   updateSettings: typeof Settings.updateSettings
   readOwner: typeof Lock.readOwner
@@ -120,6 +121,7 @@ async function loadClone(clone: string): Promise<Helpers> {
     projectHome: project.projectHome,
     decisionRoot: projectSetup.decisionRoot,
     projectDecision: projectSetup.projectDecision,
+    projectDiagnostics: projectSetup.projectDiagnostics,
     readSettings: settings.readSettings,
     updateSettings: settings.updateSettings,
     readOwner: lock.readOwner,
@@ -128,7 +130,7 @@ async function loadClone(clone: string): Promise<Helpers> {
   }
 }
 
-/** Reads and writes nothing: what each of the four pieces needs. */
+/** Writes nothing (reading the trust store takes its lock): what each of the four pieces needs. */
 export async function inspect(options: InspectOptions): Promise<Inspection> {
   const { clone, userHome } = options
   const project = realpathSync(options.project)
@@ -345,6 +347,11 @@ function planTrust(helpers: Helpers, project: string, userHome: string): Piece {
   const root = helpers.decisionRoot(project)
   const file = join(userHome, '.ultimate/trust.json')
   const what = `trust for ${root} in ${file}`
+  // No trust store yet: undecided, without taking the store's lock, which creates `<userHome>/.ultimate`.
+  if (!existsSync(file)) return writeTrust(helpers, project, root, userHome, what)
+  // `projectDecision` reads an unreadable store as undecided; its write would then fail after the other pieces.
+  const [unreadable] = helpers.projectDiagnostics(project, userHome)
+  if (unreadable) return refused('trust', what, `${unreadable.replace(/^Error: /, '')}; fix or remove ${file}, and run init again.`)
   const decision = helpers.projectDecision(project, userHome)
   if (decision === true) return { name: 'trust', state: 'there', what }
   if (decision === false)
@@ -353,6 +360,10 @@ function planTrust(helpers: Helpers, project: string, userHome: string): Piece {
       what,
       `you declined this project's Ultimate setup in ${file}; init never overrides that. Remove the entry for ${root} there, or trust the project in Ultimate, and run init again.`,
     )
+  return writeTrust(helpers, project, root, userHome, what)
+}
+
+function writeTrust(helpers: Helpers, project: string, root: string, userHome: string, what: string): Piece {
   return {
     name: 'trust',
     state: 'write',
@@ -464,7 +475,8 @@ async function main(argv: string[], env: NodeJS.ProcessEnv) {
       project,
       clone,
       userHome,
-      fawkesHome: env.FAWKES_HOME || join(userHome, '.fawkes'),
+      // Where `fawkes` itself looks: `$FAWKES_HOME`, else `$HOME/.fawkes`.
+      fawkesHome: env.FAWKES_HOME || join(env.HOME || homedir(), '.fawkes'),
       port,
     })
     const refusals = plan.pieces.filter((piece) => piece.state === 'refused')

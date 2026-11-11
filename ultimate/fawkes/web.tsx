@@ -390,7 +390,7 @@ function SetupCard() {
       <div className="border-b border-border/70 px-3 py-2 text-[11.5px]">
         <div className="section-label">Fawkes</div>
         <div className="text-muted-foreground">
-          {preview.data && !missing
+          {preview.data?.steps && !missing
             ? 'Set up: start Fawkes from a terminal to finish'
             : 'Run this Ultimate under Fawkes: upgrades that roll back'}
         </div>
