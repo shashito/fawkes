@@ -426,7 +426,13 @@ fn run_down(cli: &Cli, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
             .into();
         return fail(cli.json, out, ErrorCode::InvalidState, message);
     }
-    client(cli, &Request::Down, endpoint, REQUEST_TIMEOUT, out)
+    // The text ends with how to start it again, which for a launchd agent is its service, not a terminal's `up`.
+    let outcome = exchange(cli, &Request::Down, endpoint, REQUEST_TIMEOUT, out).map(|result| {
+        let text = render_result(&Request::Down, &result);
+        let text = format!("{text}; {}", endpoint.start_hint());
+        (result, text)
+    });
+    finish(cli, out, outcome)
 }
 
 /// `fawkes skill`: the agent skill built into this binary. Returns the exit code.
@@ -481,9 +487,14 @@ fn run_confirm(
 /// The refusal of `fawkes {command}` in a test run, which serves its health check and nothing else; `why`, when not
 /// empty, follows the command.
 fn test_run_message(command: &str, why: &str) -> String {
+    // The live app may not end its own supervisor either (`run_down`), nor start a second one.
+    let who = if matches!(command, "up" | "down") {
+        "a shell outside the app"
+    } else {
+        "the live app or a shell outside the app"
+    };
     format!(
-        "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {command}`{why}; the live \
-         app or a shell outside the app does"
+        "a test run (FAWKES_PHASE=test) only serves its health check: it does not `fawkes {command}`{why}; {who} does"
     )
 }
 

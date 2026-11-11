@@ -76,9 +76,9 @@ not built yet. Don't start one unless asked.
   daemon code paths, return `protocol::Error` with `?` and don't add `unwrap`/`expect`. They are fine in tests.
 - **A generation rolls back at most once.** Never add a path that rolls back a rolled-back generation.
 - **Locking** (see the header of `daemon/mod.rs`): never hold `inner` across a slow step (install, health check,
-  process stop). The lock order is `inner` → `manifest` → `log` → `hub` and `echo` (`step_pgids` and `downs` are only
-  ever taken alone, and `wake` last, with nothing taken while it is held), and no thread waits on another while holding
-  one. Nothing that may hold a lock writes stderr: event lines go to it through `Echo`'s thread.
+  process stop). The lock order is `inner` → `manifest` → `log` → `hub` and `echo` (`step_pgids` and `downs` are
+  only ever taken alone, and `wake` last, with nothing taken while it is held), and no thread waits on another while
+  holding one. Nothing that may hold a lock writes stderr: event lines go to it through `Echo`'s thread.
 - **Processes:** the app runs in its own process group, and stopping or crash handling signals the whole group
   (`process::kill_group`, rustix's `kill_process_group`), never just the child pid. Every child that must end by
   itself (install, hooks, git, cp, health commands) goes through `process::run_bounded`.

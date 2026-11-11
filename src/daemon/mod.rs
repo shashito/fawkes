@@ -3,9 +3,9 @@
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
 //! Lock order is `inner` before `manifest` before `log` before `hub` and `echo` (`step_pgids` and `downs` are only
-//! ever taken alone, and `wake` last, with nothing taken while it is held), and nothing waits for another thread while holding
-//! one. Events go to the hub and to stderr's queue while `log` is held, so every subscriber sees them once and in
-//! `seq` order. No thread that may hold a lock writes stderr: a thread of its own does (`Echo`).
+//! ever taken alone, and `wake` last, with nothing taken while it is held), and nothing waits for another thread while
+//! holding one. Events go to the hub and to stderr's queue while `log` is held, so every subscriber sees them once and
+//! in `seq` order. No thread that may hold a lock writes stderr: a thread of its own does (`Echo`).
 //!
 //! Neither the accept loop nor the supervisor polls: the accept loop sleeps in `poll(2)` on the socket and a pipe the
 //! signal handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.

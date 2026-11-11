@@ -17,8 +17,8 @@ its confirm deadline, Fawkes rolls back to the permanent generation, code and st
 back at most once and is never started again. `DESIGN.md` in the Fawkes repository is the full contract; this file
 is what you need to act.
 
-Every command but `up` (the supervisor itself, in the foreground) takes `--json`. Then stdout is one JSON document, the result or an error object
-`{"code": "...", "message": "..."}`, and progress lines go to stderr. The two streams are the exception:
+Every command but `up` (the supervisor itself, in the foreground) takes `--json`. Then stdout is one JSON document,
+the result or an error object `{"code": "...", "message": "..."}`, and progress lines go to stderr. The two streams are the exception:
 `log --follow --json` prints one event per line, and `watch --json` one `{"name", "event"}` per line, for as long as
 they run. Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers.
 

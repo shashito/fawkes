@@ -243,7 +243,7 @@ pub fn render_result(request: &Request, result: &Value) -> String {
                 .stopped
                 .map_or_else(String::new, |id| format!("{id} and "));
             format!(
-                "stopped {stopped}the daemon of {} (pid {}); `fawkes up` starts it again",
+                "stopped {stopped}the daemon of {} (pid {})",
                 r.name, r.daemon_pid
             )
         }),
@@ -487,10 +487,7 @@ mod tests {
             (
                 Request::Down,
                 serde_json::json!({"name": "sample", "daemon_pid": 99, "stopped": "g3"}),
-                vec![
-                    "stopped g3 and the daemon of sample (pid 99)",
-                    "`fawkes up` starts it again",
-                ],
+                vec!["stopped g3 and the daemon of sample (pid 99)"],
             ),
             (
                 Request::Subscribe {

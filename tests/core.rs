@@ -1472,7 +1472,7 @@ fn down_stops_the_app_and_its_daemon_and_answers_once_they_are_free() {
         (Some(1), Some("invalid_state")),
         "{error}"
     );
-    // In text, it names what it stopped and what starts it again.
+    // In text, it names what it stopped and how to start it again.
     let output = common::fawkes()
         .arg("--manifest")
         .arg(h.manifest())
@@ -1483,7 +1483,10 @@ fn down_stops_the_app_and_its_daemon_and_answers_once_they_are_free() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
         text.starts_with("stopped g1 and the daemon of t (pid ")
-            && text.ends_with("; `fawkes up` starts it again\n"),
+            && text.ends_with(&format!(
+                "; start one with `fawkes up --manifest {}`\n",
+                h.manifest().display()
+            )),
         "{text}"
     );
     assert!(h.daemon_exits_within(Duration::from_secs(5)));

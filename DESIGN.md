@@ -569,9 +569,13 @@ usage error that names the similar commands (`tip: a similar subcommand exists: 
 The two levels are the supervisor and the app's process. `up` brings the app up under supervision: it runs the daemon
 in the foreground, with its events on stderr, until `down`, `SIGTERM` or `SIGINT` (Process model, Daemon start). A
 second `up` of the same app is refused while the first holds the state lock. `down` stops the app and its daemon over
-the socket and answers once both are gone and the state lock is free, so `fawkes down && fawkes up` never finds the
-old daemon in the way. Its text names the generation it stopped and the daemon's pid, and ends with `fawkes up`,
-which starts both again. `start`, `stop` and `restart` act on the app's process and leave the supervisor running.
+the socket and answers once the app is stopped and the daemon has let go of its socket and state lock, just before it
+exits, so `fawkes down && fawkes up` never finds the old daemon in the way. Its text names the generation it stopped
+and the daemon's pid, and ends with the command that starts both again: `fawkes up --manifest …`, or `fawkes service
+restart --manifest …` for an app installed as a launchd agent, whose daemon a terminal's `up` would contend with at the
+next login. A `down` that reaches a daemon already on its way out may get no answer and fail `daemon_unreachable`
+(exit 3): there is no daemon left either way. `start`, `stop` and `restart` act on the app's process and leave the
+supervisor running.
 
 In text, `log` and `history` print nothing, not a blank line, when there are no events or generations to show (`log -n 0`
 included); under `--json` the result is `{"events": []}` as ever. `log --since N` is how an agent asks for what came after
