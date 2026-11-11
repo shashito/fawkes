@@ -1,18 +1,20 @@
 import {
   ArrowDownIcon,
   CheckIcon,
+  CopyIcon,
   LoaderCircleIcon,
   RefreshCwIcon,
   TimerIcon,
   TriangleAlertIcon,
+  WrenchIcon,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { actionRef, api, cn, defineWebExtension, formatAgo, useAction, useNow } from '@/sdk'
+import { actionRef, api, cn, defineWebExtension, errorMessage, formatAgo, useAction, useNow } from '@/sdk'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
-import type { FawkesState, Generation, Upgrade } from './types.ts'
+import type { FawkesState, Generation, SetupPreview, SetupResult, Upgrade } from './types.ts'
 
 type Supervised = Extract<FawkesState, { supervised: true }>
 
@@ -26,6 +28,19 @@ const UpgradeAction = actionRef<{ ref?: string }, FawkesState>('fawkes', 'upgrad
 const ConfirmAction = actionRef<null, FawkesState>('fawkes', 'confirm')
 /** No arguments → roll the pending generation back now. */
 const RollbackAction = actionRef<null, FawkesState>('fawkes', 'rollback')
+/** No arguments → the manifest first-time setup would write, or the one that already sets this host up. */
+const SetupPreviewAction = actionRef<null, SetupPreview>('fawkes', 'setupPreview')
+/** No arguments → write the manifest (user-only). */
+const SetupAction = actionRef<null, SetupResult>('fawkes', 'setup')
+
+/** Ultimate's onboarding actions (`extensions/onboarding/refs.ts`): the project's setup decision and extension switches. */
+type ProjectSetup = { config: boolean; decision: boolean | null }
+const ProjectStatusAction = actionRef<null, { project: ProjectSetup }>('onboarding', 'status')
+const DecideAction = actionRef<{ local: boolean }, { project: ProjectSetup }>('onboarding', 'decide')
+const SetExtensionAction = actionRef<
+  { name: string; enabled: boolean; scope: 'user' | 'project' },
+  { ok: boolean }
+>('onboarding', 'setExtension')
 
 const statusButton =
   '-mx-1 flex cursor-pointer items-center gap-1.5 rounded-sm px-1 transition-colors hover:bg-accent'
@@ -326,6 +341,186 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
   )
 }
 
+/** What setup did, kept while the popover is closed: the manifest written and how turning `update` off went. */
+type Done = { result: SetupResult; update: { off: boolean; text: string } }
+
+/**
+ * Turn the built-in `update` extension off for this project through the onboarding actions: the user's click is the
+ * project decision when it is still open, and a declined decision is never overridden.
+ */
+async function turnUpdateOff() {
+  const { project } = await api.action(ProjectStatusAction)
+  if (project.decision === false)
+    return {
+      off: false,
+      text: "update could not be turned off: you declined this project's Ultimate setup, and that choice stays. Turn update off yourself once you trust the setup; it would move a clone that Fawkes runs generations from.",
+    }
+  if (project.decision === null) await api.action(DecideAction, { local: true })
+  await api.action(SetExtensionAction, { name: 'update', enabled: false, scope: 'project' })
+  return { off: true, text: 'The built-in update extension is off for this project.' }
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <Button
+      className="size-6 shrink-0 text-muted-foreground"
+      onClick={() => {
+        void navigator.clipboard.writeText(text).then(() => {
+          setCopied(true)
+          setTimeout(() => setCopied(false), 1500)
+        })
+      }}
+      size="icon"
+      title="Copy"
+      variant="ghost"
+    >
+      {copied ? <CheckIcon className="size-3 text-success" /> : <CopyIcon className="size-3" />}
+    </Button>
+  )
+}
+
+function SetupSteps({ done }: { done: Done }) {
+  return (
+    <>
+      <div>
+        <CheckIcon className="mr-1 inline size-3 text-success" />
+        Wrote <span title={done.result.file}>{done.result.file.split('/').slice(-2).join('/')}</span>
+      </div>
+      <div className={cn('flex items-start gap-1.5', done.update.off ? 'text-muted-foreground' : 'text-warning')}>
+        {!done.update.off && <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />}
+        <span>{done.update.text}</span>
+      </div>
+      <ol className="space-y-1.5 border-t border-border/60 pt-2">
+        {done.result.steps.map((step, index) => (
+          <li key={step.label}>
+            <div>
+              <span className="text-muted-foreground">{index + 1}.</span> {step.label}
+            </div>
+            {step.command && (
+              <div className="mt-0.5 flex items-center gap-1 rounded-sm bg-muted/50 py-0.5 pl-2 pr-0.5">
+                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{step.command}</code>
+                <CopyButton text={step.command} />
+              </div>
+            )}
+          </li>
+        ))}
+      </ol>
+      <div className="text-muted-foreground">
+        The first start tests the running version on a spare port, then runs it. If that test fails, nothing changes and{' '}
+        <code>ultimate</code> can be started as before.
+      </div>
+    </>
+  )
+}
+
+/** First-time setup: the manifest it would write, what it does to `update`, and after writing the terminal steps. */
+function SetupCard({ done, setDone }: { done?: Done; setDone: (done: Done) => void }) {
+  const preview = useAction(SetupPreviewAction, null, { onError: () => {} })
+  const project = useAction(ProjectStatusAction, null, { onError: () => {} })
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const decision = project.data?.project.decision
+  const write = async () => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      const result = await api.action(SetupAction)
+      // The manifest stands whatever happens to update: its outcome is told, never thrown away.
+      const update = await turnUpdateOff().catch((failure: unknown) => ({
+        off: false,
+        text: `update could not be turned off: ${errorMessage(failure)}`,
+      }))
+      setDone({ result, update })
+    } catch (failure) {
+      setError(errorMessage(failure))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const { existing, text, file, error: unavailable } = preview.data ?? {}
+  return (
+    <>
+      <div className="border-b border-border/70 px-3 py-2 text-[11.5px]">
+        <div className="section-label">Fawkes</div>
+        <div className="text-muted-foreground">
+          {existing ? 'This Ultimate is set up for Fawkes' : 'Run this Ultimate under Fawkes: upgrades that roll back'}
+        </div>
+      </div>
+      <div className="space-y-2 px-3 py-2 text-[11.5px] leading-[1.55]">
+        {done ? (
+          <SetupSteps done={done} />
+        ) : (
+          <>
+            {preview.loading && !preview.data && <div className="text-muted-foreground">Reading the Fawkes folder…</div>}
+            {unavailable && (
+              <div className="flex items-start gap-1.5 text-warning">
+                <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
+                <span>{unavailable}</span>
+              </div>
+            )}
+            {existing && (
+              <>
+                <div>
+                  <span className="text-success">Already set up</span> by{' '}
+                  <span title={existing.file}>{existing.file}</span>, which is never overwritten.
+                </div>
+                <pre className="max-h-56 overflow-auto whitespace-pre text-muted-foreground">{existing.text}</pre>
+              </>
+            )}
+            {text && (
+              <>
+                <div>
+                  Writes <span title={file}>{file?.split('/').slice(-2).join('/')}</span>:
+                </div>
+                <pre className="max-h-56 overflow-auto whitespace-pre text-muted-foreground">{text}</pre>
+                <div className="text-muted-foreground">
+                  {decision === false
+                    ? "You declined this project's Ultimate setup, so the built-in update extension stays on; it would move a clone Fawkes runs from."
+                    : decision === null
+                      ? "Also turns the built-in update extension off for this project. That trusts this project's Ultimate setup (.ultimate/)."
+                      : 'Also turns the built-in update extension off for this project.'}
+                </div>
+              </>
+            )}
+          </>
+        )}
+        {error && <div className="break-words text-error">{error}</div>}
+      </div>
+      {text && !done && (
+        <div className="flex items-center justify-end border-t border-border/70 px-3 py-1.5">
+          <Button className={smallButton} disabled={busy} onClick={() => void write()} size="sm" variant="outline">
+            {busy ? 'Setting up…' : 'Set up'}
+          </Button>
+        </div>
+      )}
+    </>
+  )
+}
+
+/** Muted, like the item of a current generation: a host not under Fawkes only offers to be set up. */
+function SetupItem() {
+  const [done, setDone] = useState<Done>()
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          className={cn(statusButton, 'text-muted-foreground/70 hover:text-foreground')}
+          data-fawkes-setup
+          title="Run this Ultimate under the Fawkes supervisor"
+          type="button"
+        >
+          <WrenchIcon className="size-3" />
+          fawkes<span className="max-md:hidden"> · set up</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-[26rem] max-w-[calc(100vw-1rem)] p-0 font-mono" side="top">
+        <SetupCard done={done} setDone={setDone} />
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 /** The status-line item: quiet while this generation is current, prominent during an upgrade or a pending confirm. */
 function Fawkes() {
   const { data, refetch } = useAction(StateAction, null, { onError: () => {} })
@@ -337,7 +532,7 @@ function Fawkes() {
     return () => clearInterval(timer)
   }, [refetch, live])
   const now = useNow(1000, Boolean(data?.supervised && awaitingConfirm(data.status)))
-  if (!data?.supervised) return null
+  if (!data?.supervised) return data?.setup ? <SetupItem /> : null
   const act = (name: string) => {
     const ref = { check: CheckAction, upgrade: UpgradeAction, confirm: ConfirmAction, rollback: RollbackAction }[name]
     if (!ref) return

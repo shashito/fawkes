@@ -144,9 +144,30 @@ export type Confirming =
   | { state: 'refused'; reason: string }
   | { state: 'confirmed' }
 
+/** `setupPreview`: what the setup card shows before anything is written. */
+export type SetupPreview = {
+  /** The manifest that would be written, and where. */
+  file?: string
+  text?: string
+  /** A manifest in the Fawkes home that already sets this host up: shown as it is, never overwritten. */
+  existing?: { file: string; text: string }
+  /** Why no manifest can be previewed. */
+  error?: string
+}
+
+/** One thing the user does in a terminal after setup; `command` has a copy button. */
+export type SetupStep = { label: string; command?: string }
+
+/** `setup`: the manifest written and the terminal steps that remain. */
+export type SetupResult = { file: string; steps: SetupStep[] }
+
 /** The `state` action: everything the status line and its popover show. */
 export type FawkesState =
-  | { supervised: false }
+  | {
+      supervised: false
+      /** The host is not under Fawkes and is a real host, not a preview or test server: the setup item shows. */
+      setup: boolean
+    }
   | {
       supervised: true
       /** This process's generation (`FAWKES_GENERATION`). */

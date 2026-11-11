@@ -96,6 +96,8 @@ export function eventLine(event: FawkesEvent, time: (iso: string) => string = (i
       return `switched to ${g}${event.previous ? ` from ${event.previous}` : ''}${event.deadline ? `, confirm by ${time(event.deadline)}` : ''}`
     case 'confirmed':
       return `${g} confirmed, now permanent`
+    case 'adopted':
+      return `${g} adopted, now permanent`
     case 'rolled_back':
       return [
         `${g} rolled back: ${causeText(event.cause, event.reason)}`,

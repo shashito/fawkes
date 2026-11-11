@@ -1,6 +1,17 @@
 import { execFile } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { obj, oneOf, opt, str } from '@earendil-works/pi-schema'
 import { defineDoc, defineExtension, defineTool, GenerationTask, hook, section } from '@earendil-works/pi-durable'
@@ -13,8 +24,19 @@ import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { HELD_MARKER, role } from './role.ts'
+import { buildManifest, findExisting, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
 import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
-import type { Confirming, FawkesEvent, FawkesState, Generation, Status, Upgrade } from './types.ts'
+import type {
+  Confirming,
+  FawkesEvent,
+  FawkesState,
+  Generation,
+  SetupPreview,
+  SetupResult,
+  SetupStep,
+  Status,
+  Upgrade,
+} from './types.ts'
 import { up, UpFailure } from './up.ts'
 
 const run = promisify(execFile)
@@ -23,6 +45,12 @@ const PauseApi = { name: 'pause' } as typeof PauseApiType
 
 /** What this process is to Fawkes, from its environment, which never changes while it runs. */
 const fawkes = role(process.env)
+
+/**
+ * First-time setup is offered by a real host that does not run under Fawkes. A preview or a test server Ultimate starts
+ * carries `ULTIMATE_INSTANCE_OWNER` and is never set up.
+ */
+const canSetup = fawkes.kind === 'inert' && !process.env.ULTIMATE_INSTANCE_OWNER
 
 /** The ref an upgrade stages unless it names another. */
 const DEFAULT_REF = 'origin/main'
@@ -54,7 +82,7 @@ const shared = (host: ExtensionHost) =>
   host.resource<Shared>('fawkes.state', () => ({ connected: false, generations: [], events: [], holding: false }))
 
 function state(host: ExtensionHost): FawkesState {
-  if (fawkes.kind === 'inert') return { supervised: false }
+  if (fawkes.kind === 'inert') return { supervised: false, setup: canSetup }
   const s = shared(host)
   return {
     supervised: true,
@@ -321,7 +349,126 @@ function liveSocket() {
   return fawkes.socket
 }
 
+// ------------------------------------------------ first-time setup
+
+/**
+ * The port users open, which `bin/ultimate.ts` records in `<home>/ultimate.lock` once its proxy listens: the same lock
+ * the project list reads for `running.url`. The core's own port (`server.address()` here) is internal and moves on every
+ * core swap. A missing lock or a dead owner means this process is not served by Ultimate's supervisor.
+ */
+function publicPort(home: string) {
+  const lock = join(home, 'ultimate.lock')
+  let owner: { pid?: unknown; port?: unknown }
+  try {
+    owner = JSON.parse(readFileSync(lock, 'utf8'))
+  } catch {
+    throw new Error(`Cannot read ${lock}: start Ultimate with bin/ultimate.ts, which records the port it serves on`)
+  }
+  const { pid, port } = owner
+  if (typeof pid !== 'number' || typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error(`${lock} has no port this host serves on`)
+  try {
+    process.kill(pid, 0)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw new Error(`${lock} names a process that is gone`)
+  }
+  return port
+}
+
+/** The manifest this host would get, or the one that already sets it up. Writes nothing. */
+function setupPlan(host: ExtensionHost) {
+  if (!canSetup) throw new Error('This Ultimate already runs under Fawkes, or is a preview or test server')
+  const directory = process.env.FAWKES_HOME || join(host.userHome, '.fawkes')
+  const name = manifestName(host.projectRoot)
+  const file = `${name}.toml`
+  const manifests = (() => {
+    try {
+      return readdirSync(directory)
+        .filter((entry) => entry.endsWith('.toml'))
+        .toSorted()
+        .map((entry) => ({ file: entry, text: readFileSync(join(directory, entry), 'utf8') }))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+      throw error
+    }
+  })()
+  const existing = findExisting(manifests, { file, project: host.projectRoot, home: host.home })
+  if (existing) return { directory, existing }
+  const port = publicPort(host.home)
+  // The folder of this extension as Fawkes will run it: start.ts, health.ts and storage.ts live beside this file.
+  const extension = realpathSync(dirname(fileURLToPath(import.meta.url)))
+  const text = buildManifest({
+    name,
+    project: host.projectRoot,
+    repo: host.ultimateRoot,
+    home: host.home,
+    port,
+    spare: spareBlock(
+      manifests.map((manifest) => readManifest(manifest.text)),
+      port,
+    ),
+    extension,
+  })
+  return { directory, file, path: join(directory, file), text, extension }
+}
+
+/** Whether a `fawkes` binary is on this process's PATH. */
+function fawkesOnPath() {
+  return (process.env.PATH ?? '').split(':').some((directory) => {
+    try {
+      const path = join(directory || '.', 'fawkes')
+      accessSync(path, constants.X_OK)
+      return statSync(path).isFile()
+    } catch {
+      return false
+    }
+  })
+}
+
+/** What the user does in a terminal once the manifest is written. */
+async function setupSteps(host: ExtensionHost, extension: string): Promise<SetupStep[]> {
+  const steps: SetupStep[] = []
+  if (!fawkesOnPath()) {
+    const repo = await run('git', ['rev-parse', '--show-toplevel'], { cwd: extension, timeout: 10_000 }).then(
+      ({ stdout }) => stdout.trim(),
+      () => undefined,
+    )
+    steps.push(
+      repo
+        ? { label: 'Install fawkes', command: `cargo install --path ${shellWord(repo)} --locked` }
+        : { label: 'Install fawkes (cargo install --path <the fawkes repository> --locked)' },
+    )
+  }
+  steps.push(
+    { label: 'Stop this Ultimate (Ctrl-C in its terminal)' },
+    { label: 'Start Fawkes in the project', command: `cd ${shellWord(host.projectRoot)} && fawkes daemon` },
+  )
+  return steps
+}
+
 export const actions = {
+  /** No arguments → the manifest setup would write, or the one that already sets this host up. */
+  async setupPreview(_args: unknown, { host }: { host: ExtensionHost }): Promise<SetupPreview> {
+    try {
+      const plan = setupPlan(host)
+      return plan.existing
+        ? { existing: plan.existing }
+        : { file: plan.path, text: plan.text }
+    } catch (error) {
+      return { error: (error as Error).message }
+    }
+  },
+  /** No arguments → write the previewed manifest (never over another) and say what the user does next. */
+  async setup(_args: unknown, { host }: { host: ExtensionHost }): Promise<SetupResult> {
+    const plan = setupPlan(host)
+    if (plan.existing) throw new Error(`${plan.existing.file} already sets this host up`)
+    mkdirSync(plan.directory, { recursive: true, mode: 0o700 })
+    // `wx`: another manifest created since the preview is never overwritten.
+    writeFileSync(plan.path, plan.text, { flag: 'wx', mode: 0o644 })
+    // The umask may have narrowed the mode.
+    chmodSync(plan.path, 0o644)
+    return { file: plan.path, steps: await setupSteps(host, plan.extension) }
+  },
   /** No arguments → what the status line shows. */
   async state(_args: unknown, { host }: { host: ExtensionHost }) {
     return state(host)
@@ -361,7 +508,7 @@ export const actions = {
 /** The status line polls it. */
 export const pollActions = ['state']
 /** Moving the live process is the user's call. */
-export const userActions = ['upgrade', 'confirm', 'rollback']
+export const userActions = ['upgrade', 'confirm', 'rollback', 'setup']
 
 export default function fawkesExtension(host: ExtensionHost) {
   if (fawkes.kind === 'inert') return defineExtension({ name: 'fawkes' })

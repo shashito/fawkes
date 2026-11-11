@@ -1,9 +1,33 @@
 Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes up` stages, tests and switches a ref, and the new generation confirms itself once it works, or Fawkes rolls back code and storage.
 
+## Setup
+
+To move an Ultimate host under Fawkes for the first time:
+
+1. **Link this folder** into `~/.ultimate/extensions/fawkes` (every host loads it, and it stays inert outside Fawkes
+   except for the setup item below), or into `<project>/.ultimate/extensions/fawkes` (that project only; it needs the
+   project's Ultimate setup trusted).
+2. **Open the host.** A host that does not run under Fawkes shows a muted `fawkes · set up` item in its status line (not
+   a preview or a test server). Its card previews the manifest and writes it to `$FAWKES_HOME/<name>.toml`
+   (`~/.fawkes` by default; `<name>` is the project folder's name reduced to letters, digits, `_` and `-`), with the
+   project, the clone the host runs from, its home, the port it serves on now (the one recorded in `<home>/ultimate.lock`,
+   which is the port you open) and the first free block of ten spare ports from 4790 up. A manifest that already sets
+   the host up (same file name, same `project`, or the same `home`) is shown as it is and never overwritten.
+3. **Update turns off.** The card also turns the built-in `update` extension off for this project, through Ultimate's
+   onboarding actions; if the project's Ultimate setup is still undecided, clicking Set up trusts it. A project that
+   declined its setup keeps `update` on, and the card says so.
+4. **In a terminal:** stop this Ultimate, then run `fawkes daemon` in the project's folder (`cargo install --path
+   <this repository> --locked` first when no `fawkes` is on `PATH`; the card lists each step with a copy button).
+
+The manifest has `adopt = true`: the first start does not stage anything, it adopts the version that was running. The
+daemon tests it on a spare port, then runs it and calls it permanent (an `adopted` event). If that test fails, nothing
+changes: no generation goes live, and `ultimate` can be started as before. Setup is the user's action (`setup`); an
+agent may read the preview (`setupPreview`).
+
 ## Where it runs
 
-A user extension: link this folder into `~/.ultimate/extensions/fawkes`. Without a Fawkes daemon around it
-(`FAWKES_SOCKET`, `FAWKES_GENERATION` and `FAWKES_PHASE` unset) it does nothing: no status-line item, no tool, no hold.
+A user extension, linked as above. Without a Fawkes daemon around it (`FAWKES_SOCKET`, `FAWKES_GENERATION` and
+`FAWKES_PHASE` unset) it has no tool and no hold, and its status-line item is the setup item.
 
 Under a daemon, Ultimate runs from a generation (a git worktree of the clone at one commit), not from the clone
 itself, so a landing or a merge in the clone no longer goes live before it is installed and tested. Turn the built-in
@@ -102,6 +126,8 @@ switch awaits its confirm. An older daemon sends no `actions`: its pending switc
 - `check` (no arguments): fetch the clone and count what an upgrade would bring.
 - `upgrade` `{ ref? }` (user-only): `fawkes up` `ref` (default `origin/main`) in the background.
 - `confirm` (user-only): confirm the pending generation now, without its own checks.
+- `setupPreview` (no arguments): the manifest first-time setup would write, or the one that already sets this host up.
+- `setup` (user-only): write the previewed manifest and return the terminal steps that remain.
 - `rollback` (user-only): roll the pending generation back now.
 
 ## For agents
@@ -144,4 +170,5 @@ test_copy = "node /path/to/fawkes/ultimate/fawkes/storage.ts test-copy {home} {t
 
 A database is copied with `VACUUM INTO` (one read transaction, waiting up to 10 s for a lock), never with a file copy
 of a live database, which loses the `-wal`; only a restore copies the snapshot's finished file as it is. Each copy keeps the mode of its source, a read-only file included. Exit 0 is success, 1 a failed
-step with the file and the reason on stderr, 2 a usage error. It needs `node:sqlite` (Node 22.13 or newer).
+step with the file and the reason on stderr, 2 a usage error. It needs `node:sqlite`, and the hooks are TypeScript run by the `node` Ultimate runs on, which needs Node 26
+(Ultimate's `engines`); Node 22.13 would need `--experimental-strip-types`.

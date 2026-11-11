@@ -99,6 +99,7 @@ test('an event is said from its fields, not from its message', () => {
     eventLine(event('rolled_back', { to: 'g2', cause: 'deadline', storage: 'restored', reason: 'old words' })),
     eventLine(event('rolled_back', { to: 'g2', cause: 'exited', storage: 'restore_failed' })),
     eventLine(event('tested', { port: 4791, seconds: 2.14 })),
+    eventLine(event('adopted', { generation: 'g1' })),
     eventLine(event('daemon', { generation: null, action: 'started', pid: 812, version: '0.1.0' })),
   ]
   assert.deepEqual(lines, [
@@ -109,6 +110,7 @@ test('an event is said from its fields, not from its message', () => {
     'g3 rolled back: missed its confirm deadline; back to g2; storage restored',
     'g3 rolled back: exited before it confirmed; back to g2; storage could not be restored',
     'g3 passed its test on port 4791 in 2.1 s',
+    'g1 adopted, now permanent',
     'daemon started, pid 812, version 0.1.0',
   ])
   // An error's code is a field; its message is the only account of what failed.
