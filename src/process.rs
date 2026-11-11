@@ -406,7 +406,8 @@ fn wait_group(
     }
 }
 
-/// Try the health check every `interval` until it passes, the app stops being alive, or `timeout` passes. The app's exit (`exited`, from `exited`) ends the wait between two tries at once.
+/// Try the health check every `interval` until it passes, the app stops being alive, or `timeout` passes. A message
+/// on `exited` (the app's exit) ends the wait between two tries at once.
 pub fn wait_healthy(
     check: &Check,
     cwd: &Path,

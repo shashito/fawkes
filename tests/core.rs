@@ -2930,6 +2930,11 @@ fn a_daemon_start_refuses_a_namesake_recovers_state_json_and_removes_a_stray_dir
         "{}",
         h.daemon_log()
     );
+    // Repaired at once, so the copy is not the only readable record until the next change.
+    let repaired: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.dir.join("s/state.json")).unwrap())
+            .expect("state.json is written again from its copy");
+    assert_eq!(repaired["generations"][0]["id"], "g1");
     assert!(!h.dir.join("s/generations/g99").exists());
     assert!(
         messages(&h, "daemon")

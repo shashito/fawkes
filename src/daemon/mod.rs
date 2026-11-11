@@ -78,7 +78,7 @@ impl App {
     /// `try_wait` keeps the status it reaps, so the supervisor's `reap` still sees an exit found here first. An error
     /// (which a child of ours never gives) counts as running: only `reap` takes an app out, so an exit counted
     /// without a status would be one nothing ever handles, while a pending generation that counts as running still
-    /// rolls back on a failed health check or at its deadline.
+    /// rolls back at its deadline, or on a failed health check under `rollback_on_unhealthy`.
     fn exit_status(&mut self) -> Option<ExitStatus> {
         self.child.try_wait().ok().flatten()
     }
@@ -525,6 +525,9 @@ impl Daemon {
         );
         if let Some(warning) = recovered {
             daemon.event(EventKind::Error, None, warning);
+            // Write state.json again from its copy at once: until the next change the copy would be the only
+            // readable record, and one more bad write to it would leave none.
+            daemon.update(&mut daemon.inner().store, |_| ());
         }
 
         // A crashed daemon leaves its app, and the install, test or hook it was running, behind. The state lock proves

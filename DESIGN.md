@@ -270,7 +270,8 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
 3. Bind the socket: refuse when a daemon of another state directory answers on it (a `--socket` shared by two
    manifests); a socket file nobody answers on belongs to a dead daemon and is replaced.
    Then link it into `<fawkes_home>/run/`. A startup that fails after this removes the socket and the link again.
-4. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event). Refuse to
+4. Read `state.json`, or `state.json.bak` when `state.json` is unreadable (reported as an `error` event, and
+   `state.json` is written again from the copy at once). Refuse to
    start when neither can be read, and when a generation is in a state this daemon does not know (a `state.json`
    written by a newer fawkes): the error names the generation and says to run the newer fawkes again or upgrade this
    binary, and the copy is not tried, since `state.json` was readable.

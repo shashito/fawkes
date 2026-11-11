@@ -133,7 +133,8 @@ a test that reproduced it first. Where the build differs from §4: a manifest du
 `ExitTimeOut` adds `stop_timeout` and a margin to; an `Err` from `try_wait` counts as running at all five exited
 checks (`App::exit_status`), `judge_unhealthy` included; and L34 (`point_current_link`) is left, since it would add
 an event. Left out on purpose, as §4 says: I23, I24, P22, P23, P15–P21, P24, L53, and L10–L12 and I2 on the record.
-`src/` went from 13347 to 13260 lines.
+The review found that dropping `daemon_pid` (P13) also dropped the startup save that rewrote a `state.json`
+recovered from its copy; startup now writes it again explicitly, with a test. `src/` went from 13347 to 13264 lines.
 
 ## Housekeeping (with phase 5)
 

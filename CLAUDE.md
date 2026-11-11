@@ -33,7 +33,7 @@ All three are clean on `main`. Treat any warning or failure as yours: don't assu
   or `Harness::fk`. They drop the `FAWKES_*` variables a suite inherits when it runs inside an app Fawkes supervises,
   which would otherwise send the test's requests to that app's live daemon.
 - Unit tests live next to the code in `#[cfg(test)] mod tests` (`state.rs`, `manifest.rs`,
-  `process.rs`, `protocol.rs`, `main.rs`, `discovery.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`,
+  `process.rs`, `protocol.rs`, `main.rs`, `render.rs`, `discovery.rs`, `daemon/mod.rs`, `daemon/supervisor.rs`,
   `daemon/transactions.rs`, `watch.rs`); a scratch directory comes from `tempfile::tempdir()`. The restart policy is
   the pure `after_exit` in `daemon/supervisor.rs`: test a change to it there, in milliseconds, and keep the
   integration tests as end-to-end smoke tests.
