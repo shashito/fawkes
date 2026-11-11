@@ -15,6 +15,8 @@ cargo test
 ```
 
 All three are clean on `main`. Treat any warning or failure as yours: don't assume it was already there.
+`scripts/check` runs these and `cargo deny check` in the lander's order, keeps cargo's exit code and prints only a
+failing step's output; `scripts/check --only <test>` runs fmt, clippy and one test.
 
 - Run the narrowest test first (`cargo test --test core <name>`, `cargo test watch::`), then the whole suite.
 - Use debug builds. Don't build with `--release` unless asked.
