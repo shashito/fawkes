@@ -60,7 +60,7 @@ Several branches, workers and test suites share one Mac with little free disk.
 - **Never touch the live Ultimate** (`~/Code/ultimate`, `~/.ultimate`) or link into `~/.ultimate/extensions`. Check
   the Ultimate extension against a sandboxed fresh clone under `/tmp`, started under `env -i`.
 - **Nobody runs Fawkes yet.** Remove old names, migrations and upgrade notes outright; don't keep aliases or
-  tombstones (this waives R31 in `docs/cli-style.md` until Fawkes has users).
+  tombstones (this waives R31 of the `cli-designer` skill until Fawkes has users).
 
 ## DESIGN.md is the contract
 

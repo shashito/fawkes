@@ -1,18 +1,18 @@
-# Fawkes's CLI against the guide's style
+# Fawkes's CLI against the CLI style guide
 
-This review runs the checklist of [`docs/cli-style.md`](../docs/cli-style.md) against Fawkes's
+This review runs the checklist of the CLI style guide (the `cli-designer` skill's `style.md`) against Fawkes's
 command line on `main` at `d4bacad` (PLAN-05 phase 11). It then adds what the contrast study
-[`docs/cli-patterns-others.md`](../docs/cli-patterns-others.md) suggests, and weighs the user's pending ideas.
-Rules are cited as `R<n>` (the guide's) and `P<n>` (other tools'). Nothing here changes code.
+(the skill's `patterns.md`) suggests, and weighs the user's pending ideas.
+Rules are cited as `R<n>` (the style guide's) and `P<n>` (other tools'). Nothing here changes code.
 
 The inputs were `fawkes --help` and each command's `--help` from a debug build of `d4bacad`, the CLI section of
 `DESIGN.md` (lines 461–533), and `src/main.rs`. Phase 12's `fawkes service install|uninstall|restart` (#26095) is
 being built in parallel and is not assessed; it is a noun group of three verbs, which is exactly what R1 allows.
 
-**Verdict:** the grammar, errors, exit codes and agent safety already match his style, in places more strictly
-than he is himself. Three things fall short: the first use (a hand-written manifest and `--manifest` on every
+**Verdict:** the grammar, errors, exit codes and agent safety already match the style, in places more strictly
+than its own tools do. Three things fall short: the first use (a hand-written manifest and `--manifest` on every
 command), the help text (a three-line `--json` description repeated under every command, positionals without help,
-no examples), and `--version`, which is missing. The user's ideas fix the first, and they fit his style, except for
+no examples), and `--version`, which is missing. The user's ideas fix the first, and they fit the style, except for
 grouped command help and the "only one daemon is running" fallback.
 
 ## The checklist
@@ -35,7 +35,7 @@ grouped command help and the "only one daemon is running" fallback.
 | 14 | `--version` (R16) | **No** | `fawkes -V`: `error: unexpected argument '-V' found`, exit 2; `--version` the same |
 | 15 | `error:` on stderr, causes on their own lines (R17) | **Yes** | One `error: <sentence>` line on stderr; under `--json`, one `{"code","message"}` object on stdout (`DESIGN.md:511-518`) |
 | 16 | Errors name the fix (R18) | **Yes** | "…; stage the ref again for a new generation", "…; start one with `fawkes daemon --manifest fawkes.toml`" (`DESIGN.md:528-533`). A mistyped command gets no suggestion |
-| 17 | Exit codes 0/1/2, documented (R19) | **Yes, better than his** | 0, 1, 2 and 3 (`daemon_unreachable`), in `--help`'s footer and `DESIGN.md:519-522` |
+| 17 | Exit codes 0/1/2, documented (R19) | **Yes, better than the guide's tools** | 0, 1, 2 and 3 (`daemon_unreachable`), in `--help`'s footer and `DESIGN.md:519-522` |
 | 18 | Starting twice fails clearly (R20) | **Yes** | A second daemon is refused by the `flock` on `<state_dir>/lock` and by a socket that answers (`DESIGN.md:232-246`) |
 | 19 | stdout is only the result (R21) | **Yes** | Progress lines go to stderr (`DESIGN.md:511`) |
 | 20 | One machine format, additive promise written down (R22) | **Partly** | Every command but `daemon` has `--json`, and readers tolerate unknown enum values (`DESIGN.md:567-575`). No sentence promises that result fields are only ever added |
@@ -47,12 +47,12 @@ grouped command help and the "only one daemon is running" fallback.
 | 26 | Renamed names keep working or explain (R31) | **Yes** | A manifest with `storage` is refused with an error that says `[hooks]` replaced it (`DESIGN.md:343`) |
 | 27 | Bounded time, readable logs (R32) | **Yes** | Quick commands give up after 30 s with `no_answer` (`DESIGN.md:524-526`); `log`, `history`'s `log_tail`, and the event log on disk |
 
-**What already matches him:**
+**What already matches the style:**
 - Verbs at one level (R1).
 - Few flags (R5).
 - Errors that say what to do next (R18).
-- Exit codes beyond his 0/1/2, and documented, which he never does (R19).
-- Refusing a second daemon, his shoreman lesson (R20).
+- Exit codes beyond 0/1/2, and documented, which the guide's tools never do (R19).
+- Refusing a second daemon, the shoreman lesson (R20).
 - A clean stdout (R21).
 - `status`'s `actions` line (R23).
 - No prompts (R26).
@@ -60,21 +60,21 @@ grouped command help and the "only one daemon is running" fallback.
 
 ## Proposed changes
 
-The source column says whether a change follows the guide's practice or another tool's (`other`). The order is the
+The source column says whether a change follows the style guide (`style`) or another tool's practice (`other`). The order is the
 recommended order of work.
 
 | # | Change | Source | Size |
 |---|---|---|---|
-| C1 | Find the app from the current directory (user idea 1, below) | the guide R8, R9; other P12 | about 80 lines + unit tests |
-| C2 | `--manifest` also takes a bare name, plus `FAWKES_MANIFEST` (user idea 2) | the guide R6, R11; other P7 | about 20 lines |
-| C3 | Looser manifest defaults (user idea 6) | the guide R7 | about 30 lines + `DESIGN.md` |
-| C4 | Help text: one-line `--json`, help for `<REF>`/`<GEN>`, one-sentence abouts, examples in long help | the guide R3, R13, R14 | help strings only |
-| C5 | `fawkes --version` | the guide R16 | one attribute |
-| C6 | Say which manifest was picked, and by which rule | the guide R16; other P14 | a line in `status` and in discovery errors |
-| C7 | The binary installs its skill | the guide R28 | about 30 lines |
-| C8 | Write the additive-only promise for `--json` results into `DESIGN.md` | the guide R22 | one sentence |
-| C9 | Adopt the running version on the first daemon start (user idea 3) | the guide R27 | a phase of its own |
-| C10 | Show `[env: FAWKES_…]` next to the options | the guide R11; other P11 | clap's `env` feature, no new crate |
+| C1 | Find the app from the current directory (user idea 1, below) | style R8, R9; other P12 | about 80 lines + unit tests |
+| C2 | `--manifest` also takes a bare name, plus `FAWKES_MANIFEST` (user idea 2) | style R6, R11; other P7 | about 20 lines |
+| C3 | Looser manifest defaults (user idea 6) | style R7 | about 30 lines + `DESIGN.md` |
+| C4 | Help text: one-line `--json`, help for `<REF>`/`<GEN>`, one-sentence abouts, examples in long help | style R3, R13, R14 | help strings only |
+| C5 | `fawkes --version` | style R16 | one attribute |
+| C6 | Say which manifest was picked, and by which rule | style R16; other P14 | a line in `status` and in discovery errors |
+| C7 | The binary installs its skill | style R28 | about 30 lines |
+| C8 | Write the additive-only promise for `--json` results into `DESIGN.md` | style R22 | one sentence |
+| C9 | Adopt the running version on the first daemon start (user idea 3) | style R27 | a phase of its own |
+| C10 | Show `[env: FAWKES_…]` next to the options | style R11; other P11 | clap's `env` feature, no new crate |
 
 ### C4 in detail: what `--help` would look like
 
@@ -129,30 +129,30 @@ Examples:
 
 ### 1. Find the app's daemon from the current directory
 
-**Fits his style, with one change.** Walking up from the current directory to a project marker is what rye
+**Fits the style, with one change.** Walking up from the current directory to a project marker is what rye
 (`pyproject.toml`), sentry-cli (`.sentryclirc`), platter (`setup.py`) and gh-issue-sync (`.issues/`, stopping at
 `.git`) do (R8). rye, sentry-cli and platter walk all the way to `/`; only gh-issue-sync stops at the repository
 root. The side chat's order was `--socket`, `--manifest`, `FAWKES_SOCKET`, the current directory, `./fawkes.toml`,
-then "the only daemon running". In his terms:
+then "the only daemon running". In the guide's terms:
 
 1. `--socket`, then `--manifest` (a name or a path): the flag wins.
 2. `FAWKES_SOCKET`, then `FAWKES_MANIFEST` (C2): the environment comes next, and an app Fawkes runs keeps reaching
    its own daemon.
 3. **Walk up** from the current directory to the first `fawkes.toml`, stopping at the repository root (the `.git`).
-   The walk is his pattern, and the project carries its manifest. The stop at `.git` is gh-issue-sync's (and
+   The walk is the guide's pattern, and the project carries its manifest. The stop at `.git` is gh-issue-sync's (and
    just's `--ceiling`, P12, other), chosen so that a project nested in another never picks up the outer one's
    manifest. It replaces today's `./fawkes.toml`, which is the first step of that walk.
 
 **Steps 1 and 2 change today's contract.** Today `FAWKES_SOCKET` beats `--manifest` (`DESIGN.md:482-483`,
 `socket_path` in `src/main.rs:293-304`), so an inherited `FAWKES_SOCKET` silently overrides an explicit
-`--manifest`. Flag over environment is his rule (R8), and it fits Fawkes better: an app running under Fawkes that
+`--manifest`. Flag over environment is the guide's rule (R8), and it fits Fawkes better: an app running under Fawkes that
 names another app's manifest means that app. It needs a `DESIGN.md` change. A bare `confirm` must then use
 `FAWKES_GENERATION` only when the daemon it reaches is the caller's own, as `src/main.rs:228-232` already does for
 `--socket`.
 4. **Then the registry:** match the current directory against the `project`, else the `repo`, of each
-   `<fawkes_home>/*.toml`. He never does this reverse lookup, because his tools' configuration always lives in the
+   `<fawkes_home>/*.toml`. The guide's tools never do this reverse lookup, because their configuration always lives in the
    tree. Fawkes needs it for Ultimate hosts, whose manifests live in `~/.fawkes` and whose `repo` is the shared
-   Ultimate clone. It stays in his spirit as long as it is deterministic and refuses when it is ambiguous.
+   Ultimate clone. It stays in the style's spirit as long as it is deterministic and refuses when it is ambiguous.
 5. **Ambiguous: refuse, list the names, and say how to be explicit:** `error: ~/Code/ultimate matches the apps
    fawkes, xana; pass --manifest <name>` (R9, Flask's "Use '{module}:name' to specify the correct one").
 
@@ -168,25 +168,25 @@ win.
 
 ### 2. `--manifest` taking a bare name instead of an `--app` flag
 
-**Fits.** One flag whose value is read by its shape is his habit (R6): Flask's `FLASK_APP` takes `hello`,
+**Fits.** One flag whose value is read by its shape is the guide's habit (R6): Flask's `FLASK_APP` takes `hello`,
 `hello:app` or a path in one value, and systemfd's `-s` takes `TYPE::SPEC`. tmux splits the same idea into `-L name`
 and `-S path` (P7, other). Rule: a value with a `/` or ending in `.toml` is a path, anything else is
 `<fawkes_home>/<name>.toml`. Add `FAWKES_MANIFEST` with the same meaning (R11). It ranks below `FAWKES_SOCKET`,
 which Fawkes sets for its own children, so an inherited `FAWKES_MANIFEST` cannot pull an app's `fawkes confirm` to
 another daemon.
 
-On the name: he names a flag after a file when it takes a path (`--pyproject`, `--manifest-path`,
+On the name: the guide's tools name a flag after a file when it takes a path (`--pyproject`, `--manifest-path`,
 `--config-file`), and after the object when it takes a name (`--org`, `--project`, Flask's `--app`). A flag that
 takes both could be either. Keeping `--manifest` costs nothing, and renaming it would need a hidden alias forever
 (R31). Keep it.
 
 ### 3. `fawkes daemon` adopting the running version on first start
 
-**Fits.** This is his "bootstrap on first use" (R27): bare `rye` installs itself (`rye/rye/src/cli/mod.rs:105`), and
-idasen's client starts its daemon when none answers. Three details keep it in his style and inside Fawkes's
+**Fits.** This is the guide's "bootstrap on first use" (R27): bare `rye` installs itself (`rye/rye/src/cli/mod.rs:105`), and
+idasen's client starts its daemon when none answers. Three details keep it in the style and inside Fawkes's
 promise:
 
-- **Log it as its own event.** His tools say what they did automatically.
+- **Log it as its own event.** The guide's tools say what they did automatically.
 - **Only with an empty `state.json`.** It is first-use behaviour, never a fallback for a broken state.
 - **No flag to start with.** If an opt-out is ever needed, make it an environment variable like
   `RYE_NO_AUTO_INSTALL`, not a new flag (R5).
@@ -196,19 +196,19 @@ nothing new.
 
 ### 4. Setup through the Ultimate extension rather than `fawkes init`
 
-**Fits for Ultimate, and leaves room for `init` later.** His agent-era integrations configure themselves from the
+**Fits for Ultimate, and leaves room for `init` later.** Agent-era integrations configure themselves from the
 host they run in. pi-llamacpp and pi-ds4 start and configure their servers ("Most users do not need any
 configuration.", `pi-ds4/README.md:80`), so an extension that writes the manifest from what the host already knows
-is in that line. His tools that own files in a project also have an `init` (`rye init`, `gh-issue-sync init`,
+is in that line. Tools that own files in a project also have an `init` (`rye init`, `gh-issue-sync init`,
 `absurdctl init`; R27). For a generic app, a later `fawkes init` should write `./fawkes.toml` into the repository,
 because that is the file the walk-up in idea 1 finds. Together with looser defaults (idea 6), that file could be
 four lines. The extension first; `init` once a non-Ultimate app needs it.
 
 ### 5. Grouped help
 
-**Does not fit, and is not needed.** He groups options under headings (minijinja-cli's "Template Behavior",
+**Does not fit, and is not needed.** The guide's tools group options under headings (minijinja-cli's "Template Behavior",
 "Security", "Advanced"; R13) but never commands: rye lists 23 in one block and sentry-cli 24. When commands need
-structure he nests them (R1), and phase 12's `service` group does exactly that. clap 4.6.7 offers only one heading
+structure they nest them (R1), and phase 12's `service` group does exactly that. clap 4.6.7 offers only one heading
 for all subcommands (`Command::subcommand_help_heading`), so per-group headings would mean a hand-written help
 template kept in sync by hand. The real problem the side chat named, a page that does not fit on one screen, is the
 repeated `--json` paragraph and the long abouts. C4 fixes both, and the 15 commands, already in workflow order,
@@ -240,12 +240,12 @@ Each item is marked with its source.
 - **Not recommended:**
   - Output that changes when piped (P6, other): an agent would read something different from what a person sees.
     `--json` stays the explicit switch.
-  - gh's field-selected `--json` (P2, other): the documents are small, and his additive promise (C8) is simpler.
+  - gh's field-selected `--json` (P2, other): the documents are small, and the additive promise (C8) is simpler.
   - cargo's `--format-version` (P5, other): versioning only pays off once a field must change meaning. The additive
     promise avoids that.
   - A client that starts the daemon itself, as tmux and idasen do (P7): a supervisor must outlive its clients, and
     phase 12's service covers starting it.
-  - Prefix matching for commands (P7, other): his R10 forbids it.
+  - Prefix matching for commands (P7, other): R10 forbids it.
 - **Later, not proposed now:** a blocking wait for a generation's outcome (tmux's `wait-for`, P7, other). Today an
   agent watches `fawkes watch --json` or polls `status`.
 

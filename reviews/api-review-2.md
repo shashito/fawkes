@@ -1,7 +1,7 @@
 # Fawkes's API, second review
 
-This review runs [`docs/cli-style.md`](../docs/cli-style.md) (rules `R<n>`) and
-[`docs/cli-patterns-others.md`](../docs/cli-patterns-others.md) (patterns `P<n>`) against everything an agent or app
+This review runs the `cli-designer` skill's style guide (rules `R<n>`) and
+its patterns from other tools (patterns `P<n>`) against everything an agent or app
 talks to: the CLI, `--json`, the socket protocol, events, the manifest, the `FAWKES_*` environment and
 `skills/fawkes/SKILL.md`. It follows [`cli-api-review-1.md`](cli-api-review-1.md) and leaves out what branch
 #28950 is building from it (discovery, `--manifest <name>`, `FAWKES_MANIFEST`, `fawkes skill`, suggestions,
