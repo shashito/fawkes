@@ -1,4 +1,4 @@
-# The lander's checks (fmt, deny, clippy, test) through scripts/check, on macOS and Linux. release.yml runs them too,
+# The lander's checks (fmt, scripts, deny, clippy, test) through scripts/check, on macOS and Linux. release.yml runs them too,
 # before it builds.
 #
 # Left out: ultimate/check, the Ultimate extension's tests and type checks, which need a full Ultimate clone with its
@@ -39,5 +39,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny,shellcheck
+      # scripts/check skips its scripts step without actionlint. Its download script takes only an exact version.
+      - name: Install actionlint
+        run: |
+          bin=$RUNNER_TEMP/actionlint
+          mkdir -p "$bin"
+          curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash |
+            bash -s -- 1.7.12 "$bin"
+          echo "$bin" >>"$GITHUB_PATH"
       - run: scripts/check

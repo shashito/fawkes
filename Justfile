@@ -3,7 +3,7 @@
 default:
     @just --list
 
-# The lander's checks, in its order: fmt, deny, clippy, test. Prints only a failing step's output.
+# The lander's checks, in its order: fmt, scripts, deny, clippy, test. Prints only a failing step's output.
 check:
     scripts/check
 
@@ -22,6 +22,10 @@ fmt:
 # Clippy on every target, warnings as errors.
 lint:
     cargo clippy --all-targets -- -D warnings
+
+# shellcheck on every shell script, found by its shebang, and actionlint on the workflows.
+lint-scripts:
+    scripts/lint
 
 # Licences and advisories of the dependencies, against deny.toml.
 deny:

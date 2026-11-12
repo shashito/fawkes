@@ -151,8 +151,9 @@ Ultimate, never on a live install. The tests pass on macOS and Linux.
 ## Development
 
 ```bash
-scripts/check           # cargo fmt, cargo deny, cargo clippy and cargo test, as every landing runs them
+scripts/check           # cargo fmt, scripts/lint, cargo deny, cargo clippy and cargo test, as every landing runs them
 scripts/check --only X  # fmt, clippy and the one test X
+scripts/lint            # shellcheck on the shell scripts and actionlint on the workflows
 scripts/package T       # the release archive of target T, in dist/
 ```
 

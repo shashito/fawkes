@@ -15,7 +15,8 @@ cargo test
 ```
 
 All three are clean on `main`. Treat any warning or failure as yours: don't assume it was already there.
-`scripts/check` runs these and `cargo deny check` in the lander's order, keeps cargo's exit code and prints only a
+`scripts/check` runs these, `cargo deny check` and `scripts/lint` (shellcheck on every shell script, actionlint on
+the workflows; skipped without the tools) in the lander's order, keeps cargo's exit code and prints only a
 failing step's output; `scripts/check --only <test>` runs fmt, clippy and one test.
 
 - Run the narrowest test first (`cargo test --test core <name>`, `cargo test watch::`), then the whole suite.
@@ -95,7 +96,7 @@ not built yet. Don't start one unless asked.
 
 `DESIGN.md` → Releases is the contract for the archives and `install.sh`. Never push a tag or create a release: the
 user does. Check `install.sh` against `scripts/package` output with `FAWKES_DOWNLOAD_URL=file://$PWD/dist` and a
-`HOME` under `/tmp`, and the workflows with `actionlint`.
+`HOME` under `/tmp`.
 
 ## Dependencies
 

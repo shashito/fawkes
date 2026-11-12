@@ -1,0 +1,21 @@
+#!/bin/sh
+# Lint the shell scripts and the workflows: shellcheck on every file in the checkout that starts with a sh, bash,
+# dash or ksh shebang (most have no .sh extension), and actionlint on .github/workflows, which also runs shellcheck
+# on the workflows' run steps.
+#
+# The scripts are found with find, not git ls-files: under act (`just ci`) a worktree's .git points outside the
+# container. The pruned folders are the ones .gitignore names, and node_modules.
+
+set -eu
+# shellcheck disable=SC3040 # pipefail only where the shell has it
+if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
+
+cd "$(dirname "$0")/.."
+
+find . \( -name .git -o -name node_modules -o -path ./target -o -path ./dist -o -path ./examples/sample/sample-home \) \
+	-prune -o -type f -print | while IFS= read -r file; do
+	if head -n 1 "$file" | grep -Eq '^#!.*[/ ](ba|da|k)?sh( |$)'; then
+		printf '%s\n' "${file#./}"
+	fi
+done | tr '\n' '\0' | xargs -0 shellcheck
+actionlint
