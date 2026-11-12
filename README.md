@@ -139,5 +139,8 @@ scripts/check           # cargo fmt, cargo deny, cargo clippy and cargo test, as
 scripts/check --only X  # fmt, clippy and the one test X
 ```
 
+`just` lists the [Justfile](Justfile)'s shortcuts for these and other steps, among them `just ci`, the Linux CI job under
+[act](https://github.com/nektos/act).
+
 `cargo deny` comes from `brew install cargo-deny`. The integration tests run the sample app in `examples/sample`, so
 they need `git` and Node.js 22.13 or later. They run in parallel, each in its own `/tmp/fk<port>` with its own ports.
