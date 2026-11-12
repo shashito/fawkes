@@ -6,12 +6,15 @@
 
 use super::transactions::{check_abandon, check_prune, check_rollback, check_switch, check_test};
 use super::{App, Daemon, Inner, LOG_BYTES, Live, Slot, Why, tenths};
+use crate::manifest::Check;
 use crate::process;
 use crate::protocol::{
     DaemonAction, ErrorCode, EventKind, Facts, History, HistoryEntry, LastExit, Out, Process,
-    ProcessState, R, RollbackCause, Status, err, not_found,
+    ProcessState, R, ReportResult, RollbackCause, Status, err, invalid_state, not_found,
 };
+use crate::render::{render_info, render_up_block};
 use crate::state::{Txn, format_time, now_secs, parse_time, with_suffix};
+use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::DirBuilderExt;
@@ -437,6 +440,10 @@ impl Daemon {
         // generation that gives up is rolled back by the supervisor without waiting for its deadline. The thread
         // takes only what it reads, so a manifest replaced by a reload is not kept alive for the whole check.
         let check = m.health_check(&vars);
+        let health_url = match &check {
+            Check::Url(url) => Some(url.clone()),
+            Check::Command(_) => None,
+        };
         let (interval, timeout, roll_back) =
             (m.health.interval, m.health.timeout, m.rollback_on_unhealthy);
         let code = vars.code;
@@ -455,6 +462,7 @@ impl Daemon {
             match result {
                 Ok(()) => {
                     daemon.event(EventKind::Healthy, Some(&id), "health check passed");
+                    daemon.announce(pid, &id, health_url.as_deref());
                 }
                 Err(e) if daemon.judge_unhealthy(&id, pid, roll_back) => {
                     daemon.event(EventKind::Unhealthy, Some(&id), e);
@@ -494,6 +502,55 @@ impl Daemon {
         inner.live = Live::Failed;
         self.event(EventKind::Failed, Some(id), e.message);
         false
+    }
+
+    /// Tell the terminal `up` runs in where the app is, once process `pid` of generation `id` is healthy and still the
+    /// live one. For the operator only, so it goes to stderr and not to the event log.
+    fn announce(&self, pid: u32, id: &str, health_url: Option<&str>) {
+        let status = self.status();
+        if status.process.pid == Some(pid) {
+            self.echo(render_up_block(
+                &status,
+                &self.paths.app_log(id),
+                health_url,
+            ));
+        }
+    }
+
+    /// `report`: the live app, running now as generation `generation`, replaces the info it has told about itself. It
+    /// is the daemon's only answer to an app that is not the live one (a test run, a generation that was switched
+    /// away, an app that has stopped). The info is logged only when it changed, so a retry is silent.
+    pub(super) fn report(
+        &self,
+        generation: &str,
+        info: BTreeMap<String, String>,
+    ) -> R<ReportResult> {
+        let mut inner = self.inner();
+        let Some(app) = inner
+            .running_mut()
+            .filter(|app| app.generation == generation)
+        else {
+            let runs = inner.running().map_or_else(
+                || "nothing runs right now".to_string(),
+                |app| format!("{} runs", app.generation),
+            );
+            return Err(invalid_state(format!(
+                "only the running live app reports, and {runs}, not {generation}"
+            )));
+        };
+        if app.info != info {
+            app.info = info.clone();
+            self.event_with(
+                EventKind::Reported,
+                Some(generation),
+                render_info(&info),
+                Facts {
+                    info: Some(info.clone()),
+                    ..Facts::default()
+                },
+            );
+        }
+        Ok(ReportResult { info })
     }
 
     /// Whether process `pid` of generation `id` is still the live one when its health check gives up, i.e. whether
@@ -568,13 +625,14 @@ impl Daemon {
     }
 
     pub(super) fn process(&self, inner: &Inner) -> Process {
-        let (state, generation, pid, started_at, uptime) = match &inner.live {
+        let (state, generation, pid, started_at, uptime, info) = match &inner.live {
             Live::Running(app) => (
                 ProcessState::Running,
                 Some(app.generation.clone()),
                 Some(app.child.id()),
                 Some(app.started_at.clone()),
                 Some(tenths(app.started.elapsed())),
+                app.info.clone(),
             ),
             Live::Stopped | Live::Backoff { .. } | Live::Failed => (
                 if matches!(inner.live, Live::Failed) {
@@ -586,6 +644,7 @@ impl Daemon {
                 None,
                 None,
                 None,
+                BTreeMap::new(),
             ),
         };
         Process {
@@ -601,6 +660,7 @@ impl Daemon {
                 Live::Backoff { at, .. } => Some(at.clone()),
                 _ => None,
             },
+            info,
         }
     }
 

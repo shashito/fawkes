@@ -236,6 +236,7 @@ impl Daemon {
             }
             Request::Status => Ok(self.status().into()),
             Request::History => Ok(self.history().into()),
+            Request::Report { generation, info } => self.report(&generation, info).map(Reply::from),
             Request::Log {
                 limit,
                 since,
@@ -306,7 +307,8 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::scratch_daemon;
+    use super::super::tests::{KillOnDrop, scratch_daemon};
+    use super::super::{App, Live};
     use super::*;
     use crate::protocol::Line;
     use std::io::{BufRead, BufReader, Write};
@@ -344,6 +346,108 @@ mod tests {
 
         let status = answer(&daemon, b"{\"command\":\"status\"}\n".to_vec());
         assert!(matches!(status, Line::Done { .. }), "{status:?}");
+    }
+
+    fn report_line(generation: &str, info: &str) -> Vec<u8> {
+        format!(r#"{{"command":"report","args":{{"generation":"{generation}","info":{info}}}}}"#)
+            .into_bytes()
+            .into_iter()
+            .chain(*b"\n")
+            .collect()
+    }
+
+    fn reported_events(daemon: &Daemon) -> Vec<String> {
+        lock(&daemon.log)
+            .replay(Some(0), None)
+            .into_iter()
+            .filter(|event| event.kind == EventKind::Reported)
+            .map(|event| event.message)
+            .collect()
+    }
+
+    #[test]
+    fn only_the_running_live_app_reports_and_what_it_reports_is_checked_and_logged_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(scratch_daemon(temp.path()));
+        let refused = |line: Line| match line {
+            Line::Failed { error, .. } => error,
+            other => panic!("expected a failure, got {other:?}"),
+        };
+        let info = r#"{"url":"http://127.0.0.1:4790","log":"/p/supervisor.log"}"#;
+
+        let nothing = refused(answer(&daemon, report_line("g2", info)));
+        assert_eq!(nothing.code, ErrorCode::InvalidState);
+        assert!(
+            nothing.message.contains("nothing runs"),
+            "{}",
+            nothing.message
+        );
+
+        let sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let _reaper = KillOnDrop(sleeper.id());
+        daemon.inner().live = Live::Running(App::new(sleeper, "g2"));
+
+        // A test run's generation, or one that was switched away from, is not the one that runs.
+        let other = refused(answer(&daemon, report_line("g3", info)));
+        assert_eq!(other.code, ErrorCode::InvalidState);
+        assert!(
+            other.message.contains("g2 runs, not g3"),
+            "{}",
+            other.message
+        );
+        assert!(daemon.status().process.info.is_empty());
+
+        // Refused before anything changes.
+        let nine = (0..9)
+            .map(|i| format!(r#""k{i}":"v""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        for bad in [
+            format!("{{{nine}}}"),
+            r#"{"url":"http://x\u001b[2J"}"#.into(),
+            r#"{"URL":"http://x"}"#.into(),
+            r#"{"url":""}"#.into(),
+        ] {
+            let error = refused(answer(&daemon, report_line("g2", &bad)));
+            assert_eq!(error.code, ErrorCode::Usage, "{bad}");
+        }
+        assert!(daemon.status().process.info.is_empty());
+        assert_eq!(reported_events(&daemon), Vec::<String>::new());
+
+        let Line::Done { result, .. } = answer(&daemon, report_line("g2", info)) else {
+            panic!("the running app's report is accepted");
+        };
+        assert_eq!(
+            result,
+            serde_json::json!({"info": {"url": "http://127.0.0.1:4790", "log": "/p/supervisor.log"}})
+        );
+        assert_eq!(daemon.status().process.info.len(), 2);
+        // A retry changes nothing and says nothing.
+        answer(&daemon, report_line("g2", info));
+        assert_eq!(
+            reported_events(&daemon),
+            ["url http://127.0.0.1:4790 · log /p/supervisor.log"]
+        );
+        // Each report replaces the whole info.
+        answer(
+            &daemon,
+            report_line("g2", r#"{"url":"http://127.0.0.1:1"}"#),
+        );
+        assert_eq!(daemon.status().process.info.len(), 1);
+        answer(&daemon, report_line("g2", "{}"));
+        assert_eq!(reported_events(&daemon).len(), 3);
+        assert_eq!(reported_events(&daemon)[2], "info cleared");
+        let facts = lock(&daemon.log).replay(None, Some(1)).remove(0).facts;
+        assert_eq!(facts.info, Some(std::collections::BTreeMap::new()));
+
+        // The info belongs to the process: the next app starts with none.
+        answer(&daemon, report_line("g2", info));
+        let app = daemon.inner().take_running().unwrap();
+        daemon.inner().live = Live::Running(App::new(app.child, "g2"));
+        assert!(daemon.status().process.info.is_empty());
     }
 
     #[test]

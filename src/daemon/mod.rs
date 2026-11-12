@@ -27,10 +27,12 @@ use crate::protocol::{
     DaemonAction, DownResult, Error, ErrorCode, Event, EventKind, Facts, LastExit, Out, Pending, R,
     ReloadResult, RollbackCause, err,
 };
+use crate::render::render_event;
 use crate::state::{EventLog, Paths, State, Store, Txn, Unchanged, now, parse_time, with_suffix};
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{FlockOperation, flock};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
@@ -62,6 +64,9 @@ struct App {
     generation: String,
     started: Instant,
     started_at: String,
+    /// What this process reported about itself (`report`). Kept here, not in `State`, so it ends with the process: a
+    /// restarted or switched app starts with none.
+    info: BTreeMap<String, String>,
 }
 
 impl App {
@@ -71,6 +76,7 @@ impl App {
             generation: generation.into(),
             started: Instant::now(),
             started_at: now(),
+            info: BTreeMap::new(),
         }
     }
 
@@ -1053,13 +1059,7 @@ impl Daemon {
             let event = log.append(event);
             self.broadcast(&Msg::Event(event.clone()));
             if let Some(echo) = lock(&self.echo).as_ref() {
-                echo.line(format!(
-                    "{} {} {} {}",
-                    event.at,
-                    event.kind.as_str(),
-                    event.generation.as_deref().unwrap_or("-"),
-                    event.message
-                ));
+                echo.line(render_event(&event));
             }
             event
         };
@@ -1067,6 +1067,13 @@ impl Daemon {
             self.changed();
         }
         event
+    }
+
+    /// Text for whoever watches the terminal `up` runs in, and for no one else: not the event log, not subscribers.
+    fn echo(&self, text: String) {
+        if let Some(echo) = lock(&self.echo).as_ref() {
+            echo.line(text);
+        }
     }
 
     /// An `error` event for a failure that has an `ErrorCode`, which it carries as `error_code`.

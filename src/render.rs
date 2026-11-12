@@ -3,9 +3,11 @@
 
 use crate::protocol::{
     DownResult, Event, Events, GenState, Generation, History, Process, ProcessState, PruneResult,
-    ReloadResult, Request, RollbackResult, StageResult, Status, Step, SwitchResult,
+    ReloadResult, ReportResult, Request, RollbackResult, StageResult, Status, Step, SwitchResult,
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 /// An optional field as text: `-` for null.
 fn or_dash(value: Option<impl std::fmt::Display>) -> String {
@@ -28,6 +30,79 @@ pub fn render_event(event: &Event) -> String {
         or_dash(event.generation.as_deref()),
         event.message
     )
+}
+
+/// An app's info in the order people read it: `url` first, then the rest by key.
+fn ordered_info(info: &BTreeMap<String, String>) -> Vec<(&str, &str)> {
+    info.get_key_value("url")
+        .into_iter()
+        .chain(info.iter().filter(|(key, _)| key.as_str() != "url"))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+/// The message of a `reported` event: the info as `key value` pairs.
+pub fn render_info(info: &BTreeMap<String, String>) -> String {
+    if info.is_empty() {
+        return "info cleared".into();
+    }
+    ordered_info(info)
+        .iter()
+        .map(|(key, value)| format!("{key} {value}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// `rows` as lines of `indent`, label and value, the values in one column at least `min_width` wide.
+fn aligned_rows(rows: &[(&str, &str)], indent: &str, min_width: usize) -> Vec<String> {
+    let width = rows
+        .iter()
+        .map(|(label, _)| label.len() + 1)
+        .fold(min_width, usize::max);
+    rows.iter()
+        .map(|(label, value)| format!("{indent}{label:<width$}{value}"))
+        .collect()
+}
+
+/// What `up` prints to its terminal after the live app turned healthy, so the operator sees where it is. Framed by a
+/// blank line on each side, as one line of the daemon's stderr writer. `health_url` is the manifest's expanded health
+/// URL when it checks one, the app's address when it reports none of its own.
+pub fn render_up_block(s: &Status, app_log: &Path, health_url: Option<&str>) -> String {
+    let generation = s.process.generation.as_deref();
+    let standing = match s.awaiting_confirm() {
+        Some(pending) if Some(pending.generation.as_str()) == generation => {
+            format!("pending, confirm by {}", pending.deadline)
+        }
+        _ => "permanent".into(),
+    };
+    let info = ordered_info(&s.process.info);
+    let url = info
+        .iter()
+        .find(|(key, _)| *key == "url")
+        .map(|(_, value)| *value)
+        .or(health_url);
+    let app_log = app_log.display().to_string();
+    let state_dir = s.state_dir.display().to_string();
+    let manifest = s.manifest.display();
+    let next = format!(
+        "fawkes status --manifest {manifest} · fawkes watch · fawkes down --manifest {manifest}"
+    );
+    let mut rows: Vec<(&str, &str)> = url.map(|url| ("url", url)).into_iter().collect();
+    rows.extend(info.iter().filter(|(key, _)| *key != "url"));
+    rows.extend([
+        ("output", app_log.as_str()),
+        ("state", state_dir.as_str()),
+        ("next", next.as_str()),
+    ]);
+    let header = format!(
+        "{}  {} {standing} · pid {} · port {}",
+        s.name,
+        or_dash(generation),
+        or_dash(s.process.pid),
+        s.process.port
+    );
+    let lines = std::iter::once(header).chain(aligned_rows(&rows, "  ", 9));
+    format!("\n{}\n", lines.collect::<Vec<_>>().join("\n"))
 }
 
 fn render_generation(g: &Generation) -> String {
@@ -53,6 +128,9 @@ fn render_process(p: &Process) -> String {
     line = format!("{line}  restarts {}", p.restarts);
     if let Some(at) = &p.restart_at {
         line = format!("{line}  restart at {at}");
+    }
+    for row in aligned_rows(&ordered_info(&p.info), "  ", 8) {
+        line = format!("{line}\n{row}");
     }
     if let Some(exit) = &p.last_exit {
         let who = if exit.requested {
@@ -231,6 +309,14 @@ pub fn render_result(request: &Request, result: &Value) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }),
+        Request::Report { generation, .. } => typed(result, |r: ReportResult| {
+            if r.info.is_empty() {
+                format!("cleared the info of {generation}")
+            } else {
+                let keys: Vec<_> = ordered_info(&r.info).iter().map(|(key, _)| *key).collect();
+                format!("reported {} for {generation}", keys.join(", "))
+            }
+        }),
         Request::Reload => typed(result, |r: ReloadResult| {
             if r.changed.is_empty() {
                 "reloaded the manifest; nothing changed".into()
@@ -284,6 +370,7 @@ mod tests {
                 restarts: 0,
                 last_exit: None,
                 restart_at: None,
+                info: BTreeMap::new(),
             },
         }
     }
@@ -331,6 +418,105 @@ mod tests {
         );
     }
 
+    fn info(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_info_of_an_app_reads_url_first_then_by_key() {
+        let both = info(&[
+            ("remote", "https://r"),
+            ("log", "/p/l"),
+            ("url", "http://u"),
+        ]);
+        assert_eq!(
+            render_info(&both),
+            "url http://u · log /p/l · remote https://r"
+        );
+        assert_eq!(render_info(&info(&[("log", "/p/l")])), "log /p/l");
+        assert_eq!(render_info(&BTreeMap::new()), "info cleared");
+
+        let mut status = status_in(None, false);
+        status.process.info = both;
+        let text = render_status(&status);
+        assert!(
+            text.contains("restarts 0\n  url     http://u\n  log     /p/l\n  remote  https://r\n"),
+            "{text}"
+        );
+
+        let cleared = render_result(
+            &Request::Report {
+                generation: "g3".into(),
+                info: BTreeMap::new(),
+            },
+            &serde_json::json!({"info": {}}),
+        );
+        assert_eq!(cleared, "cleared the info of g3");
+    }
+
+    fn running_status(pending: bool) -> Status {
+        let mut status = status_in(pending.then_some(Step::Pending), pending);
+        status.name = "xana".into();
+        status.manifest = "/h/xana.toml".into();
+        status.state_dir = "/h/xana".into();
+        status.process.state = ProcessState::Running;
+        status.process.generation = Some("g3".into());
+        status.process.pid = Some(71568);
+        status.process.port = 4749;
+        if let Some(p) = status.pending.as_mut() {
+            p.generation = "g3".into();
+        }
+        status
+    }
+
+    #[test]
+    fn the_block_up_prints_says_where_the_app_is() {
+        let log = Path::new("/h/xana/generations/g3/logs/app.log");
+        let mut status = running_status(false);
+        status.process.info = info(&[
+            ("url", "http://127.0.0.1:4749"),
+            ("remote", "https://xana.ts.net:4749"),
+            ("log", "/p/supervisor.log"),
+        ]);
+        assert_eq!(
+            render_up_block(&status, log, Some("http://127.0.0.1:4749/health")),
+            "\nxana  g3 permanent · pid 71568 · port 4749\n\
+             \x20 url      http://127.0.0.1:4749\n\
+             \x20 log      /p/supervisor.log\n\
+             \x20 remote   https://xana.ts.net:4749\n\
+             \x20 output   /h/xana/generations/g3/logs/app.log\n\
+             \x20 state    /h/xana\n\
+             \x20 next     fawkes status --manifest /h/xana.toml · fawkes watch · fawkes down --manifest /h/xana.toml\n"
+        );
+
+        // Nothing reported: the health URL is the address, and it is the only row that is guessed.
+        let bare = render_up_block(&running_status(false), log, Some("http://127.0.0.1:4749/"));
+        assert!(
+            bare.contains("\n  url      http://127.0.0.1:4749/\n  output   "),
+            "{bare}"
+        );
+        // No URL anywhere: no row, not an empty one.
+        let none = render_up_block(&running_status(false), log, None);
+        assert!(!none.contains("url"), "{none}");
+        assert!(none.contains("\n  output   /h/xana/generations/g3/logs/app.log\n"));
+
+        // A switch that still awaits its confirm says so, with the time it is due by.
+        let pending = render_up_block(&running_status(true), log, None);
+        assert!(
+            pending.starts_with(
+                "\nxana  g3 pending, confirm by 2030-01-01T00:00:00Z · pid 71568 · port 4749\n"
+            ),
+            "{pending}"
+        );
+        // A rollback decided on it does not.
+        let mut rolling_back = running_status(true);
+        rolling_back.step = Some(Step::RollingBack);
+        assert!(render_up_block(&rolling_back, log, None).contains("g3 permanent"));
+    }
+
     fn generation(id: &str, state: &str, reason: Option<&str>) -> Value {
         serde_json::json!({
             "id": id, "ref": "main", "commit": "0123456789abcdef", "state": state, "dir": "/w/g",
@@ -366,6 +552,7 @@ mod tests {
             Request::Subscribe { .. } => 12,
             Request::Reload => 13,
             Request::Down => 14,
+            Request::Report { .. } => 15,
         }
     }
 
@@ -483,6 +670,14 @@ mod tests {
                 Request::Reload,
                 serde_json::json!({"changed": ["port", "env"]}),
                 vec!["reloaded the manifest; changed: port, env"],
+            ),
+            (
+                Request::Report {
+                    generation: g("g3"),
+                    info: BTreeMap::new(),
+                },
+                serde_json::json!({"info": {"log": "/p/x.log", "url": "http://x"}}),
+                vec!["reported url, log for g3"],
             ),
             (
                 Request::Down,

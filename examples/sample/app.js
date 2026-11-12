@@ -15,8 +15,12 @@
 //   unhealthy-live     when live, answers every request with 500 and never confirms (it passes its test)
 //   slow-stop          like confirm, but takes 1.5 s to exit on SIGTERM
 //   slow-stop-never    like never, but takes 1.5 s to exit on SIGTERM
+//
+// With $SAMPLE_REPORT set, the live app reports its URL to the daemon (`report` over $FAWKES_SOCKET) before it
+// listens, so `status` and the block `fawkes up` prints have it by the time the health check passes.
 const { DatabaseSync } = require('node:sqlite');
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
@@ -50,7 +54,18 @@ const server = http.createServer((req, res) => {
   if (mode === 'unhealthy-live' && phase === 'live') res.statusCode = 500;
   res.end(version);
 });
-server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
+// Calls `then` once the daemon has answered the report, or at once when this run does not report.
+const report = (then) => {
+  if (!process.env.SAMPLE_REPORT || phase !== 'live') return then();
+  const request = { command: 'report', args: { generation: process.env.FAWKES_GENERATION, info: { url: `http://127.0.0.1:${process.env.APP_PORT}` } } };
+  const socket = net.createConnection(process.env.FAWKES_SOCKET, () => socket.write(`${JSON.stringify(request)}\n`));
+  // The daemon closes the connection after its answer; the answer itself is read and dropped.
+  socket.resume();
+  socket.on('close', then);
+  socket.on('error', () => {});
+};
+
+report(() => server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
   console.log(`${version} listening on ${process.env.APP_PORT} (${phase})`);
   if (['confirm', 'slow-stop'].includes(mode) && phase === 'live') {
     // FAWKES_BIN, FAWKES_SOCKET and FAWKES_GENERATION are in our environment. Nothing is pending when this
@@ -60,7 +75,7 @@ server.listen(Number(process.env.APP_PORT), '127.0.0.1', () => {
   if (mode === 'confirm-always') {
     spawnSync('/bin/sh', ['-c', '"$FAWKES_BIN" --json confirm > confirm.json'], { cwd: __dirname, stdio: 'inherit' });
   }
-});
+}));
 
 process.on('SIGTERM', () => {
   setTimeout(() => {

@@ -320,7 +320,7 @@ fn a_failed_adoption_ends_the_daemon_and_starts_nothing() {
             ),
         "{stderr}"
     );
-    assert!(stderr.contains(" daemon - stopped"), "{stderr}");
+    assert!(stderr.contains("  daemon      -    stopped"), "{stderr}");
 
     assert!(h.get().is_none(), "something serves the live port");
     let state: Value =
@@ -3674,4 +3674,77 @@ fn service_is_refused_without_launchd() {
             "{message}"
         );
     }
+}
+
+/// An app that reports where it is (the sample does with `SAMPLE_REPORT`) has it in `status`, in one `reported` event,
+/// and in the block `up` prints to its stderr once the app is healthy, under the aligned event lines.
+#[test]
+fn the_live_app_reports_its_url_and_up_prints_where_it_is() {
+    let mut h = Harness::new("");
+    h.edit_manifest(
+        r#"APP_HOME = "{home}""#,
+        "APP_HOME = \"{home}\"\nSAMPLE_REPORT = \"1\"",
+    );
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+
+    let url = format!("http://127.0.0.1:{}", h.port);
+    assert_eq!(
+        h.status()["process"]["info"],
+        serde_json::json!({ "url": url })
+    );
+    let reported = events_of(&h, "reported", "g1");
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported[0]["message"], format!("url {url}"));
+    assert_eq!(reported[0]["info"], serde_json::json!({ "url": url }));
+
+    // The block follows the `healthy` event on the daemon's stderr (`daemon.log` here), and so does nothing else.
+    h.wait("the block on the daemon's stderr", 10, || {
+        h.daemon_log().contains("\n  next     ")
+    });
+    let log = h.daemon_log();
+    let block = log.split("\n\n").find(|b| b.contains("\n  next ")).unwrap();
+    // The resolved directory (`/private/tmp` for `/tmp` on macOS), as status names it.
+    let state = std::path::PathBuf::from(h.status()["state_dir"].as_str().unwrap());
+    let lines: Vec<&str> = block.lines().collect();
+    // Still awaiting its confirm or already permanent: the confirm races the block.
+    assert!(
+        lines[0].starts_with("t  g1 pending, confirm by ")
+            || lines[0].starts_with("t  g1 permanent ·"),
+        "{block}"
+    );
+    assert!(
+        lines[0].ends_with(&format!(" · port {}", h.port)) && lines[0].contains(" · pid "),
+        "{block}"
+    );
+    assert!(
+        lines.contains(&format!("  url      {url}").as_str()),
+        "{block}"
+    );
+    assert!(
+        lines.contains(
+            &format!(
+                "  output   {}",
+                state.join("generations/g1/logs/app.log").display()
+            )
+            .as_str()
+        ),
+        "{block}"
+    );
+    assert!(
+        lines.contains(&format!("  state    {}", state.display()).as_str()),
+        "{block}"
+    );
+    // The event lines read like `fawkes log`: the kind and the generation in columns.
+    assert!(
+        log.contains(&format!("  reported    g1   url {url}")),
+        "{log}"
+    );
+    // The block is not an event.
+    assert!(
+        !h.ok(&["log", "-n", "1000"])
+            .to_string()
+            .contains("output   ")
+    );
 }

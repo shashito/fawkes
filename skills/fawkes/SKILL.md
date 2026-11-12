@@ -30,8 +30,9 @@ they run. Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no da
   `switched` has `previous` and `deadline`; `exited` has `code`, `signal` and `restart_at`; `tested` and
   `test_failed` have `port` and `seconds`; `confirmed` has `named`; `adopted` (a first daemon start made its tested
   HEAD permanent, with no switch and no confirm) has none; `rolled_back` has `to`, `reason`, `cause` and
-  `storage` (`restored`, `kept`, `restore_failed`, `none`); `pruned` has `removed`; `error` has `error_code`; `daemon`
-  has `action` (`started`, `stopped`, `reloaded`, `cleaned_up`, `switch_cut_short`, `deferred`, `adopting`).
+  `storage` (`restored`, `kept`, `restore_failed`, `none`); `pruned` has `removed`; `reported` has `info` (see
+  below); `error` has `error_code`; `daemon` has `action` (`started`, `stopped`, `reloaded`, `cleaned_up`,
+  `switch_cut_short`, `deferred`, `adopting`).
 
 A result only ever gains fields, and an enumeration may gain values: ignore the fields you do not know, and treat a
 value you do not know as "something else happened". `fawkes skill` prints this file as built into the binary you run.
@@ -83,6 +84,22 @@ restart`) as the permanent generation needs no confirm.
 Hold back work with effects outside your storage (scheduled tasks, outgoing messages, migrations of anything the
 hooks do not copy) until the confirm has answered ok: until then a rollback can still undo your storage, but not those
 effects.
+
+## Say where you are: `report`
+
+The live app may tell the operator where it is, which Fawkes cannot know: a few named lines, such as `url` (where it
+listens), `remote` or `log`. It is a socket request, not a CLI command: write one JSON line to `$FAWKES_SOCKET` and read
+the answer.
+
+```json
+{"command": "report", "args": {"generation": "<$FAWKES_GENERATION>", "info": {"url": "http://127.0.0.1:4749"}}}
+```
+
+Only the live app that runs now is heard (`invalid_state` otherwise, so never from a test run). At most 8 keys, each
+`[a-z][a-z0-9_]{0,15}`, each value 1 to 256 characters without control characters, else `usage`. Every report replaces
+the whole info, so report everything each time and retry freely. The info ends with your process; report again after
+each start. Read it from `status` → `process.info` (`{}` when none); a change is a `reported` event, and `fawkes up`
+prints it in the block it shows after every healthy start.
 
 ## Upgrade
 

@@ -26,7 +26,7 @@ lifecycle commands exclude each other and a switch or rollback, and get `busy` w
 `stage`, `test` or `prune` never delays them, and an automatic rollback never waits for a stage or test (it runs
 beside them; a `switch` or `rollback` asked meanwhile gets `busy` from the stage or test). When both slots are
 taken, `busy` names the step in the step slot first, and the live slot's step otherwise. `status`, `log`, `history`,
-`reload` and `confirm` are always answered.
+`reload`, `confirm` and `report` are always answered.
 
 The daemon is a few threads and no async runtime: one accepts clients, one per client answers it, one supervises
 the app, one per running child waits for its exit, and short-lived ones run health checks and read a step's output.
@@ -42,6 +42,31 @@ daemon, and lines it cannot take are dropped. `events.jsonl` is the record. When
 (the same file, as a launchd service's is), the thread that writes it keeps it under 10 MiB: past that it copies the
 file to `daemon.log.1` (replacing the one before) and empties it, between two lines, so none is lost. Whoever starts
 the daemon decides where stderr goes; the daemon only looks at what it is.
+
+The lines are aligned as `fawkes log` prints them (time, kind and generation in columns, then the message). After every
+healthy start of the live app (the `healthy` event: the daemon's start, a crash restart, a switch, a rollback, an
+adoption), if that process is still the running live app, the daemon also writes a block to stderr, so whoever ran
+`fawkes up` sees where the app is. The block is not an event: it is neither in `events.jsonl` nor sent to
+subscribers, and under `fawkes service` it is in `daemon.log` with the rest of stderr.
+
+```text
+
+xana  g3 permanent · pid 71568 · port 4749
+  url      http://127.0.0.1:4749
+  log      /Users/me/.ultimate/projects/xana-1a2b/supervisor.log
+  remote   https://xana.tail1234.ts.net:4749
+  output   /Users/me/.fawkes/xana/generations/g3/logs/app.log
+  state    /Users/me/.fawkes/xana
+  next     fawkes status --manifest /Users/me/.fawkes/xana.toml · fawkes watch · fawkes down --manifest /Users/me/.fawkes/xana.toml
+
+```
+
+The header has the app's name, the generation with `permanent` or, while it awaits its confirm, `pending, confirm by
+<deadline>`, the pid and the port. The rows are `url` (what the app reported, else the manifest's health URL when the
+health check is a URL, else no row), the other things the app reported, by key (Report), then what Fawkes knows:
+`output` (the generation's `logs/app.log`), `state` (the state directory) and `next` (commands that work from any
+terminal, naming the manifest by its path as the text of `down` does). Labels share one column. What the app reported
+before its health check passed is in the block; a later report shows only as its `reported` event.
 
 Signals are only for the daemon's lifecycle: `fawkes down`, `SIGTERM` and `SIGINT` stop the live app and exit 0 (the
 generation keeps its state, so the next start resumes it), `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
@@ -836,6 +861,7 @@ Results per command:
 | `status` | — | see below |
 | `log` | `limit?` (default 20 without `since`, at most the 1000 newest), `since?` (a `seq`: the events after it still kept, the newest `limit` of them when both are given; ignored as `subscribe` ignores it; a daemon older than `since` ignores the argument and answers the newest 20), `follow?` | `events`, oldest first; with `follow` the daemon instead sends the same events and then every new one as `event` lines until the client closes or the daemon ends the stream with a `result` of null |
 | `history` | — | `generations`, oldest first, each the generation record plus `log_tail`; `failed_install_tail` |
+| `report` | `generation`, `info` | `info`: what the daemon now holds for the app; see Report below |
 | `reload` | — | `changed`: the manifest fields that changed, empty when none; the manifest is read again as for `SIGHUP` (see Process model), and a refusal is `usage` (invalid manifest) or `invalid_state` (a field that cannot change now) |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
 | `down` | — | `name`, `daemon_pid`, `stopped` (the generation whose app it stopped, `null` when none ran); sent once the daemon has stopped the app as for `SIGTERM` and let go of its socket, `run/` link and state lock, just before it exits 0 |
@@ -876,6 +902,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `adopted` | a first daemon start made its tested HEAD permanent without a switch (Adopt) | the generation adopted |
 | `rolled_back` | a rollback ended: normally, or with its restore failed, with `state.json` unwritable, or with the restore given up by `--keep-storage`; the message says which | the generation rolled back (not the one that runs now) |
 | `pruned` | `prune` removed at least one generation; the message lists them | `null` |
+| `reported` | the live app reported info that differs from what it reported before (a repeat logs nothing); the message is the pairs as `key value` joined by ` · `, `url` first and the rest by key, or `info cleared` | the generation that reported |
 | `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a failed adoption (the daemon then exits), a panic | the generation concerned, else `null` |
 
 | Kind | Fields |
@@ -888,6 +915,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `confirmed` | `named`: `true` when the confirm named the generation (an app confirms itself that way), `false` when it did not |
 | `rolled_back` | `to` (the permanent generation it returns to, absent when none), `reason` (the readable text), `cause` (see Rollback), `storage`: `restored`, `kept` (`--keep-storage`), `restore_failed`, or `none` (no `restore` hook: a code-only rollback) |
 | `pruned` | `removed`: the ids |
+| `reported` | `info`: the info the app now has, an object of strings (empty when it cleared it) |
 | `error` | `error_code`: the error code of the failure, when it has one (a failed stage, a lost spare port, a failed prune, a failed adoption). Not `code`, which is the exit status of `exited` |
 | `progress`, `healthy`, `unhealthy`, `failed`, `stopped`, `staged`, `adopted` | none |
 
@@ -926,7 +954,8 @@ explain its predecessor's rollback with one call. A client reads a missing field
  "actions": ["stop", "restart", "stage", "confirm g3", "rollback"],
  "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
              "uptime": 42.5, "restarts": 1,
-             "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}, "restart_at": null}}
+             "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}, "restart_at": null,
+             "info": {"url": "http://127.0.0.1:4790"}}}
 ```
 
 `step` is where the transaction in flight is, null when none: `switching`, `pending` (the switch is live and awaits
@@ -978,10 +1007,35 @@ restore that failed; `prune` a `keep` in the manifest. A status without `actions
 `process.state` is `running`, `stopped` or `failed`; `uptime` is seconds, null when not running; `restarts` counts
 starts of the current generation after its first (crash restarts and `restart`) since it became current or the daemon
 started; `last_exit` is the most recent exit of the app (exit `code` or terminating `signal`, and whether Fawkes asked
-for it), null before the first. `restart_at` is the UTC time of the scheduled crash restart while the app waits out
+for it), null before the first. `info` is what the running app reported about itself (Report), `{}` when it reported
+nothing or does not run; the text form prints one line per key after the `process` line, `url` first and the rest by
+key. `restart_at` is the UTC time of the scheduled crash restart while the app waits out
 its backoff (`state` is `stopped` then), null otherwise. `busy` names the step in progress: a transaction step (`stage`, `test g3`,
 `switch g3`, `rollback`, `prune`), else one that moves the live process (`start`, `stop`, `restart`, or the
 supervisor's `reap`, `restart` and `rollback`).
+
+### Report
+
+`report` is how the live app tells the operator things only it knows, such as where it listens or where its own log is:
+
+```json
+{"command": "report", "args": {"generation": "g3", "info": {"url": "http://127.0.0.1:4749", "remote": "https://xana.ts.net:4749", "log": "/p/supervisor.log"}}}
+{"ok": true, "result": {"info": {"log": "/p/supervisor.log", "remote": "https://xana.ts.net:4749", "url": "http://127.0.0.1:4749"}}}
+```
+
+The app sends it over `$FAWKES_SOCKET` with `$FAWKES_GENERATION`, once it knows its addresses (before or after it
+listens). It is accepted only from the live app that runs now: `generation` must be the generation of the process in
+the live slot, else `invalid_state`, whose message says that only the running live app reports and names what runs (or
+that nothing does). A test run's generation is never that one, so a test run cannot report; the CLI has no `report`
+command. Refused as `usage`, before anything changes: more than 8 keys; a key that is not `[a-z][a-z0-9_]{0,15}`; a
+value that is empty, longer than 256 characters or has a control character (the values are printed to the operator's
+terminal); an `info` that is missing or not an object of strings. Each report replaces the whole info (`{}` clears it),
+so a retry is safe. The info lives with the process: it is gone when the app exits, stops or is replaced, and a
+restarted or switched app starts with none and reports again. It is not in `state.json`. The text of the answer is one
+line, such as `reported url, log, remote for g3`.
+
+The daemon logs a `reported` event only when the info changed. The request is answered at once, like `status` and
+`confirm`, and takes no slot.
 
 ## Watch
 

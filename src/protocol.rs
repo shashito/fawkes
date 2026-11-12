@@ -8,6 +8,7 @@ use rustix::net::{RecvFlags, recv};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
@@ -199,6 +200,14 @@ pub enum Request {
     },
     Status,
     History,
+    /// The live app says a few things about itself (where it listens, where its own log is), which `status` shows
+    /// and `up` prints. Replaces what it reported before.
+    Report {
+        /// Must be the generation of the app that runs now.
+        generation: String,
+        /// At most `MAX_INFO_KEYS` entries, checked by `check_info` when the request is read.
+        info: BTreeMap<String, String>,
+    },
     /// Read the manifest again, as SIGHUP does, and answer what changed.
     Reload,
     Log {
@@ -258,6 +267,10 @@ impl Request {
             },
             "status" => Request::Status,
             "history" => Request::History,
+            "report" => Request::Report {
+                generation: required(&args, "generation")?,
+                info: info_arg(&args)?,
+            },
             "reload" => Request::Reload,
             "log" => Request::Log {
                 limit: optional_limit(&args)?,
@@ -289,6 +302,7 @@ impl Request {
             Request::Rollback { .. } => "rollback",
             Request::Status => "status",
             Request::History => "history",
+            Request::Report { .. } => "report",
             Request::Reload => "reload",
             Request::Log { .. } => "log",
             Request::Subscribe { .. } => "subscribe",
@@ -307,6 +321,7 @@ impl Request {
                 | Request::Confirm { .. }
                 | Request::Status
                 | Request::History
+                | Request::Report { .. }
                 | Request::Reload
                 | Request::Log { follow: false, .. }
         )
@@ -337,6 +352,9 @@ impl Serialize for Request {
                 deadline,
             } => json!({ "generation": generation, "deadline": deadline }),
             Request::Confirm { generation } => json!({ "generation": generation }),
+            Request::Report { generation, info } => {
+                json!({ "generation": generation, "info": info })
+            }
             Request::Rollback { keep_storage } => json!({ "keep_storage": keep_storage }),
             Request::Log {
                 limit,
@@ -415,6 +433,73 @@ fn deadline_arg(args: &Value) -> R<Option<u64>> {
             None => Err(bad_deadline(value)),
         },
     }
+}
+
+/// The most entries an app's info may have.
+pub const MAX_INFO_KEYS: usize = 8;
+
+/// The longest key of an app's info, in characters.
+const MAX_INFO_KEY: usize = 16;
+
+/// The longest value of an app's info, in characters.
+const MAX_INFO_VALUE: usize = 256;
+
+/// The `info` argument of `report`: an object of strings that `check_info` accepts.
+fn info_arg(args: &Value) -> R<BTreeMap<String, String>> {
+    let value = args
+        .get("info")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| err(ErrorCode::Usage, "missing argument `info`"))?;
+    let not_strings = || {
+        err(
+            ErrorCode::Usage,
+            format!("the argument `info` must be an object of strings, not {value}"),
+        )
+    };
+    let mut info = BTreeMap::new();
+    for (key, item) in value.as_object().ok_or_else(not_strings)? {
+        info.insert(
+            key.clone(),
+            item.as_str().ok_or_else(not_strings)?.to_string(),
+        );
+    }
+    check_info(&info)?;
+    Ok(info)
+}
+
+/// What an app may report: at most `MAX_INFO_KEYS` entries, each key `[a-z][a-z0-9_]{0,15}` and each value 1 to 256
+/// characters without a control character, since the daemon prints them to the operator's terminal.
+fn check_info(info: &BTreeMap<String, String>) -> R<()> {
+    let usage = |message: String| Err(err(ErrorCode::Usage, message));
+    if info.len() > MAX_INFO_KEYS {
+        return usage(format!(
+            "an app reports at most {MAX_INFO_KEYS} entries, not {}",
+            info.len()
+        ));
+    }
+    for (key, value) in info {
+        let mut chars = key.chars();
+        let name_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && key.len() <= MAX_INFO_KEY;
+        if !name_ok {
+            return usage(format!(
+                "the info key {key:?} must be a lowercase letter, then up to {} lowercase letters, digits or underscores",
+                MAX_INFO_KEY - 1
+            ));
+        }
+        if value.is_empty() || value.chars().count() > MAX_INFO_VALUE {
+            return usage(format!(
+                "the info value of `{key}` must be 1 to {MAX_INFO_VALUE} characters"
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return usage(format!(
+                "the info value of `{key}` must not contain a control character"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A deadline in `1..=MAX_DEADLINE`; the client checks it too, before `upgrade` stages anything.
@@ -627,6 +712,8 @@ pub enum EventKind {
     Adopted,
     RolledBack,
     Pruned,
+    /// The live app reported different info about itself.
+    Reported,
     Error,
     /// A kind a newer daemon logs that this client does not know. Decode-only; a log written by a newer daemon
     /// replays with it.
@@ -654,6 +741,7 @@ impl EventKind {
             EventKind::Adopted => "adopted",
             EventKind::RolledBack => "rolled_back",
             EventKind::Pruned => "pruned",
+            EventKind::Reported => "reported",
             EventKind::Error => "error",
             EventKind::Unknown => "unknown",
         }
@@ -777,6 +865,9 @@ pub struct Facts {
     /// `pruned`: the generations removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed: Option<Vec<String>>,
+    /// `reported`: the info the app now has, empty when it cleared it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<BTreeMap<String, String>>,
     /// `error`: the `ErrorCode` of the failure, when it has one. Not `code`, which is the exit status of `exited`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
@@ -870,6 +961,9 @@ pub struct Process {
     pub last_exit: Option<LastExit>,
     /// When the supervisor restarts a crashed app; null unless one is scheduled. `state` is `stopped` until then.
     pub restart_at: Option<String>,
+    /// What the running app reported about itself (`report`); empty when it reported nothing or does not run.
+    #[serde(default)]
+    pub info: BTreeMap<String, String>,
 }
 
 /// The result of `status`, and the `status` line of a `subscribe` stream.
@@ -954,6 +1048,12 @@ pub struct ReloadResult {
     pub changed: Vec<String>,
 }
 
+/// The result of `report`: the info the daemon now holds for the app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportResult {
+    pub info: BTreeMap<String, String>,
+}
+
 /// The result of `log`. Oldest first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Events {
@@ -1016,6 +1116,7 @@ pub enum Reply {
     History(History),
     Events(Events),
     Reload(ReloadResult),
+    Report(ReportResult),
     Down(DownResult),
     /// A stream (`log --follow`, `subscribe`) has ended: its result is null.
     Streamed,
@@ -1042,6 +1143,7 @@ reply_from!(
     History(History),
     Events(Events),
     Reload(ReloadResult),
+    Report(ReportResult),
     Down(DownResult),
 );
 
@@ -1241,6 +1343,7 @@ mod tests {
         Adopted => "adopted",
         RolledBack => "rolled_back",
         Pruned => "pruned",
+        Reported => "reported",
         Error => "error",
         Unknown => "unknown",
     });
@@ -1459,6 +1562,70 @@ mod tests {
         assert_eq!(parse(r#"{"command":"reload"}"#).unwrap(), Request::Reload);
     }
 
+    fn report(info: &str) -> String {
+        format!(r#"{{"command":"report","args":{{"generation":"g3","info":{info}}}}}"#)
+    }
+
+    #[test]
+    fn a_report_is_read_with_its_limits() {
+        let info = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            parse(&report(r#"{"url":"http://127.0.0.1:1","log":"/p/x.log"}"#)).unwrap(),
+            Request::Report {
+                generation: "g3".into(),
+                info: info(&[("url", "http://127.0.0.1:1"), ("log", "/p/x.log")])
+            }
+        );
+        // An empty object clears the info.
+        assert_eq!(
+            parse(&report("{}")).unwrap(),
+            Request::Report {
+                generation: "g3".into(),
+                info: BTreeMap::new()
+            }
+        );
+        let nine: Vec<_> = (0..9).map(|i| format!(r#""k{i}":"v""#)).collect();
+        let eight = nine[..8].join(",");
+        assert!(parse(&report(&format!("{{{eight}}}"))).is_ok());
+        let too_many = refused(&report(&format!("{{{}}}", nine.join(","))));
+        assert!(too_many.contains("at most 8"), "{too_many}");
+
+        let long = "v".repeat(256);
+        assert!(parse(&report(&format!(r#"{{"a":"{long}"}}"#))).is_ok());
+        for bad in [
+            format!(r#"{{"a":"{long}v"}}"#),
+            r#"{"a":""}"#.into(),
+            r#"{"a":"line\nbreak"}"#.into(),
+            r#"{"a":"escape\u001b[2J"}"#.into(),
+            r#"{"a":"del\u007f"}"#.into(),
+            r#"{"Url":"x"}"#.into(),
+            r#"{"1a":"x"}"#.into(),
+            r#"{"_a":"x"}"#.into(),
+            r#"{"a-b":"x"}"#.into(),
+            r#"{"":"x"}"#.into(),
+            r#"{"abcdefghijklmnopq":"x"}"#.into(),
+            r#"{"a":1}"#.into(),
+            r#"["a"]"#.into(),
+            "null".into(),
+        ] {
+            refused(&report(&bad));
+        }
+        assert!(parse(&report(r#"{"abcdefghijklmnop":"x"}"#)).is_ok());
+        assert_eq!(
+            refused(r#"{"command":"report","args":{"generation":"g3"}}"#),
+            "missing argument `info`"
+        );
+        assert_eq!(
+            refused(r#"{"command":"report","args":{"info":{}}}"#),
+            "missing argument `generation`"
+        );
+    }
+
     #[test]
     fn a_request_serializes_to_the_envelope_clients_send() {
         let wire = |request: Request| serde_json::to_string(&request).unwrap();
@@ -1494,6 +1661,10 @@ mod tests {
                 since: Some(7),
             },
             Request::Rollback { keep_storage: true },
+            Request::Report {
+                generation: "g3".into(),
+                info: BTreeMap::from([("url".into(), "http://x".into())]),
+            },
         ] {
             assert_eq!(parse(&wire(request.clone())).unwrap(), request);
         }
@@ -1647,6 +1818,7 @@ mod tests {
                     requested: true,
                 }),
                 restart_at: None,
+                info: BTreeMap::new(),
             },
         };
         let text = serde_json::to_string(&Line::<Reply>::Status {
@@ -1655,7 +1827,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            r#"{"status":{"name":"sample","daemon_pid":812,"version":"0.3.0","manifest":"/apps/sample/fawkes.toml","state_dir":"/apps/sample/state","socket":"/apps/sample/state/fawkes.sock","permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null}}}"#
+            r#"{"status":{"name":"sample","daemon_pid":812,"version":"0.3.0","manifest":"/apps/sample/fawkes.toml","state_dir":"/apps/sample/state","socket":"/apps/sample/state/fawkes.sock","permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null,"info":{}}}}"#
         );
         let Line::Status { status } = serde_json::from_str::<Line>(&text).unwrap() else {
             panic!("a status line reads as one");
