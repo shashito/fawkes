@@ -156,6 +156,9 @@ scripts/check --only X  # fmt, clippy and the one test X
 scripts/package T       # the release archive of target T, in dist/
 ```
 
+`just` lists the [Justfile](Justfile)'s shortcuts for these and other steps, among them `just ci`, the Linux CI job under
+[act](https://github.com/nektos/act).
+
 To release, set the `version` in `Cargo.toml`, commit, and push the tag `v<version>`: the release workflow runs the
 checks, builds macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) archives and publishes them with
 `install.sh`.
