@@ -62,7 +62,10 @@ $ fawkes up
 
 `init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
 and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
-to roll back to. To update Fawkes, run the `curl` line again.
+to roll back to. To update Fawkes, run the `curl` line again, then restart each daemon once no switch is pending (a
+restart rolls a pending switch back): `fawkes service restart --manifest <app>` for a launchd agent, else `fawkes down`
+and `fawkes up`. The extension checks for a new release once a day and says so in its status-line popover, with these
+commands; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off.
 
 To build it from source instead, with [Rust](https://rustup.rs):
 

@@ -1144,6 +1144,12 @@ moment), so running it again upgrades both, and a running daemon keeps the binar
 says when the install directory is not on `PATH`, or when another `fawkes` comes first there. `FAWKES_DOWNLOAD_URL`
 replaces the release's download folder (a mirror, or a `file://` folder of archives for a test).
 
+Fawkes itself never looks for a release, so no command touches the network. The Ultimate extension does, in the live
+generation: once a day it reads the tag GitHub's `releases/latest` redirect names (not the API, which is rate
+limited) and, when that release is newer than the daemon and the installed binary, shows the command that installs it
+and then the daemon restart; when the installed binary alone is newer than the daemon, only the restart
+(`ultimate/fawkes/README.md`, "Releases"). `FAWKES_NO_UPDATE_CHECK` turns it off.
+
 ## Crates
 
 For the daemon and CLI, each replacing something not worth hand-writing:

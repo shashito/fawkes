@@ -100,7 +100,7 @@ main() {
 	installed=$("$bin/fawkes" --version)
 	if [ -n "$previous" ]; then
 		say "installed $installed to $bin/fawkes (was $previous)"
-		say "running daemons keep the version they started with until \`fawkes down\` and \`fawkes up\`"
+		say "running daemons keep the version they started with until they restart: \`fawkes service restart --manifest <app>\` for a launchd agent, else \`fawkes down\` and \`fawkes up\`, once \`fawkes status\` shows no pending switch (a restart rolls it back)"
 	else
 		say "installed $installed to $bin/fawkes"
 	fi

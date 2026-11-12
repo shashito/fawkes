@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
-import { realpathSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, realpathSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { obj, oneOf, opt, str } from '@earendil-works/pi-schema'
 import { defineDoc, defineExtension, defineTool, GenerationTask, hook, section } from '@earendil-works/pi-durable'
@@ -13,6 +13,7 @@ import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
+import { RELEASES, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
 import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
@@ -22,6 +23,7 @@ import type {
   FawkesEvent,
   FawkesState,
   Generation,
+  Release,
   SetupPreview,
   SetupStep,
   Status,
@@ -61,6 +63,8 @@ type Shared = {
   upgrade?: Upgrade
   confirming?: Confirming
   behind?: Extract<FawkesState, { supervised: true }>['behind']
+  release?: Omit<Release, 'restart'>
+  releaseRun?: Promise<void>
   /** The scheduler is held by this extension until its generation is confirmed. */
   holding: boolean
   stop?: () => void
@@ -86,7 +90,14 @@ function state(host: ExtensionHost): Extract<FawkesState, { supervised: true }> 
     upgrade: s.upgrade,
     confirming: s.confirming,
     behind: s.behind,
+    release: s.release && s.status && { ...s.release, restart: daemonRestart(host, s.status) },
   }
+}
+
+/** The command that restarts this daemon: its launchd agent's when `fawkes service install` wrote one, as `fawkes down` says. */
+function daemonRestart(host: ExtensionHost, status: Status) {
+  const plist = join(host.userHome, 'Library', 'LaunchAgents', `dev.fawkes.${status.name}.plist`)
+  return restartCommand(status.manifest ?? status.name, process.platform === 'darwin' && existsSync(plist), shellWord)
 }
 
 /**
@@ -202,6 +213,50 @@ async function check(host: ExtensionHost, fetch: boolean, ref = DEFAULT_REF) {
   }
 }
 
+/** How often GitHub is asked for the newest release. */
+const RELEASE_EVERY = 24 * 3_600_000
+
+/** The release check is off with `FAWKES_NO_UPDATE_CHECK` set, in the daemon's environment or the manifest's `[env]`. */
+const releaseCheck = !process.env.FAWKES_NO_UPDATE_CHECK
+
+/**
+ * Read the installed binary's version, and once a day (or when `force`d) ask GitHub for the newest release. The
+ * daemon's `FAWKES_BIN` is the path it was started from, where `install.sh` renames the new binary into place, so
+ * `--version` there says what a daemon restart would run. A check GitHub does not answer keeps the last answer and
+ * is retried at the next tick.
+ */
+function checkRelease(host: ExtensionHost, force = false) {
+  const s = shared(host)
+  s.releaseRun ??= (async () => {
+    const bin = process.env.FAWKES_BIN
+    const installed = bin
+      ? await run(bin, ['--version'], { timeout: 5_000 }).then(
+          ({ stdout }) => stdout.trim().replace(/^fawkes /, ''),
+          () => undefined,
+        )
+      : undefined
+    const repo = dirname(dirname(extensionFolder()))
+    const command = upgradeCommand(existsSync(join(repo, 'Cargo.toml')) ? repo : undefined, shellWord)
+    let latest = s.release?.latest ?? null
+    let checkedAt = s.release?.checkedAt ?? 0
+    if (force || Date.now() - checkedAt >= RELEASE_EVERY) {
+      try {
+        const answer = await fetch(`${RELEASES}/latest`, {
+          method: 'HEAD',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(10_000),
+        })
+        latest = tagOf(answer.status, answer.headers.get('location'))
+        checkedAt = Date.now()
+      } catch {
+        // Offline, or GitHub answered something else: the last answer stands until the next tick asks again.
+      }
+    }
+    s.release = { latest, installed, command, checkedAt }
+  })().finally(() => (s.releaseRun = undefined))
+  return s.releaseRun
+}
+
 /**
  * Fetch `ref`, then `fawkes upgrade` it: one call that stages, tests and switches. Runs in the background. In the live app
  * the switch stops this process, and the new generation confirms itself after its boot or is rolled back.
@@ -278,6 +333,8 @@ function describe(state: FawkesState) {
   const recent = state.events.filter((event) => event.kind !== 'progress').slice(-5)
   if (recent.length) lines.push('Recent events:', ...recent.map((event) => `  ${event.at} ${eventLine(event)}`))
   if (state.behind) lines.push(`${state.behind.ref} has ${state.behind.count} commits this generation lacks.`)
+  const release = releaseText(state.release, status)
+  if (release) lines.push(release)
   return lines.join('\n')
 }
 
@@ -408,7 +465,7 @@ export const actions = {
   async check(_args: unknown, { host }: { host: ExtensionHost }) {
     liveSocket()
     // A failure is shown in the popover from the state.
-    await check(host, true).catch(() => undefined)
+    await Promise.all([check(host, true).catch(() => undefined), releaseCheck && checkRelease(host, true)])
     return state(host)
   },
   /** `{ ref? }` → start an upgrade to `ref` (default origin/main). */
@@ -491,10 +548,17 @@ export default function fawkesExtension(host: ExtensionHost) {
     const timer = setInterval(quiet, 5 * 60_000)
     // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
     const reported = setInterval(() => void reports?.tick(), INTERVAL)
+    // Hourly, so a reinstall shows within the hour and a check missed while offline or asleep runs soon after; GitHub
+    // itself is asked once a day.
+    const release = () => void (releaseCheck && checkRelease(host))
+    const firstRelease = setTimeout(release, 30_000)
+    const releases = setInterval(release, 3_600_000)
     host.onClose(async () => {
       clearTimeout(first)
       clearInterval(timer)
       clearInterval(reported)
+      clearTimeout(firstRelease)
+      clearInterval(releases)
     })
   }
   host.onClose(async () => {
