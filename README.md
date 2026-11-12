@@ -17,7 +17,7 @@ flowchart LR
     test -- passes --> switch["switch<br/>snapshot the storage,<br/>go live"]
     switch --> confirm{"confirmed<br/>in time?"}
     confirm -- yes --> permanent(["permanent"])
-    confirm -- "crash or<br/>missed deadline" --> rollback["rollback<br/>restore the storage"]
+    confirm -- "crash, missed<br/>deadline or rollback" --> rollback["rollback<br/>restore the storage"]
     rollback --> previous(["previous<br/>generation runs"])
     adopt(["first start,<br/>adopt = true"]) -. "test HEAD" .-> permanent
 ```
@@ -124,9 +124,10 @@ fawkes down                       # stop the app and its supervisor
 too, and `fawkes confirm <gen>` is what the app calls. `fawkes prune` removes old generations beyond the manifest's
 `keep`, and `fawkes reload` reads the manifest again.
 
-Run from the app's repository or project, a command finds its `fawkes.toml`; from anywhere else, `--manifest <name>`
-names a manifest in `~/.fawkes` (DESIGN.md → Finding the app). Every command but `up` takes `--json` and answers
-with one JSON document and stable error codes, made for agents, and `fawkes skill` prints the skill that teaches an
+A command finds its app through the nearest `fawkes.toml` (up to the repository root), or a manifest in `~/.fawkes`
+whose `project` (or `repo`) holds the current directory; elsewhere, `--manifest <name>` names one (DESIGN.md → Finding the app).
+Every command but `up` takes `--json` and answers with one JSON document (`log --follow` and `watch` stream one per
+line) and stable error codes, made for agents, and `fawkes skill` prints the skill that teaches an
 agent all of this. Exit codes: 0 ok, 1 failed, 2 usage, 3 daemon unreachable.
 
 ## Running an Ultimate host
@@ -159,8 +160,9 @@ fawkes service uninstall    # unload it and remove the plist
 ```
 
 The agent starts the daemon at login and again whenever it fails; `fawkes down` keeps it stopped until the next login
-or `fawkes service restart`. Its stderr goes to `<state_dir>/daemon.log`. Run `install` from the installed copy (it
-refuses a binary in cargo's `target/`), and again after an update. It is a LaunchAgent, so it runs while you are
+or `fawkes service restart`, which, like every daemon start, rolls a pending switch back. Its stderr goes to
+`<state_dir>/daemon.log`. Run `install` from the installed copy (it refuses a binary in cargo's `target/`), from a
+shell whose `PATH` finds `git` and your app's tools (the plist keeps it), and again after an update. It is a LaunchAgent, so it runs while you are
 logged in: give a headless Mac automatic login. macOS only; DESIGN.md → Service has the details.
 
 When the app is what broke, its own way in (Ultimate's Tailscale extension, say) is gone with it. Turn on SSH on the
