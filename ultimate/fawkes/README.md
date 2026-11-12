@@ -81,6 +81,16 @@ but run with a home of their own, so they never confirm, upgrade or roll back th
   back), a git guard that never pushes and moves only the preview's own branches, and `ULTIMATE_INSTANCE_OWNER`,
   which turns off what previews skip. The preview's branch and checkouts are removed after the run.
 
+## The report
+
+The live host tells the daemon where it can be reached (`report.ts`): `url` (the address it serves), `remote` (its
+Tailscale HTTPS URLs, joined by `, `, left out while there are none) and `log` (`supervisor.log` in the host's home).
+`fawkes up` and `fawkes status` print them, since the host's own dashboard goes to that log file under Fawkes. The
+report is sent when the subscribe stream connects or reconnects and whenever the info changes (the host is asked every
+5 s; it has no change notification for extensions). Each report replaces the previous one. A refused or failed report
+is logged once and retried on the next tick; only the live generation reports, never a test run, a preview or a host
+without a daemon.
+
 ## The hold and the confirm
 
 The server facet holds Pi Durable's scheduler in `onOpen`, before the server resumes it:

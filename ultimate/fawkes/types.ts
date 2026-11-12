@@ -64,6 +64,8 @@ export type Status = {
     uptime: number | null
     restarts: number
     restart_at: string | null
+    /** What the live app last reported (`report.ts`), shown by `fawkes up` and `fawkes status`. */
+    info?: Record<string, string>
   }
 }
 

@@ -13,6 +13,7 @@ import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
+import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
 import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
@@ -445,6 +446,15 @@ export default function fawkesExtension(host: ExtensionHost) {
   const daemon = fawkes
   const s = shared(host)
   host.want(PauseApi)
+  // Only the live generation tells the daemon about itself; a test run is not the app people open.
+  const reports =
+    daemon.kind === 'live'
+      ? reporter({
+          read: () => reportInfo(host.system(), host.home),
+          send: (info) => request(daemon.socket, 'report', { generation: daemon.generation, info }),
+          fail: (message) => console.error(`fawkes: cannot report to the daemon: ${message}`),
+        })
+      : undefined
   // Before the server resumes scheduling (it waits for every opener): a test run never resumes the copied storage's
   // work, and a new live generation resumes it only once it is confirmed, so a rollback forgets nothing that ran.
   // Every open holds again until then: a failed core swap reopens a new harness in this same process.
@@ -455,6 +465,10 @@ export default function fawkesExtension(host: ExtensionHost) {
         connected: (connected, error) => {
           s.connected = connected
           s.error = connected ? undefined : error
+          if (connected) {
+            reports?.connected()
+            void reports?.tick()
+          }
         },
         status: (status) => (s.status = status),
         history: (generations) => (s.generations = generations),
@@ -475,9 +489,12 @@ export default function fawkesExtension(host: ExtensionHost) {
     const quiet = () => void check(host, false).catch(() => undefined)
     const first = setTimeout(quiet, 30_000)
     const timer = setInterval(quiet, 5 * 60_000)
+    // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
+    const reported = setInterval(() => void reports?.tick(), INTERVAL)
     host.onClose(async () => {
       clearTimeout(first)
       clearInterval(timer)
+      clearInterval(reported)
     })
   }
   host.onClose(async () => {
