@@ -51,6 +51,9 @@ Ask Ultimate to install it. Or, by hand, on macOS or Linux:
 curl -LsSf https://github.com/shashito/fawkes/releases/latest/download/install.sh | sh
 ```
 
+It checks the download's sha256 and, when the GitHub CLI is logged in, its build attestation, which you can also
+check by hand: `gh attestation verify fawkes-<target>.tar.gz --repo shashito/fawkes`.
+
 This puts `fawkes` in `~/.local/bin` and its Ultimate extension in `~/.local/share/fawkes`. Then stop the Ultimate of
 your project, set the project up once, and start it:
 

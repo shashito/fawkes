@@ -1,6 +1,8 @@
 # A `v*` tag publishes a GitHub release once the checks pass: one archive per target (scripts/package), its sha256
 # and install.sh, which installs this release. Run by hand (workflow_dispatch), it builds and checks everything the
-# same way and keeps the archives as the run's artifacts, without a release.
+# same way and keeps the archives as the run's artifacts, without a release. A tag's archives and install.sh also get
+# a build provenance attestation, which install.sh and `gh attestation verify` check; a run by hand attests nothing,
+# since its archives are never published.
 
 name: Release
 
@@ -61,8 +63,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Attesting here rather than in the build jobs keeps the right to sign out of the jobs that run build scripts.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
@@ -77,7 +82,18 @@ jobs:
           else
             cp install.sh dist/install.sh
           fi
+      - name: Attest the archives and install.sh
+        if: github.event_name == 'push'
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/install.sh
+      # A tag's install must verify the attestation it just got, as a user's does.
       - name: Install from the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FAWKES_REQUIRE_ATTESTATION: ${{ github.event_name == 'push' && '1' || '' }}
         run: |
           home=$RUNNER_TEMP/home
           mkdir -p "$home"
