@@ -167,13 +167,13 @@ The live generation checks for a newer Fawkes 30 s after it starts and then ever
 When that release is newer than the installed binary and the daemon, the popover shows it with two commands to copy:
 the upgrade (the `curl` line of `install.sh`, or `git pull` and `cargo install` in the checkout when this folder is
 one), then the daemon's restart (`fawkes service restart` when it has a launchd agent, else `fawkes down` and
-`fawkes up`), to run from a shell outside this Ultimate once no switch is pending, since a daemon restart rolls a
-pending switch back. When only the installed binary is newer than the daemon, it shows the restart alone. The
-`fawkes` tool's `status` says the same. Versions compare as numbers, a prerelease before its release. Check now asks
-GitHub at once.
+`fawkes up` with the daemon's own binary, which may not be the first `fawkes` on `PATH`), to run from a shell outside
+this Ultimate once no switch is pending, since a daemon restart rolls a pending switch back. When only the installed
+binary is newer than the daemon, it shows the restart alone. The `fawkes` tool's `status` says the same. Versions
+compare as numbers, a prerelease before its release. Check now asks GitHub at once, after a check already under way.
 
-`FAWKES_NO_UPDATE_CHECK` (set and not empty), in the daemon's environment or the manifest's `[env]`, turns the check off. A test
-run never checks.
+`FAWKES_NO_UPDATE_CHECK` (set and not empty), in the daemon's environment or the manifest's `[env]`, turns the check
+off. A test run never checks.
 
 ## Actions
 
@@ -200,7 +200,8 @@ changed since that conversation last heard, and once more when it no longer appl
 `ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases), `test-env.test.ts` (the test run's
 environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it),
 `upgrade.test.ts` (the `fawkes upgrade` call and its result and error fields), `facts.test.ts` (outcomes and words
-from fields), `release.test.ts` (versions, the redirect's tag and what the popover says) and the rest, and type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
+from fields), `release.test.ts` (versions, the redirect's tag and what the popover says) and the rest, and
+type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
 
 ## Storage hooks
 

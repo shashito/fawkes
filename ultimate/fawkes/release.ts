@@ -41,10 +41,20 @@ export function tagOf(status: number, location: string | null): string | null {
 export const upgradeCommand = (repo: string | undefined, quote: (word: string) => string) =>
   repo ? `cd ${quote(repo)} && git pull && cargo install --path . --locked` : INSTALL_LINE
 
-/** The daemon restart that runs the installed binary: its launchd agent's when it has one, else `down` and `up`. */
-export function restartCommand(manifest: string, launchd: boolean, quote: (word: string) => string) {
+/**
+ * The daemon restart that runs the installed binary: its launchd agent's when it has one (the agent names the binary
+ * itself), else `down` and `up` with the daemon's own binary `bin`, since another `fawkes` may come first on PATH.
+ */
+export function restartCommand(
+  manifest: string,
+  launchd: boolean,
+  bin: string | undefined,
+  quote: (word: string) => string,
+) {
   const named = `--manifest ${quote(manifest)}`
-  return launchd ? `fawkes service restart ${named}` : `fawkes down ${named} && fawkes up ${named}`
+  if (launchd) return `fawkes service restart ${named}`
+  const fawkes = bin ? quote(bin) : 'fawkes'
+  return `${fawkes} down ${named} && ${fawkes} up ${named}`
 }
 
 /**

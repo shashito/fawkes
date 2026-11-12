@@ -75,6 +75,13 @@ test('the commands fit the install: curl or a rebuild, launchd or down and up', 
     upgradeCommand('/Users/me/Code/my fawkes', shellWord),
     "cd '/Users/me/Code/my fawkes' && git pull && cargo install --path . --locked",
   )
-  assert.equal(restartCommand('/m/xana.toml', true, shellWord), 'fawkes service restart --manifest /m/xana.toml')
-  assert.equal(restartCommand('xana', false, shellWord), 'fawkes down --manifest xana && fawkes up --manifest xana')
+  assert.equal(
+    restartCommand('/m/xana.toml', true, '/u/.local/bin/fawkes', shellWord),
+    'fawkes service restart --manifest /m/xana.toml',
+  )
+  assert.equal(
+    restartCommand('xana', false, '/u/.local/bin/fawkes', shellWord),
+    '/u/.local/bin/fawkes down --manifest xana && /u/.local/bin/fawkes up --manifest xana',
+  )
+  assert.equal(restartCommand('xana', false, undefined, shellWord), 'fawkes down --manifest xana && fawkes up --manifest xana')
 })

@@ -13,7 +13,7 @@ import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
-import { RELEASES, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
+import { parseVersion, RELEASES, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
 import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
@@ -97,7 +97,8 @@ function state(host: ExtensionHost): Extract<FawkesState, { supervised: true }> 
 /** The command that restarts this daemon: its launchd agent's when `fawkes service install` wrote one, as `fawkes down` says. */
 function daemonRestart(host: ExtensionHost, status: Status) {
   const plist = join(host.userHome, 'Library', 'LaunchAgents', `dev.fawkes.${status.name}.plist`)
-  return restartCommand(status.manifest ?? status.name, process.platform === 'darwin' && existsSync(plist), shellWord)
+  const launchd = process.platform === 'darwin' && existsSync(plist)
+  return restartCommand(status.manifest ?? status.name, launchd, process.env.FAWKES_BIN, shellWord)
 }
 
 /**
@@ -223,18 +224,22 @@ const releaseCheck = !process.env.FAWKES_NO_UPDATE_CHECK
  * Read the installed binary's version, and once a day (or when `force`d) ask GitHub for the newest release. The
  * daemon's `FAWKES_BIN` is the path it was started from, where `install.sh` renames the new binary into place, so
  * `--version` there says what a daemon restart would run. A check GitHub does not answer keeps the last answer and
- * is retried at the next tick.
+ * is retried at the next tick. It never throws: a timer runs it, and a rejection nobody handles would end the host.
  */
-function checkRelease(host: ExtensionHost, force = false) {
+function checkRelease(host: ExtensionHost, force = false): Promise<void> {
   const s = shared(host)
+  // A forced check that finds an hourly one under way runs after it, so Check now always asks GitHub.
+  if (force && s.releaseRun) return s.releaseRun.then(() => checkRelease(host, true))
   s.releaseRun ??= (async () => {
     const bin = process.env.FAWKES_BIN
-    const installed = bin
+    const printed = bin
       ? await run(bin, ['--version'], { timeout: 5_000 }).then(
           ({ stdout }) => stdout.trim().replace(/^fawkes /, ''),
           () => undefined,
         )
       : undefined
+    // Only a version it can compare: anything else would hide a newer release behind it.
+    const installed = printed && parseVersion(printed) ? printed : undefined
     const repo = dirname(dirname(extensionFolder()))
     const command = upgradeCommand(existsSync(join(repo, 'Cargo.toml')) ? repo : undefined, shellWord)
     let latest = s.release?.latest ?? null
@@ -253,7 +258,10 @@ function checkRelease(host: ExtensionHost, force = false) {
       }
     }
     s.release = { latest, installed, command, checkedAt }
-  })().finally(() => (s.releaseRun = undefined))
+  })()
+    // The extension's folder can vanish for a moment (install.sh swaps it in two renames): the next tick tries again.
+    .catch(() => undefined)
+    .finally(() => (s.releaseRun = undefined))
   return s.releaseRun
 }
 
