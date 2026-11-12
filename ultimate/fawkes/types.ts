@@ -192,8 +192,18 @@ export type FawkesState =
       events: FawkesEvent[]
       upgrade?: Upgrade
       confirming?: Confirming
-      /** Commits on the upgrade ref that this generation does not have; undefined until checked. */
-      behind?: { ref: string; count: number; commits: { sha: string; subject: string }[]; fetchedAt: number; error?: string }
+      /**
+       * Commits on the upgrade ref that this generation does not have; undefined until checked. `checkedAt` is the last
+       * comparison, `fetchedAt` the clone's last fetch by any host on it (absent before the first).
+       */
+      behind?: {
+        ref: string
+        count: number
+        commits: { sha: string; subject: string }[]
+        checkedAt: number
+        fetchedAt?: number
+        error?: string
+      }
       /** Undefined until the first release check, and when `FAWKES_NO_UPDATE_CHECK` turns it off. */
       release?: Release
     }

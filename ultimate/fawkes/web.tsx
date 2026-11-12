@@ -321,7 +321,12 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
       </div>
       <div className="flex items-center justify-between gap-2 border-t border-border/70 px-3 py-1.5">
         <span className="text-[10.5px] text-muted-foreground">
-          {behind ? `checked ${formatAgo(behind.fetchedAt, Date.now(), { ago: true })}` : ''}
+          {/* The comparison runs every minute; when the clone was last fetched is what says how fresh it is. */}
+          {behind?.fetchedAt
+            ? `fetched ${formatAgo(behind.fetchedAt, Date.now(), { ago: true })}`
+            : behind
+              ? `checked ${formatAgo(behind.checkedAt, Date.now(), { ago: true })}`
+              : ''}
         </span>
         <div className="flex items-center gap-1">
           {!pending && (

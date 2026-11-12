@@ -11,6 +11,7 @@ import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
 import { request, subscribe } from './client.ts'
 import { mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
+import { cloneGitDir, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
 import { parseVersion, RELEASES, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
@@ -65,6 +66,10 @@ type Shared = {
   behind?: Extract<FawkesState, { supervised: true }>['behind']
   release?: Omit<Release, 'restart'>
   releaseRun?: Promise<void>
+  /** When a scheduled fetch was last tried: a failed one (offline) is retried an interval later, not every tick. */
+  fetchTried?: number
+  /** A scheduled check is under way: a slow fetch never overlaps the next tick's. */
+  checking?: boolean
   /** The scheduler is held by this extension until its generation is confirmed. */
   holding: boolean
   stop?: () => void
@@ -169,16 +174,25 @@ async function remoteOf(repo: string, ref: string) {
 }
 
 /**
- * Count the commits on `ref` that the running generation lacks, fetching its remote first when `fetch` is set. A
- * failure is kept for the popover and rethrown, so an upgrade never stages a ref it could not fetch.
+ * Count the commits on `ref` that the running generation lacks, fetching its remote first when `fetch` is `true`, or
+ * when it is `'due'` and nobody fetched the clone within `fawkes.fetchEvery` (`fetch.ts`). A failure is kept for the
+ * popover and rethrown, so an upgrade never stages a ref it could not fetch.
  */
-async function check(host: ExtensionHost, fetch: boolean, ref = DEFAULT_REF) {
+async function check(host: ExtensionHost, fetch: boolean | 'due', ref = DEFAULT_REF) {
   const s = shared(host)
   const repo = host.ultimateRoot
+  let gitDir: string | undefined
   try {
+    gitDir = await cloneGitDir(repo)
+    if (fetch === 'due') {
+      const every = await fetchEvery(host.userHome)
+      const last = Math.max((await lastFetch(gitDir)) ?? 0, s.fetchTried ?? 0)
+      fetch = fetchDue(last || undefined, every, Date.now())
+      if (fetch) s.fetchTried = Date.now()
+    }
     if (fetch) {
       const remote = await remoteOf(repo, ref)
-      if (remote) await run('git', ['fetch', '--quiet', remote], { cwd: repo, timeout: 60_000 })
+      if (remote) await fetchRemote(gitDir, remote)
     }
     const range = `HEAD..${ref}`
     const { stdout } = await run(
@@ -200,14 +214,16 @@ async function check(host: ExtensionHost, fetch: boolean, ref = DEFAULT_REF) {
           const [sha, ...subject] = line.split('\t')
           return { sha, subject: subject.join('\t') }
         }),
-      fetchedAt: Date.now(),
+      checkedAt: Date.now(),
+      fetchedAt: await lastFetch(gitDir),
     }
   } catch (error) {
     s.behind = {
       ref,
       count: s.behind?.count ?? 0,
       commits: s.behind?.commits ?? [],
-      fetchedAt: Date.now(),
+      checkedAt: Date.now(),
+      fetchedAt: gitDir ? await lastFetch(gitDir) : s.behind?.fetchedAt,
       error: (error as Error).message.split('\n')[0],
     }
     throw error
@@ -551,9 +567,16 @@ export default function fawkesExtension(host: ExtensionHost) {
       )
   })
   if (daemon.kind === 'live') {
-    const quiet = () => void check(host, false).catch(() => undefined)
+    // Once a minute (`FETCH_FLOOR`): the comparison is local, and the clone is fetched only when it is due.
+    const quiet = () => {
+      if (s.checking) return
+      s.checking = true
+      void check(host, 'due')
+        .catch(() => undefined)
+        .finally(() => (s.checking = false))
+    }
     const first = setTimeout(quiet, 30_000)
-    const timer = setInterval(quiet, 5 * 60_000)
+    const timer = setInterval(quiet, 60_000)
     // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
     const reported = setInterval(() => void reports?.tick(), INTERVAL)
     // Hourly, so a reinstall shows within the hour and a check missed while offline or asleep runs soon after; GitHub

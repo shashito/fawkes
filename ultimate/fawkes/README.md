@@ -136,8 +136,7 @@ the status and the latest events. Everything shown is read from fields (`status.
 `rollback_cause`, the facts of each event), never from the text of a message. The item shows:
 
 - `✓ g7` (muted) while the running generation is current;
-- `↓ 3 new · upgrade` when the upgrade ref (`origin/main`) has commits the generation lacks (checked every 5
-  minutes from the clone, fetched by Check now or an upgrade);
+- `↓ 3 new · upgrade` when the upgrade ref (`origin/main`) has commits the generation lacks (Fetching, below);
 - the step in progress during an upgrade, or any other client's step (`stage`, `test g8`, `switch g8`, from
   `status.busy`);
 - `⏱ confirming 01:42` while the new generation awaits its confirm, with the reason in the popover when its checks
@@ -153,6 +152,27 @@ storage), lists the newest generations with the cause of each rollback and the l
 `status.actions` allows: Confirm (`confirm gN`), Roll back (`rollback`, which also retries a failed restore), and
 Upgrade when the ref has new commits, `stage` is allowed and no switch is in flight. Check now is there unless a
 switch awaits its confirm. An older daemon sends no `actions`: its pending switch still offers Confirm and Roll back.
+
+## Fetching
+
+The live generation compares its commit with the upgrade ref in the clone 30 s after it starts and then every minute.
+That comparison is local. It fetches the ref's remote first when the clone's last fetch is older than
+`fawkes.fetchEvery` in `~/.ultimate/settings.json` (`fetch.ts`):
+
+```json
+{ "fawkes": { "fetchEvery": "15m" } }
+```
+
+The value is minutes or hours (`"5m"`, `"1h"`) or a number of minutes; without it the clone is fetched every 15
+minutes. `"off"` or `0` turns the scheduled fetch off, and anything shorter than a minute counts as a minute. The file is
+read at every tick, so a change applies within a minute, without a restart. A value it cannot read fails the check,
+which the popover says.
+
+The last fetch is the mtime of `FETCH_HEAD` in the clone's shared git directory (`--git-common-dir`), where every
+fetch here writes it: a generation is a linked worktree, whose own git directory would keep one per generation. So
+the hosts on one clone fetch about once per interval between them. A failed fetch (offline) is tried again an interval
+later; it never changes the item, and the popover shows it as "Last check failed". The popover's footer says when the
+clone was last fetched (when the comparison ran, before the first fetch). Check now and an upgrade always fetch.
 
 ## Releases
 
@@ -200,7 +220,8 @@ changed since that conversation last heard, and once more when it no longer appl
 `ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases), `test-env.test.ts` (the test run's
 environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it),
 `upgrade.test.ts` (the `fawkes upgrade` call and its result and error fields), `facts.test.ts` (outcomes and words
-from fields), `release.test.ts` (versions, the redirect's tag and what the popover says) and the rest, and
+from fields), `release.test.ts` (versions, the redirect's tag and what the popover says), `fetch.test.ts` (the
+`fetchEvery` setting and the shared `FETCH_HEAD` gate, on a clone with a local bare `origin`) and the rest, and
 type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
 
 ## Storage hooks

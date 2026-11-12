@@ -68,7 +68,9 @@ and trusts the project's setup. The first `fawkes up` tests the Ultimate you wer
 to roll back to. To update Fawkes, run the `curl` line again, then restart each daemon once no switch is pending (a
 restart rolls a pending switch back): `fawkes service restart --manifest <app>` for a launchd agent, else `fawkes down`
 and `fawkes up`. The extension checks for a new release once a day and says so in its status-line popover, with these
-commands; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off.
+commands; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off. It also
+fetches your Ultimate clone every 15 minutes to show new commits; set `"fawkes": { "fetchEvery": "5m" }` (or `"off"`)
+in `~/.ultimate/settings.json` to change that.
 
 To build it from source instead, with [Rust](https://rustup.rs):
 
