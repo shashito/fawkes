@@ -104,7 +104,7 @@ impl Admission {
     fn release(&mut self) {
         if let Some(daemon) = self.0.take() {
             daemon.open.fetch_sub(1, Ordering::SeqCst);
-            // Read after the count changed, as `shutdown` sets the flag before it reads the count: whichever comes
+            // Read after the count changed, as the flag is set before `shutdown` reads the count: whichever comes
             // second sees the other. Only then, so an ordinary request does not wake the supervisor.
             if daemon.shutting_down() {
                 daemon.wake.notify();

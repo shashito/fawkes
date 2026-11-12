@@ -349,8 +349,8 @@ fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
 /// What the supervisor sleeps on: a count of changes, and a condvar to wait for the next one. Every change
 /// subscribers hear of (`Daemon::changed`) moves it, since whatever changes the picture may be for the supervisor to
 /// act on, and so do an exit of the live app, the start of shutdown and, during shutdown, the end of a connection
-/// (`Admission`). A waiter reads the count before it looks at
-/// the state, so a change made after the look ends the wait, and none is lost in between.
+/// (`Admission`). A waiter reads the count before it looks at the state, so a change made after the look ends the
+/// wait, and none is lost in between.
 struct Wake {
     count: Mutex<u64>,
     moved: Condvar,

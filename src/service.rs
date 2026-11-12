@@ -249,7 +249,8 @@ mod launchd {
         // ------------------------------------------------ launchctl
 
         /// launchd's `ExitTimeOut`, the longest a daemon's shutdown takes (`Daemon::shutdown`): its wait for a switch
-        /// or rollback in flight, then `stop_timeout` of grace for the app, plus a margin. launchd's default of 20 s
+        /// or rollback in flight, then `stop_timeout` of grace for the app, plus a margin that covers its 2 s wait for
+        /// the answers it owes (`ANSWER_WAIT`). launchd's default of 20 s
         /// would SIGKILL it partway, and the next start would have to recover.
         fn exit_timeout(&self) -> u64 {
             let stop = self.manifest.shutdown_wait() + self.manifest.stop_timeout;
