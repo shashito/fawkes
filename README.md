@@ -4,7 +4,7 @@
 
 <h1 align="center">Fawkes</h1>
 
-A process supervisor for agents that upgrade themselves.
+A process supervisor for durable agents that upgrade themselves.
 
 ```mermaid
 flowchart LR
