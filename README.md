@@ -166,7 +166,9 @@ scripts/package T       # the release archive of target T, in dist/
 
 To release, set the `version` in `Cargo.toml`, commit, and push the tag `v<version>`: the release workflow runs the
 checks, builds macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) archives and publishes them with
-`install.sh`.
+`install.sh`. `just release-dry-run` runs that workflow on `main` without publishing, `just release` tags and pushes
+once `main` matches GitHub's and you confirm, then follows the run, and `just install-check` installs the published
+release with the `curl` line into a throwaway `HOME`.
 
 `cargo deny` comes from `brew install cargo-deny`. The integration tests run the sample app in `examples/sample`, so
 they need `git` and Node.js 22.13 or later. They run in parallel, each in its own `/tmp/fk<port>` with its own ports.
