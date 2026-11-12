@@ -41,11 +41,12 @@ run from a directory the next `cargo build` replaces. To update, pull and run th
 
 ### An Ultimate host
 
-Stop the Ultimate you run for a project, then, in the `fawkes` folder you cloned, with the project's path:
+Say Ultimate runs for the project folder `~/Code/my-app` (the path you start `ultimate` with). Stop that Ultimate,
+then, in the `fawkes` folder you cloned:
 
 ```sh
-node ultimate/fawkes/init.ts <project>
-cd <project> && fawkes up
+node ultimate/fawkes/init.ts ~/Code/my-app
+cd ~/Code/my-app && fawkes up
 ```
 
 The first `fawkes up` tests the Ultimate clone's HEAD on a spare port and makes it the first generation; from then on
