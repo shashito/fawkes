@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/shashito/fawkes/releases/latest"><img src="https://img.shields.io/github/v/release/shashito/fawkes?label=version" alt="Version"></a>
+  <a href="https://github.com/shashito/fawkes/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/shashito/fawkes/ci.yml?branch=main&label=CI" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue" alt="Platform: macOS, Linux">
 </p>
