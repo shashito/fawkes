@@ -48,6 +48,8 @@ test('the interval is read from the user settings file, and none there is the de
   assert.equal(await fetchEvery(home), 0)
   settings({ fawkes: { fetchEvery: 'soon' } })
   await assert.rejects(fetchEvery(home), /fawkes\.fetchEvery/)
+  writeFileSync(join(home, '.ultimate/settings.json'), '{ "fawkes": ')
+  await assert.rejects(fetchEvery(home), /settings\.json is not valid JSON/)
 })
 
 test('a fetch is due before the first, then once the interval passed since any host fetched, and never when off', () => {

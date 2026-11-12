@@ -34,11 +34,17 @@ export function parseFetchEvery(value: unknown): number {
 
 /** The interval the user's settings file (`<userHome>/.ultimate/settings.json`) sets; a missing file sets none. */
 export async function fetchEvery(userHome: string) {
-  const text = await readFile(join(userHome, '.ultimate', 'settings.json'), 'utf8').catch((error: unknown) => {
+  const path = join(userHome, '.ultimate', 'settings.json')
+  const text = await readFile(path, 'utf8').catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '{}'
     throw error
   })
-  const settings = JSON.parse(text) as { fawkes?: { fetchEvery?: unknown } } | null
+  let settings: { fawkes?: { fetchEvery?: unknown } } | null
+  try {
+    settings = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`${path} is not valid JSON: ${(error as Error).message}`)
+  }
   return parseFetchEvery(settings?.fawkes?.fetchEvery)
 }
 
@@ -67,7 +73,9 @@ export const lastFetch = (gitDir: string) =>
 
 /** Fetch `remote` into the clone's shared git directory, never prompting: a fetch without a login fails rather than hangs. */
 export async function fetchRemote(gitDir: string, remote: string) {
+  // A fixed directory, so a relative remote URL never depends on where the host was started.
   await run('git', [`--git-dir=${gitDir}`, 'fetch', '--quiet', '--end-of-options', remote], {
+    cwd: gitDir,
     timeout: 60_000,
     env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
   })
