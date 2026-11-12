@@ -25,6 +25,7 @@ flowchart LR
 ## Highlights
 
 - Upgrades as transactions: **stage, test, switch, confirm**, or an automatic rollback.
+- Runs each version from its own git worktree, so a merge or a landing in your clone never goes live untested.
 - Tests every new version on a spare port, with a copy of the app's storage, before it goes live.
 - Rolls code and storage back together when the new version crashes or does not confirm itself in time.
 - Leaves storage to the app: its own hooks snapshot and restore it, always run from the last good version.
