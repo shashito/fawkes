@@ -28,9 +28,9 @@ flowchart LR
 ## Install
 
 Fawkes builds with stable Rust ([rustup](https://rustup.rs)), needs `git` at run time, and runs on macOS and Linux.
-From a checkout of this repository:
-
 ```sh
+git clone https://github.com/shashito/fawkes.git
+cd fawkes
 cargo install --path . --locked
 ```
 
@@ -41,7 +41,7 @@ run from a directory the next `cargo build` replaces. To update, pull and run th
 
 ### An Ultimate host
 
-Stop the Ultimate you run for a project, then, from this repository:
+Stop the Ultimate you run for a project, then, in the `fawkes` folder you cloned, with the project's path:
 
 ```sh
 node ultimate/fawkes/init.ts <project>
@@ -54,8 +54,8 @@ Ultimate upgrades through Fawkes. [Running an Ultimate host](#running-an-ultimat
 ### The sample app
 
 The sample app in [`examples/sample/`](examples/sample/) serves its `VERSION` file, keeps a SQLite database, and
-confirms itself once it listens. It needs Node.js 22.13 or later. From this repository, make it a git repository of
-its own beside a manifest:
+confirms itself once it listens. It needs Node.js 22.13 or later. In the `fawkes` folder you cloned, copy it into a
+git repository of its own beside a manifest:
 
 ```sh
 mkdir -p /tmp/fawkes-demo/app
