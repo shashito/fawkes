@@ -436,13 +436,19 @@ fn deadline_arg(args: &Value) -> R<Option<u64>> {
 }
 
 /// The most entries an app's info may have.
-pub const MAX_INFO_KEYS: usize = 8;
+const MAX_INFO_KEYS: usize = 8;
 
 /// The longest key of an app's info, in characters.
 const MAX_INFO_KEY: usize = 16;
 
 /// The longest value of an app's info, in characters.
 const MAX_INFO_VALUE: usize = 256;
+
+/// A zero-width or bidirectional formatting character: invisible itself, it can hide text or reorder what a terminal
+/// shows around it.
+fn hidden(c: char) -> bool {
+    matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
+}
 
 /// The `info` argument of `report`: an object of strings that `check_info` accepts.
 fn info_arg(args: &Value) -> R<BTreeMap<String, String>> {
@@ -468,7 +474,8 @@ fn info_arg(args: &Value) -> R<BTreeMap<String, String>> {
 }
 
 /// What an app may report: at most `MAX_INFO_KEYS` entries, each key `[a-z][a-z0-9_]{0,15}` and each value 1 to 256
-/// characters without a control character, since the daemon prints them to the operator's terminal.
+/// characters without a control character, since the daemon prints them to the operator's terminal, nor one that
+/// changes how the text around it reads there (`hidden`).
 fn check_info(info: &BTreeMap<String, String>) -> R<()> {
     let usage = |message: String| Err(err(ErrorCode::Usage, message));
     if info.len() > MAX_INFO_KEYS {
@@ -493,9 +500,9 @@ fn check_info(info: &BTreeMap<String, String>) -> R<()> {
                 "the info value of `{key}` must be 1 to {MAX_INFO_VALUE} characters"
             ));
         }
-        if value.chars().any(char::is_control) {
+        if value.chars().any(|c| c.is_control() || hidden(c)) {
             return usage(format!(
-                "the info value of `{key}` must not contain a control character"
+                "the info value of `{key}` must not contain a control, zero-width or bidirectional character"
             ));
         }
     }
@@ -1603,6 +1610,8 @@ mod tests {
             r#"{"a":"line\nbreak"}"#.into(),
             r#"{"a":"escape\u001b[2J"}"#.into(),
             r#"{"a":"del\u007f"}"#.into(),
+            r#"{"a":"right\u202eto left"}"#.into(),
+            r#"{"a":"zero\u200bwidth"}"#.into(),
             r#"{"Url":"x"}"#.into(),
             r#"{"1a":"x"}"#.into(),
             r#"{"_a":"x"}"#.into(),

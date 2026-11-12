@@ -69,9 +69,14 @@ fn aligned_rows(rows: &[(&str, &str)], indent: &str, min_width: usize) -> Vec<St
 /// URL when it checks one, the app's address when it reports none of its own.
 pub fn render_up_block(s: &Status, app_log: &Path, health_url: Option<&str>) -> String {
     let generation = s.process.generation.as_deref();
-    let standing = match s.awaiting_confirm() {
-        Some(pending) if Some(pending.generation.as_str()) == generation => {
+    let standing = match (s.awaiting_confirm(), s.step, &s.pending) {
+        (Some(pending), ..) if Some(pending.generation.as_str()) == generation => {
             format!("pending, confirm by {}", pending.deadline)
+        }
+        (None, Some(Step::RollingBack), Some(pending))
+            if Some(pending.generation.as_str()) == generation =>
+        {
+            "rolling back".into()
         }
         _ => "permanent".into(),
     };
@@ -511,10 +516,10 @@ mod tests {
             ),
             "{pending}"
         );
-        // A rollback decided on it does not.
+        // A rollback decided on it says that instead.
         let mut rolling_back = running_status(true);
         rolling_back.step = Some(Step::RollingBack);
-        assert!(render_up_block(&rolling_back, log, None).contains("g3 permanent"));
+        assert!(render_up_block(&rolling_back, log, None).contains("g3 rolling back · pid"));
     }
 
     fn generation(id: &str, state: &str, reason: Option<&str>) -> Value {

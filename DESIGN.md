@@ -62,7 +62,7 @@ xana  g3 permanent · pid 71568 · port 4749
 ```
 
 The header has the app's name, the generation with `permanent` or, while it awaits its confirm, `pending, confirm by
-<deadline>`, the pid and the port. The rows are `url` (what the app reported, else the manifest's health URL when the
+<deadline>` (`rolling back` once its rollback is decided), the pid and the port. The rows are `url` (what the app reported, else the manifest's health URL when the
 health check is a URL, else no row), the other things the app reported, by key (Report), then what Fawkes knows:
 `output` (the generation's `logs/app.log`), `state` (the state directory) and `next` (commands that work from any
 terminal, naming the manifest by its path as the text of `down` does). Labels share one column. What the app reported
@@ -1028,11 +1028,10 @@ listens). It is accepted only from the live app that runs now: `generation` must
 the live slot, else `invalid_state`, whose message says that only the running live app reports and names what runs (or
 that nothing does). A test run's generation is never that one, so a test run cannot report; the CLI has no `report`
 command. Refused as `usage`, before anything changes: more than 8 keys; a key that is not `[a-z][a-z0-9_]{0,15}`; a
-value that is empty, longer than 256 characters or has a control character (the values are printed to the operator's
-terminal); an `info` that is missing or not an object of strings. Each report replaces the whole info (`{}` clears it),
+value that is empty, longer than 256 characters or has a control, zero-width or bidirectional formatting character
+(the values are printed to the operator's terminal); an `info` that is missing or not an object of strings. Each report replaces the whole info (`{}` clears it),
 so a retry is safe. The info lives with the process: it is gone when the app exits, stops or is replaced, and a
-restarted or switched app starts with none and reports again. It is not in `state.json`. The text of the answer is one
-line, such as `reported url, log, remote for g3`.
+restarted or switched app starts with none and reports again. It is not in `state.json`.
 
 The daemon logs a `reported` event only when the info changed. The request is answered at once, like `status` and
 `confirm`, and takes no slot.
