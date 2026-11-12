@@ -39,6 +39,20 @@ run from a directory the next `cargo build` replaces. To update, pull and run th
 
 ## Quickstart
 
+### An Ultimate host
+
+Stop the Ultimate you run for a project, then, from this repository:
+
+```sh
+node ultimate/fawkes/init.ts <project>
+cd <project> && fawkes up
+```
+
+The first `fawkes up` tests the Ultimate clone's HEAD on a spare port and makes it the first generation; from then on
+Ultimate upgrades through Fawkes. [Running an Ultimate host](#running-an-ultimate-host) says what `init.ts` sets up.
+
+### The sample app
+
 The sample app in [`examples/sample/`](examples/sample/) serves its `VERSION` file, keeps a SQLite database, and
 confirms itself once it listens. It needs Node.js 22.13 or later. From this repository, make it a git repository of
 its own beside a manifest:
@@ -134,13 +148,7 @@ agent all of this. Exit codes: 0 ok, 1 failed, 2 usage, 3 daemon unreachable.
 
 The extension in [`ultimate/fawkes/`](ultimate/fawkes/) runs an [Ultimate](https://github.com/HazAT/ultimate) host
 under Fawkes: upgrades go through `fawkes upgrade`, a new generation confirms itself once its extensions load, and
-storage is Ultimate's two SQLite databases. Set a project up once, stop the Ultimate you run for it, and start Fawkes
-there:
-
-```sh
-node ultimate/fawkes/init.ts <project>
-cd <project> && fawkes up
-```
+storage is Ultimate's two SQLite databases. The [Quickstart](#an-ultimate-host) starts one.
 
 `init.ts` writes the manifest (`~/.fawkes/<name>.toml`), links the extension into the project, turns Ultimate's own
 `update` off and trusts the project's setup; run again, it changes nothing. The manifest has `adopt = true`, so the
