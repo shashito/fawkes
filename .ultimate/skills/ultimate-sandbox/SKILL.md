@@ -36,7 +36,10 @@ the live host's `ULTIMATE_*` and `FAWKES_*` variables.
    Look at it with the screenshot and browser tools on `http://127.0.0.1:4870/`. The daemon, from the project
    folder as a user would run it: `sandbox.sh start daemon fawkes up`; the CLI: `sandbox.sh run fawkes status`.
 4. **Moving a host under Fawkes**, as a user does it: run `init.ts` once (the `fawkes · set up` card shows this
-   command and writes nothing), stop the host (`sandbox.sh stop host`), start the daemon:
+   command and writes nothing), stop the host (`sandbox.sh stop host`), start the daemon. The sandbox's Fawkes home
+   cannot see `~/.fawkes`, so `init.ts` would pick xana's spare ports 4790–4799: first write a stand-in manifest
+   that claims them, `/tmp/fxs/fh/xana.toml` with `name = "xana"`, `port = 4749` and `spare_ports = [4790, 4799]`
+   (plus `repo`, `home` and `start`, which nothing runs), so the run takes the next free block:
 
    ```sh
    sh .ultimate/skills/ultimate-sandbox/sandbox.sh run node /tmp/fxs/ext/init.ts /tmp/fxs/proj --ultimate /tmp/fxs/ultimate --port 4870
