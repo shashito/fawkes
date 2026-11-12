@@ -66,13 +66,15 @@ attestation() {
 	fi
 	# Under `curl | sh` the script is standard input, which nothing it runs may read.
 	help=$(gh attestation verify --help 2>&1 </dev/null) || help=
-	case $help in
-	*--signer-workflow*--source-ref*) ;;
-	*)
-		unverified "this gh is too old to verify attestations; update it"
-		return
-		;;
-	esac
+	for flag in --signer-workflow --source-ref --deny-self-hosted-runners; do
+		case $help in
+		*"$flag"*) ;;
+		*)
+			unverified "this gh is too old to verify attestations; update it"
+			return
+			;;
+		esac
+	done
 	set -- "$1" --repo shashito/fawkes --signer-workflow shashito/fawkes/.github/workflows/release.yml \
 		--deny-self-hosted-runners
 	[ "$version" = latest ] || set -- "$@" --source-ref "refs/tags/$version"
