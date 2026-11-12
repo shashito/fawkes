@@ -53,6 +53,8 @@ export type Status = {
   busy: string | null
   /** The daemon's build; a status without it is older than this extension expects (`step.ts`, `outdated`). */
   version?: string
+  /** The manifest's absolute path; sent along with `version`. */
+  manifest?: string
   /** The commands the daemon accepts right now, as command lines without `fawkes` (`confirm g3`, `rollback`). */
   actions?: string[]
   process: {
@@ -158,6 +160,14 @@ export type SetupPreview = {
   error?: string
 }
 
+/**
+ * The last release check (`release.ts`): the newest release's tag (null when there is none, or GitHub has not answered
+ * yet), the version of the binary the daemon was started from as it is installed now (absent when it could not be run),
+ * the command that upgrades this install, the one that restarts the daemon, and when GitHub last answered (0 before it
+ * has).
+ */
+export type Release = { latest: string | null; installed?: string; command: string; restart: string; checkedAt: number }
+
 /** One thing the user does in a terminal; `command` has a copy button. */
 export type SetupStep = { label: string; command?: string }
 
@@ -184,4 +194,6 @@ export type FawkesState =
       confirming?: Confirming
       /** Commits on the upgrade ref that this generation does not have; undefined until checked. */
       behind?: { ref: string; count: number; commits: { sha: string; subject: string }[]; fetchedAt: number; error?: string }
+      /** Undefined until the first release check, and when `FAWKES_NO_UPDATE_CHECK` turns it off. */
+      release?: Release
     }

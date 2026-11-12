@@ -145,7 +145,8 @@ the status and the latest events. Everything shown is read from fields (`status.
 - `rolling back g8` while a rollback runs, and `restore failed` in red when its storage restore failed;
 - `g8 rolled back` or `upgrade failed`, in red, for an hour after it happened;
 - `fawkes too old` when the daemon's status has no `version`: it predates the fields this extension reads. The
-  generation still holds the scheduler and confirms itself, but upgrades are off until Fawkes is upgraded.
+  generation still holds the scheduler and confirms itself, but upgrades are off until Fawkes is upgraded;
+- `✓ g7 · fawkes 0.2.0` (muted) when a newer Fawkes is out or installed (Releases, below).
 
 The popover says how the latest switch ended (its cause in words, where it went back to and what became of the
 storage), lists the newest generations with the cause of each rollback and the latest events, and offers only what
@@ -153,10 +154,32 @@ storage), lists the newest generations with the cause of each rollback and the l
 Upgrade when the ref has new commits, `stage` is allowed and no switch is in flight. Check now is there unless a
 switch awaits its confirm. An older daemon sends no `actions`: its pending switch still offers Confirm and Roll back.
 
+## Releases
+
+The live generation checks for a newer Fawkes 30 s after it starts and then every hour (`release.ts`):
+
+- `$FAWKES_BIN --version`: the binary the daemon was started from, as it is installed now. `install.sh` renames the
+  new binary into that path, so it says what a daemon restart would run.
+- Once a day, the tag GitHub's `releases/latest` redirect names (a `HEAD` request, not the API, which limits clients
+  without a token to 60 requests an hour). No release yet redirects to the releases page instead. A check that fails
+  (offline, a timeout of 10 s) keeps the last answer and runs again at the next tick.
+
+When that release is newer than the installed binary and the daemon, the popover shows it with two commands to copy:
+the upgrade (the `curl` line of `install.sh`, or `git pull` and `cargo install` in the checkout when this folder is
+one), then the daemon's restart (`fawkes service restart` when it has a launchd agent, else `fawkes down` and
+`fawkes up` with the daemon's own binary, which may not be the first `fawkes` on `PATH`), to run from a shell outside
+this Ultimate once no switch is pending, since a daemon restart rolls a pending switch back. When only the installed
+binary is newer than the daemon, it shows the restart alone. The `fawkes` tool's `status` says the same. Versions
+compare as numbers, a prerelease before its release. Check now asks GitHub at once, after a check already under way.
+
+`FAWKES_NO_UPDATE_CHECK` (set and not empty), in the daemon's environment or the manifest's `[env]`, turns the check
+off. A test run never checks.
+
 ## Actions
 
 - `state` (no arguments): what the status line shows.
-- `check` (no arguments): fetch the clone and count what an upgrade would bring.
+- `check` (no arguments): fetch the clone and count what an upgrade would bring, and ask GitHub for the newest
+  release.
 - `upgrade` `{ ref? }` (user-only): `fawkes upgrade` `ref` (default `origin/main`) in the background.
 - `confirm` (user-only): confirm the pending generation now, without its own checks.
 - `setupPreview` (no arguments): the terminal steps that set this host up (the `init.ts` command while a piece is
@@ -177,7 +200,8 @@ changed since that conversation last heard, and once more when it no longer appl
 `ultimate/check` runs `storage.test.ts` (the hooks against real WAL databases), `test-env.test.ts` (the test run's
 environment against the clone's own preview helpers, so a change in Ultimate that breaks the isolation fails it),
 `upgrade.test.ts` (the `fawkes upgrade` call and its result and error fields), `facts.test.ts` (outcomes and words
-from fields) and the rest, and type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
+from fields), `release.test.ts` (versions, the redirect's tag and what the popover says) and the rest, and
+type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
 
 ## Storage hooks
 

@@ -1,5 +1,6 @@
 import {
   ArrowDownIcon,
+  ArrowUpIcon,
   CheckIcon,
   CopyIcon,
   LoaderCircleIcon,
@@ -13,6 +14,7 @@ import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { actionRef, api, cn, defineWebExtension, formatAgo, useAction, useNow } from '@/sdk'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
+import { releaseNote, RESTART_WHEN } from './release.ts'
 import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
 import type { FawkesState, Generation, SetupPreview, SetupStep, Upgrade } from './types.ts'
 
@@ -150,6 +152,36 @@ function UpgradeRow({ state }: { state: Supervised }) {
   )
 }
 
+/** A command with a copy button. */
+function Command({ text }: { text: string }) {
+  return (
+    <div className="mt-0.5 flex items-center gap-1 rounded-sm bg-muted/50 py-0.5 pl-2 pr-0.5">
+      <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{text}</code>
+      <CopyButton text={text} />
+    </div>
+  )
+}
+
+/** A newer Fawkes: the command that installs it, then the daemon restart that runs it; or only the restart. */
+function ReleaseRow({ state }: { state: Supervised }) {
+  const note = releaseNote(state.release, state.status)
+  if (!note || !state.release) return null
+  return (
+    <div className="border-t border-border/60 pt-2">
+      <div>
+        <ArrowUpIcon className="mr-1 inline size-3 text-brand" />
+        Fawkes {note.version} {note.kind === 'available' ? 'is available' : 'is installed'}
+        <span className="text-muted-foreground"> · the daemon runs {note.daemon}</span>
+      </div>
+      {note.kind === 'available' && <Command text={state.release.command} />}
+      <div className="mt-1 text-muted-foreground">
+        {note.kind === 'available' ? 'Then restart' : 'Restart'} the daemon {RESTART_WHEN}:
+      </div>
+      <Command text={state.release.restart} />
+    </div>
+  )
+}
+
 /** How the latest switch ended, when it rolled back: its cause in words, where it went, what became of the storage. */
 function LastSwitch({ state }: { state: Supervised }) {
   const last = lastOutcome(state)
@@ -281,6 +313,7 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
             {behind.error && <div className="text-error">Last check failed: {behind.error}</div>}
           </div>
         )}
+        <ReleaseRow state={state} />
         <div className="border-t border-border/60 pt-2">
           <Generations state={state} />
         </div>
@@ -359,12 +392,7 @@ function SetupSteps({ steps }: { steps: SetupStep[] }) {
             <div>
               <span className="text-muted-foreground">{index + 1}.</span> {step.label}
             </div>
-            {step.command && (
-              <div className="mt-0.5 flex items-center gap-1 rounded-sm bg-muted/50 py-0.5 pl-2 pr-0.5">
-                <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap">{step.command}</code>
-                <CopyButton text={step.command} />
-              </div>
-            )}
+            {step.command && <Command text={step.command} />}
           </li>
         ))}
       </ol>
@@ -483,6 +511,7 @@ function Fawkes() {
   }
   const item = itemOf(data)
   const pending = awaitingConfirm(data.status)
+  const release = releaseNote(data.release, data.status)
   const label =
     item === 'disconnected' ? (
       <>
@@ -533,6 +562,7 @@ function Fawkes() {
       <>
         <CheckIcon className="size-3" />
         {data.generation}
+        {release && <span className="max-md:hidden">· fawkes {release.version}</span>}
       </>
     )
   return (
