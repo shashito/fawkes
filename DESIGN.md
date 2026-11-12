@@ -1117,6 +1117,29 @@ event log started over`. Until the first `status` line names the app, a note nam
 
 `state.json` is the source of truth; the deadline is an absolute time so it survives a daemon restart.
 
+## Releases
+
+A tag `v<version>` naming the `version` in `Cargo.toml` publishes a GitHub release once `scripts/check` passes on
+macOS and Linux (`.github/workflows/release.yml`; run by hand, it builds the same archives without a release). Its
+assets:
+
+- `fawkes-<target>.tar.gz` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and
+  `aarch64-unknown-linux-musl` (static, for any distribution), made by `scripts/package <target>`: one folder
+  `fawkes-<target>` with `fawkes`, `LICENSE` and the Ultimate extension in `ultimate/fawkes`, without its tests.
+- `fawkes-<target>.tar.gz.sha256`, in `sha256sum`'s format.
+- `install.sh`, which installs that release (the copy in the repository installs the latest).
+
+`install.sh` is POSIX `sh` and needs `curl`, `tar` and `sha256sum` or `shasum`. It picks the archive of the machine
+(the Apple silicon one in a shell under Rosetta), refuses one that does not match its checksum, and installs:
+
+- `fawkes` to `$FAWKES_INSTALL_DIR`, default `~/.local/bin`;
+- the extension to `~/.local/share/fawkes/ultimate/fawkes`, which `init.ts` in it links into a project.
+
+Each is copied beside its place and renamed into it, so running it again upgrades both, and a running daemon keeps
+the binary it started from until `down` and `up`. It never needs root and never changes a shell startup file: it
+says when the install directory is not on `PATH`, or when another `fawkes` comes first there. `FAWKES_DOWNLOAD_URL`
+replaces the release's download folder (a mirror, or a `file://` folder of archives for a test).
+
 ## Crates
 
 For the daemon and CLI, each replacing something not worth hand-writing:
@@ -1159,6 +1182,8 @@ message. anyhow's context chains would have to be flattened into every one of th
 
 ## Later
 
+- Signed and notarized macOS binaries, build provenance attestations for the release archives, and a Homebrew
+  formula.
 - `confirm = "health"` for apps that cannot call `confirm` themselves.
 - Falling back past the permanent generation when it crash-loops.
 - Generic apps (`reviews/api-review-3.md`, sections 2 and 4):

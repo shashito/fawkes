@@ -2,3 +2,4 @@
 .DS_Store
 .*.swp
 /examples/sample/sample-home
+/dist

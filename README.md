@@ -4,6 +4,12 @@
 
 <h1 align="center">Fawkes</h1>
 
+<p align="center">
+  <a href="https://github.com/shashito/fawkes/releases/latest"><img src="https://img.shields.io/github/v/release/shashito/fawkes?label=version" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue" alt="Platform: macOS, Linux">
+</p>
+
 A process supervisor for durable agents that upgrade themselves.
 
 ```mermaid
@@ -38,7 +44,26 @@ flowchart LR
 
 ## Installation and Usage
 
-Ask Ultimate to install it. Or, by hand, build Fawkes with [Rust](https://rustup.rs):
+Ask Ultimate to install it. Or, by hand, on macOS or Linux:
+
+```bash
+curl -LsSf https://github.com/shashito/fawkes/releases/latest/download/install.sh | sh
+```
+
+This puts `fawkes` in `~/.local/bin` and its Ultimate extension in `~/.local/share/fawkes`. Then stop the Ultimate of
+your project, set the project up once, and start it:
+
+```console
+$ node ~/.local/share/fawkes/ultimate/fawkes/init.ts ~/Code/my-app
+$ cd ~/Code/my-app
+$ fawkes up
+```
+
+`init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
+and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
+to roll back to. To update Fawkes, run the `curl` line again.
+
+To build it from source instead, with [Rust](https://rustup.rs):
 
 ```bash
 git clone https://github.com/shashito/fawkes.git
@@ -46,17 +71,8 @@ cd fawkes
 cargo install --path . --locked
 ```
 
-Then stop the Ultimate of your project, set the project up once from the `fawkes` folder, and start it:
-
-```console
-$ node ultimate/fawkes/init.ts ~/Code/my-app
-$ cd ~/Code/my-app
-$ fawkes up
-```
-
-`init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
-and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
-to roll back to. To update Fawkes, pull and run `cargo install` again.
+Then run `init.ts` from the clone (`node ultimate/fawkes/init.ts ~/Code/my-app`), and update with `git pull` and
+`cargo install` again.
 
 ## Features
 
@@ -137,7 +153,12 @@ Ultimate, never on a live install. The tests pass on macOS and Linux.
 ```bash
 scripts/check           # cargo fmt, cargo deny, cargo clippy and cargo test, as every landing runs them
 scripts/check --only X  # fmt, clippy and the one test X
+scripts/package T       # the release archive of target T, in dist/
 ```
+
+To release, set the `version` in `Cargo.toml`, commit, and push the tag `v<version>`: the release workflow runs the
+checks, builds macOS (Apple silicon and Intel) and static Linux (x86_64 and arm64) archives and publishes them with
+`install.sh`.
 
 `cargo deny` comes from `brew install cargo-deny`. The integration tests run the sample app in `examples/sample`, so
 they need `git` and Node.js 22.13 or later. They run in parallel, each in its own `/tmp/fk<port>` with its own ports.

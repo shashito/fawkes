@@ -91,6 +91,12 @@ not built yet. Don't start one unless asked.
 - **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `up`
   supports `--json`, and under it every failure, the client's own included, prints one error object.
 
+## Releases
+
+`DESIGN.md` → Releases is the contract for the archives and `install.sh`. Never push a tag or create a release: the
+user does. Check `install.sh` against `scripts/package` output with `FAWKES_DOWNLOAD_URL=file://$PWD/dist` and a
+`HOME` under `/tmp`, and the workflows with `actionlint`.
+
 ## Dependencies
 
 The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rustix, signal-hook,

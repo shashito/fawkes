@@ -1,0 +1,40 @@
+#!/bin/sh
+# Build the release archive of one target, as the release workflow does, and its checksum.
+#
+#   scripts/package <target>     dist/fawkes-<target>.tar.gz and dist/fawkes-<target>.tar.gz.sha256
+#
+# The archive holds one folder, fawkes-<target>, with the `fawkes` binary, LICENSE and the Ultimate extension
+# (ultimate/fawkes without its tests); install.sh unpacks it. The target must be installed (`rustup target add`).
+
+set -eu
+
+[ $# -eq 1 ] || {
+	echo "usage: scripts/package <target>" >&2
+	exit 2
+}
+target=$1
+name=fawkes-$target
+
+cd "$(dirname "$0")/.."
+cargo build --release --locked --target "$target"
+
+rm -rf "dist/$name" "dist/$name.tar.gz" "dist/$name.tar.gz.sha256"
+mkdir -p "dist/$name/ultimate/fawkes"
+cp "target/$target/release/fawkes" LICENSE "dist/$name/"
+for file in ultimate/fawkes/*; do
+	case $file in
+	*.test.ts) ;;
+	*) cp "$file" "dist/$name/ultimate/fawkes/" ;;
+	esac
+done
+# COPYFILE_DISABLE keeps macOS's tar from adding ._ metadata files.
+COPYFILE_DISABLE=1 tar -czf "dist/$name.tar.gz" -C dist "$name"
+rm -rf "dist/$name"
+
+cd dist
+if command -v sha256sum >/dev/null; then
+	sha256sum "$name.tar.gz" >"$name.tar.gz.sha256"
+else
+	shasum -a 256 "$name.tar.gz" >"$name.tar.gz.sha256"
+fi
+echo "dist/$name.tar.gz"

@@ -1,0 +1,91 @@
+# A `v*` tag publishes a GitHub release once the checks pass: one archive per target (scripts/package), its sha256
+# and install.sh, which installs this release. Run by hand (workflow_dispatch), it builds and checks everything the
+# same way and keeps the archives as the run's artifacts, without a release.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          # Built on Apple silicon too: Intel runners are on their way out, and Xcode links both.
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          # musl, so one static binary runs on any distribution, whatever its glibc.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup toolchain install --no-self-update && rustup target add "$TARGET"
+      # No build cache: a release is built from scratch.
+      - run: scripts/package "$TARGET"
+      - name: Check the binary and its version
+        run: |
+          tar -xzf "dist/fawkes-$TARGET.tar.gz" -C "$RUNNER_TEMP"
+          binary=$RUNNER_TEMP/fawkes-$TARGET/fawkes
+          if [ "$TARGET" = x86_64-apple-darwin ]; then
+            # The runner may have no Rosetta to run it.
+            [ "$(lipo -archs "$binary")" = x86_64 ]
+            exit
+          fi
+          version=$("$binary" --version)
+          echo "$version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "fawkes ${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not name the version in Cargo.toml ($version); delete the tag, and tag the commit that sets the version"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fawkes-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write the release's tag into install.sh
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            sed "s/^version=latest\$/version=$GITHUB_REF_NAME/" install.sh >dist/install.sh
+            grep -qx "version=$GITHUB_REF_NAME" dist/install.sh
+          else
+            cp install.sh dist/install.sh
+          fi
+      - name: Install from the archives
+        run: |
+          home=$RUNNER_TEMP/home
+          mkdir -p "$home"
+          HOME=$home FAWKES_DOWNLOAD_URL=file://$PWD/dist sh dist/install.sh
+          "$home/.local/bin/fawkes" --version
+          test -f "$home/.local/share/fawkes/ultimate/fawkes/init.ts"
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "Fawkes ${GITHUB_REF_NAME#v}" --generate-notes dist/*
