@@ -35,9 +35,9 @@ flowchart LR
 > **Disclaimer.** Fawkes was built for Ultimate, by Ultimate's agents. It is shared as is, and no support is
 > planned.
 
-## Installation
+## Installation and Usage
 
-Build and install Fawkes with [Rust](https://rustup.rs):
+Ask Ultimate to install it. Or, by hand, build Fawkes with [Rust](https://rustup.rs):
 
 ```bash
 git clone https://github.com/shashito/fawkes.git
@@ -45,19 +45,7 @@ cd fawkes
 cargo install --path . --locked
 ```
 
-To update, pull and run `cargo install` again.
-
-## Documentation
-
-[DESIGN.md](DESIGN.md) is the full contract: the manifest, the CLI, the socket protocol, the files on disk and the
-states. `fawkes --help` covers every command, and [`ultimate/fawkes/README.md`](ultimate/fawkes/README.md) the
-Ultimate extension.
-
-## Features
-
-### Run Ultimate under Fawkes
-
-Stop the Ultimate of your project, then set the project up once from the `fawkes` folder, and start it:
+Then stop the Ultimate of your project, set the project up once from the `fawkes` folder, and start it:
 
 ```console
 $ node ultimate/fawkes/init.ts ~/Code/my-app
@@ -67,7 +55,9 @@ $ fawkes up
 
 `init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
 and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
-to roll back to.
+to roll back to. To update Fawkes, pull and run `cargo install` again.
+
+## Features
 
 ### Upgrade
 
@@ -129,6 +119,12 @@ The ideas are borrowed:
 - **Confirming itself** comes from RAUC and Mender A/B updates.
 - **The deadline** comes from Junos `commit confirmed`.
 - **No loops:** a generation rolls back at most once.
+
+## Documentation
+
+[DESIGN.md](DESIGN.md) is the full contract: the manifest, the CLI, the socket protocol, the files on disk and the
+states. `fawkes --help` covers every command, and [`ultimate/fawkes/README.md`](ultimate/fawkes/README.md) the
+Ultimate extension.
 
 ## Status
 
