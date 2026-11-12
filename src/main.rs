@@ -36,7 +36,7 @@ macro_rules! exit_codes {
     };
 }
 
-/// The process's exit codes besides 0, as `exit_codes!` names them.
+// The process's exit codes besides 0, as `exit_codes!` names them.
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;

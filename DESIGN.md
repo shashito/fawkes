@@ -719,8 +719,9 @@ long as it runs. `--json` does not apply to `up`, which prints text only.
 **A `--json` result only ever gains fields:** a field is never removed, renamed or given another meaning, so a
 reader ignores the fields it does not know. Enumerations may gain values (see Socket protocol).
 Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
-for `up` too), `3` no daemon answers (`daemon_unreachable`). A stdout or stderr that cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
-decides, and `log --follow` ends with `0`.
+for `up` too), `3` no daemon answers (`daemon_unreachable`). A stdout or stderr that cannot be written (a reader
+that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer decides, and
+`log --follow` ends with `0`.
 
 `start`, `confirm`, `status`, `history`, `reload` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
 fail with exit 1 and `no_answer`, "the daemon … did not answer in time". The other commands wait as long as their step runs, which the
