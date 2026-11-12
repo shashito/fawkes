@@ -2620,6 +2620,55 @@ fn a_usage_error_exits_2_and_help_exits_0() {
     }
 }
 
+/// The help of `fawkes` and of every command reflows to the terminal: at 80 columns no line is wider.
+#[test]
+fn help_fits_an_80_column_terminal() {
+    // clap takes the width of the first terminal among stdout, stderr and stdin, else `COLUMNS`, else 100 columns. With
+    // none of them a terminal, `COLUMNS` decides, wherever the suite runs.
+    let help = |path: &[String], flag: &str| {
+        let output = common::fawkes()
+            .args(&path[1..])
+            .arg(flag)
+            .env("COLUMNS", "80")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{path:?} {flag}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let mut paths = vec![vec!["fawkes".to_string()]];
+    let mut checked = 0;
+    while let Some(path) = paths.pop() {
+        for flag in ["-h", "--help"] {
+            let text = help(&path, flag);
+            for line in text.lines() {
+                assert!(
+                    line.chars().count() <= 80,
+                    "`{} {flag}` has a line over 80 columns:\n{line}",
+                    path.join(" ")
+                );
+            }
+            if flag == "--help" {
+                // The commands are listed under `Commands:`, each name indented by two spaces; a description that
+                // wraps goes on further indented.
+                let commands = text.lines().skip_while(|line| *line != "Commands:").skip(1);
+                for line in commands.take_while(|line| !line.is_empty()) {
+                    if let Some(named) = line
+                        .strip_prefix("  ")
+                        .filter(|rest| !rest.starts_with(' '))
+                    {
+                        let name = named.split_whitespace().next().unwrap().to_string();
+                        paths.push(path.iter().cloned().chain([name]).collect());
+                    }
+                }
+            }
+        }
+        checked += 1;
+    }
+    // `fawkes`, its 20 commands, and the 3 of `fawkes service`.
+    assert!(checked >= 24, "only {checked} commands checked");
+}
+
 /// Without `--manifest` or `--socket` the client finds the app from where it runs: the nearest `fawkes.toml` above
 /// it, else the manifest in `FAWKES_HOME` whose repo holds it; `--manifest` takes that manifest's name too, and beats an
 /// inherited `FAWKES_SOCKET`, which beats what is found.

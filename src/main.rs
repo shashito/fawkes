@@ -29,7 +29,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 daemon unreachable.
+/// The exit codes, which `fawkes -h` and `fawkes --help` end with. A macro, because `concat!` takes only literals.
+macro_rules! exit_codes {
+    () => {
+        "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers."
+    };
+}
+
+/// The process's exit codes besides 0, as `exit_codes!` names them.
 const EXIT_FAILED: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_UNREACHABLE: u8 = 3;
@@ -37,32 +44,32 @@ const EXIT_UNREACHABLE: u8 = 3;
 /// `skills/fawkes/SKILL.md` as it was when this binary was built, for `fawkes skill`.
 const SKILL: &str = include_str!("../skills/fawkes/SKILL.md");
 
-const EXIT_CODES: &str =
-    "Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers.";
+/// The end of `fawkes -h`.
+const EXIT_CODES: &str = exit_codes!();
 
-/// The end of `fawkes --help` (not `-h`): how the app is found, what `--json` prints, examples, and the exit codes.
-const LONG_HELP_END: &str = "\
-Finding the app: --socket, else --manifest, else $FAWKES_SOCKET (set for the processes Fawkes starts), else
-$FAWKES_MANIFEST, else the nearest fawkes.toml from the current directory up to the repository root (the first
-directory with a .git), else the manifest in $FAWKES_HOME (default ~/.fawkes) whose repo holds the current
-directory; when several do, name one. --manifest and $FAWKES_MANIFEST take a path (a value with a / or ending in
-.toml) or an app name, for $FAWKES_HOME/<APP>.toml.
-
-JSON: stdout carries one document, the result or the error object {\"code\", \"message\"}, and progress goes to
-stderr as JSON lines. A result only ever gains fields. The streams differ: `log --follow` prints one event per
-line, `watch` one {\"name\", \"event\"} document per event. `up` prints text only.
-
-Examples:
-  fawkes up                          supervise the app of this project, in the foreground
-  fawkes upgrade main                stage, test and switch main; the new generation confirms itself
-  fawkes wait                        until the pending switch is confirmed or rolled back
-  fawkes status --json               what runs, what is pending, and the commands accepted now
-  fawkes rollback                    undo the pending switch
-  fawkes --manifest xana log -n 20   the last 20 events of the app xana, from anywhere
-  fawkes down                        stop the app and its supervisor
-  fawkes skill                       how an agent uses Fawkes, for this version
-
-Exit codes: 0 ok, 1 the command failed, 2 usage error, 3 no daemon answers.";
+/// The end of `fawkes --help`: how the app is found, what `--json` prints, examples, and the exit codes. clap
+/// reflows each paragraph to the terminal, so a paragraph is one line; an example line must fit 80 columns, since a
+/// wrapped one would lose its column.
+const LONG_HELP_END: &str = concat!(
+    "Finding the app: --socket, else --manifest, else $FAWKES_SOCKET (set for the processes Fawkes starts), else \
+     $FAWKES_MANIFEST, else the nearest fawkes.toml from the current directory up to the repository root (the first \
+     directory with a .git), else the manifest in $FAWKES_HOME (default ~/.fawkes) whose repo holds the current \
+     directory; when several do, name one. --manifest and $FAWKES_MANIFEST take a path (a value with a / or ending \
+     in .toml) or an app name, for $FAWKES_HOME/<APP>.toml.\n\n",
+    "JSON: stdout carries one document, the result or the error object {\"code\", \"message\"}, and progress goes to \
+     stderr as JSON lines. A result only ever gains fields. The streams differ: `log --follow` prints one event per \
+     line, `watch` one {\"name\", \"event\"} document per event. `up` prints text only.\n\n",
+    "Examples:\n  \
+     fawkes up                          run this project's app, in the foreground\n  \
+     fawkes upgrade main                stage, test and switch to main\n  \
+     fawkes wait                        until the switch confirms or rolls back\n  \
+     fawkes status --json               what runs, and the commands accepted now\n  \
+     fawkes rollback                    undo the pending switch\n  \
+     fawkes --manifest xana log -n 20   the last 20 events of xana, from anywhere\n  \
+     fawkes down                        stop the app and its supervisor\n  \
+     fawkes skill                       how an agent uses Fawkes, for this version\n\n",
+    exit_codes!()
+);
 
 /// A process supervisor whose upgrades are transactions: stage, test, switch, confirm, or roll back.
 #[derive(Parser)]

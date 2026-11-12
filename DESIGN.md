@@ -719,8 +719,7 @@ long as it runs. `--json` does not apply to `up`, which prints text only.
 **A `--json` result only ever gains fields:** a field is never removed, renamed or given another meaning, so a
 reader ignores the fields it does not know. Enumerations may gain values (see Socket protocol).
 Exit codes: `0` ok, `1` the command failed (`no_answer` included), `2` usage error (a manifest that cannot be loaded,
-for `up` too), `3` the daemon is unreachable (`daemon_unreachable`). A stdout or stderr that
-cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
+for `up` too), `3` no daemon answers (`daemon_unreachable`). A stdout or stderr that cannot be written (a reader that has gone, as in `fawkes status | head -0`) changes none of them: the daemon's answer
 decides, and `log --follow` ends with `0`.
 
 `start`, `confirm`, `status`, `history`, `reload` and `log` without `--follow` wait 30 seconds for the daemon's next line, then
@@ -1149,12 +1148,14 @@ replaces the release's download folder (a mirror, or a `file://` folder of archi
 For the daemon and CLI, each replacing something not worth hand-writing:
 
 - **serde** (derive): typed manifest, state file and protocol messages.
-- **clap** (no default features; `std`, `derive`, `help`, `usage`, `error-context`, `suggestions`): the command line,
-  declared as one struct and one enum whose doc comments are the help text. It keeps the global options valid on
-  either side of the command, exits 2 on a usage error and gives every command its own `--help`, which a
-  hand-written parser had to spell out in a usage string kept in step by hand.
+- **clap** (no default features; `std`, `derive`, `help`, `usage`, `error-context`, `suggestions`, `wrap_help`): the
+  command line, declared as one struct and one enum whose doc comments are the help text. It keeps the global
+  options valid on either side of the command, exits 2 on a usage error and gives every command its own `--help`,
+  which a hand-written parser had to spell out in a usage string kept in step by hand.
 - **strsim** (through clap's `suggestions`): the similar names in the error for a mistyped command or option
   (`fawkes logs` → `log`), which would otherwise be a hand-written edit distance.
+- **terminal_size** (through clap's `wrap_help`): the terminal's width, to which clap reflows the help (else
+  `COLUMNS`, else 100 columns), instead of wrapping the help to the terminal width by hand.
 - **serde_json:** the socket protocol, `--json` output, `state.json` and `events.jsonl`.
 - **toml:** the manifest format; people and agents write manifests by hand and want comments.
 - **rustix** (features `event`, `fs`, `net`, `param`, `process`): safe wrappers for the system calls std lacks:

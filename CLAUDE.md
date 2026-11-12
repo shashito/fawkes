@@ -89,7 +89,7 @@ not built yet. Don't start one unless asked.
 - **The socket protocol** sends one JSON object per line. Errors carry a stable `code` (the `ErrorCode` enum) and a
   readable `message`. Agents depend on the code strings, so add variants instead of renaming them. The daemon and the
   CLI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
-- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 daemon unreachable. Every command but `up`
+- **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 no daemon answers. Every command but `up`
   supports `--json`, and under it every failure, the client's own included, prints one error object.
 
 ## Releases
@@ -102,7 +102,8 @@ user does. Check `install.sh` against `scripts/package` output with `FAWKES_DOWN
 
 The crate list is deliberate (`DESIGN.md` → Crates): serde, serde_json, toml, clap, rustix, signal-hook,
 jiff and libc, strsim through clap's `suggestions` (the "similar command" tip, instead of a hand-written edit
-distance), and tempfile for the tests. The HTTP health check and the thread-based concurrency are
+distance), terminal_size through clap's `wrap_help` (instead of wrapping help to the terminal width by hand), and
+tempfile for the tests. The HTTP health check and the thread-based concurrency are
 hand-written on purpose, and errors stay `protocol::Error` and `String`, without anyhow or thiserror.
 
 A well-known crate is preferred over hand-written code when it removes a meaningful amount of code or `unsafe`, but
