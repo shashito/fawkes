@@ -69,7 +69,9 @@ terminal, naming the manifest by its path as the text of `down` does). Labels sh
 before its health check passed is in the block; a later report shows only as its `reported` event.
 
 Signals are only for the daemon's lifecycle: `fawkes down`, `SIGTERM` and `SIGINT` stop the live app and exit 0 (the
-generation keeps its state, so the next start resumes it), `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
+generation keeps its state, so the next start resumes it). Before it exits, the daemon waits up to 2 s after the app
+has stopped for the requests it is still serving to send their answers, such as the `busy` of a switch that it cut
+short; a request still at work after that gets none and fails `daemon_unreachable` (exit 3). `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
 is logged as a `daemon` event naming the changed fields, or an `error` event (with its `error_code`) saying why it was
 refused. `fawkes reload` also answers: the changed fields (`{"changed": ["port", "env"]}`, empty when nothing
 changed), or the refusal, `usage` for a manifest that is invalid and `invalid_state` for the two cases below. A signal

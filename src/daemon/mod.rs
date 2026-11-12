@@ -348,7 +348,8 @@ fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
 
 /// What the supervisor sleeps on: a count of changes, and a condvar to wait for the next one. Every change
 /// subscribers hear of (`Daemon::changed`) moves it, since whatever changes the picture may be for the supervisor to
-/// act on, and so do an exit of the live app and the start of shutdown. A waiter reads the count before it looks at
+/// act on, and so do an exit of the live app, the start of shutdown and, during shutdown, the end of a connection
+/// (`Admission`). A waiter reads the count before it looks at
 /// the state, so a change made after the look ends the wait, and none is lost in between.
 struct Wake {
     count: Mutex<u64>,
@@ -412,7 +413,14 @@ pub struct Daemon {
     signalled: UnixStream,
     /// The connections of `down` requests, answered at the end of `run`.
     downs: Mutex<Vec<Out>>,
+    /// Connections that hold a place (`Admission`): every one but a stream's still owes its client an answer.
+    open: AtomicUsize,
 }
+
+/// How long a daemon shutting down waits, once its app has stopped, for the requests it is serving to send their
+/// answers. Their steps end with the app's (the live slot is free, test and install groups are killed), so what is
+/// left is a write, which `WRITE_TIMEOUT` bounds; a request still at work past this is cut off.
+const ANSWER_WAIT: Duration = Duration::from_secs(2);
 
 /// How long the accept loop pauses after a failed `accept` or `poll`, so an error that persists does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
@@ -515,6 +523,7 @@ impl Daemon {
             echo: Mutex::new(Some(echo)),
             signalled,
             downs: Mutex::new(Vec::new()),
+            open: AtomicUsize::new(0),
         });
         let flush = Flush {
             daemon: daemon.clone(),
@@ -683,7 +692,6 @@ impl Daemon {
     ) -> Result<(), String> {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         signals.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let open = Arc::new(AtomicUsize::new(0));
         loop {
             // Drained before the flags are read: a signal that comes after the drain leaves a byte that ends the
             // next `poll` at once.
@@ -698,7 +706,7 @@ impl Daemon {
             let failed = match listener.accept() {
                 Ok((stream, _)) => {
                     // Taken before anything is read, so a client that sends nothing still holds its place.
-                    match Admission::take(&open) {
+                    match Admission::take(self) {
                         Some(admitted) => {
                             let daemon = self.clone();
                             thread::spawn(move || daemon.handle(stream, admitted));
@@ -813,15 +821,9 @@ impl Daemon {
         self.wake.notify();
         // A switch, rollback or restart in flight finishes first (start_live refuses from now on), so no app it
         // starts outlives the daemon. Its end frees the live slot, which moves `wake`.
-        let give_up = Instant::now() + self.manifest().shutdown_wait();
-        loop {
-            let seen = self.wake.seen();
-            let left = give_up.saturating_duration_since(Instant::now());
-            if self.inner().moving.is_none() || left.is_zero() {
-                break;
-            }
-            self.wake.wait(seen, Some(left));
-        }
+        self.wait_until(self.manifest().shutdown_wait(), || {
+            self.inner().moving.is_none()
+        });
         let app = self.inner().take_running();
         let stopped = app.as_ref().map(|app| app.generation.clone());
         if let Some(app) = app {
@@ -830,6 +832,9 @@ impl Daemon {
         for pgid in lock(&self.step_pgids).drain(..) {
             process::kill_group(pgid);
         }
+        // The process exits soon after this returns, and with it every thread: a switch cut short above has freed
+        // the live slot but may not have sent its `busy` yet. Each connection's end moves `wake` from now on.
+        self.wait_until(ANSWER_WAIT, || self.open.load(Ordering::SeqCst) == 0);
         self.event_with(
             EventKind::Daemon,
             None,
@@ -843,6 +848,20 @@ impl Daemon {
             name: self.manifest().name.clone(),
             daemon_pid: std::process::id(),
             stopped,
+        }
+    }
+
+    /// Sleep on `wake` until `done` holds or `limit` has passed. `done` is looked at after the count is read, so a
+    /// change that makes it hold always ends the wait.
+    fn wait_until(&self, limit: Duration, done: impl Fn() -> bool) {
+        let give_up = Instant::now() + limit;
+        loop {
+            let seen = self.wake.seen();
+            let left = give_up.saturating_duration_since(Instant::now());
+            if done() || left.is_zero() {
+                return;
+            }
+            self.wake.wait(seen, Some(left));
         }
     }
 }
@@ -1200,6 +1219,7 @@ mod tests {
             echo: Mutex::new(None),
             signalled: UnixStream::pair().unwrap().0,
             downs: Mutex::new(Vec::new()),
+            open: AtomicUsize::new(0),
         }
     }
 

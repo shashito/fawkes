@@ -11,7 +11,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -87,22 +87,28 @@ const CLOSE_CHECK: Duration = Duration::from_millis(500);
 /// a file descriptor, and a client that opens them without end must not starve `confirm` of both.
 const MAX_CONNECTIONS: usize = 64;
 
-/// A place among the open connections, given back when the connection ends or turns out to be a stream.
-pub(super) struct Admission(Option<Arc<AtomicUsize>>);
+/// A place among the open connections (`Daemon::open`), given back when the connection has its answer or turns out to
+/// be a stream. `shutdown` waits for every place to be given back.
+pub(super) struct Admission(Option<Arc<Daemon>>);
 
 impl Admission {
     /// A place, or None when `MAX_CONNECTIONS` are open.
-    pub(super) fn take(open: &Arc<AtomicUsize>) -> Option<Admission> {
-        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            open.fetch_sub(1, Ordering::SeqCst);
+    pub(super) fn take(daemon: &Arc<Daemon>) -> Option<Admission> {
+        if daemon.open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            daemon.open.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        Some(Admission(Some(open.clone())))
+        Some(Admission(Some(daemon.clone())))
     }
 
     fn release(&mut self) {
-        if let Some(open) = self.0.take() {
-            open.fetch_sub(1, Ordering::SeqCst);
+        if let Some(daemon) = self.0.take() {
+            daemon.open.fetch_sub(1, Ordering::SeqCst);
+            // Read after the count changed, as `shutdown` sets the flag before it reads the count: whichever comes
+            // second sees the other. Only then, so an ordinary request does not wake the supervisor.
+            if daemon.shutting_down() {
+                daemon.wake.notify();
+            }
         }
     }
 }
@@ -204,6 +210,8 @@ impl Daemon {
                 self.dispatch(&mut out, request)
             });
         out.finish(result);
+        // Given back only now: `shutdown` waits for it, so the answer is sent before the daemon exits.
+        drop(admitted);
     }
 
     fn dispatch(self: &Arc<Self>, out: &mut Out, request: Request) -> R<Reply> {
@@ -322,10 +330,9 @@ mod tests {
             // The daemon may stop reading and answer before the last byte is sent.
             let _ = writer.write_all(&bytes);
         });
-        let open = Arc::new(AtomicUsize::new(0));
         daemon
             .clone()
-            .handle(server, Admission::take(&open).unwrap());
+            .handle(server, Admission::take(daemon).unwrap());
         let mut line = String::new();
         BufReader::new(client).read_line(&mut line).unwrap();
         sender.join().unwrap();
@@ -492,24 +499,53 @@ mod tests {
         assert_eq!(ask(&longest, 64).unwrap_err().code, ErrorCode::Usage);
     }
 
+    /// The process exits soon after `shutdown` returns: a request still being answered, such as a switch that the
+    /// shutdown cut short, must have sent its answer by then.
+    #[test]
+    fn shutdown_waits_for_the_answer_an_open_connection_owes() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(scratch_daemon(temp.path()));
+        let owed = Admission::take(&daemon).unwrap();
+        daemon.shutdown.store(true, Ordering::SeqCst);
+        let (done, finished) = std::sync::mpsc::channel();
+        let shutting = {
+            let daemon = daemon.clone();
+            std::thread::spawn(move || {
+                daemon.shutdown();
+                done.send(()).unwrap();
+            })
+        };
+        // A wait that ends too early is all this can catch, so it never fails a slow machine.
+        assert!(
+            finished.recv_timeout(Duration::from_millis(500)).is_err(),
+            "shutdown returned with an answer still owed"
+        );
+        // Well inside the rest of `ANSWER_WAIT`: the answer sent wakes `shutdown`, not its time running out.
+        drop(owed);
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        shutting.join().unwrap();
+    }
+
     #[test]
     fn the_65th_open_connection_gets_no_place_until_one_ends() {
-        let open = Arc::new(AtomicUsize::new(0));
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(scratch_daemon(temp.path()));
+        let open = || daemon.open.load(Ordering::SeqCst);
         let mut places: Vec<_> = (0..MAX_CONNECTIONS)
-            .map(|_| Admission::take(&open).unwrap())
+            .map(|_| Admission::take(&daemon).unwrap())
             .collect();
-        assert!(Admission::take(&open).is_none());
-        assert_eq!(open.load(Ordering::SeqCst), MAX_CONNECTIONS);
+        assert!(Admission::take(&daemon).is_none());
+        assert_eq!(open(), MAX_CONNECTIONS);
 
         // A stream gives its place back at once, and a second release (the drop) gives nothing more.
         places[0].release();
-        assert_eq!(open.load(Ordering::SeqCst), MAX_CONNECTIONS - 1);
+        assert_eq!(open(), MAX_CONNECTIONS - 1);
         places.remove(0);
-        assert_eq!(open.load(Ordering::SeqCst), MAX_CONNECTIONS - 1);
-        let again = Admission::take(&open).unwrap();
-        assert!(Admission::take(&open).is_none());
+        assert_eq!(open(), MAX_CONNECTIONS - 1);
+        let again = Admission::take(&daemon).unwrap();
+        assert!(Admission::take(&daemon).is_none());
         drop(again);
         drop(places);
-        assert_eq!(open.load(Ordering::SeqCst), 0);
+        assert_eq!(open(), 0);
     }
 }
