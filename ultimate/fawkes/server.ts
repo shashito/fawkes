@@ -386,7 +386,7 @@ export const actions = {
       const refusals = plan.pieces.filter((piece) => piece.state === 'refused')
       const steps: SetupStep[] = [
         ...(missing ? [{ label: 'Set up this project (run once)', command: initCommand(host, plan.project) }] : []),
-        ...(await installSteps(extensionFolder())),
+        ...installSteps(extensionFolder()),
         { label: 'Stop this Ultimate (Ctrl-C in its terminal)' },
         { label: 'Start Fawkes in the project', command: `cd ${shellWord(plan.project)} && fawkes up` },
       ]

@@ -1120,8 +1120,8 @@ event log started over`. Until the first `status` line names the app, a note nam
 ## Releases
 
 A tag `v<version>` naming the `version` in `Cargo.toml` publishes a GitHub release once `scripts/check` passes on
-macOS and Linux (`.github/workflows/release.yml`; run by hand, it builds the same archives without a release). Its
-assets:
+macOS and Linux (`.github/workflows/release.yml`; run by hand, on any ref, it builds the same archives without a
+release). A tag with a suffix (`v0.2.0-rc.1`) makes a prerelease, which `releases/latest` skips. Its assets:
 
 - `fawkes-<target>.tar.gz` for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and
   `aarch64-unknown-linux-musl` (static, for any distribution), made by `scripts/package <target>`: one folder
@@ -1135,8 +1135,9 @@ assets:
 - `fawkes` to `$FAWKES_INSTALL_DIR`, default `~/.local/bin`;
 - the extension to `~/.local/share/fawkes/ultimate/fawkes`, which `init.ts` in it links into a project.
 
-Each is copied beside its place and renamed into it, so running it again upgrades both, and a running daemon keeps
-the binary it started from until `down` and `up`. It never needs root and never changes a shell startup file: it
+Each is copied beside its place and renamed into it (the extension's folder in two renames, missing for that
+moment), so running it again upgrades both, and a running daemon keeps the binary it started from until `down` and
+`up`. It never needs root and never changes a shell startup file: it
 says when the install directory is not on `PATH`, or when another `fawkes` comes first there. `FAWKES_DOWNLOAD_URL`
 replaces the release's download folder (a mirror, or a `file://` folder of archives for a test).
 

@@ -16,7 +16,6 @@
  * As a module (`inspect`, `resolveClone`) the extension's server facet shows the same plan on its card. As a program:
  * `node init.ts [--ultimate <clone>] [--port <n>] <project>`; exit 0 done, 1 failed or refused, 2 usage.
  */
-import { execFile } from 'node:child_process'
 import {
   accessSync,
   chmodSync,
@@ -36,7 +35,7 @@ import { createConnection, createServer } from 'node:net'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { parseArgs, promisify } from 'node:util'
+import { parseArgs } from 'node:util'
 import type { JsonObject } from '@earendil-works/pi-durable'
 import type * as PiCodingAgent from '@earendil-works/pi-coding-agent'
 // Types only: the code itself is loaded from the clone being set up (`loadClone`).
@@ -47,8 +46,6 @@ import type * as ProjectSetup from 'ultimate/server/project-setup.ts'
 import { buildManifest, claimedPorts, findExisting, freeName, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
 import type { ManifestFile } from './setup.ts'
 import type { SetupStep } from './types.ts'
-
-const run = promisify(execFile)
 
 /** The real path of this folder, where `start.ts`, `health.ts` and `storage.ts` live beside this file. */
 export const extensionFolder = () => realpathSync(dirname(fileURLToPath(import.meta.url)))
@@ -433,17 +430,17 @@ export function fawkesOnPath(path = process.env.PATH) {
   })
 }
 
-/** The step that installs `fawkes` from the repository this extension lives in; none when one is on PATH. */
-export async function installSteps(extension: string, path = process.env.PATH): Promise<SetupStep[]> {
+/**
+ * The step that puts `fawkes` on PATH; none when one is there. From a Fawkes checkout (`<repo>/ultimate/fawkes`) it
+ * installs from it; a release installed by install.sh has `fawkes` in ~/.local/bin, which PATH may lack.
+ */
+export function installSteps(extension: string, path = process.env.PATH): SetupStep[] {
   if (fawkesOnPath(path)) return []
-  const repo = await run('git', ['rev-parse', '--show-toplevel'], { cwd: extension, timeout: 10_000 }).then(
-    ({ stdout }) => stdout.trim(),
-    () => undefined,
-  )
+  const repo = dirname(dirname(extension))
   return [
-    repo
+    existsSync(join(repo, 'Cargo.toml'))
       ? { label: 'Install fawkes', command: `cargo install --path ${shellWord(repo)} --locked` }
-      : { label: 'Install fawkes (cargo install --path <the fawkes repository> --locked)' },
+      : { label: 'Put fawkes on PATH (install.sh puts it in ~/.local/bin, or $FAWKES_INSTALL_DIR)' },
   ]
 }
 
@@ -496,7 +493,7 @@ async function main(argv: string[], env: NodeJS.ProcessEnv) {
       if (piece.write && piece.note) console.log(`  ${piece.note}`)
     }
     const steps: SetupStep[] = [
-      ...(await installSteps(extensionFolder(), env.PATH)),
+      ...installSteps(extensionFolder(), env.PATH),
       { label: 'Stop the Ultimate running on this project, if any (Ctrl-C in its terminal)' },
       { label: 'Start Fawkes in the project', command: `cd ${shellWord(plan.project)} && fawkes up` },
     ]

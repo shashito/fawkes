@@ -68,6 +68,8 @@ main() {
 
 	tmp=$(mktemp -d)
 	trap 'rm -rf "$tmp"' EXIT
+	# dash runs the EXIT trap on exit, not when a signal ends it.
+	trap 'exit 1' INT TERM
 
 	say "downloading $url/$archive"
 	curl -fsSL -o "$tmp/$archive" "$url/$archive" || fail "cannot download $url/$archive"
@@ -84,7 +86,7 @@ main() {
 	[ -x "$bin/fawkes" ] && previous=$("$bin/fawkes" --version 2>/dev/null || true)
 
 	# Each is copied beside its place and renamed into it, so a running daemon keeps the binary it started from and
-	# nothing is ever half copied.
+	# nothing is ever half copied. The extension's folder is swapped in two renames: for that moment it is missing.
 	mkdir -p "$bin" "$share/ultimate"
 	cp "$unpacked/fawkes" "$bin/.fawkes.new"
 	chmod 755 "$bin/.fawkes.new"

@@ -84,8 +84,14 @@ jobs:
           HOME=$home FAWKES_DOWNLOAD_URL=file://$PWD/dist sh dist/install.sh
           "$home/.local/bin/fawkes" --version
           test -f "$home/.local/share/fawkes/ultimate/fawkes/init.ts"
+      # Only a pushed tag publishes; a run by hand never does, whatever ref it was started on.
       - name: Publish the release
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "Fawkes ${GITHUB_REF_NAME#v}" --generate-notes dist/*
+        run: |
+          # A tag with a suffix (v0.2.0-rc.1) is a prerelease, so the curl line, which installs the latest, skips it.
+          prerelease=
+          case $GITHUB_REF_NAME in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag $prerelease --title "Fawkes ${GITHUB_REF_NAME#v}" \
+            --generate-notes dist/*
