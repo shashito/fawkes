@@ -69,10 +69,12 @@ terminal, naming the manifest by its path as the text of `down` does). Labels sh
 before its health check passed is in the block; a later report shows only as its `reported` event.
 
 Signals are only for the daemon's lifecycle: `fawkes down`, `SIGTERM` and `SIGINT` stop the live app and exit 0 (the
-generation keeps its state, so the next start resumes it), `fawkes reload` or `SIGHUP` re-reads the manifest. A reload is all or nothing and
-is logged as a `daemon` event naming the changed fields, or an `error` event (with its `error_code`) saying why it was
-refused. `fawkes reload` also answers: the changed fields (`{"changed": ["port", "env"]}`, empty when nothing
-changed), or the refusal, `usage` for a manifest that is invalid and `invalid_state` for the two cases below. A signal
+generation keeps its state, so the next start resumes it). Before it exits, the daemon waits up to 2 s after the app
+has stopped for the requests it is still serving to send their answers, such as the `busy` of a switch that it cut
+short; a request still at work after that gets none and fails `daemon_unreachable` (exit 3). `fawkes reload` or
+`SIGHUP` re-reads the manifest. A reload is all or nothing and is logged as a `daemon` event naming the changed
+fields, or an `error` event (with its `error_code`) saying why it was refused. `fawkes reload` also answers: the
+changed fields (`{"changed": ["port", "env"]}`, empty when nothing changed), or the refusal, `usage` for a manifest that is invalid and `invalid_state` for the two cases below. A signal
 has no one to answer, so `SIGHUP` only logs:
 
 - `name`, `repo`, `state_dir` and `home` never change by reload; they need a daemon restart. (A changed `home` would
@@ -757,7 +759,8 @@ which `launchctl` runs. The plist holds:
   stays down after a clean one (`fawkes down` or a SIGTERM): the agent stays loaded with no daemon until the next
   login or `fawkes service restart`, and `uninstall` removes it.
 - `ExitTimeOut`: `3 × stop_timeout + 5`, rounded up, plus 10 s: the longest a daemon's shutdown takes (it waits up
-  to `2 × stop_timeout + 5` s for a switch or rollback in flight, then stops the app with `stop_timeout` of grace).
+  to `2 × stop_timeout + 5` s for a switch or rollback in flight, stops the app with `stop_timeout` of grace, then
+  waits up to 2 s for the answers it owes, inside the 10 s).
   launchd's default of 20 s would SIGKILL it partway, and the next daemon start would have to recover. A changed
   `stop_timeout` reaches the plist with the next `install`.
 - `StandardErrorPath`: `<state_dir>/daemon.log`, where the daemon's stderr goes. `install` creates `state_dir` (mode

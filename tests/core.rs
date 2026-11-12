@@ -1814,12 +1814,15 @@ fn a_daemon_stopped_during_a_switch_leaves_the_target_tested() {
         kill_process(daemon_pid, Signal::TERM).unwrap();
         switch.join().unwrap()
     });
-    assert_ne!(code, 0, "{answer}");
-    if let Some(message) = answer["message"].as_str() {
-        assert_eq!(answer["code"], "busy", "{answer}");
-        assert!(message.contains("shutting down"), "{answer}");
-        assert!(message.contains("g2 stays tested"), "{answer}");
-    }
+    // The daemon answers before it exits, however late the switch's thread gets to it.
+    assert_eq!(
+        (code, answer["code"].as_str()),
+        (1, Some("busy")),
+        "{answer}"
+    );
+    let message = answer["message"].as_str().unwrap();
+    assert!(message.contains("shutting down"), "{answer}");
+    assert!(message.contains("g2 stays tested"), "{answer}");
     h.wait("the daemon to end", 15, || h.fk(&["status"]).0 == 3);
     h.kill_daemon();
 
