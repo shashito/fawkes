@@ -9,7 +9,7 @@ use crate::protocol::{
     TestInfo, describe_status, err, invalid_state, not_found, short_commit,
 };
 use crate::state::{self, State, Txn, allowed, now, now_secs, parse_time, refusal};
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -551,7 +551,7 @@ impl Daemon {
             check_test(inner.store.state(), id)?.clone()
         };
         let port = (m.spare_ports[0]..=m.spare_ports[1])
-            .find(|&p| p != m.port && port_free(p))
+            .find(|&p| p != m.port && spare_port_free(p))
             .ok_or_else(|| {
                 err(
                     ErrorCode::StartFailed,
@@ -633,7 +633,7 @@ impl Daemon {
         drop(test_home_guard);
         // Our test process is gone, so a port that is still taken was taken by someone else, most likely between
         // the probe and the app's bind: not the generation's fault, so its state and last result stay as they were.
-        if result.is_err() && !port_free(port) {
+        if result.is_err() && !spare_port_free(port) {
             let message = format!(
                 "spare port {port} was taken by another process during the test of {id}; {id} is unchanged, run `fawkes test {id}` again"
             );
@@ -849,8 +849,8 @@ impl Daemon {
     pub(super) fn adopt(self: &Arc<Self>) -> R<()> {
         let m = self.manifest();
         // The app runs outside Fawkes on the live port until now, and a start beside it would only crash-loop.
-        let live_port_free = |m: &Manifest| {
-            if port_free(m.port) {
+        let check_live_port = |m: &Manifest| {
+            if live_port_free(m.port) {
                 return Ok(());
             }
             Err(err(
@@ -863,7 +863,7 @@ impl Daemon {
                 ),
             ))
         };
-        live_port_free(&m)?;
+        check_live_port(&m)?;
         self.event_with(
             EventKind::Daemon,
             None,
@@ -910,7 +910,7 @@ impl Daemon {
         // A reload during the adoption may have moved the live port.
         let now = self.manifest();
         if now.port != m.port {
-            live_port_free(&now)?;
+            check_live_port(&now)?;
         }
         let mut inner = self.inner();
         // Written before anything starts, so a daemon that dies from here on runs it as the permanent generation at its
@@ -1409,9 +1409,24 @@ pub(super) fn not_adopted(e: &Error) -> String {
     )
 }
 
-/// Whether nothing listens on `port`, on the loopback address or on all addresses: an app may bind either.
-fn port_free(port: u16) -> bool {
+/// Whether a spare port is free on the loopback address and on all addresses, since a test's app may bind either. It
+/// is stricter than `live_port_free`: a port held on any one address is skipped, which costs only the next spare port,
+/// where a test that cannot bind would count against its generation.
+fn spare_port_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("0.0.0.0", port)).is_ok()
+}
+
+/// Whether the live `port` is free for the app: `127.0.0.1` binds and nothing answers a connect on `127.0.0.1` or
+/// `::1` (on macOS the bind alone misses an app listening on all addresses). A listener on another address only, such
+/// as Tailscale serve on the tailnet address, leaves the port free: an app on the loopback address starts beside it,
+/// and one that binds all addresses fails its own start, which its `exited` events and `status` report.
+fn live_port_free(port: u16) -> bool {
+    let answers = |ip: IpAddr| {
+        TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_millis(200)).is_ok()
+    };
+    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok()
+        && !answers(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        && !answers(IpAddr::V6(Ipv6Addr::LOCALHOST))
 }
 
 /// Copy-on-write clone of a directory (APFS `clonefile` on macOS, reflinks elsewhere), for at most `timeout`.
@@ -1433,5 +1448,51 @@ fn clone_directory(from: &Path, to: &Path, timeout: Duration) -> Result<(), Stri
         Ok(())
     } else {
         Err(format!("cp failed ({})", describe_status(finished.status)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::UdpSocket;
+
+    /// A local address other than 127.0.0.1 to listen on: 127.0.0.2 where all of 127/8 is loopback (Linux), else the
+    /// address of the default route's interface (macOS), which a UDP `connect` finds without sending anything.
+    fn other_local_address() -> Option<IpAddr> {
+        let alias = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        if TcpListener::bind((alias, 0)).is_ok() {
+            return Some(alias);
+        }
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+        socket.connect(("192.0.2.1", 9)).ok()?;
+        let address = socket.local_addr().ok()?.ip();
+        (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+    }
+
+    // Linux refuses the `0.0.0.0` bind beside any listener on the port. macOS refuses it only beside another user's
+    // (Tailscale's daemon runs as root), so there this test cannot show the refusal and checks only the outcome.
+    #[test]
+    fn a_port_held_on_another_local_address_is_free_for_the_live_app() {
+        let Some(address) = other_local_address() else {
+            eprintln!("skipped: this machine has no local address besides 127.0.0.1");
+            return;
+        };
+        // What Tailscale serve does: it listens on the tailnet address, and an app on 127.0.0.1 starts beside it.
+        let held = TcpListener::bind((address, 0)).expect("listen on the other address");
+        let port = held.local_addr().expect("its port").port();
+        assert!(
+            live_port_free(port),
+            "port {port} is held on {address} only"
+        );
+    }
+
+    #[test]
+    fn a_port_answered_on_loopback_or_all_addresses_is_taken() {
+        for ip in [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED] {
+            let held = TcpListener::bind((ip, 0)).expect("listen");
+            let port = held.local_addr().expect("its port").port();
+            assert!(!live_port_free(port), "port {port} is held on {ip}");
+            assert!(!spare_port_free(port), "port {port} is held on {ip}");
+        }
     }
 }

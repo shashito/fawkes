@@ -339,7 +339,10 @@ at HEAD of `repo` instead of starting nothing. It runs once the socket serves, o
 run, `status` and `watch` reach the daemon meanwhile (`busy` names the stage, then the test):
 
 1. Refuse when the live `port` is taken (`port_in_use`, "port N is in use: stop the app running there first"): the
-   app still runs outside Fawkes, and a start beside it would crash-loop.
+   app still runs outside Fawkes, and a start beside it would crash-loop. The port is taken when `127.0.0.1` does
+   not bind or something answers a connect on `127.0.0.1` or `::1`. A listener on another address only (Tailscale
+   serve on the tailnet address) leaves it free: an app on the loopback address starts beside it, and one that binds
+   all addresses fails its own start on the live port, which its `exited` events and `status` report.
 2. Log a `daemon` event (`action` `adopting`), then stage `HEAD` and test it as `stage` and `test` do: a `staged`,
    `tested` or `test_failed` generation of that commit is reused, and the test runs on a spare port with a copy of
    the storage (Hooks), never on the live home.
