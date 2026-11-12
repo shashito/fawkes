@@ -7,8 +7,9 @@
 # FAWKES_DOWNLOAD_URL replaces the release's download folder (a mirror, or a file:// folder of archives). Nothing
 # needs sudo and no shell startup file is changed. Running it again replaces both with this release's.
 #
-# The archive must match its sha256. When the GitHub CLI is installed and logged in, it must also carry the release
-# workflow's attestation (`gh attestation verify`); FAWKES_REQUIRE_ATTESTATION=1 refuses to install without one.
+# The archive must match its sha256. When the GitHub CLI is installed and logged in, a release download must also
+# carry the release workflow's attestation (`gh attestation verify`); FAWKES_REQUIRE_ATTESTATION=1 refuses any
+# archive whose attestation is not verified.
 
 set -eu
 
@@ -53,23 +54,30 @@ sha256() {
 	fi
 }
 
-# Whether $1 is the release workflow's build, by its attestation: refuses an archive that fails verification, and
-# one without an attestation unless it comes from $FAWKES_DOWNLOAD_URL (a local build has none). When gh cannot
-# verify (not installed, not logged in, no network), it says so and the sha256 check stands alone, unless
-# FAWKES_REQUIRE_ATTESTATION=1. gh exits 1 for a failed verification and for a failed request alike, so its message
-# tells them apart, and a message it does not recognize refuses.
+# Whether $1 is the release workflow's build, by its attestation: signed by release.yml of shashito/fawkes on GitHub's
+# runners, and for a release's own script on its tag, so it cannot install another release's archive. Refuses an
+# archive that fails verification, and one without an attestation unless it comes from $FAWKES_DOWNLOAD_URL (a local
+# build has none). When gh cannot verify (not installed, too old, not logged in, no network), it says so and the
+# sha256 check stands alone, unless FAWKES_REQUIRE_ATTESTATION=1.
 attestation() {
 	if ! command -v gh >/dev/null; then
 		unverified "the GitHub CLI (gh) is not installed"
 		return
 	fi
-	if ! gh attestation verify --help >/dev/null 2>&1 </dev/null; then
-		unverified "this gh has no \`gh attestation\` (2.49 or newer has it)"
-		return
-	fi
-	status=0
 	# Under `curl | sh` the script is standard input, which nothing it runs may read.
-	output=$(gh attestation verify "$1" --repo shashito/fawkes 2>&1 </dev/null) || status=$?
+	help=$(gh attestation verify --help 2>&1 </dev/null) || help=
+	case $help in
+	*--signer-workflow*--source-ref*) ;;
+	*)
+		unverified "this gh is too old to verify attestations; update it"
+		return
+		;;
+	esac
+	set -- "$1" --repo shashito/fawkes --signer-workflow shashito/fawkes/.github/workflows/release.yml \
+		--deny-self-hosted-runners
+	[ "$version" = latest ] || set -- "$@" --source-ref "refs/tags/$version"
+	status=0
+	output=$(gh attestation verify "$@" 2>&1 </dev/null) || status=$?
 	if [ "$status" = 0 ]; then
 		say "verified that $archive was built by shashito/fawkes's release workflow"
 		return
@@ -78,23 +86,27 @@ attestation() {
 		unverified "gh is not logged in (\`gh auth login\`)"
 		return
 	fi
+	# gh exits 1 for a failed verification and a failed request alike, so its last line tells them apart. A failed
+	# verification can quote the signer's ref, which whoever pushed it chose, so it is ruled out first, and an error
+	# that is not recognized refuses.
 	reason=$(printf '%s\n' "$output" | sed '/^$/d' | tail -n 1)
-	case $output in
-	*"HTTP 404"* | *"no attestations found"*)
+	case $reason in
+	"Error: verifying"* | "Error: expected"* | *[Pp]olicy*) ;;
+	"Error: HTTP 404:"* | "Error: no attestations found"*)
 		if [ -z "${FAWKES_DOWNLOAD_URL:-}" ] || [ "$require" = 1 ]; then
-			fail "$archive has no attestation from shashito/fawkes's release workflow, so it may not be the release's build; nothing was installed"
+			fail "$archive has no attestation from the release workflow, so it may not be the release's; nothing was installed"
 		fi
 		say "$archive has no attestation (a local build, or not the release's), so only its sha256 was checked"
+		return
 		;;
-	*"HTTP 401"* | *"HTTP 403"* | *"HTTP 429"* | *"HTTP 5"* | *"Sigstore verifier"* | *"dial tcp"* | *"no such host"* | \
-		*"connection refused"* | *"network is unreachable"* | *timeout*)
+	"Error: HTTP 401:"* | "Error: HTTP 403:"* | "Error: HTTP 429:"* | "Error: HTTP 5"* | *"Sigstore verifier"* | \
+		*"dial tcp"* | *"no such host"* | *"connection refused"* | *"network is unreachable"* | *timeout*)
 		unverified "gh's request to GitHub or Sigstore failed: $reason"
-		;;
-	*)
-		printf '%s\n' "$output" >&2
-		fail "$archive failed its attestation check: it is not the release's build; nothing was installed"
+		return
 		;;
 	esac
+	printf '%s\n' "$output" >&2
+	fail "$archive could not be verified as the release's build; nothing was installed"
 }
 
 # Attestation cannot be checked, for the reason $1.

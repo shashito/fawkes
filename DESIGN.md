@@ -1132,25 +1132,27 @@ release). A tag with a suffix (`v0.2.0-rc.1`) makes a prerelease, which `release
 - `fawkes-<target>.tar.gz.sha256`, in `sha256sum`'s format.
 - `install.sh`, which installs that release (the copy in the repository installs the latest).
 
-The archives and `install.sh` carry a SLSA build provenance attestation (`actions/attest` in the publish job, the only
-one allowed to sign), stored with GitHub and signed through Sigstore by the release workflow's identity, so
-`gh attestation verify <file> --repo shashito/fawkes` proves a file is the workflow's build, which a `.sha256` from
-the same release cannot. Only a pushed tag attests, before its own install test, which requires the attestation;
-a run by hand attests nothing. Releases before 0.1.1 have none.
+The archives and `install.sh` carry a SLSA build provenance attestation (`actions/attest`), stored with GitHub and
+signed through Sigstore by the release workflow's identity, which a `.sha256` from the same release cannot be. Only a
+pushed tag attests, in a job of its own that runs nothing that was built; the install test after it requires the
+attestation, and only then does a job that runs nothing built either publish. A run by hand attests nothing. Releases
+before 0.1.1 have none. `gh attestation verify <file> --repo shashito/fawkes` checks a file by hand, and
+`--signer-workflow shashito/fawkes/.github/workflows/release.yml` also ties it to that workflow.
 
 `install.sh` is POSIX `sh` and needs `curl`, `tar` and `sha256sum` or `shasum`. It picks the archive of the machine
 (the Apple silicon one in a shell under Rosetta), refuses one that does not match its checksum, then checks its
-attestation with `gh attestation verify`:
+attestation with `gh attestation verify`: signed by `release.yml` on GitHub's runners and, for a release's own
+`install.sh`, on that release's tag, so it never installs another release's archive:
 
 - verified: it says so and installs;
 - a failed verification refuses, and so does an archive without an attestation from the release itself (with
   `FAWKES_DOWNLOAD_URL` a missing one only says so, since a local build has none);
-- when gh cannot verify (not installed, older than 2.49, not logged in: gh needs a login even for a public repository,
-  or no network to GitHub's API and Sigstore), it says why in one line and the checksum stands alone.
+- when gh cannot verify (not installed, too old, not logged in: gh needs a login even for a public repository, or no
+  network to GitHub's API and Sigstore), it says why in one line and the checksum stands alone.
 
-`FAWKES_REQUIRE_ATTESTATION=1` refuses every archive that is not verified. gh exits 1 for a failed verification and a failed
-request alike, so `install.sh` tells them apart by its message, and refuses one it does not recognize. Then it
-installs:
+`FAWKES_REQUIRE_ATTESTATION=1` refuses every archive that is not verified. gh exits 1 for a failed verification and
+a failed request alike, so `install.sh` tells them apart by its last line, and refuses one it does not recognize.
+Then it installs:
 
 - `fawkes` to `$FAWKES_INSTALL_DIR`, default `~/.local/bin`;
 - the extension to `~/.local/share/fawkes/ultimate/fawkes`, which `init.ts` in it links into a project.

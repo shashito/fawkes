@@ -1,8 +1,7 @@
 # A `v*` tag publishes a GitHub release once the checks pass: one archive per target (scripts/package), its sha256
 # and install.sh, which installs this release. Run by hand (workflow_dispatch), it builds and checks everything the
 # same way and keeps the archives as the run's artifacts, without a release. A tag's archives and install.sh also get
-# a build provenance attestation, which install.sh and `gh attestation verify` check; a run by hand attests nothing,
-# since its archives are never published.
+# a build provenance attestation, which install.sh and `gh attestation verify` check; a run by hand attests nothing.
 
 name: Release
 
@@ -59,17 +58,20 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  publish:
+  # The release's files, signed on a tag. Whatever runs in this job could sign as the release workflow, so it runs
+  # nothing that was built: the binaries run in `install`, without the right to sign or to write.
+  attest:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Attesting here rather than in the build jobs keeps the right to sign out of the jobs that run build scripts.
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -82,6 +84,7 @@ jobs:
           else
             cp install.sh dist/install.sh
           fi
+      # A run by hand attests nothing: its archives are never published.
       - name: Attest the archives and install.sh
         if: github.event_name == 'push'
         uses: actions/attest@v4
@@ -89,7 +92,25 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/install.sh
-      # A tag's install must verify the attestation it just got, as a user's does.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+
+  # Installs as a user does; on a tag it requires the attestation the archive just got.
+  install:
+    needs: attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
       - name: Install from the archives
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,9 +121,22 @@ jobs:
           HOME=$home FAWKES_DOWNLOAD_URL=file://$PWD/dist sh dist/install.sh
           "$home/.local/bin/fawkes" --version
           test -f "$home/.local/share/fawkes/ultimate/fawkes/init.ts"
-      # Only a pushed tag publishes; a run by hand never does, whatever ref it was started on.
+
+  # Only a pushed tag publishes; a run by hand never does, whatever ref it was started on.
+  publish:
+    needs: install
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
       - name: Publish the release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
