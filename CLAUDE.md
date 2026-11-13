@@ -50,7 +50,9 @@ Several branches, workers and test suites share one Mac with little free disk.
 - **Kill only what you started.** Stop processes by the pid or process group your own run recorded. Never kill
   machine-wide (`pkill -f`, `killall`): another suite's processes look the same as yours.
 - **Clean up before you finish.** Run `cargo clean` in your worktree and remove every `/tmp` folder you created
-  (sandboxes, VM images, scratch clones). A finished worktree's `target/` is about 2 GB.
+  (sandboxes, VM images, scratch clones), each by its exact path. A finished worktree's `target/` is about 2 GB.
+  Never delete by glob in `/tmp` (`rm -rf /tmp/fk*`): it matches other suites' running test folders and fails
+  them. The harness removes its own `/tmp/fk<port>` when a test ends.
 - **Short socket paths.** A unit test that binds a Unix socket makes its directory with
   `tempfile::Builder::new().tempdir_in("/tmp")`, not under `$TMPDIR`: the lander's `$TMPDIR` is long enough to
   exceed the socket path limit.
