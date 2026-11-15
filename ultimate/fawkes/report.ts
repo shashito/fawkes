@@ -3,6 +3,7 @@
  * which would otherwise be lost, since Ultimate's own dashboard writes to a log file under a supervisor.
  */
 import { join } from 'node:path'
+import type { Confirming } from './types.ts'
 
 export type Info = Record<string, string>
 
@@ -26,10 +27,28 @@ function remote(origins: string[]) {
 }
 
 /**
- * `url` (the address the host serves), `remote` (its Tailscale HTTPS URLs, when it has any) and `log` (the supervisor
- * log in the host's home, where `bin/ultimate.ts` writes it). A key with nothing to say is left out.
+ * A value the daemon accepts: no control or invisible formatting character (it prints values to a terminal), at most
+ * `MAX_VALUE` characters, as the daemon counts them.
  */
-export function reportInfo(system: Known, home: string): Info {
+function value(text: string) {
+  const plain = text.replace(/[\p{Cc}\p{Cf}\s]+/gu, ' ').trim()
+  const chars = [...plain]
+  return chars.length > MAX_VALUE ? `${chars.slice(0, MAX_VALUE - 1).join('')}…` : plain
+}
+
+/** Why this generation has not confirmed itself yet, or nothing once it did or before it checked. */
+function confirmText(confirming: Confirming | undefined) {
+  if (confirming?.state === 'checking') return confirming.detail && value(`waiting: ${confirming.detail}`)
+  if (confirming?.state === 'refused') return value(`refused: ${confirming.reason}`)
+  return undefined
+}
+
+/**
+ * `url` (the address the host serves), `remote` (its Tailscale HTTPS URLs, when it has any), `log` (the supervisor
+ * log in the host's home, where `bin/ultimate.ts` writes it) and `confirm` (why a pending generation has not confirmed
+ * itself yet, which the daemon logs as a `reported` event before any rollback). A key with nothing to say is left out.
+ */
+export function reportInfo(system: Known, home: string, confirming?: Confirming): Info {
   const info: Info = {}
   const { url } = system.process
   if (url && url.length <= MAX_VALUE) info.url = url
@@ -37,6 +56,8 @@ export function reportInfo(system: Known, home: string): Info {
   if (origins) info.remote = origins
   const log = join(home, 'supervisor.log')
   if (log.length <= MAX_VALUE) info.log = log
+  const confirm = confirmText(confirming)
+  if (confirm) info.confirm = confirm
   return info
 }
 

@@ -8,15 +8,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import type { ExtensionInfo } from 'ultimate/shared/protocol.ts'
-import { judge } from './confirm.ts'
+import { failedFacets, ignoredText, judge } from './confirm.ts'
 import { role } from './role.ts'
 import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import type { Status, Step } from './types.ts'
 
-const extension = (name: string, error?: string): ExtensionInfo => ({
+const extension = (name: string, error?: string, source: ExtensionInfo['source'] = 'builtin'): ExtensionInfo => ({
   name,
   enabled: true,
-  source: 'builtin',
+  source,
   layer: 'default',
   path: `/x/${name}`,
   actions: [],
@@ -34,6 +34,24 @@ test('a generation vouches for itself only with every server facet loaded and it
   assert.equal(judge([{ ...extension('off', 'boom'), enabled: false }], 200).ok, true)
   assert.equal(judge([extension('a')], 503).ok, false)
   assert.equal(judge([extension('a')], 'fetch failed').ok, false)
+})
+
+// xana g4 and three other upgrades rolled back on their deadline because the user extension `phone` failed to load: it
+// resolves `ultimate/...` against the shared clone, so the old generation failed it just the same.
+test('a failed user or project facet does not block the confirm, but is named', () => {
+  const extensions = [
+    extension('a'),
+    extension('phone', 'TypeError: projectHome is not a function', 'user'),
+    extension('local', 'boom', 'project'),
+  ]
+  assert.deepEqual(judge(extensions, 200), { ok: true })
+  assert.deepEqual(failedFacets(extensions), { blocking: [], ignored: ['phone', 'local'] })
+  assert.match(ignoredText(failedFacets(extensions).ignored)!, /^Fawkes: phone, local failed to load; .*does not block/)
+  assert.equal(ignoredText([]), undefined)
+  assert.deepEqual(judge([...extensions, extension('update', 'boom')], 200), {
+    ok: false,
+    reason: 'server facets failed to load: update',
+  })
 })
 
 test('a confirm is offered only while the switch awaits it, though pending stays set during a rollback', () => {

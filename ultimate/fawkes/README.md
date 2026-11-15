@@ -99,9 +99,14 @@ The server facet holds Pi Durable's scheduler in `onOpen`, before the server res
   answers Fawkes's health check.
 - **In a new live generation** until it is confirmed: a rollback then forgets nothing that ran on the new code.
 
-The pending generation confirms itself (`confirm <its generation>` over the socket) once every enabled extension's
-server facet loaded (a facet broken by a changed core or a missing package is what must not become permanent) and its
-page answers. It lets go of the hold only when the daemon's status says the generation is permanent, whoever
+The pending generation confirms itself (`confirm <its generation>` over the socket) once every enabled built-in
+extension's server facet loaded (a facet broken by a changed core or a missing package is what must not become
+permanent) and its page answers. A user or project extension does not count: it resolves `ultimate/...` through its
+own folder's `node_modules`, which links to one shared clone's working tree, so it loads or fails alike in every
+generation and a rollback cannot mend it; its failure is a notice, once per set of failed names. While the generation
+waits, each new reason is a notice (the status line, and the generation's `app.log`, whose tail `fawkes history` keeps
+after a rollback) and the `confirm` key of its report (`waiting: server facets failed to load: update`, or
+`refused: …` when the daemon refused the confirm), which the daemon logs as a `reported` event. It lets go of the hold only when the daemon's status says the generation is permanent, whoever
 confirmed it (this facet, the Confirm button, `fawkes confirm`), and not while the user paused the host. A refused or
 lost confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage
 together. A restart of a generation that is already permanent releases the hold at once; every reopen of the harness
@@ -109,6 +114,8 @@ together. A restart of a generation that is already permanent releases the hold 
 
 In a test run the hold fails closed: a hold that throws ends the process, and `health.ts` passes only once the
 facet wrote `fawkes-held` into the test home, so a generation that breaks this extension or the hold never goes live.
+A test run whose built-in facets failed to load ends too, before it holds, with their names in `app.log`: live, it
+could never confirm itself, and its switch would cost a missed deadline and a storage restore.
 
 The pause extension holds the same scheduler with one flag, and its Play (pressed, or its auto-play after a rate limit,
 which a copied storage carries into a test run) would end this hold too. So while this extension holds, it sets

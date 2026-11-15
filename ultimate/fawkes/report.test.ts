@@ -29,6 +29,25 @@ test('a first origin that is too long alone leaves the key out', () => {
   assert.ok(!('remote' in reportInfo(system(['https://' + 'a'.repeat(300)]), '/h')))
 })
 
+test('confirm says why a pending generation waits or was refused, in a value the daemon accepts', () => {
+  const confirm = (confirming?: Parameters<typeof reportInfo>[2]) => reportInfo(system([]), '/h', confirming).confirm
+  assert.equal(
+    confirm({ state: 'checking', detail: 'server facets failed to load: update' }),
+    'waiting: server facets failed to load: update',
+  )
+  assert.equal(
+    confirm({ state: 'refused', reason: 'g4 is not pending\nsee status' }),
+    'refused: g4 is not pending see status',
+  )
+  assert.equal(confirm({ state: 'confirmed' }), undefined)
+  assert.equal(confirm(undefined), undefined)
+  // The daemon refuses a control, zero-width or bidirectional character, and counts characters, not UTF-16 units.
+  assert.equal(confirm({ state: 'checking', detail: 'a\u200b\u202eb\u0007c' }), 'waiting: a b c')
+  const long = confirm({ state: 'checking', detail: '🔥'.repeat(400) })!
+  assert.equal([...long].length, MAX_VALUE)
+  assert.ok(long.endsWith('…'))
+})
+
 test('the reporter sends on the first tick, on a change and after a reconnect, not otherwise', async () => {
   let info = { url: 'u' }
   const sent: unknown[] = []

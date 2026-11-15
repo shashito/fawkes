@@ -9,7 +9,7 @@ import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 import type { ExtensionHost } from 'ultimate/server/extensions.ts'
 import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
 import { request, subscribe } from './client.ts'
-import { mayConfirm } from './confirm.ts'
+import { facetRefusal, failedFacets, ignoredText, mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { cloneGitDir, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
 import { deferRelease, releaseHold } from './hold.ts'
@@ -72,6 +72,8 @@ type Shared = {
   checking?: boolean
   /** The scheduler is held by this extension until its generation is confirmed. */
   holding: boolean
+  /** The last notice about failed facets that do not block the confirm, so each set is told once. */
+  ignored?: string
   stop?: () => void
   confirmRun?: Promise<void>
   upgradeRun?: Promise<void>
@@ -127,6 +129,18 @@ function hold(host: ExtensionHost) {
   }
 }
 
+/**
+ * End a test run whose built-in facets failed to load, before it holds the scheduler and passes its health check:
+ * once live it could never confirm itself, and would cost a switch, a missed deadline and a storage restore. The line
+ * goes to the generation's `app.log`, which `fawkes history` shows.
+ */
+function endBrokenTest(host: ExtensionHost) {
+  const refusal = facetRefusal(host.extensions())
+  if (!refusal) return
+  console.error(`fawkes: ${refusal}; ending the test run, since this generation could not confirm itself`)
+  process.exit(1)
+}
+
 /** Release the hold this extension took, unless the user's pause holds the scheduler too (`hold.ts`). */
 function release(host: ExtensionHost) {
   const s = shared(host)
@@ -140,6 +154,10 @@ function release(host: ExtensionHost) {
  * the daemon reports this generation is no longer pending (permanent: release; rolled back: this process is stopped);
  * a refused or lost confirm just goes round again on the next status. While the switch is being rolled back it is
  * still pending but no longer confirmable, and the hold stays until the rollback is done.
+ *
+ * Each new reason it waits or was refused for is a notice (the status line, and the generation's `app.log`, whose
+ * tail `fawkes history` keeps after a rollback) and the `confirm` key of its report (a `reported` event in the
+ * daemon's log).
  */
 async function confirmWhenReady(host: ExtensionHost, socket: string, generation: string) {
   const s = shared(host)
@@ -153,15 +171,28 @@ async function confirmWhenReady(host: ExtensionHost, socket: string, generation:
     // Confirmed already: wait for the status that says so, rather than confirm again and be refused.
     if (status && awaitingConfirm(status) && s.confirming?.state !== 'confirmed') {
       const verdict = await mayConfirm(host)
+      const ignored = ignoredText(failedFacets(host.extensions()).ignored)
+      if (ignored && ignored !== s.ignored) host.notice(ignored)
+      s.ignored = ignored
+      const before = s.confirming
       if (verdict.ok) {
         try {
           await request(socket, 'confirm', { generation })
           s.confirming = { state: 'confirmed' }
           host.notice(`Fawkes: ${generation} confirmed itself and is now permanent`)
         } catch (error) {
-          s.confirming = { state: 'refused', reason: (error as Error).message }
+          const reason = (error as Error).message
+          s.confirming = { state: 'refused', reason }
+          if (before?.state !== 'refused' || before.reason !== reason)
+            host.notice(`Fawkes: the daemon refused ${generation}'s confirm: ${reason}`)
         }
-      } else s.confirming = { state: 'checking', detail: verdict.reason }
+      } else {
+        s.confirming = { state: 'checking', detail: verdict.reason }
+        if (before?.state !== 'checking' || before.detail !== verdict.reason)
+          host.notice(
+            `Fawkes: ${generation} does not confirm itself yet: ${verdict.reason}; it rolls back at its deadline`,
+          )
+      }
     }
     await new Promise((resolve) => setTimeout(resolve, 2000))
   }
@@ -531,7 +562,7 @@ export default function fawkesExtension(host: ExtensionHost) {
   const reports =
     daemon.kind === 'live'
       ? reporter({
-          read: () => reportInfo(host.system(), host.home),
+          read: () => reportInfo(host.system(), host.home, s.confirming),
           send: (info) => request(daemon.socket, 'report', { generation: daemon.generation, info }),
           fail: (message) => console.error(`fawkes: cannot report to the daemon: ${message}`),
         })
@@ -540,6 +571,8 @@ export default function fawkesExtension(host: ExtensionHost) {
   // work, and a new live generation resumes it only once it is confirmed, so a rollback forgets nothing that ran.
   // Every open holds again until then: a failed core swap reopens a new harness in this same process.
   host.onOpen(async () => {
+    // Every facet has loaded (or failed) by the time the host runs its openers.
+    if (daemon.kind === 'test') endBrokenTest(host)
     if (daemon.kind === 'test' || s.confirming?.state !== 'confirmed') hold(host)
     if (!s.stop) {
       s.stop = subscribe(daemon.socket, {
