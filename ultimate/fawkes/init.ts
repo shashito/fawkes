@@ -39,10 +39,10 @@ import { parseArgs } from 'node:util'
 import type { JsonObject } from '@earendil-works/pi-durable'
 import type * as PiCodingAgent from '@earendil-works/pi-coding-agent'
 // Types only: the code itself is loaded from the clone being set up (`loadClone`).
+import type * as Lock from 'ultimate/lib/lock.ts'
+import type * as ProjectPaths from 'ultimate/lib/project-paths.ts'
+import type * as ProjectSetup from 'ultimate/lib/project-setup.ts'
 import type * as Settings from 'ultimate/lib/settings.ts'
-import type * as Lock from 'ultimate/server/lock.ts'
-import type * as Project from 'ultimate/server/project.ts'
-import type * as ProjectSetup from 'ultimate/server/project-setup.ts'
 import { buildManifest, claimedPorts, findExisting, freeName, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
 import type { ManifestFile } from './setup.ts'
 import type { SetupStep } from './types.ts'
@@ -88,7 +88,7 @@ export type InspectOptions = {
 
 /** The clone's own helpers. */
 type Helpers = {
-  projectHome: typeof Project.projectHome
+  projectHome: typeof ProjectPaths.projectHome
   decisionRoot: typeof ProjectSetup.decisionRoot
   projectDecision: typeof ProjectSetup.projectDecision
   projectDiagnostics: typeof ProjectSetup.projectDiagnostics
@@ -107,15 +107,15 @@ async function loadClone(clone: string): Promise<Helpers> {
   const agent = join(clone, 'node_modules/@earendil-works/pi-coding-agent')
   const entry = (JSON.parse(readFileSync(join(agent, 'package.json'), 'utf8')) as { exports: Record<string, { import: string }> })
     .exports['.'].import
-  const [project, projectSetup, settings, lock, pi] = await Promise.all([
-    load('server/project.ts'),
-    load('server/project-setup.ts'),
+  const [projectPaths, projectSetup, settings, lock, pi] = await Promise.all([
+    load('lib/project-paths.ts'),
+    load('lib/project-setup.ts'),
     load('lib/settings.ts'),
-    load('server/lock.ts'),
+    load('lib/lock.ts'),
     import(/* @vite-ignore */ pathToFileURL(join(agent, entry)).href),
   ])
   return {
-    projectHome: project.projectHome,
+    projectHome: projectPaths.projectHome,
     decisionRoot: projectSetup.decisionRoot,
     projectDecision: projectSetup.projectDecision,
     projectDiagnostics: projectSetup.projectDiagnostics,

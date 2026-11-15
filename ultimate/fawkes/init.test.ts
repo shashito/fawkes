@@ -51,7 +51,7 @@ test('init writes the manifest, the link, update off and the trust, and a second
     ['manifest', 'link', 'update', 'trust'],
   )
   const written = files()
-  const { projectHome } = await import(pathToFileURL(join(clone, 'server/project.ts')).href)
+  const { projectHome } = await import(pathToFileURL(join(clone, 'lib/project-paths.ts')).href)
   assert.equal(written.manifests.length, 1)
   assert.match(written.manifest, /^adopt = true$/m)
   assert.match(written.manifest, new RegExp(`^project = ${JSON.stringify(project)}$`, 'm'))
