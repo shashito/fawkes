@@ -63,7 +63,7 @@ None of them set: Fawkes does not run you. Run from the app's repository, or pas
 In the `test` phase your home is a copy of the live storage (or empty), and the live app may be running beside you.
 Serve your health check and nothing else: no confirm, no upgrade, no work with effects outside your home (messages
 sent, jobs run, remote writes), since your code is not trusted yet. Fawkes enforces part of it: with `FAWKES_PHASE=test`
-every command that changes something (`up`, `down`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
+every command that changes something (`up`, `down`, `reexec`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
 `start`, `stop`, `restart`, `reload`) fails with `test_phase`, whichever app it names, and so does a `confirm` of any generation but your
 own `$FAWKES_GENERATION` towards your own daemon. `status`, `history`, `log`, `wait` and `watch` still work.
 
@@ -219,7 +219,9 @@ person to run it from a shell outside the app.
 `fawkes up` runs the supervisor of one app in the foreground; `fawkes down` stops the app and its supervisor, and a
 launchd agent's daemon then stays down until the next login or `fawkes service restart`. People run them, from a
 shell outside the app: `down` from inside the app it supervises is refused (`invalid_state`), since it would stop you
-and leave nothing to start the app again. To restart only the app, `fawkes restart`.
+and leave nothing to start the app again. To restart only the app, `fawkes restart`. After a new Fawkes install,
+`fawkes reexec` moves the running daemon onto the new binary with the same pid while the app keeps running (you
+included, so it may run from inside the app); it is refused while a switch is pending or a step runs.
 
 ## Storage rolls back only through the app's hooks
 

@@ -2217,6 +2217,85 @@ fn read_pid(path: impl AsRef<std::path::Path>) -> Pid {
     .unwrap()
 }
 
+/// `reexec` runs the daemon on the installed binary in its own process: its pid and the app's stay, it answers again,
+/// and the app it took over is still supervised, so a crash is reaped and restarted.
+#[test]
+fn reexec_keeps_the_daemon_and_its_app_and_goes_on_supervising_it() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    let before = h.status();
+    let app = read_pid(h.dir.join("s/app.pid"));
+    let starts = messages(&h, "started");
+
+    // g1 may confirm itself before the health check of its switch has finished, and `reexec` waits for that.
+    let mut result = Value::Null;
+    h.wait("reexec to be taken", 20, || {
+        let (exit, answer) = h.fk(&["reexec"]);
+        assert!(exit == 0 || answer["code"] == "busy", "{answer}");
+        result = answer;
+        exit == 0
+    });
+    assert_eq!(result["pid"], before["daemon_pid"], "{result}");
+    assert_eq!(result["to"], env!("CARGO_PKG_VERSION"), "{result}");
+    let after = h.status();
+    assert_eq!(after["daemon_pid"], before["daemon_pid"], "{after}");
+    assert_eq!(after["process"]["pid"], before["process"]["pid"], "{after}");
+    assert_eq!(after["process"]["state"], "running", "{after}");
+    assert!(
+        after["process"]["uptime"].as_f64() >= before["process"]["uptime"].as_f64(),
+        "{before} {after}"
+    );
+    assert_eq!(read_pid(h.dir.join("s/app.pid")), app);
+    assert_eq!(h.daemon_exit_within(Duration::ZERO), None);
+    assert_eq!(h.get().as_deref(), Some("v1"));
+    let reexecuted: Vec<Value> = h.ok(&["log", "-n", "1000"])["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "daemon" && event["action"] == "reexecuted")
+        .cloned()
+        .collect();
+    assert_eq!(reexecuted.len(), 1, "{reexecuted:?}");
+    let message = reexecuted[0]["message"].as_str().unwrap();
+    assert!(message.contains("g1 keeps running, pid"), "{message}");
+    assert_eq!(reexecuted[0]["version"], env!("CARGO_PKG_VERSION"));
+    // The new program did not start the app again.
+    assert_eq!(messages(&h, "started"), starts);
+
+    h.crash_app();
+    h.wait("g1 to be restarted", 15, || {
+        let status = h.status();
+        status["process"]["state"] == "running"
+            && status["process"]["pid"] != before["process"]["pid"]
+    });
+    h.wait("v1 to serve again", 10, || h.get().as_deref() == Some("v1"));
+    assert_eq!(h.status()["daemon_pid"], before["daemon_pid"]);
+}
+
+/// A pending switch is the daemon's to decide, so `reexec` is refused until it is, and the switch stays pending.
+#[test]
+fn reexec_is_refused_while_a_switch_is_pending() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.commit("v2", "never");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    h.ok(&["stage", "v2"]);
+    h.ok(&["test", "g2"]);
+    h.ok(&["switch", "g2", "--deadline", "120"]);
+
+    refused(&h, &["reexec"], "invalid_state", "g2 is pending");
+    let status = h.status();
+    assert_eq!(status["pending"]["generation"], "g2", "{status}");
+    assert_eq!(status["step"], "pending", "{status}");
+    assert_eq!(
+        messages_starting(&h, "daemon", "re-executed"),
+        Vec::<String>::new()
+    );
+}
+
 /// SIGHUP applies what may change while the daemon runs and the next start uses it. A manifest that changes a fixed
 /// field is refused whole, the hot field edited along with it included.
 #[test]

@@ -3,7 +3,8 @@
 
 use crate::protocol::{
     DownResult, Event, Events, GenState, Generation, History, Process, ProcessState, PruneResult,
-    ReloadResult, ReportResult, Request, RollbackResult, StageResult, Status, Step, SwitchResult,
+    ReexecResult, ReloadResult, ReportResult, Request, RollbackResult, StageResult, Status, Step,
+    SwitchResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -213,6 +214,21 @@ pub fn render_switch(r: &SwitchResult) -> String {
     )
 }
 
+/// What `fawkes reexec` prints once the daemon answers `status` on its new binary.
+pub fn render_reexec(r: &ReexecResult, s: &Status) -> String {
+    let app = &s.process;
+    let generation = or_dash(app.generation.as_deref());
+    let kept = match app.state {
+        ProcessState::Running => format!("{generation} keeps running (pid {})", or_dash(app.pid)),
+        ProcessState::Failed => format!("{generation} stays failed"),
+        ProcessState::Stopped | ProcessState::Unknown => "no app runs".into(),
+    };
+    format!(
+        "{}'s daemon (pid {}) re-executed: fawkes {} → {}; {kept}",
+        s.name, r.pid, r.from, r.to
+    )
+}
+
 /// What `fawkes wait` prints for a generation that was confirmed: still permanent, or retired by a later one.
 pub fn render_decided(g: &Generation) -> String {
     let at = or_dash(g.confirmed_at.as_deref());
@@ -336,6 +352,12 @@ pub fn render_result(request: &Request, result: &Value) -> String {
             format!(
                 "stopped {stopped}the daemon of {} (pid {})",
                 r.name, r.daemon_pid
+            )
+        }),
+        Request::Reexec => typed(result, |r: ReexecResult| {
+            format!(
+                "the daemon (pid {}) re-executes: fawkes {} → {}",
+                r.pid, r.from, r.to
             )
         }),
         Request::Subscribe { .. } => result.to_string(),
@@ -478,6 +500,24 @@ mod tests {
     }
 
     #[test]
+    fn reexec_says_which_binary_the_daemon_moved_to_and_what_runs() {
+        let result = ReexecResult {
+            pid: 812,
+            from: "0.1.4".into(),
+            to: "0.1.5".into(),
+        };
+        let mut status = running_status(false);
+        status.process.generation = Some("g5".into());
+        status.process.pid = Some(4657);
+        assert_eq!(
+            render_reexec(&result, &status),
+            "xana's daemon (pid 812) re-executed: fawkes 0.1.4 → 0.1.5; g5 keeps running (pid 4657)"
+        );
+        status.process.state = ProcessState::Stopped;
+        assert!(render_reexec(&result, &status).ends_with("; no app runs"));
+    }
+
+    #[test]
     fn the_block_up_prints_says_where_the_app_is() {
         let log = Path::new("/h/xana/generations/g3/logs/app.log");
         let mut status = running_status(false);
@@ -558,10 +598,12 @@ mod tests {
             Request::Reload => 13,
             Request::Down => 14,
             Request::Report { .. } => 15,
+            Request::Reexec => 16,
         }
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one case per request")]
     fn each_result_is_rendered_as_a_sentence_with_its_key_facts() {
         let g = |id: &str| id.to_string();
         let exit = serde_json::json!({"at": "t", "code": null, "signal": 9, "requested": false});
@@ -696,6 +738,11 @@ mod tests {
                 },
                 Value::Null,
                 vec!["null"],
+            ),
+            (
+                Request::Reexec,
+                serde_json::json!({"pid": 99, "from": "0.1.4", "to": "0.1.5"}),
+                vec!["the daemon (pid 99) re-executes: fawkes 0.1.4 → 0.1.5"],
             ),
         ];
         let mut seen: Vec<usize> = cases

@@ -14,11 +14,13 @@ use clap::{Parser, Subcommand};
 use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
-    ErrorCode, Generation, Line, REQUEST_TIMEOUT, Request, StageResult, UpgradeResult, UpgradeStep,
-    err, read_line, timed_out,
+    ErrorCode, Generation, Line, REQUEST_TIMEOUT, ReexecResult, Request, StageResult, Status,
+    UpgradeResult, UpgradeStep, err, read_line, timed_out,
 };
-use render::{render_decided, render_event, render_progress, render_result, render_switch};
-use serde::Serialize;
+use render::{
+    render_decided, render_event, render_progress, render_reexec, render_result, render_switch,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fmt::Display;
@@ -27,7 +29,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The exit codes, which `fawkes -h` and `fawkes --help` end with. A macro, because `concat!` takes only literals.
 macro_rules! exit_codes {
@@ -112,7 +114,11 @@ enum Command {
     #[command(after_long_help = "Examples:\n  \
                                  fawkes up\n  \
                                  fawkes up --manifest xana")]
-    Up,
+    Up {
+        /// What the daemon's earlier program hands over when it re-executes (`fawkes reexec`)
+        #[arg(long, hide = true, value_name = "JSON")]
+        handover: Option<String>,
+    },
     /// Stop the app and its supervisor
     ///
     /// Answers once the daemon has let go of its socket and state lock, so `fawkes up` can follow at once. A daemon
@@ -122,6 +128,16 @@ enum Command {
                                  fawkes down\n  \
                                  fawkes down --manifest xana --json")]
     Down,
+    /// Run this app's daemon on the installed fawkes binary, keeping the app running
+    ///
+    /// The daemon executes the fawkes binary at its path in its own process: its pid stays, the app keeps running as
+    /// its child, and nothing rolls back. This is how a new Fawkes install reaches a running daemon. It is refused
+    /// while a switch is pending or a step runs (stage, test, prune, start, restart, the health check of a start).
+    /// Answers once the daemon answers `status` again on the new binary.
+    #[command(after_long_help = "Examples:\n  \
+                                 fawkes reexec\n  \
+                                 fawkes reexec --manifest xana --json")]
+    Reexec,
     /// Run the current generation (pending, else permanent)
     Start,
     /// Stop the app
@@ -273,8 +289,9 @@ impl Command {
             Command::Rollback { .. } => Some("rollback"),
             Command::Prune => Some("prune"),
             Command::Reload => Some("reload"),
-            Command::Up => Some("up"),
+            Command::Up { .. } => Some("up"),
             Command::Down => Some("down"),
+            Command::Reexec => Some("reexec"),
             // A test run may confirm its own generation, which is never pending; `run_confirm` refuses the rest once it
             // knows which daemon the confirm reaches (DESIGN.md, Refusals).
             Command::Confirm { .. }
@@ -345,7 +362,7 @@ fn main() -> ExitCode {
         })
     };
     let code = match &cli.command {
-        Command::Up => run_up(&given, cli.socket.clone()),
+        Command::Up { handover } => run_up(&given, cli.socket.clone(), handover.as_deref()),
         Command::Skill => run_skill(&cli, out),
         Command::Watch { since } => run_watch(&cli, &given, *since, out),
         Command::Service { action } => run_service(&cli, &given, *action, out),
@@ -356,6 +373,9 @@ fn main() -> ExitCode {
         }
         Command::Down => with_endpoint(&cli, &given, out, |endpoint, out| {
             run_down(&cli, &endpoint, out)
+        }),
+        Command::Reexec => with_endpoint(&cli, &given, out, |endpoint, out| {
+            run_reexec(&cli, &endpoint, out)
         }),
         Command::Wait { generation } => with_endpoint(&cli, &given, out, |endpoint, out| {
             run_wait(&cli, generation.as_deref(), &endpoint, out)
@@ -400,7 +420,7 @@ fn main() -> ExitCode {
 }
 
 /// `fawkes up`: the supervisor of one app, in the foreground. Returns the exit code.
-fn run_up(given: &Given, socket: Option<PathBuf>) -> u8 {
+fn run_up(given: &Given, socket: Option<PathBuf>, handover: Option<&str>) -> u8 {
     // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of the
     // daemon's startup failures are not.
     let manifest_path = match given.manifest() {
@@ -414,7 +434,7 @@ fn run_up(given: &Given, socket: Option<PathBuf>) -> u8 {
         warn(format!("error: {message}"));
         return EXIT_USAGE;
     }
-    match daemon::Daemon::run(manifest_path, socket) {
+    match daemon::Daemon::run(manifest_path, socket, handover) {
         Ok(()) => 0,
         Err(message) => {
             warn(format!("error: {message}"));
@@ -440,6 +460,60 @@ fn run_down(cli: &Cli, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
         (result, text)
     });
     finish(cli, out, outcome)
+}
+
+/// How long `fawkes reexec` waits for the daemon to answer on its new binary.
+const REEXEC_WAIT: Duration = Duration::from_secs(30);
+
+/// How often `fawkes reexec` asks again meanwhile.
+const REEXEC_POLL: Duration = Duration::from_millis(100);
+
+/// `fawkes reexec`: the daemon answers before it replaces its program, so the command ends once `status` answers
+/// with the same pid and the version it named. Returns the exit code.
+fn run_reexec(cli: &Cli, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
+    let outcome = exchange(cli, &Request::Reexec, endpoint, REQUEST_TIMEOUT, out).and_then(|raw| {
+        let result = ReexecResult::deserialize(&raw).map_err(|e| {
+            let message = format!("the daemon's reexec result could not be read: {e}");
+            Failure::new(ErrorCode::Internal, message)
+        })?;
+        let status = reexecuted(cli, &result, endpoint)?;
+        let text = render_reexec(&result, &status);
+        Ok((raw, text))
+    });
+    finish(cli, out, outcome)
+}
+
+/// The status of the daemon once it answers as process `result.pid` on fawkes `result.to`, within `REEXEC_WAIT`.
+fn reexecuted(cli: &Cli, result: &ReexecResult, endpoint: &Endpoint) -> Result<Status, Failure> {
+    let until = Instant::now() + REEXEC_WAIT;
+    loop {
+        // A status asked while the daemon executes waits in its socket's backlog for the next program.
+        let left = until.saturating_duration_since(Instant::now());
+        let answer = exchange(
+            cli,
+            &Request::Status,
+            endpoint,
+            left.clamp(REEXEC_POLL, REQUEST_TIMEOUT),
+            &mut std::io::sink(),
+        );
+        if let Ok(status) = answer.and_then(|raw| {
+            Status::deserialize(&raw).map_err(|e| Failure::new(ErrorCode::Internal, e.to_string()))
+        }) && status.daemon_pid == result.pid
+            && status.version == result.to
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= until {
+            let message = format!(
+                "the daemon on {} took `reexec` but did not answer as fawkes {} within {} s; `fawkes log` says why",
+                endpoint.socket.display(),
+                result.to,
+                REEXEC_WAIT.as_secs()
+            );
+            return Err(Failure::new(ErrorCode::NoAnswer, message));
+        }
+        std::thread::sleep(REEXEC_POLL);
+    }
 }
 
 /// `fawkes skill`: the agent skill built into this binary. Returns the exit code.
@@ -1044,7 +1118,8 @@ mod tests {
             assert!(matches!(cli.command, Command::Status), "{args}");
         }
         let up = parse("up --manifest f.toml");
-        assert!(matches!(up.command, Command::Up));
+        assert!(matches!(up.command, Command::Up { handover: None }));
+        assert!(matches!(parse("reexec").command, Command::Reexec));
         assert_eq!(up.manifest, Some("f.toml".into()));
         let upgrade = parse("upgrade main --deadline 60");
         assert!(

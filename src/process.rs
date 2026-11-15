@@ -6,12 +6,13 @@ use crate::protocol::describe_status;
 use crate::state;
 use rustix::io::Errno;
 use rustix::process::{
-    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+    Pid, Signal, WaitId, WaitIdOptions, WaitOptions, kill_process_group, test_kill_process_group,
+    waitid, waitpid,
 };
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -127,11 +128,81 @@ fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<String> {
     })
 }
 
+/// A child of this process that can be waited for: std's `Child`, or a `ChildPid`.
+pub trait Waitable {
+    fn pid(&self) -> Pid;
+    /// The exit status once the child has exited, reaped; None while it runs. Asked again, the same status.
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+}
+
+impl Waitable for Child {
+    fn pid(&self) -> Pid {
+        Pid::from_child(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+}
+
+/// A child process known by its pid alone: the live app's handle. A daemon that re-executes itself (`reexec`) keeps
+/// its children but loses std's `Child`, so the image after it waits for the app by the pid it was handed.
+pub struct ChildPid {
+    pid: Pid,
+    /// Kept once reaped, since the pid may name another process after that.
+    status: Option<ExitStatus>,
+}
+
+impl ChildPid {
+    /// The child as process `pid`, when that is an unreaped child of this process, running or exited: the app an
+    /// earlier image of this process started.
+    pub fn handed_over(pid: u32) -> Option<ChildPid> {
+        let pid = i32::try_from(pid).ok().and_then(Pid::from_raw)?;
+        // WNOWAIT leaves an exit unreaped, for `try_wait`; ECHILD means it is no child of ours.
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )
+        .ok()?;
+        Some(ChildPid { pid, status: None })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.pid.as_raw_pid().unsigned_abs()
+    }
+}
+
+/// std's `Child` neither kills nor reaps its process when dropped, so its pid is all there is to keep, with the exit
+/// status it may have reaped already.
+impl From<Child> for ChildPid {
+    fn from(mut child: Child) -> ChildPid {
+        ChildPid {
+            pid: Pid::from_child(&child),
+            status: child.try_wait().ok().flatten(),
+        }
+    }
+}
+
+impl Waitable for ChildPid {
+    fn pid(&self) -> Pid {
+        self.pid
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.status.is_none()
+            && let Some((_, status)) = waitpid(Some(self.pid), WaitOptions::NOHANG)?
+        {
+            self.status = Some(ExitStatus::from_raw(status.as_raw()));
+        }
+        Ok(self.status)
+    }
+}
+
 /// Run `then` once `child` has exited. A thread blocks in `waitid` with `WNOWAIT`, which leaves the exit unreaped:
-/// the status stays for `Child::try_wait`, so whoever owns the `Child` reaps it as before. A thread per child keeps
-/// one code path for macOS and Linux, where kqueue's `NOTE_EXIT` and a pidfd would need one each.
-pub fn on_exit(child: &Child, then: impl FnOnce() + Send + 'static) {
-    let pid = Pid::from_child(child);
+/// the status stays for `try_wait`, so whoever owns the child reaps it as before. A thread per child keeps one code
+/// path for macOS and Linux, where kqueue's `NOTE_EXIT` and a pidfd would need one each.
+pub fn on_exit(child: &dyn Waitable, then: impl FnOnce() + Send + 'static) {
+    let pid = child.pid();
     thread::spawn(move || {
         // Any error but an interruption means `pid` is no longer an unreaped child of ours: it has exited and been
         // reaped already.
@@ -147,7 +218,7 @@ pub fn on_exit(child: &Child, then: impl FnOnce() + Send + 'static) {
 }
 
 /// A receiver that gets a message once `child` has exited (`on_exit`), and is disconnected after it.
-pub fn exited(child: &Child) -> Receiver<()> {
+pub fn exited(child: &dyn Waitable) -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
     on_exit(child, move || {
         // The receiver is gone when nobody waits any more.
@@ -157,7 +228,10 @@ pub fn exited(child: &Child) -> Receiver<()> {
 }
 
 /// `child`'s exit status once it has exited, reaped; None when `until` passes first.
-pub fn wait_until(child: &mut Child, until: Instant) -> std::io::Result<Option<ExitStatus>> {
+pub fn wait_until(
+    child: &mut (dyn Waitable + '_),
+    until: Instant,
+) -> std::io::Result<Option<ExitStatus>> {
     if let Some(status) = child.try_wait()? {
         return Ok(Some(status));
     }
@@ -166,7 +240,7 @@ pub fn wait_until(child: &mut Child, until: Instant) -> std::io::Result<Option<E
         return Ok(None);
     }
     // A message or a timeout: `try_wait` tells which.
-    let _ = exited(child).recv_timeout(left);
+    let _ = exited(&*child).recv_timeout(left);
     child.try_wait()
 }
 
@@ -365,7 +439,7 @@ const KILL_WAIT: Duration = Duration::from_secs(2);
 pub fn stop_group(
     pgid: u32,
     timeout: Duration,
-    mut leader: Option<&mut Child>,
+    mut leader: Option<&mut dyn Waitable>,
 ) -> Option<ExitStatus> {
     signal_group(pgid, Signal::TERM);
     let mut status = None;
@@ -383,7 +457,7 @@ pub fn stop_group(
 /// and no other member left. True when it has ended.
 fn wait_group(
     pgid: u32,
-    leader: Option<&mut Child>,
+    leader: Option<&mut (dyn Waitable + '_)>,
     status: &mut Option<ExitStatus>,
     until: Instant,
 ) -> bool {

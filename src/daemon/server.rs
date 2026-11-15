@@ -104,9 +104,9 @@ impl Admission {
     fn release(&mut self) {
         if let Some(daemon) = self.0.take() {
             daemon.open.fetch_sub(1, Ordering::SeqCst);
-            // Read after the count changed, as the flag is set before `shutdown` reads the count: whichever comes
-            // second sees the other. Only then, so an ordinary request does not wake the supervisor.
-            if daemon.shutting_down() {
+            // Read after the count changed, as the flags are set before `shutdown` or `reexec_now` reads the count:
+            // whichever comes second sees the other. Only then, so an ordinary request does not wake the supervisor.
+            if daemon.shutting_down() || daemon.draining.load(Ordering::SeqCst) {
                 daemon.wake.notify();
             }
         }
@@ -271,6 +271,7 @@ impl Daemon {
                 self.down(out);
                 Ok(Reply::Streamed)
             }
+            Request::Reexec => self.reexec_command(out),
         }
     }
 
@@ -453,7 +454,7 @@ mod tests {
         // The info belongs to the process: the next app starts with none.
         answer(&daemon, report_line("g2", info));
         let app = daemon.inner().take_running().unwrap();
-        daemon.inner().live = Live::Running(App::new(app.child, "g2"));
+        daemon.inner().live = Live::Running(App::new(app.process, "g2"));
         assert!(daemon.status().process.info.is_empty());
     }
 

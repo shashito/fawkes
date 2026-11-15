@@ -13,8 +13,8 @@ implements all of it except where a section says **later**.
 
 `fawkes up` brings the app up under supervision: the daemon, a long-running foreground process (launchd or systemd
 keeps it alive; on macOS `fawkes service install` sets up launchd, see Service). It is the parent of the app's live
-process and the only writer of the state directory. Every other command (`down`, `start`, `stop`, `restart`, `stage`,
-`test`, `switch`, `upgrade`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `reload`, `watch`) is a thin
+process and the only writer of the state directory. Every other command (`down`, `reexec`, `start`, `stop`, `restart`,
+`stage`, `test`, `switch`, `upgrade`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `reload`, `watch`) is a thin
 client that sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run
 one daemon per manifest.
 
@@ -93,6 +93,25 @@ has no one to answer, so `SIGHUP` only logs:
 Change `home` only while no switch is pending: a daemon start rolls a pending switch back into the `home` of the
 manifest it reads. The same goes for a `restore` hook that cannot read what the `snapshot` hook before it wrote, since
 the rollback of a pending switch runs the `restore` the daemon has then.
+
+**Reexec.** `fawkes reexec` moves a running daemon onto the fawkes binary installed at the path it was started from,
+which is how a new Fawkes install reaches it: the daemon executes that binary in its own process (`execve`), so its pid
+stays, the app stays its child and keeps running, and nothing stops or rolls back. It is refused `invalid_state`
+while a transaction is under way (`txn` is `switching`, `pending` or `rolling_back`; the message names the generation
+and says to run `fawkes reexec` again once `fawkes wait` reports it decided) and during a crash backoff, and `busy`
+while either slot is taken (a stage, test, prune, start, stop, restart, switch or rollback, or the supervisor's own
+work) or the health check after a start of the live app still runs. The live app may be running and healthy, stopped
+or given up on (`failed`). The daemon first runs `<binary> --version`, bounded at 5 s: unless it exits 0 and prints
+`fawkes <version>`, `reexec` fails `start_failed`, names the binary and what it did, and nothing changes. Then it
+answers (`pid`, `from`, `to`), waits up to 2 s for the other requests it is serving to send their answers, as a
+shutdown does (streams are cut, and their clients reconnect with `since`), lets stderr's writer catch up (bounded at
+1 s), and holds the state and the event log, so no write of `state.json` or `events.jsonl` is cut short, while it
+executes the binary with the arguments `up` was given (`--manifest`, and `--socket` when given) plus a hidden
+`--handover <json>`. The handover carries the descriptors of the state lock and the listening socket, kept open
+across the exec, the live app (pid, generation, `started_at`, uptime, reported info) or whether it was given up on,
+and the restart count, the last start and the last exit, which `state.json` does not hold. An exec that fails is an
+`error` event, and the daemon carries on as before on its own binary. The new program starts as Daemon start
+describes, with the handover in place of the lock, the bind and the start of the app.
 
 **Panics** abort the daemon (`panic = "abort"`) after an `error` event with the message. The init system restarts
 it, and the daemon start below recovers whatever was in flight; no thread carries on past a broken invariant.
@@ -330,6 +349,16 @@ A cold start of the daemon always runs the permanent generation; `start` and `re
    - `pending`: roll the switch back (reason `daemon_restart`, cause `daemon_restart`); a pending switch is never resumed;
    - `rolling_back`: retry the rollback with its recorded reason and cause (a `restore` hook is safe to run again, see
      Hooks), then start the permanent generation.
+
+A daemon started by `reexec` (Process model) with `--handover` takes over what the program before it held. Step 2
+uses the descriptor handed over, which must be `<state_dir>/lock` and hold its lock, and step 3 the listening socket,
+which must be bound at the daemon's socket path; the socket file and the `run/` link stay as they are, and clients
+that connected during the exec wait in its backlog. The live app handed over is still this process's child, so it
+runs on under supervision as it was: step 5 leaves it and `app.pid` alone, and step 7 starts nothing (`txn` is none,
+since `reexec` is refused otherwise), with no health check and no `started` event; a stopped app stays stopped and
+one given up on stays `failed`. It logs a `daemon` event (`reexecuted`: `re-executed from fawkes 0.1.4; g3 keeps
+running, pid 123`) instead of `started`. An app handed over that is no child of the process is treated as one a
+crashed daemon left (step 5), and the permanent generation is started.
 
 ### Adopt
 
@@ -569,6 +598,7 @@ whose storage is worth a snapshot is never tested on an empty home.
 ```
 fawkes up
 fawkes down
+fawkes reexec
 fawkes start
 fawkes stop
 fawkes restart
@@ -604,8 +634,13 @@ exits, so `fawkes down && fawkes up` never finds the old daemon in the way. Its 
 and the daemon's pid, and ends with the command that starts both again: `fawkes up --manifest …`, or `fawkes service
 restart --manifest …` for an app installed as a launchd agent, whose daemon a terminal's `up` would contend with at the
 next login. A `down` that reaches a daemon already on its way out may get no answer and fail `daemon_unreachable`
-(exit 3): there is no daemon left either way. `start`, `stop` and `restart` act on the app's process and leave the
-supervisor running.
+(exit 3): there is no daemon left either way. `reexec` runs the daemon on the fawkes binary installed at its path,
+with the same pid and the app still running (Process model, Reexec); since the daemon answers before it executes the
+binary, the command ends once `status` answers with the same `daemon_pid` and the new `version`, or fails `no_answer`
+after 30 s (the `error` event of a failed exec says why). Its text names the app, the daemon's pid, both versions and
+the app that keeps running: `xana's daemon (pid 812) re-executed: fawkes 0.1.4 → 0.1.5; g5 keeps running (pid
+4657)`; under `--json` it prints the result. Unlike `down` it may run from inside the app, which it never stops.
+`start`, `stop` and `restart` act on the app's process and leave the supervisor running.
 
 In text, `log` and `history` print nothing, not a blank line, when there are no events or generations to show (`log -n 0`
 included); under `--json` the result is `{"events": []}` as ever. `log --since N` is how an agent asks for what came after
@@ -699,7 +734,7 @@ stderr says what it waits for (`waiting for g4: confirm due by …`); under `--j
 object and stderr stays quiet. `wait` only reads, so it is the same in a test run.
 
 **Refusals, before a request is sent** (a change of the earlier contract, which let a test run call every command): with
-`FAWKES_PHASE=test` in the environment, `up`, `down`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
+`FAWKES_PHASE=test` in the environment, `up`, `down`, `reexec`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
 `start`, `stop`, `restart` and `reload` fail `test_phase` (exit 1) whatever daemon they would reach: a test run serves its health check
 and nothing else. Read-only commands (`status`, `history`, `log`, `watch`, `wait`, `skill`) still run. `confirm` runs
 only for the test run's own `FAWKES_GENERATION` towards the daemon `FAWKES_SOCKET` names (bare, or naming that
@@ -871,6 +906,7 @@ Results per command:
 | `reload` | — | `changed`: the manifest fields that changed, empty when none; the manifest is read again as for `SIGHUP` (see Process model), and a refusal is `usage` (invalid manifest) or `invalid_state` (a field that cannot change now) |
 | `subscribe` | `limit?`, `since?` | never ends; see below |
 | `down` | — | `name`, `daemon_pid`, `stopped` (the generation whose app it stopped, `null` when none ran); sent once the daemon has stopped the app as for `SIGTERM` and let go of its socket, `run/` link and state lock, just before it exits 0 |
+| `reexec` | — | `pid` (the daemon's, which stays), `from` (the version it runs), `to` (the version the installed binary printed); sent before the daemon executes that binary (Process model, Reexec); `invalid_state`, `busy` or `start_failed` when it is refused |
 
 `subscribe` is the stream for live clients such as `watch`. With `limit` it first replays that many recent events as
 `{"event": …}` lines. With `since` (a `seq`) it instead replays the events after that number that are still in memory
@@ -892,7 +928,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 
 | Kind | Logged when | `generation` |
 |---|---|---|
-| `daemon` | the daemon starts (`started, pid …`) or ends (`stopped`, after `down` or a signal); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down; a first start begins to adopt HEAD (Adopt) | the generation concerned, else `null` |
+| `daemon` | the daemon starts (`started, pid …`), re-executes (`re-executed from fawkes …`, by `reexec`) or ends (`stopped`, after `down` or a signal); a manifest reload succeeds; startup stops an app or step an earlier daemon left, removes a stage it cut short or a directory no generation owns, or finds a switch it cut short; a start is left to the next daemon because this one is shutting down; a first start begins to adopt HEAD (Adopt) | the generation concerned, else `null` |
 | `progress` | a step narrates itself to the client waiting for it (stage, test, switch, rollback, prune, stop, restart); it does not mark a change of state | the generation the line is about |
 | `started` | the live app's process has been spawned, with its pid and port (a `test` run does not log it) | the generation started |
 | `healthy` | the live app's health check passed | the generation checked |
@@ -909,11 +945,11 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `rolled_back` | a rollback ended: normally, or with its restore failed, with `state.json` unwritable, or with the restore given up by `--keep-storage`; the message says which | the generation rolled back (not the one that runs now) |
 | `pruned` | `prune` removed at least one generation; the message lists them | `null` |
 | `reported` | the live app reported info that differs from what it reported before (a repeat logs nothing); the message is the pairs as `key value` joined by ` · `, `url` first and the rest by key, or `info cleared` | the generation that reported |
-| `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a failed adoption (the daemon then exits), a panic | the generation concerned, else `null` |
+| `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a failed adoption (the daemon then exits), a `reexec` whose exec failed, a panic | the generation concerned, else `null` |
 
 | Kind | Fields |
 |---|---|
-| `daemon` | `action`: `started`, `stopped`, `reloaded`, `cleaned_up` (a leftover app, step or hook stopped, a cut-short stage or a stray directory removed), `switch_cut_short`, `deferred` (a start left to the next daemon), `adopting` (a first start stages and tests HEAD to adopt it). `started` adds `pid` and `version`; `reloaded` adds `changed`, the manifest fields that changed (empty when none); `cleaned_up` adds `pid` when it stopped a process |
+| `daemon` | `action`: `started`, `stopped`, `reloaded`, `cleaned_up` (a leftover app, step or hook stopped, a cut-short stage or a stray directory removed), `switch_cut_short`, `deferred` (a start left to the next daemon), `adopting` (a first start stages and tests HEAD to adopt it), `reexecuted` (the daemon runs on the binary `reexec` executed). `started` and `reexecuted` add `pid` and `version` (the version that runs now); `reloaded` adds `changed`, the manifest fields that changed (empty when none); `cleaned_up` adds `pid` when it stopped a process |
 | `started` | `pid`, `port` |
 | `exited` | `code` (exit status) or `signal`, as in `last_exit`; `restart_at` (UTC time) when a restart is scheduled |
 | `tested`, `test_failed` | `port` (the spare port), `seconds` |
@@ -1161,15 +1197,16 @@ Then it installs:
 - the extension to `~/.local/share/fawkes/ultimate/fawkes`, which `init.ts` in it links into a project.
 
 Each is copied beside its place and renamed into it (the extension's folder in two renames, missing for that
-moment), so running it again upgrades both, and a running daemon keeps the binary it started from until it restarts
-(`down` and `up`, or `service restart`), which rolls a pending switch back. It never needs root and never changes a
+moment), so running it again upgrades both, and a running daemon keeps the binary it started from until `fawkes
+reexec` moves it onto the new one, with its app still running, or until it restarts (`down` and `up`, or `service
+restart`), which rolls a pending switch back. It never needs root and never changes a
 shell startup file: it says when the install directory is not on `PATH`, or when another `fawkes` comes first there. `FAWKES_DOWNLOAD_URL`
 replaces the release's download folder (a mirror, or a `file://` folder of archives for a test).
 
 Fawkes itself never looks for a release, so no command touches the network. The Ultimate extension does, in the live
 generation: once a day it reads the tag GitHub's `releases/latest` redirect names (not the API, which is rate
 limited) and, when that release is newer than the daemon and the installed binary, shows the command that installs it
-and then the daemon restart; when the installed binary alone is newer than the daemon, only the restart
+and then `fawkes reexec`; when the installed binary alone is newer than the daemon, only `fawkes reexec`
 (`ultimate/fawkes/README.md`, "Releases"). `FAWKES_NO_UPDATE_CHECK` turns it off.
 
 ## Crates
