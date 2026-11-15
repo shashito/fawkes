@@ -190,7 +190,7 @@ async function confirmWhenReady(host: ExtensionHost, socket: string, generation:
         s.confirming = { state: 'checking', detail: verdict.reason }
         if (before?.state !== 'checking' || before.detail !== verdict.reason)
           host.notice(
-            `Fawkes: ${generation} does not confirm itself yet: ${verdict.reason}; it rolls back at its deadline`,
+            `Fawkes: ${generation} does not confirm itself yet: ${verdict.reason}; unless that clears, it rolls back at its deadline`,
           )
       }
     }

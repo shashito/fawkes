@@ -42,7 +42,7 @@ test('confirm says why a pending generation waits or was refused, in a value the
   assert.equal(confirm({ state: 'confirmed' }), undefined)
   assert.equal(confirm(undefined), undefined)
   // The daemon refuses a control, zero-width or bidirectional character, and counts characters, not UTF-16 units.
-  assert.equal(confirm({ state: 'checking', detail: 'a\u200b\u202eb\u0007c' }), 'waiting: a b c')
+  assert.equal(confirm({ state: 'checking', detail: 'a\u200b\u202eb\u0007c\u2065d' }), 'waiting: a b c d')
   const long = confirm({ state: 'checking', detail: '🔥'.repeat(400) })!
   assert.equal([...long].length, MAX_VALUE)
   assert.ok(long.endsWith('…'))

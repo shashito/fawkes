@@ -31,7 +31,8 @@ function remote(origins: string[]) {
  * `MAX_VALUE` characters, as the daemon counts them.
  */
 function value(text: string) {
-  const plain = text.replace(/[\p{Cc}\p{Cf}\s]+/gu, ' ').trim()
+  // \p{Cf} holds every zero-width and bidirectional character the daemon refuses but the unassigned U+2065.
+  const plain = text.replace(/[\p{Cc}\p{Cf}\u2065\s]+/gu, ' ').trim()
   const chars = [...plain]
   return chars.length > MAX_VALUE ? `${chars.slice(0, MAX_VALUE - 1).join('')}…` : plain
 }

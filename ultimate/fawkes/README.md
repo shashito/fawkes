@@ -106,10 +106,10 @@ own folder's `node_modules`, which links to one shared clone's working tree, so 
 generation and a rollback cannot mend it; its failure is a notice, once per set of failed names. While the generation
 waits, each new reason is a notice (the status line, and the generation's `app.log`, whose tail `fawkes history` keeps
 after a rollback) and the `confirm` key of its report (`waiting: server facets failed to load: update`, or
-`refused: …` when the daemon refused the confirm), which the daemon logs as a `reported` event. It lets go of the hold only when the daemon's status says the generation is permanent, whoever
-confirmed it (this facet, the Confirm button, `fawkes confirm`), and not while the user paused the host. A refused or
-lost confirm is retried. If the checks never pass, the deadline runs out and Fawkes rolls back code and storage
-together. A restart of a generation that is already permanent releases the hold at once; every reopen of the harness
+`refused: …` when the daemon refused the confirm), which the daemon logs as a `reported` event. It lets go of the
+hold only when the daemon's status says the generation is permanent, whoever confirmed it (this facet, the Confirm
+button, `fawkes confirm`), and not while the user paused the host. A refused or lost confirm is retried. If the
+checks never pass, the deadline runs out and Fawkes rolls back code and storage together. A restart of a generation that is already permanent releases the hold at once; every reopen of the harness
 (a failed core swap) holds again until then.
 
 In a test run the hold fails closed: a hold that throws ends the process, and `health.ts` passes only once the
