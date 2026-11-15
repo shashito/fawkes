@@ -2,8 +2,9 @@
 
 A host moved to a new Ultimate commit and is now permanent. This review reads what the commits since the last review
 change for extensions, and says, with evidence, what each extension on this machine should fix or could use. The
-message that sent you here has the facts: the range `<from>..<to>`, the clone, and every extension the host loads
-beyond the built-in ones, with its real path and owning project.
+message that sent you here has the facts: the commits to review as a `<range>` for `git log` (the new commit and,
+excluded, every commit reviewed before), the base of their diff `<from>..<to>`, the clone, and every extension the host
+loads beyond the built-in ones, with its real path and owning project.
 
 Read only. Never check out, merge, pull or reset anything in the clone, and change no code: propose, and wait for the
 user's go.
@@ -13,7 +14,7 @@ user's go.
 In the clone:
 
 ```sh
-git log --format='%h %s' <from>..<to>
+git log --format='%h %s' <range>
 ```
 
 Note the commits whose subject touches extensions, the host API, events, hooks, actions, settings or packages.
@@ -28,7 +29,7 @@ git diff <from>..<to> -- shared/extension-api.ts server/extensions.ts lib/ docs/
 ```
 
 Use `--stat` first when it is long, then read the files that changed. For each change, note the commit
-(`git log --format='%h %s' <from>..<to> -- <path>`), what was added, renamed, removed or deprecated, and what it does.
+(`git log --format='%h %s' <range> -- <path>`), what was added, renamed, removed or deprecated, and what it does.
 
 ## 3. The extensions
 

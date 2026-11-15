@@ -5,7 +5,15 @@ import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { obj, oneOf, opt, str } from '@earendil-works/pi-schema'
-import { defineDoc, defineExtension, defineTool, GenerationTask, hook, section } from '@earendil-works/pi-durable'
+import {
+  defineDoc,
+  defineExtension,
+  defineTool,
+  GenerationTask,
+  hook,
+  ROOT_CONVERSATION_ID,
+  section,
+} from '@earendil-works/pi-durable'
 import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 // Types only: at runtime this folder must not load code from a clone other than the generation it runs in.
 import type { ExtensionHost } from 'ultimate/server/extensions.ts'
@@ -26,9 +34,10 @@ import { shellWord } from './setup.ts'
 import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import {
   claim,
+  installedAt,
   ownerOf,
   readJson,
-  readWatermark,
+  readReviewed,
   reviewDecision,
   sharedFolder,
   withLock,
@@ -39,6 +48,7 @@ import {
   autofixBrief,
   autofixStep,
   failureName,
+  failingSince,
   failures,
   failureTask,
   giveUpText,
@@ -107,8 +117,6 @@ type Shared = {
   followAgain?: boolean
   /** What the last run of the tasks failed with, so each message is a notice once. */
   taskProblems?: string[]
-  /** Facets that failed to load since the last run, with their errors, as `onLoadError` told them. */
-  loadErrors?: Map<string, string>
   stop?: () => void
   confirmRun?: Promise<void>
   upgradeRun?: Promise<void>
@@ -504,6 +512,8 @@ type TaskRun = {
   own: string
   /** Who gets the upgrade tasks and the autofix give-ups (`afterUpgrade.project`). */
   coordinator: string
+  /** When the tasks first ran on this machine: what happened before is the state they found. */
+  installed: number
   /** The Ultimate clone every generation comes from. */
   clone: string
   facts: HostFacts
@@ -514,7 +524,7 @@ async function deliver(run: TaskRun, project: string, text: string, requestId: s
   const messages = run.host.need(MessagesApi)
   try {
     if (project === run.own) {
-      await messages.send(1 as ConversationId, { to: '@ultimate', text, reply: false }, requestId, BACKGROUND_CONTEXT)
+      await messages.send(ROOT_CONVERSATION_ID, { to: '@ultimate', text, reply: false }, requestId, BACKGROUND_CONTEXT)
       return
     }
     const from = await run.host.need(SubagentsApi).standing('ultimate', BACKGROUND_CONTEXT)
@@ -538,37 +548,32 @@ const inventory = (run: TaskRun): Promise<Owned[]> =>
   )
 
 /**
- * Review what the commits since the watermark offer every extension, once for all hosts: under `review.lock`, the
- * first run only sets the watermark, a commit it already covers brings nothing, and a delivered review moves it on. A
- * commit beside the watermark rather than after it (another branch) leaves the watermark where it is, so its own claim
- * keeps it from being reviewed again.
+ * Review what the commits not yet reviewed offer every extension, once for all hosts: under `review.lock`, the first
+ * run only records this commit, a commit the reviewed tips already cover brings nothing, and a delivered review records
+ * the new tips. A generation confirmed before the extension was installed is the state it found, not an upgrade.
  */
 async function review(run: TaskRun, running: Generation, instructions: string | true) {
   const to = running.commit
   await withLock(join(run.folder, 'review.lock'), async () => {
     const mark = join(run.folder, 'reviewed')
-    const decision = await reviewDecision(run.host.ultimateRoot, await readWatermark(mark), to)
-    if (decision.state === 'quiet') return writeAtomic(mark, `${to}\n`)
+    const reviewed = await readReviewed(mark)
+    if (!reviewed) return writeAtomic(mark, `${to}\n`)
+    if (!(Date.parse(running.confirmed_at ?? '') >= run.installed)) return
+    const decision = await reviewDecision(run.host.ultimateRoot, reviewed, to)
     if (decision.state === 'skip') return
-    const beside = decision.advance ? undefined : join(run.folder, `review-${to}`)
-    if (beside && !(await claim(beside))) return
-    try {
-      const facts = {
-        ...run.facts,
-        generation: running.id,
-        ref: running.ref,
-        clone: run.clone,
-        from: decision.from,
-        to,
-        count: decision.count,
-        inventory: await inventory(run),
-      }
-      await deliver(run, run.coordinator, successTask(instructions, extensionFolder(), facts), `fawkes-review-${to}`)
-    } catch (error) {
-      if (beside) await rm(beside, { force: true })
-      throw error
+    const facts = {
+      ...run.facts,
+      generation: running.id,
+      ref: running.ref,
+      clone: run.clone,
+      from: decision.from,
+      to,
+      reviewed,
+      count: decision.count,
+      inventory: await inventory(run),
     }
-    if (decision.advance) await writeAtomic(mark, `${to}\n`)
+    await deliver(run, run.coordinator, successTask(instructions, extensionFolder(), facts), `fawkes-review-${to}`)
+    await writeAtomic(mark, decision.tips.map((tip) => `${tip}\n`).join(''))
     const commits = decision.count === 1 ? 'the new Ultimate commit' : `the ${decision.count} new Ultimate commits`
     run.host.notice(`Fawkes: asked ${run.coordinator}'s @ultimate to review ${commits} up to ${to.slice(0, 8)}`)
   })
@@ -598,18 +603,29 @@ async function investigate(run: TaskRun, failure: Failure, instructions: string 
  * route it), the next one 30 minutes later, then the coordinator tells the user. One record for all hosts, under its
  * lock. A host that does not load the extension leaves it to those that do.
  */
-async function autofix(run: TaskRun, name: string, loadError: string | undefined) {
+async function autofix(run: TaskRun, name: string) {
   const extension = run.host
     .extensions()
     .find((each) => each.name === name && each.enabled && each.source !== 'builtin')
   if (!extension) return
-  // `onLoadError` runs before the host's own record shows the error.
-  const error = loadError ?? (failedFacets([extension]).ignored.length ? extension.server?.error : undefined)
+  const error = failedFacets([extension]).ignored.length ? extension.server?.error : undefined
   await withLock(join(run.folder, `autofix-${name}.lock`), async () => {
     const file = join(run.folder, `autofix-${name}.json`)
     const record = await readJson<AutofixRecord>(file)
     const now = Date.now()
     const step = autofixStep(record, error !== undefined, now, run.facts.host)
+    // The record is written before the delivery and put back when it fails: a delivered message whose record was
+    // never written would be sent again at every tick.
+    const send = async (project: string, text: string, next: AutofixRecord, requestId: string) => {
+      await writeAtomic(file, JSON.stringify(next))
+      try {
+        await deliver(run, project, text, requestId)
+      } catch (failure) {
+        if (record) await writeAtomic(file, JSON.stringify(record))
+        else await rm(file, { force: true })
+        throw failure
+      }
+    }
     if (step === 'recovered') {
       await rm(file, { force: true })
       run.host.notice(`Fawkes: ${name} loads again`)
@@ -626,14 +642,13 @@ async function autofix(run: TaskRun, name: string, loadError: string | undefined
         previous: record?.error,
         clone: run.clone,
       })
-      await deliver(run, target, brief, `fawkes-autofix-${name}-${attempt}-${now}`)
-      await writeAtomic(file, JSON.stringify({ error, tries: attempt, lastTry: now, host: run.facts.host } satisfies AutofixRecord))
+      const next = { error, tries: attempt, lastTry: now, host: run.facts.host }
+      await send(target, brief, next, `fawkes-autofix-${name}-${attempt}-${now}`)
       run.host.notice(`Fawkes: asked ${target}'s @ultimate to repair ${name} (try ${attempt} of ${AUTOFIX_TRIES})`)
     } else if (step === 'give-up' && record && error !== undefined) {
       const { path } = await ownerOf(extension.path, run.projects).catch((): Owner => ({ path: extension.path }))
       const text = giveUpText({ ...run.facts, name, path, error, tries: record.tries })
-      await deliver(run, run.coordinator, text, `fawkes-autofix-${name}-gave-up-${record.lastTry}`)
-      await writeAtomic(file, JSON.stringify({ ...record, gaveUp: true } satisfies AutofixRecord))
+      await send(run.coordinator, text, { ...record, gaveUp: true }, `fawkes-autofix-${name}-gave-up-${record.lastTry}`)
       run.host.notice(
         `Fawkes: autofix gave up on ${name} after ${record.tries} tries; asked ${run.coordinator}'s @ultimate to tell the user`,
       )
@@ -650,6 +665,7 @@ async function runTasks(host: ExtensionHost, socket: string, generation: string)
   const settings = parseTaskSettings(await fawkesSettings(host.userHome))
   const folder = sharedFolder(host.userHome)
   await mkdir(folder, { recursive: true })
+  const installed = await installedAt(folder)
   const projects = await host.projects()
   const own = projects.find((project) => project.current)?.name ?? basename(host.projectRoot)
   const run: TaskRun = {
@@ -660,6 +676,7 @@ async function runTasks(host: ExtensionHost, socket: string, generation: string)
     projects,
     own,
     coordinator: settings.project ?? own,
+    installed,
     clone: dirname(await cloneGitDir(host.ultimateRoot)),
     facts: { host: status.name, manifest: status.manifest ?? status.name },
   }
@@ -670,11 +687,9 @@ async function runTasks(host: ExtensionHost, socket: string, generation: string)
   const { success, failure } = settings
   if (success !== false) await collect(() => review(run, running, success))
   if (failure !== false)
-    for (const each of failures(status.name, status, s.generations, s.events, Date.now()))
+    for (const each of failures(status.name, status, s.generations, s.events, failingSince(installed, Date.now())))
       await collect(() => investigate(run, each, failure))
-  const loadErrors = s.loadErrors ?? new Map<string, string>()
-  s.loadErrors = new Map()
-  for (const name of settings.autofix) await collect(() => autofix(run, name, loadErrors.get(name)))
+  for (const name of settings.autofix) await collect(() => autofix(run, name))
   return problems
 }
 
@@ -869,11 +884,9 @@ export default function fawkesExtension(host: ExtensionHost) {
     }
     const first = setTimeout(quiet, 30_000)
     const timer = setInterval(quiet, 60_000)
-    // A listed extension that fails to load is repaired at once, not at the next tick.
-    host.onLoadError((name, error) => {
-      s.loadErrors = new Map(s.loadErrors).set(name, error)
-      follow()
-    })
+    // A listed extension that fails to load is repaired at once, not at the next tick. The callback runs before the
+    // host records the error, which the run reads after its first await.
+    host.onLoadError(() => follow())
     // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
     const reported = setInterval(() => void reports?.tick(), INTERVAL)
     // Hourly, so a reinstall shows within the hour and a check missed while offline or asleep runs soon after; GitHub

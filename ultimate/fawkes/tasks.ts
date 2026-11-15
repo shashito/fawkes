@@ -88,15 +88,18 @@ const notFailures = new Set<Cause | null>(['requested', 'daemon_restart'])
 const stageFailed = (event: FawkesEvent, commit: string | undefined) =>
   event.kind === 'error' && !commit && event.message.startsWith('stage of ')
 
-/** The failed upgrades of the last `FAILURE_WINDOW`, one per claim key, a rollback before the test of its commit. */
+/** Since when a failure calls for an investigation: the last `FAILURE_WINDOW`, and not before the tasks first ran. */
+export const failingSince = (installed: number, now: number) => Math.max(installed, now - FAILURE_WINDOW)
+
+/** The failed upgrades since `since`, one per claim key, a rollback before the test of its commit. */
 export function failures(
   host: string,
   status: Status,
   generations: Generation[],
   events: FawkesEvent[],
-  now: number,
+  since: number,
 ): Failure[] {
-  const recent = (at: string | null | undefined) => now - Date.parse(at ?? '') <= FAILURE_WINDOW
+  const recent = (at: string | null | undefined) => Date.parse(at ?? '') >= since
   const commitOf = (id: string) => generations.find((g) => g.id === id)?.commit
   // Generation ids are the daemon's own: without a commit, the host's name keeps them apart.
   const key = (id: string, commit: string | undefined) => `failure-${commit ?? `${host}-${id}`}`
@@ -189,19 +192,25 @@ export type ReviewFacts = HostFacts & {
   ref: string
   /** The Ultimate clone the generations come from. */
   clone: string
+  /** The base of the review's diff: where the newest reviewed tip left the history of `to`. */
   from: string
   to: string
+  /** The reviewed tips: the commits to review are those of `to` in none of them. */
+  reviewed: string[]
   count: number
   inventory: Owned[]
 }
 
 export function successFacts(facts: ReviewFacts) {
-  const { host, manifest, generation, ref, clone, from, to, count, inventory } = facts
+  const { host, manifest, generation, ref, clone, from, to, reviewed, count, inventory } = facts
+  const range = [to, ...reviewed.map((tip) => `^${tip}`)].join(' ')
   return [
     'Facts:',
     `- Host: ${host}, manifest ${manifest}`,
     `- Generation: ${generation}, ${ref}@${short(to)}, now permanent`,
-    `- Ultimate commits to review: ${from}..${to}, ${count} commit${count === 1 ? '' : 's'}, in the clone ${clone}`,
+    `- Ultimate clone: ${clone}`,
+    `- Commits to review (<range>): \`${range}\`, ${count} commit${count === 1 ? '' : 's'}`,
+    `- Base of their diff (<from>..<to>): \`${from}..${to}\``,
     '- Extensions this host loads beyond the built-in ones:',
     ...(inventory.length
       ? inventory.map((each) => `  - ${each.name} (${each.source}): ${each.path}, ${ownerText(each)}`)
@@ -309,8 +318,13 @@ export type AutofixFacts = HostFacts &
 
 /** The hands-off goal of one autofix try, for the owning project's @ultimate (or the coordinator, to route it). */
 export function autofixBrief(facts: AutofixFacts) {
-  const { name, path, error, attempt, previous, clone, host, manifest } = facts
-  const routing = facts.project
+  const { name, path, repo, project, error, attempt, previous, clone, host, manifest } = facts
+  const landing = project
+    ? "- Pass the extension's own checks and a reviewer, then land through the project's lander."
+    : repo
+      ? `- Pass the extension's own checks and a reviewer, then commit in ${repo} and push it if it has a remote.`
+      : `- The folder is in no repository: copy it aside first (to ${path}.before-autofix), fix it in place, and remove the copy once the facet loads.`
+  const routing = project
     ? []
     : [
         '',
@@ -323,18 +337,17 @@ export function autofixBrief(facts: AutofixFacts) {
     'Facts:',
     `- Extension: ${name}, folder ${path}`,
     `- Owner: ${ownerText(facts)}`,
-    `- Error: ${error}`,
-    ...(previous ? [`- The first try did not fix it. It failed then with: ${previous}`] : []),
     `- Host: ${host}, manifest ${manifest}`,
     `- Ultimate clone: ${clone}; \`ultimate/...\` in a user or project extension resolves against its working tree`,
+    `- Error:\n${fenced(error)}`,
+    ...(previous ? [`- The first try did not fix it. It failed then with:\n${fenced(previous)}`] : []),
     '',
     'Rules:',
-    `- Edit only the extension's folder, ${path}.`,
-    `- Never touch the Ultimate clone (${clone}) or Ultimate core, a Fawkes generation, or ~/.ultimate.`,
+    `- Edit only the extension's folder, ${path}. Leave everything else alone: the rest of the Ultimate clone (${clone}) and Ultimate core, every Fawkes generation, and the rest of ~/.ultimate.`,
     '- Never merge, pull or reset in the clone: the break usually comes from its working tree moving, and the fix goes against that working tree as it is.',
     '- Never force push, never disable the extension or remove a feature to make it load, and add no dependency.',
-    "- Pass the extension's own checks and a reviewer, then land through the project's lander.",
-    `- Verify that the facet loads on ${host}: \`ultimate.extensions()\` shows no \`server.error\` for ${name}. The landing hot-reloads it on every host, so nothing else is needed.`,
+    landing,
+    `- Verify that the facet loads on ${host}: \`ultimate.extensions()\` shows no \`server.error\` for ${name}. The fix hot-reloads it on every host, so nothing else is needed.`,
     attempt < AUTOFIX_TRIES
       ? '- If you cannot fix it, say so and why in your final answer: Fawkes tries once more in 30 minutes, then tells the user.'
       : '- If you cannot fix it, say so and why in your final answer: this is the last try, and Fawkes then tells the user.',
@@ -347,7 +360,7 @@ export function giveUpText(facts: HostFacts & { name: string; path: string; erro
     `Fawkes autofix gave up: the extension \`${facts.name}\` still fails to load on ${facts.host} after ${facts.tries} tries to repair it. Tell the user it needs them, with these facts:`,
     '',
     `- Extension: ${facts.name}, folder ${facts.path}`,
-    `- Error: ${facts.error}`,
+    `- Error:\n${fenced(facts.error)}`,
     `- Tries: ${facts.tries}, ${AUTOFIX_WAIT / 60_000} minutes apart`,
     `- Fawkes tries no more until it loads again, or until ~/.ultimate/fawkes/autofix-${facts.name}.json is removed`,
   ].join('\n')

@@ -8,6 +8,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -17,11 +18,13 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { claim, lock, ownerOf, reviewDecision, STALE, withLock } from './store.ts'
+import { claim, installedAt, lock, ownerOf, reviewDecision, STALE, unlock, withLock } from './store.ts'
 import {
   AUTOFIX_WAIT,
   autofixBrief,
   autofixStep,
+  FAILURE_WINDOW,
+  failingSince,
   failures,
   failureTask,
   giveUpText,
@@ -95,13 +98,26 @@ test('of five hosts claiming one key at once exactly one wins, and a stale lock 
   utimesSync(held, old, old)
   const takeovers = await Promise.all(Array.from({ length: 5 }, () => lock(held)))
   assert.equal(takeovers.filter(Boolean).length, 1, 'one host takes the stale lock over')
-  rmSync(held)
+  await unlock(held, locks.find(Boolean)!)
+  assert.ok(existsSync(held), 'a holder that lost its lock to a takeover leaves the new one alone')
+  await unlock(held, takeovers.find(Boolean)!)
+  assert.ok(!existsSync(held))
   let ran = false
   assert.equal(await withLock(held, async () => void (ran = true)), true)
   assert.ok(ran && !existsSync(held), 'the lock is released after the work')
 })
 
-test('the watermark: none is quiet, a commit under it brings nothing, one after it is a range that moves it on', async (t) => {
+test('the install time is the first host\'s, kept by every later one', async (t) => {
+  const dir = scratch(t)
+  const first = await installedAt(dir)
+  const old = new Date(first - 60_000)
+  utimesSync(join(dir, 'installed'), old, old)
+  assert.equal(await installedAt(dir), old.getTime())
+  assert.equal(failingSince(old.getTime(), old.getTime() + 2 * FAILURE_WINDOW), old.getTime() + FAILURE_WINDOW)
+  assert.equal(failingSince(old.getTime(), old.getTime() + 60_000), old.getTime(), 'nothing from before the install')
+})
+
+test('the reviewed tips: a commit they hold brings nothing, a newer one is reviewed, a branch never holds the main line', async (t) => {
   const repo = scratch(t)
   const git = gitIn(repo)
   git(repo, 'init', '-q', '-b', 'main')
@@ -112,13 +128,24 @@ test('the watermark: none is quiet, a commit under it brings nothing, one after 
   const one = commit('one')
   const two = commit('two')
   const three = commit('three')
-  assert.deepEqual(await reviewDecision(repo, undefined, three), { state: 'quiet' })
-  assert.deepEqual(await reviewDecision(repo, three, three), { state: 'skip' })
-  assert.deepEqual(await reviewDecision(repo, three, one), { state: 'skip' }, 'a host on an older commit')
-  assert.deepEqual(await reviewDecision(repo, one, three), { state: 'review', from: one, count: 2, advance: true })
-  git(repo, 'checkout', '-q', '-b', 'side', two)
+  assert.deepEqual(await reviewDecision(repo, [three], three), { state: 'skip' })
+  assert.deepEqual(await reviewDecision(repo, [three], one), { state: 'skip' }, 'a host on an older commit')
+  assert.deepEqual(await reviewDecision(repo, [one], three), { state: 'review', from: one, count: 2, tips: [three] })
+  // A branch off three is reviewed and kept beside it; the main line after it is reviewed from three, and the
+  // branch stays a tip, so going back to it brings nothing.
+  git(repo, 'checkout', '-q', '-b', 'side', three)
   const side = commit('side')
-  assert.deepEqual(await reviewDecision(repo, three, side), { state: 'review', from: three, count: 1, advance: false })
+  assert.deepEqual(await reviewDecision(repo, [three], side), { state: 'review', from: three, count: 1, tips: [side] })
+  git(repo, 'checkout', '-q', 'main')
+  const four = commit('four')
+  assert.deepEqual(await reviewDecision(repo, [side], four), {
+    state: 'review',
+    from: three,
+    count: 1,
+    tips: [four, side],
+  })
+  assert.deepEqual(await reviewDecision(repo, [four, side], side), { state: 'skip' })
+  assert.deepEqual(await reviewDecision(repo, [four, side], two), { state: 'skip' })
 })
 
 test('autofix tries, waits, tries once more, gives up once, and forgets the record when the extension loads', () => {
@@ -193,13 +220,9 @@ test('a rollback is investigated with its cause, reason, storage, confirm report
     event(2, 'reported', { info: { url: 'u', confirm: 'waiting: server facets failed to load: update' } }),
     event(3, 'rolled_back', { to: 'g7', reason: 'missed confirm deadline', cause: 'deadline', storage: 'restored' }),
   ]
-  const found = failures('fawkes', status, history.generations, events, now)
+  const found = failures('fawkes', status, history.generations, events, now - FAILURE_WINDOW)
   assert.deepEqual(found, [{ kind: 'rollback', generation: 'g8', commit: 'g8c0ffee0000', key: 'failure-g8c0ffee0000' }])
-  assert.deepEqual(
-    failures('fawkes', status, history.generations, events, now + 25 * 3_600_000),
-    [],
-    'older than a day',
-  )
+  assert.deepEqual(failures('fawkes', status, history.generations, events, now), [], 'before the install')
 
   const text = failureTask(true, { host: 'fawkes', manifest: '/h/.fawkes/fawkes.toml' }, found[0], {
     status,
@@ -225,6 +248,9 @@ test('a rollback is investigated with its cause, reason, storage, confirm report
 })
 
 test('a failed test and a failed stage are failures too; a requested rollback is not', () => {
+  // A failed stage is told by the daemon's words alone: this fails when they change.
+  const daemon = readFileSync(join(import.meta.dirname, '../../src/daemon/transactions.rs'), 'utf8')
+  assert.match(daemon, /"stage of \{git_ref\} failed: /)
   const now = Date.parse('2026-11-03T12:00:00Z')
   const status = { name: 'xana', permanent: 'g7', pending: null, step: null, busy: null } as Status
   const generations = [
@@ -253,7 +279,7 @@ test('a failed test and a failed stage are failures too; a requested rollback is
     { seq: 5, at, kind: 'error', generation: 'g11', message: 'prune: cannot remove', error_code: 'internal' },
   ]
   assert.deepEqual(
-    failures('xana', status, generations, events, now).map(({ kind, generation, key }) => ({ kind, generation, key })),
+    failures('xana', status, generations, events, now - FAILURE_WINDOW).map(({ kind, generation, key }) => ({ kind, generation, key })),
     [
       { kind: 'test', generation: 'g8', key: 'failure-g8c0ffee0000' },
       { kind: 'stage', generation: 'g10', key: 'failure-xana-g10' },
@@ -270,6 +296,7 @@ test('the review names its range, its procedure and every extension with its own
     clone: '/h/Code/ultimate',
     from: 'aaaa1111',
     to: 'bbbb2222cccc',
+    reviewed: ['aaaa1111', 'dddd3333'],
     count: 12,
     inventory: [
       {
@@ -285,10 +312,8 @@ test('the review names its range, its procedure and every extension with its own
   assert.match(review, /^Fawkes: fawkes now runs Ultimate bbbb2222 as g9, 12 commits since the last review\./)
   assert.match(review, /follow `\/f\/ultimate\/fawkes\/review\.md`/)
   assert.match(review, /change nothing without the user's go/)
-  assert.match(
-    review,
-    /^- Ultimate commits to review: aaaa1111\.\.bbbb2222cccc, 12 commits, in the clone \/h\/Code\/ultimate$/m,
-  )
+  assert.match(review, /^- Commits to review \(<range>\): `bbbb2222cccc \^aaaa1111 \^dddd3333`, 12 commits$/m)
+  assert.match(review, /^- Base of their diff \(<from>\.\.<to>\): `aaaa1111\.\.bbbb2222cccc`$/m)
   assert.match(review, /^ {2}- fawkes \(project\): \/h\/Code\/fawkes\/ultimate\/fawkes, project fawkes$/m)
   assert.match(
     review,
@@ -313,11 +338,27 @@ test('the review names its range, its procedure and every extension with its own
     brief,
     /No Ultimate project owns this folder .* Route this goal, word for word, to whoever owns \/h\/Code\/ultimate-extensions/,
   )
-  assert.match(brief, /^- Error: Cannot find module ultimate\/lib\/gone\.ts$/m)
-  assert.match(brief, /^- The first try did not fix it\. It failed then with: SyntaxError$/m)
+  assert.match(brief, /^- Error:\n```text\nCannot find module ultimate\/lib\/gone\.ts\n```$/m)
+  assert.match(brief, /^- The first try did not fix it\. It failed then with:\n```text\nSyntaxError\n```$/m)
   assert.match(brief, /Never merge, pull or reset in the clone/)
+  assert.match(brief, /commit in \/h\/Code\/ultimate-extensions and push it/)
   assert.match(brief, /this is the last try/)
-  assert.match(giveUpText({ ...host, name: 'phone', path: '/p', error: 'E', tries: 2 }), /after 2 tries[^]*- Error: E/)
+  assert.match(
+    giveUpText({ ...host, name: 'phone', path: '/p', error: 'E\n  at x', tries: 2 }),
+    /after 2 tries[^]*- Error:\n```text\nE\n {2}at x\n```/,
+  )
+  // A personal extension in no repository: its own folder is the one place in ~/.ultimate it may edit, in place.
+  const loose = autofixBrief({
+    ...host,
+    name: 'mine',
+    path: '/h/.ultimate/extensions/mine',
+    error: 'E',
+    attempt: 1,
+    clone: '/h/Code/ultimate',
+  })
+  assert.match(loose, /Edit only the extension's folder, \/h\/\.ultimate\/extensions\/mine\. Leave everything else alone/)
+  assert.match(loose, /in no repository: copy it aside first/)
+  assert.doesNotMatch(loose, /lander/)
 })
 
 test('an extension belongs to the project whose root is its repository; one in another repository to none', async (t) => {

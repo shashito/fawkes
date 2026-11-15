@@ -241,24 +241,28 @@ fail to load. Both are set in `~/.ultimate/settings.json`, read at every tick li
 
 A value it cannot read is a notice, once per message. Only the live generation runs them, once it is permanent: at
 open, on the minute tick, and at once when a facet fails to load. Every host on the machine shares
-`~/.ultimate/fawkes/` (`store.ts`), so each task happens once whichever host sees it first:
+`~/.ultimate/fawkes/` (`store.ts`), so each task happens once whichever host sees it first. `installed` is made by the
+first host to run them: an upgrade or failure from before it is the state the extension found, and brings nothing.
 
-- **Success:** `reviewed` holds the newest reviewed Ultimate commit, written under `review.lock`. A generation whose
-  commit brings commits beyond it sends a review of that range (`review.md`, the procedure, beside this file), with
-  every extension the host loads beyond the built-in ones and the project owning its folder, then moves `reviewed` on.
-  A commit already under it sends nothing, so a restart of the same generation or a host on an older commit is quiet.
-  The first success after install only writes `reviewed` and sends nothing. A commit beside it on another branch is
-  reviewed once (`review-<commit>`) and leaves it where it is.
+- **Success:** `reviewed` holds the reviewed Ultimate commits, one tip a line, newest first, written under
+  `review.lock`. A generation confirmed after `installed` whose commit has commits in none of them sends a review of
+  those (`review.md`, the procedure, beside this file), with every extension the host loads beyond the built-in ones
+  and the project owning its folder, then records its commit as a tip and drops the tips it contains. A commit they
+  already hold sends nothing, so a restart of the same generation or a host on an older commit is quiet. The first
+  run only writes `reviewed`. A set of tips rather than one commit: a reviewed branch the lander rebases never becomes
+  an ancestor of main, and with one mark every later review would repeat the main line since.
 - **Failure:** a failed test, a failed stage, or the latest switch rolled back for a cause other than `requested` or
-  `daemon_restart`, of the last 24 hours. The claim `failure-<commit>` makes it one investigation per failed commit
+  `daemon_restart`, of the last 24 hours and after `installed`. The claim `failure-<commit>` makes it one investigation per failed commit
   (`failure-<host>-<generation>` for a stage, whose generation is removed). Its facts: what happened, the cause and
   reason, the storage outcome, the generation's last `confirm` report, the last 20 lines of its `app.log` (or the failed
   install's log) and the `fawkes history` command for the rest.
 - **Autofix:** `autofix-<name>.json` keeps the error, the tries, when the last one was and the host it was for, under
-  `autofix-<name>.lock`. A try goes to the @ultimate of the project whose root is the git repository of the extension's real folder, or to
-  the coordinating project with a request to route it when no project owns it. It is a hands-off goal with
-  guardrails: edit only that folder, never the clone, a generation or `~/.ultimate`, land through the project's
-  lander and check the facet loads. A second try follows 30 minutes later, with the first one's error; 30 minutes
+  `autofix-<name>.lock`, written before each delivery and put back when it fails. Records go by name: two projects'
+  extensions of one name share one. A try goes to the @ultimate of the project whose root is the git repository of
+  the extension's real folder, or to the coordinating project with a request to route it when no project owns it. It
+  is a hands-off goal with guardrails: edit only that folder and nothing else of the clone, a generation or
+  `~/.ultimate`, land through the project's lander (commit in its repository when no project has it, or fix it in
+  place after a copy when it is in none) and check the facet loads. A second try follows 30 minutes later, with the first one's error; 30 minutes
   after that it gives up once: a notice, and a message asking the coordinating project's @ultimate to tell the user.
   Once the extension loads again on that host, the record is removed with a notice; removing it by hand starts the
   tries over. A host that does not load the extension leaves it to the hosts that do.
@@ -274,7 +278,7 @@ environment against the clone's own preview helpers, so a change in Ultimate tha
 `upgrade.test.ts` (the `fawkes upgrade` call and its result and error fields), `facts.test.ts` (outcomes and words
 from fields), `release.test.ts` (versions, the redirect's tag and what the popover says), `fetch.test.ts` (the
 `fetchEvery` setting and the shared `FETCH_HEAD` gate, on a clone with a local bare `origin`), `tasks.test.ts` (the
-`afterUpgrade` and `autofix` settings, claims and locks, the review watermark on a real repository, the autofix
+`afterUpgrade` and `autofix` settings, claims and locks, the install time, the reviewed tips on a real repository, the autofix
 decision, the texts and who owns an extension's folder) and the rest, and
 type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
 
