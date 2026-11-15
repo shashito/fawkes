@@ -32,21 +32,24 @@ export function parseFetchEvery(value: unknown): number {
   return minutes === 0 ? 0 : Math.max(FETCH_FLOOR, minutes * 60_000)
 }
 
-/** The interval the user's settings file (`<userHome>/.ultimate/settings.json`) sets; a missing file sets none. */
-export async function fetchEvery(userHome: string) {
+/** The `fawkes` key of the user's settings file (`<userHome>/.ultimate/settings.json`); a missing file sets nothing. */
+export async function fawkesSettings(userHome: string): Promise<Record<string, unknown>> {
   const path = join(userHome, '.ultimate', 'settings.json')
   const text = await readFile(path, 'utf8').catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '{}'
     throw error
   })
-  let settings: { fawkes?: { fetchEvery?: unknown } } | null
+  let settings: { fawkes?: Record<string, unknown> } | null
   try {
     settings = JSON.parse(text)
   } catch (error) {
     throw new Error(`${path} is not valid JSON: ${(error as Error).message}`)
   }
-  return parseFetchEvery(settings?.fawkes?.fetchEvery)
+  return settings?.fawkes ?? {}
 }
+
+/** The interval the user's settings file sets. */
+export const fetchEvery = async (userHome: string) => parseFetchEvery((await fawkesSettings(userHome)).fetchEvery)
 
 /** Whether a fetch is due: never when off, at once before the first, else once `every` has passed since `last`. */
 export const fetchDue = (last: number | undefined, every: number, now: number) =>

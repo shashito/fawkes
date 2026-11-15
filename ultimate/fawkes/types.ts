@@ -96,7 +96,15 @@ export type FawkesEvent = {
   action?: string
   version?: string
   changed?: string[]
+  /** `reported`: the info the app now has, its `confirm` key included (`report.ts`). */
+  info?: Record<string, string>
 }
+
+/** One generation of the `history` result: its record and the last lines of its `logs/app.log`. */
+export type HistoryEntry = Generation & { log_tail?: string | null }
+
+/** The `history` result; `failed_install_tail` is the install log of the latest stage that failed. */
+export type History = { generations: HistoryEntry[]; failed_install_tail?: string | null }
 
 /** `fawkes upgrade --json`: the switch's result, plus what the stage and the test learned. */
 export type UpgradeResult = {

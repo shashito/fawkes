@@ -1,17 +1,22 @@
 import { execFile } from 'node:child_process'
 import { existsSync, realpathSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { mkdir, rm } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
 import { obj, oneOf, opt, str } from '@earendil-works/pi-schema'
 import { defineDoc, defineExtension, defineTool, GenerationTask, hook, section } from '@earendil-works/pi-durable'
 import type { ConversationId, Tx } from '@earendil-works/pi-durable'
 // Types only: at runtime this folder must not load code from a clone other than the generation it runs in.
 import type { ExtensionHost } from 'ultimate/server/extensions.ts'
+import type { MessagesApi as MessagesApiType } from 'ultimate/extensions/messages/api.ts'
 import type { PauseApi as PauseApiType } from 'ultimate/extensions/pause/api.ts'
+import type { SubagentsApi as SubagentsApiType } from 'ultimate/extensions/subagents/api.ts'
+import type { ProjectInfo } from 'ultimate/server/project.ts'
 import { request, subscribe } from './client.ts'
 import { facetRefusal, failedFacets, ignoredText, mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
-import { cloneGitDir, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
+import { cloneGitDir, fawkesSettings, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
 import { parseVersion, RELEASES, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
@@ -19,11 +24,34 @@ import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
 import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
+import {
+  claim,
+  ownerOf,
+  readJson,
+  readWatermark,
+  reviewDecision,
+  sharedFolder,
+  withLock,
+  writeAtomic,
+} from './store.ts'
+import {
+  AUTOFIX_TRIES,
+  autofixBrief,
+  autofixStep,
+  failureName,
+  failures,
+  failureTask,
+  giveUpText,
+  parseTaskSettings,
+  successTask,
+} from './tasks.ts'
+import type { AutofixRecord, Failure, HostFacts, Owned, Owner } from './tasks.ts'
 import type {
   Confirming,
   FawkesEvent,
   FawkesState,
   Generation,
+  History,
   Release,
   SetupPreview,
   SetupStep,
@@ -74,6 +102,13 @@ type Shared = {
   holding: boolean
   /** The last notice about failed facets that do not block the confirm, so each set is told once. */
   ignored?: string
+  /** The after-upgrade tasks and autofix run (`followUp`); `followAgain` when another run was asked for meanwhile. */
+  following?: boolean
+  followAgain?: boolean
+  /** What the last run of the tasks failed with, so each message is a notice once. */
+  taskProblems?: string[]
+  /** Facets that failed to load since the last run, with their errors, as `onLoadError` told them. */
+  loadErrors?: Map<string, string>
   stop?: () => void
   confirmRun?: Promise<void>
   upgradeRun?: Promise<void>
@@ -452,6 +487,223 @@ function liveSocket() {
   return fawkes.socket
 }
 
+// ------------------------------------------------ after upgrades and autofix
+
+/** Core services, looked up by name like `PauseApi`. */
+const MessagesApi = { name: 'messages' } as typeof MessagesApiType
+const SubagentsApi = { name: 'subagents' } as typeof SubagentsApiType
+
+/** What one run of the tasks knows: the daemon's status, the shared folder and who receives what. */
+type TaskRun = {
+  host: ExtensionHost
+  socket: string
+  status: Status
+  folder: string
+  projects: ProjectInfo[]
+  /** This host's own project, which `tell` refuses: its @ultimate is reached with `send`. */
+  own: string
+  /** Who gets the upgrade tasks and the autofix give-ups (`afterUpgrade.project`). */
+  coordinator: string
+  /** The Ultimate clone every generation comes from. */
+  clone: string
+  facts: HostFacts
+}
+
+/** A one-way message to `project`'s @ultimate. `requestId` keeps `send` from delivering one twice. */
+async function deliver(run: TaskRun, project: string, text: string, requestId: string) {
+  const messages = run.host.need(MessagesApi)
+  try {
+    if (project === run.own) {
+      await messages.send(1 as ConversationId, { to: '@ultimate', text, reply: false }, requestId, BACKGROUND_CONTEXT)
+      return
+    }
+    const from = await run.host.need(SubagentsApi).standing('ultimate', BACKGROUND_CONTEXT)
+    await messages.tell(from, { project, text, reply: false }, BACKGROUND_CONTEXT)
+  } catch (error) {
+    throw new Error(`cannot reach ${project}'s @ultimate, retrying at the next tick: ${(error as Error).message}`)
+  }
+}
+
+/** The extensions this host loads beyond the built-in ones, with who owns each folder. */
+const inventory = (run: TaskRun): Promise<Owned[]> =>
+  Promise.all(
+    run.host
+      .extensions()
+      .filter((extension) => extension.enabled && extension.source !== 'builtin')
+      .map(async ({ name, source, path }) => ({
+        name,
+        source,
+        ...(await ownerOf(path, run.projects).catch(() => ({ path }))),
+      })),
+  )
+
+/**
+ * Review what the commits since the watermark offer every extension, once for all hosts: under `review.lock`, the
+ * first run only sets the watermark, a commit it already covers brings nothing, and a delivered review moves it on. A
+ * commit beside the watermark rather than after it (another branch) leaves the watermark where it is, so its own claim
+ * keeps it from being reviewed again.
+ */
+async function review(run: TaskRun, running: Generation, instructions: string | true) {
+  const to = running.commit
+  await withLock(join(run.folder, 'review.lock'), async () => {
+    const mark = join(run.folder, 'reviewed')
+    const decision = await reviewDecision(run.host.ultimateRoot, await readWatermark(mark), to)
+    if (decision.state === 'quiet') return writeAtomic(mark, `${to}\n`)
+    if (decision.state === 'skip') return
+    const beside = decision.advance ? undefined : join(run.folder, `review-${to}`)
+    if (beside && !(await claim(beside))) return
+    try {
+      const facts = {
+        ...run.facts,
+        generation: running.id,
+        ref: running.ref,
+        clone: run.clone,
+        from: decision.from,
+        to,
+        count: decision.count,
+        inventory: await inventory(run),
+      }
+      await deliver(run, run.coordinator, successTask(instructions, extensionFolder(), facts), `fawkes-review-${to}`)
+    } catch (error) {
+      if (beside) await rm(beside, { force: true })
+      throw error
+    }
+    if (decision.advance) await writeAtomic(mark, `${to}\n`)
+    run.host.notice(
+      `Fawkes: asked ${run.coordinator}'s @ultimate to review the ${decision.count} new Ultimate commits up to ${to.slice(0, 8)}`,
+    )
+  })
+}
+
+/** Ask for an investigation of `failure`, once for all hosts: its claim, dropped again when the delivery fails. */
+async function investigate(run: TaskRun, failure: Failure, instructions: string | true) {
+  const claimed = join(run.folder, failure.key)
+  if (!(await claim(claimed))) return
+  try {
+    // The log tails are in the `history` result, and the events of the generation may be older than the stream kept.
+    const [history, log] = await Promise.all([
+      request<History>(run.socket, 'history'),
+      request<{ events: FawkesEvent[] }>(run.socket, 'log', { limit: 1000 }),
+    ])
+    const text = failureTask(instructions, run.facts, failure, { status: run.status, history, events: log.events })
+    await deliver(run, run.coordinator, text, `fawkes-${failure.key}`)
+  } catch (error) {
+    await rm(claimed, { force: true })
+    throw error
+  }
+  run.host.notice(`Fawkes: asked ${run.coordinator}'s @ultimate to investigate ${failureName(failure)}`)
+}
+
+/**
+ * Keep listed extension `name` loading: a try goes to the project that owns its folder (else to the coordinator, to
+ * route it), the next one 30 minutes later, then the coordinator tells the user. One record for all hosts, under its
+ * lock. A host that does not load the extension leaves it to those that do.
+ */
+async function autofix(run: TaskRun, name: string, loadError: string | undefined) {
+  const extension = run.host
+    .extensions()
+    .find((each) => each.name === name && each.enabled && each.source !== 'builtin')
+  if (!extension) return
+  // `onLoadError` runs before the host's own record shows the error.
+  const error = loadError ?? (failedFacets([extension]).ignored.length ? extension.server?.error : undefined)
+  await withLock(join(run.folder, `autofix-${name}.lock`), async () => {
+    const file = join(run.folder, `autofix-${name}.json`)
+    const record = await readJson<AutofixRecord>(file)
+    const now = Date.now()
+    const step = autofixStep(record, error !== undefined, now)
+    if (step === 'recovered') {
+      await rm(file, { force: true })
+      run.host.notice(`Fawkes: ${name} loads again`)
+    } else if (step === 'try' && error !== undefined) {
+      const attempt = (record?.tries ?? 0) + 1
+      const owner = await ownerOf(extension.path, run.projects).catch((): Owner => ({ path: extension.path }))
+      const target = owner.project ?? run.coordinator
+      const brief = autofixBrief({
+        ...run.facts,
+        ...owner,
+        name,
+        error,
+        attempt,
+        previous: record?.error,
+        clone: run.clone,
+      })
+      await deliver(run, target, brief, `fawkes-autofix-${name}-${attempt}-${now}`)
+      await writeAtomic(file, JSON.stringify({ error, tries: attempt, lastTry: now } satisfies AutofixRecord))
+      run.host.notice(`Fawkes: asked ${target}'s @ultimate to repair ${name} (try ${attempt} of ${AUTOFIX_TRIES})`)
+    } else if (step === 'give-up' && record && error !== undefined) {
+      const text = giveUpText({ ...run.facts, name, path: extension.path, error, tries: record.tries })
+      await deliver(run, run.coordinator, text, `fawkes-autofix-${name}-gave-up-${record.lastTry}`)
+      await writeAtomic(file, JSON.stringify({ ...record, gaveUp: true } satisfies AutofixRecord))
+      run.host.notice(
+        `Fawkes: autofix gave up on ${name} after ${record.tries} tries; asked ${run.coordinator}'s @ultimate to tell the user`,
+      )
+    }
+  })
+}
+
+/** One run of every task, in the live generation once it is permanent. Returns what failed, one message each. */
+async function runTasks(host: ExtensionHost, socket: string, generation: string): Promise<string[]> {
+  const s = shared(host)
+  const status = s.status
+  const running = s.generations.find((g) => g.id === generation)
+  if (!status || status.permanent !== generation || !running) return []
+  const settings = parseTaskSettings(await fawkesSettings(host.userHome))
+  const folder = sharedFolder(host.userHome)
+  await mkdir(folder, { recursive: true })
+  const projects = await host.projects()
+  const own = projects.find((project) => project.current)?.name ?? basename(host.projectRoot)
+  const run: TaskRun = {
+    host,
+    socket,
+    status,
+    folder,
+    projects,
+    own,
+    coordinator: settings.project ?? own,
+    clone: dirname(await cloneGitDir(host.ultimateRoot)),
+    facts: { host: status.name, manifest: status.manifest ?? status.name },
+  }
+  // Each task on its own: a review that cannot be delivered never holds up an investigation or a repair.
+  const problems: string[] = []
+  const collect = (work: () => Promise<void>) =>
+    work().catch((error: unknown) => void problems.push((error as Error).message.split('\n')[0]))
+  const { success, failure } = settings
+  if (success !== false) await collect(() => review(run, running, success))
+  if (failure !== false)
+    for (const each of failures(status.name, status, s.generations, s.events, Date.now()))
+      await collect(() => investigate(run, each, failure))
+  const loadErrors = s.loadErrors ?? new Map<string, string>()
+  s.loadErrors = new Map()
+  for (const name of settings.autofix) await collect(() => autofix(run, name, loadErrors.get(name)))
+  return problems
+}
+
+/**
+ * Run the tasks, never two at a time: one asked for while one runs follows it. Whatever fails is a notice, once per
+ * distinct message, never an unhandled rejection.
+ */
+function followUp(host: ExtensionHost, socket: string, generation: string) {
+  const s = shared(host)
+  if (s.following) {
+    s.followAgain = true
+    return
+  }
+  s.following = true
+  s.followAgain = false
+  void (async () => {
+    const problems = await runTasks(host, socket, generation).catch((error: unknown) => [
+      (error as Error).message.split('\n')[0],
+    ])
+    for (const problem of problems) if (!s.taskProblems?.includes(problem)) host.notice(`Fawkes: ${problem}`)
+    s.taskProblems = problems
+  })()
+    .catch((error: unknown) => console.error(`fawkes: the after-upgrade tasks failed: ${String(error)}`))
+    .finally(() => {
+      s.following = false
+      if (s.followAgain) followUp(host, socket, generation)
+    })
+}
+
 // ------------------------------------------------ first-time setup
 
 /** What `init.ts` needs to inspect this host: the clone it runs from and the homes of the user and of Fawkes. */
@@ -558,6 +810,8 @@ export default function fawkesExtension(host: ExtensionHost) {
   const daemon = fawkes
   const s = shared(host)
   host.want(PauseApi)
+  // The after-upgrade tasks and autofix run in the live generation alone, and only once it is permanent (`runTasks`).
+  const follow = () => daemon.kind === 'live' && followUp(host, daemon.socket, daemon.generation)
   // Only the live generation tells the daemon about itself; a test run is not the app people open.
   const reports =
     daemon.kind === 'live'
@@ -584,7 +838,12 @@ export default function fawkesExtension(host: ExtensionHost) {
             void reports?.tick()
           }
         },
-        status: (status) => (s.status = status),
+        status: (status) => {
+          const first = !s.status
+          s.status = status
+          // At open, the tasks run as soon as the daemon's first status says whether this generation is permanent.
+          if (first) follow()
+        },
         history: (generations) => (s.generations = generations),
         event: (event) => {
           // A reconnect without `since` (after a facet reload) replays events this process already has.
@@ -594,14 +853,14 @@ export default function fawkesExtension(host: ExtensionHost) {
         },
       })
     }
+    follow()
     if (daemon.kind === 'live' && !s.confirmRun)
-      s.confirmRun = confirmWhenReady(host, daemon.socket, daemon.generation).finally(
-        () => (s.confirmRun = undefined),
-      )
+      s.confirmRun = confirmWhenReady(host, daemon.socket, daemon.generation).finally(() => (s.confirmRun = undefined))
   })
   if (daemon.kind === 'live') {
     // Once a minute (`FETCH_FLOOR`): the comparison is local, and the clone is fetched only when it is due.
     const quiet = () => {
+      follow()
       if (s.checking) return
       s.checking = true
       void check(host, 'due')
@@ -610,6 +869,11 @@ export default function fawkesExtension(host: ExtensionHost) {
     }
     const first = setTimeout(quiet, 30_000)
     const timer = setInterval(quiet, 60_000)
+    // A listed extension that fails to load is repaired at once, not at the next tick.
+    host.onLoadError((name, error) => {
+      s.loadErrors = new Map(s.loadErrors).set(name, error)
+      follow()
+    })
     // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
     const reported = setInterval(() => void reports?.tick(), INTERVAL)
     // Hourly, so a reinstall shows within the hour and a check missed while offline or asleep runs soon after; GitHub
