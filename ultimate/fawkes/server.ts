@@ -569,9 +569,8 @@ async function review(run: TaskRun, running: Generation, instructions: string | 
       throw error
     }
     if (decision.advance) await writeAtomic(mark, `${to}\n`)
-    run.host.notice(
-      `Fawkes: asked ${run.coordinator}'s @ultimate to review the ${decision.count} new Ultimate commits up to ${to.slice(0, 8)}`,
-    )
+    const commits = decision.count === 1 ? 'the new Ultimate commit' : `the ${decision.count} new Ultimate commits`
+    run.host.notice(`Fawkes: asked ${run.coordinator}'s @ultimate to review ${commits} up to ${to.slice(0, 8)}`)
   })
 }
 
@@ -610,7 +609,7 @@ async function autofix(run: TaskRun, name: string, loadError: string | undefined
     const file = join(run.folder, `autofix-${name}.json`)
     const record = await readJson<AutofixRecord>(file)
     const now = Date.now()
-    const step = autofixStep(record, error !== undefined, now)
+    const step = autofixStep(record, error !== undefined, now, run.facts.host)
     if (step === 'recovered') {
       await rm(file, { force: true })
       run.host.notice(`Fawkes: ${name} loads again`)
@@ -628,10 +627,11 @@ async function autofix(run: TaskRun, name: string, loadError: string | undefined
         clone: run.clone,
       })
       await deliver(run, target, brief, `fawkes-autofix-${name}-${attempt}-${now}`)
-      await writeAtomic(file, JSON.stringify({ error, tries: attempt, lastTry: now } satisfies AutofixRecord))
+      await writeAtomic(file, JSON.stringify({ error, tries: attempt, lastTry: now, host: run.facts.host } satisfies AutofixRecord))
       run.host.notice(`Fawkes: asked ${target}'s @ultimate to repair ${name} (try ${attempt} of ${AUTOFIX_TRIES})`)
     } else if (step === 'give-up' && record && error !== undefined) {
-      const text = giveUpText({ ...run.facts, name, path: extension.path, error, tries: record.tries })
+      const { path } = await ownerOf(extension.path, run.projects).catch((): Owner => ({ path: extension.path }))
+      const text = giveUpText({ ...run.facts, name, path, error, tries: record.tries })
       await deliver(run, run.coordinator, text, `fawkes-autofix-${name}-gave-up-${record.lastTry}`)
       await writeAtomic(file, JSON.stringify({ ...record, gaveUp: true } satisfies AutofixRecord))
       run.host.notice(

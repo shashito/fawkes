@@ -125,17 +125,27 @@ export const failureName = (failure: Failure) =>
 export const AUTOFIX_WAIT = 30 * 60_000
 export const AUTOFIX_TRIES = 2
 
-/** What the shared folder keeps for one extension under repair (`autofix-<name>.json`). */
-export type AutofixRecord = { error: string; tries: number; lastTry: number; gaveUp?: boolean }
+/**
+ * What the shared folder keeps for one extension under repair (`autofix-<name>.json`); `host` is the one whose failure
+ * the last try was for.
+ */
+export type AutofixRecord = { error: string; tries: number; lastTry: number; host: string; gaveUp?: boolean }
 
 export type AutofixStep = 'try' | 'wait' | 'give-up' | 'recovered' | 'idle'
 
 /**
  * What to do for a listed extension: a first try when it fails without a record, another once the last try had its
- * time, giving up (once) after the last try, forgetting the record once it loads again.
+ * time, giving up (once) after the last try, forgetting the record once it loads again on `host`. Only the host that
+ * failed can say so: one that loaded the extension before it broke, and has not reloaded it since, would otherwise
+ * forget the record every minute, and the failing host try again at once.
  */
-export function autofixStep(record: AutofixRecord | undefined, failing: boolean, now: number): AutofixStep {
-  if (!failing) return record ? 'recovered' : 'idle'
+export function autofixStep(
+  record: AutofixRecord | undefined,
+  failing: boolean,
+  now: number,
+  host: string,
+): AutofixStep {
+  if (!failing) return record?.host === host ? 'recovered' : 'idle'
   if (!record) return 'try'
   if (record.gaveUp) return 'idle'
   if (now - record.lastTry < AUTOFIX_WAIT) return 'wait'

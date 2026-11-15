@@ -254,14 +254,14 @@ open, on the minute tick, and at once when a facet fails to load. Every host on 
   (`failure-<host>-<generation>` for a stage, whose generation is removed). Its facts: what happened, the cause and
   reason, the storage outcome, the generation's last `confirm` report, the last 20 lines of its `app.log` (or the failed
   install's log) and the `fawkes history` command for the rest.
-- **Autofix:** `autofix-<name>.json` keeps the error, the tries and when the last one was, under `autofix-<name>.lock`.
-  A try goes to the @ultimate of the project whose root is the git repository of the extension's real folder, or to
+- **Autofix:** `autofix-<name>.json` keeps the error, the tries, when the last one was and the host it was for, under
+  `autofix-<name>.lock`. A try goes to the @ultimate of the project whose root is the git repository of the extension's real folder, or to
   the coordinating project with a request to route it when no project owns it. It is a hands-off goal with
   guardrails: edit only that folder, never the clone, a generation or `~/.ultimate`, land through the project's
   lander and check the facet loads. A second try follows 30 minutes later, with the first one's error; 30 minutes
   after that it gives up once: a notice, and a message asking the coordinating project's @ultimate to tell the user.
-  Once the extension loads again, the record is removed with a notice; removing it by hand starts the tries over. A
-  host that does not load the extension leaves it to the hosts that do.
+  Once the extension loads again on that host, the record is removed with a notice; removing it by hand starts the
+  tries over. A host that does not load the extension leaves it to the hosts that do.
 
 Success, failure and the give-up go to `afterUpgrade.project`, else to the host's own @ultimate. A delivery that fails
 (the project's host is down) changes nothing, and the next tick tries again. Each delivery is a notice: "Fawkes: asked

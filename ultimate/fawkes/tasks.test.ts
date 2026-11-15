@@ -123,16 +123,26 @@ test('the watermark: none is quiet, a commit under it brings nothing, one after 
 
 test('autofix tries, waits, tries once more, gives up once, and forgets the record when the extension loads', () => {
   const now = 10 * AUTOFIX_WAIT
-  const record = (tries: number, ago: number, gaveUp?: boolean) => ({ error: 'e', tries, lastTry: now - ago, gaveUp })
-  assert.equal(autofixStep(undefined, true, now), 'try')
-  assert.equal(autofixStep(record(1, AUTOFIX_WAIT - 1), true, now), 'wait')
-  assert.equal(autofixStep(record(1, AUTOFIX_WAIT), true, now), 'try')
-  assert.equal(autofixStep(record(2, AUTOFIX_WAIT - 1), true, now), 'wait')
-  assert.equal(autofixStep(record(2, AUTOFIX_WAIT), true, now), 'give-up')
-  assert.equal(autofixStep(record(2, AUTOFIX_WAIT * 5, true), true, now), 'idle')
-  assert.equal(autofixStep(record(2, 0, true), false, now), 'recovered')
-  assert.equal(autofixStep(record(1, 0), false, now), 'recovered')
-  assert.equal(autofixStep(undefined, false, now), 'idle')
+  const record = (tries: number, ago: number, gaveUp?: boolean) => ({
+    error: 'e',
+    tries,
+    lastTry: now - ago,
+    host: 'xana',
+    gaveUp,
+  })
+  const step = (each: ReturnType<typeof record> | undefined, failing: boolean, host = 'xana') =>
+    autofixStep(each, failing, now, host)
+  assert.equal(step(undefined, true), 'try')
+  assert.equal(step(record(1, AUTOFIX_WAIT - 1), true), 'wait')
+  assert.equal(step(record(1, AUTOFIX_WAIT), true), 'try')
+  assert.equal(step(record(2, AUTOFIX_WAIT - 1), true), 'wait')
+  assert.equal(step(record(2, AUTOFIX_WAIT), true), 'give-up')
+  assert.equal(step(record(2, AUTOFIX_WAIT * 5, true), true), 'idle')
+  assert.equal(step(record(2, 0, true), false), 'recovered')
+  assert.equal(step(record(1, 0), false), 'recovered')
+  assert.equal(step(undefined, false), 'idle')
+  // A host that never reloaded the extension since it broke elsewhere keeps the other host's record.
+  assert.equal(step(record(1, 0), false, 'forge'), 'idle')
 })
 
 const generation = (id: string, more: Partial<Generation>): Generation => ({
