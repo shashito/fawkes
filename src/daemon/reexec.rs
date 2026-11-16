@@ -4,6 +4,7 @@
 //! takes over instead of locking, binding and starting anew.
 
 use super::{ANSWER_WAIT, App, Daemon, Inner, Live, Slot, lock};
+use crate::manifest::Manifest;
 use crate::process::{self, ChildPid};
 use crate::protocol::{
     DaemonAction, ErrorCode, EventKind, Facts, LastExit, Out, R, ReexecResult, Reply, err,
@@ -28,7 +29,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What one program of the daemon hands the next, as the JSON of the hidden `up --handover`: the descriptors it keeps
 /// open across the exec, and what `Inner` holds beyond state.json. No transaction is under way (`check_reexec`), so
-/// state.json says the rest.
+/// state.json says the rest. A program reads the handover of an older one, so a field added later needs
+/// `#[serde(default)]`.
 #[derive(Serialize, Deserialize)]
 pub(super) struct Handover {
     /// The version the program before ran.
@@ -78,6 +80,14 @@ impl Handover {
 
 // ------------------------------------------------------------- daemon
 
+/// A `reexec` waiting for `run` to replace the program, from before it answers until it ends.
+pub(super) struct Reexec {
+    /// Dropped when `run` gives up on the exec (or shuts down instead), which ends the request's wait.
+    _asked: mpsc::Sender<()>,
+    /// Sent once the request's answer is written, which the exec must not cut off.
+    answered: mpsc::Receiver<()>,
+}
+
 impl Daemon {
     /// `fawkes reexec`: check, answer, and have `run` replace the program (`reexec_now`). Both slots stay taken until
     /// then, so no step starts that the exec would cut short.
@@ -85,8 +95,23 @@ impl Daemon {
         self.check_reexec(&mut self.inner())?;
         let _busy = self.begin("reexec", Slot::Both)?;
         let to = self.installed_version()?;
-        // Answered and closed before the exec: the program after it has no record of this request, and the client
-        // confirms by asking `status`.
+        let (asked, given_up) = mpsc::channel::<()>();
+        let (answered, wait_for_answer) = mpsc::channel::<()>();
+        {
+            let mut waiting = lock(&self.reexec);
+            // A shutdown that has begun would never look at it, and keep waiting for the slots held here.
+            if self.shutting_down() {
+                return Err(err(ErrorCode::Busy, "the daemon is shutting down"));
+            }
+            // Set before the answer: `serve` reads it before every accept, so the `status` the client confirms with
+            // waits in the backlog for the program after the exec, never answered by this one.
+            *waiting = Some(Reexec {
+                _asked: asked,
+                answered: wait_for_answer,
+            });
+        }
+        self.wake_serve();
+        // Answered and closed before the exec: the program after it has no record of this request.
         let mut answer = std::mem::replace(out, Out::none());
         answer.finish(Ok(ReexecResult {
             pid: std::process::id(),
@@ -95,24 +120,16 @@ impl Daemon {
         }
         .into()));
         drop(answer);
-        let (asked, given_up) = mpsc::channel::<()>();
-        {
-            let mut waiting = lock(&self.reexec);
-            // A shutdown that has begun would never look at it, and keep waiting for the slots held here.
-            if self.shutting_down() {
-                return Ok(Reply::Streamed);
-            }
-            *waiting = Some(asked);
-        }
-        self.wake_serve();
+        // Fails only when `run` gave up waiting for it.
+        let _ = answered.send(());
         // After an exec nothing comes back here; disconnected when `run` gave up on it (and logged why) or shut down
         // instead.
         let _ = given_up.recv();
         Ok(Reply::Streamed)
     }
 
-    /// What `reexec` needs: no transaction, no crash restart waiting, and no step whose thread the exec would end.
-    /// The slots are `begin`'s to check.
+    /// What `reexec` needs: no transaction, no crash restart waiting, no step whose thread the exec would end, and a
+    /// manifest on disk that `reload` would take. The slots are `begin`'s to check.
     fn check_reexec(&self, inner: &mut Inner) -> R<()> {
         if self.shutting_down() {
             return Err(err(ErrorCode::Busy, "the daemon is shutting down"));
@@ -145,6 +162,24 @@ impl Daemon {
                 ),
             ));
         }
+        // The program after the exec loads the manifest again: one that does not load would end it at once, with the
+        // app left running without its daemon, and one with a field a reload refuses would supervise the app under
+        // a name, state directory, home or port it does not run with.
+        let path = self.manifest_path.display();
+        let new = Manifest::load(&self.manifest_path).map_err(|e| {
+            err(
+                ErrorCode::Usage,
+                format!("{e}; fix {path} and run `fawkes reexec` again, since the daemon after it loads it again"),
+            )
+        })?;
+        self.manifest()
+            .reload(&new, inner.running().is_some())
+            .map_err(|problems| {
+                invalid_state(format!(
+                    "{path} changed since the daemon loaded it, and the daemon after `reexec` would load it again: \
+                     {problems}; or put the manifest back and run `fawkes reexec` again"
+                ))
+            })?;
         Ok(())
     }
 
@@ -166,7 +201,9 @@ impl Daemon {
     /// (streams are cut, and their clients reconnect with `since`), stderr its queued lines, and `inner` and the log
     /// are held across the exec, so no write to state.json or events.jsonl is cut short. Returns only when the exec
     /// failed, which is logged; the daemon then carries on as before.
-    pub(super) fn reexec_now(&self, state_lock: &File, listener: &UnixListener) {
+    pub(super) fn reexec_now(&self, reexec: &Reexec, state_lock: &File, listener: &UnixListener) {
+        // Timed out only by a client that does not read its answer; the exec cuts it off then.
+        let _ = reexec.answered.recv_timeout(ANSWER_WAIT);
         self.draining.store(true, Ordering::SeqCst);
         // The `reexec` request itself waits for this one.
         self.wait_until(ANSWER_WAIT, || self.open.load(Ordering::SeqCst) <= 1);
@@ -174,9 +211,10 @@ impl Daemon {
         self.flush_echo();
         let failed = {
             let mut inner = self.inner();
-            let _log = lock(&self.log);
-            // Checked again: since the answer the app may have crashed and been restarted, with a health check.
+            // Checked again: since the answer the app may have crashed and been restarted, with a health check. Before
+            // `log` is taken, since the check takes `manifest`.
             let checked = self.check_reexec(&mut inner).map_err(|e| e.message);
+            let _log = lock(&self.log);
             match checked.map(|()| handover(&inner, state_lock, listener)) {
                 Ok(handover) => exec_with_handover(
                     &self.bin,

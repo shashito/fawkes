@@ -2296,6 +2296,65 @@ fn reexec_is_refused_while_a_switch_is_pending() {
     );
 }
 
+/// The daemon after `reexec` loads the manifest again, so one edited since the daemon loaded it must be one a reload
+/// would take: a manifest that does not load, or that moves a fixed field, is refused, and nothing changes.
+#[test]
+fn reexec_is_refused_for_a_manifest_a_reload_would_refuse() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    let before = h.status();
+    let home = format!("home = \"{}/home\"", h.dir.display());
+
+    h.edit_manifest(&home, &format!("home = \"{}/home2\"", h.dir.display()));
+    // g1 may confirm itself before the health check of its switch has finished, and `reexec` is `busy` until then.
+    h.wait("the health check to finish", 20, || {
+        h.fk(&["reexec"]).1["code"] != "busy"
+    });
+    refused(&h, &["reexec"], "invalid_state", "home can only change");
+    // The client finds the socket through the manifest too, so it is named for one that does not load.
+    h.edit_manifest(&format!("{}/home2\"", h.dir.display()), "");
+    let socket = h.dir.join("s/fawkes.sock");
+    let (exit, error) = h.fk(&["--socket", socket.to_str().unwrap(), "reexec"]);
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (2, Some("usage")),
+        "{error}"
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("since the daemon after it loads it again"),
+        "{message}"
+    );
+    h.edit_manifest("home = \"", &home);
+
+    let after = h.status();
+    assert_eq!(after["daemon_pid"], before["daemon_pid"], "{after}");
+    assert_eq!(after["process"]["pid"], before["process"]["pid"], "{after}");
+    assert_eq!(
+        messages_starting(&h, "daemon", "re-executed"),
+        Vec::<String>::new()
+    );
+}
+
+/// `--all` takes the supervisor and every app in `FAWKES_HOME`, never one app named on the command line.
+#[test]
+fn all_with_manifest_or_socket_is_a_usage_error() {
+    let h = Harness::new("");
+    for command in ["up", "status", "reexec"] {
+        for named in ["--manifest", "--socket"] {
+            let (code, stdout) = fk_all(&h, &["--json", command, "--all", named, "x"]);
+            assert_eq!(code, 2, "{command} --all {named}: {stdout}");
+            // `up` has no `--json`: its usage error goes to stderr.
+            if command != "up" {
+                let answer: Value = serde_json::from_str(&stdout).unwrap();
+                assert_eq!(answer["code"], "usage", "{command} --all {named}: {answer}");
+            }
+        }
+    }
+}
+
 /// SIGHUP applies what may change while the daemon runs and the next start uses it. A manifest that changes a fixed
 /// field is refused whole, the hot field edited along with it included.
 #[test]

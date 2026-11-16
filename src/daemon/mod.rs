@@ -451,8 +451,8 @@ pub struct Daemon {
     open: AtomicUsize,
     /// Whether `up` was given `--socket`, which a `reexec` passes on.
     socket_given: bool,
-    /// A `reexec` that has answered and waits for `run` to replace the program; dropped when `run` gives up on it.
-    reexec: Mutex<Option<mpsc::Sender<()>>>,
+    /// A `reexec` that waits for `run` to replace the program; dropped when `run` gives up on it.
+    reexec: Mutex<Option<reexec::Reexec>>,
     /// Set while `reexec_now` waits for the requests in flight, so that the end of each wakes it.
     draining: AtomicBool,
 }
@@ -647,11 +647,11 @@ impl Daemon {
             daemon.serve(&listener, &signals)?;
             // Taken before a shutdown, which waits for the live slot that `reexec` holds until this is dropped.
             let reexec = lock(&daemon.reexec).take();
-            if reexec.is_none() || daemon.shutting_down() {
+            let Some(reexec) = reexec.filter(|_| !daemon.shutting_down()) else {
                 break;
-            }
+            };
             // Returns only when the exec failed; the daemon then serves on.
-            daemon.reexec_now(&state_lock, &listener);
+            daemon.reexec_now(&reexec, &state_lock, &listener);
         }
         let down = daemon.shutdown();
         let downs = std::mem::take(&mut *lock(&daemon.downs));
@@ -735,6 +735,12 @@ impl Daemon {
             }
             let failed = match listener.accept() {
                 Ok((stream, _)) => {
+                    if lock(&self.reexec).is_some() {
+                        // Accepted after a `reexec` answered, so maybe the `status` that confirms it, which only the
+                        // program after the exec may answer: closed, as the exec would, and its client asks again.
+                        drop(stream);
+                        return Ok(());
+                    }
                     // Taken before anything is read, so a client that sends nothing still holds its place.
                     match Admission::take(self) {
                         Some(admitted) => {

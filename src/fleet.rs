@@ -5,8 +5,10 @@
 //! alone a daemon whose state lock another process holds (`attached`).
 //!
 //! Locking: `apps` holds the table of apps, their down marks and the requests at work. It is never held across a wait
-//! for a daemon (its socket answering, its exit). A spawn and the exec of `reexec` happen while it is held, so no
-//! daemon inherits the descriptors that `reexec` keeps open across its exec. `wake` is taken last, with nothing taken
+//! for a daemon (its socket answering, its exit). A daemon's spawn and the exec of `reexec` happen while it is held, so
+//! no daemon inherits the descriptors that `reexec` keeps open across its exec; the one other spawn, the installed
+//! binary's version check, comes before those are made inheritable, and one `reexec` at a time (`reexecing`).
+//! `wake` is taken last, with nothing taken
 //! while it is held. Lines for stderr go through `Echo`'s thread, so whoever holds `apps` never blocks on a terminal.
 //!
 //! The daemons outlive the supervisor: each runs in its own process group, so a Ctrl-C reaches the supervisor alone,
@@ -71,6 +73,9 @@ const STOP_MARGIN: Duration = Duration::from_secs(5);
 
 /// How long the accept loop pauses after a failed `accept` or `poll`, so an error that persists does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// How often `status` looks again whether a `reexec` at work has executed or given up.
+const REEXEC_LOOK: Duration = Duration::from_millis(50);
 
 /// The variables a daemon must not inherit from the supervisor's environment: they would name another daemon, or say
 /// the daemon runs inside an app.
@@ -217,6 +222,21 @@ struct Table {
     down: BTreeSet<String>,
     /// `start` and `down` requests at work, which `reexec` waits for.
     busy: usize,
+    /// A `reexec` is at work: `start`, `down` and another `reexec` are refused until it has executed or given up.
+    reexecing: bool,
+}
+
+impl Table {
+    /// Refused `busy` while a `reexec` is at work, whose exec would cut this request's answer off.
+    fn refuse_reexecing(&self) -> R<()> {
+        if self.reexecing {
+            return Err(err(
+                ErrorCode::Busy,
+                "the supervisor is re-executing; ask again once it answers `status`",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `supervisor.json`.
@@ -332,6 +352,7 @@ pub fn run(handover: Option<&str>) -> Result<(), String> {
             apps: BTreeMap::new(),
             down,
             busy: 0,
+            reexecing: false,
         }),
         wake: Wake::new(),
         echo,
@@ -857,7 +878,17 @@ impl Fleet {
 
     fn status(&self) -> FleetStatus {
         let (mut apps, attached) = {
-            let table = lock(&self.apps);
+            // A client confirms a `reexec` by this answer, so it comes from the program after the exec, never from this
+            // one in its last moments: the exec ends this connection and the client asks again. A `reexec` that gives
+            // up clears the flag, and this one answers.
+            let table = loop {
+                let table = lock(&self.apps);
+                if !table.reexecing {
+                    break table;
+                }
+                drop(table);
+                sleep(REEXEC_LOOK);
+            };
             let mut attached = Vec::new();
             let apps: Vec<FleetApp> = table
                 .apps
@@ -920,6 +951,7 @@ impl Fleet {
             if !table.apps.contains_key(name) {
                 return Err(self.unknown(name, &table));
             }
+            table.refuse_reexecing()?;
             if table.down.remove(name) {
                 if let Err(e) = self.save_marks(&table.down) {
                     table.down.insert(name.into());
@@ -1039,7 +1071,10 @@ impl Fleet {
     fn down(&self, name: &str) -> R<FleetDownResult> {
         let (busy, daemon, child) = {
             let mut table = lock(&self.apps);
-            let Table { apps, down, busy } = &mut *table;
+            table.refuse_reexecing()?;
+            let Table {
+                apps, down, busy, ..
+            } = &mut *table;
             let Some(app) = apps.get_mut(name) else {
                 return Err(self.unknown(name, &table));
             };
@@ -1118,34 +1153,59 @@ impl Fleet {
     }
 
     /// `reexec`: answer, then replace the program with the binary installed at this one's path, handing over the lock,
-    /// the socket and the daemons. Refused while a `start` or `down` is at work, whose answer the exec would cut off.
+    /// the socket and the daemons. Refused while a `start`, `down` or another `reexec` is at work, whose answer the
+    /// exec would cut off; `reexecing` keeps new ones out meanwhile, so the binary is run and the answer written
+    /// without `apps`, which the tick and every request wait for.
     fn reexec(&self, out: &mut Out) -> R<ReexecResult> {
-        let to = installed_version(&self.bin).map_err(|why| {
-            err(
-                ErrorCode::StartFailed,
-                format!(
-                    "{why}; the supervisor carries on as fawkes {VERSION}; install a working fawkes at {} and ask \
-                     again",
-                    self.bin.display()
-                ),
-            )
-        })?;
-        // Held to the exec: no spawn, which would inherit the lock and the socket, and no request begins.
-        let table = lock(&self.apps);
-        if self.shutting_down() {
-            return Err(invalid_state("the supervisor is shutting down"));
+        {
+            let mut table = lock(&self.apps);
+            if self.shutting_down() {
+                return Err(invalid_state("the supervisor is shutting down"));
+            }
+            table.refuse_reexecing()?;
+            if table.busy > 0 {
+                return Err(err(
+                    ErrorCode::Busy,
+                    "a start or down is at work; ask again once it has answered",
+                ));
+            }
+            table.reexecing = true;
         }
-        if table.busy > 0 {
-            return Err(err(
-                ErrorCode::Busy,
-                "a start or down is at work; ask again once it has answered",
-            ));
-        }
+        let to = match installed_version(&self.bin) {
+            Ok(to) => to,
+            Err(why) => {
+                lock(&self.apps).reexecing = false;
+                return Err(err(
+                    ErrorCode::StartFailed,
+                    format!(
+                        "{why}; the supervisor carries on as fawkes {VERSION}; install a working fawkes at {} and \
+                         ask again",
+                        self.bin.display()
+                    ),
+                ));
+            }
+        };
         let result = ReexecResult {
             pid: std::process::id(),
             from: VERSION.into(),
             to: to.clone(),
         };
+        // Answered and closed before the exec: the program after it has no record of this request.
+        let mut answer = std::mem::replace(out, Out::none());
+        answer.finish(Ok(result.clone().into()));
+        drop(answer);
+        // Written before `apps` is taken: a stderr that does not drain holds this thread up to a second.
+        self.note(format!("re-executing on fawkes {to}"));
+        self.echo.flush();
+        // Held to the exec: no spawn, which would inherit the lock and the socket, and no reap of a daemon handed over.
+        let mut table = lock(&self.apps);
+        if self.shutting_down() {
+            // The program after the exec would not know a shutdown was asked for.
+            table.reexecing = false;
+            drop(table);
+            self.note("the reexec gave way to the shutdown");
+            return Ok(result);
+        }
         let handover = Handover {
             from: VERSION.into(),
             lock: self.lock_file.as_raw_fd(),
@@ -1167,19 +1227,10 @@ impl Fleet {
                 })
                 .collect(),
         };
-        // Answered and closed before the exec: the program after it has no record of this request.
-        let mut answer = std::mem::replace(out, Out::none());
-        answer.finish(Ok(result.clone().into()));
-        drop(answer);
-        self.note(format!(
-            "re-executing on fawkes {to}; {} daemon{} keep running",
-            handover.apps.len(),
-            if handover.apps.len() == 1 { "" } else { "s" }
-        ));
-        self.echo.flush();
         let args: [OsString; 2] = ["up".into(), "--all".into()];
         let keep = [self.lock_file.as_fd(), self.listener.as_fd()];
         let why = exec_with_handover(&self.bin, &args, &keep, &handover);
+        table.reexecing = false;
         drop(table);
         self.note(format!(
             "cannot re-execute ({why}); the supervisor carries on as fawkes {VERSION}"
@@ -1268,7 +1319,8 @@ fn daemon_status(socket: &Path) -> Option<Status> {
 
 /// What one program of the supervisor hands the next, as the JSON of the hidden `up --all --handover`: the descriptors
 /// it keeps open across the exec and the daemons it started. The down marks are in `supervisor.json`; an app in
-/// backoff or broken is looked at afresh.
+/// backoff or broken is looked at afresh. A program reads the handover of an older one, so a field added later needs
+/// `#[serde(default)]`.
 #[derive(Serialize, Deserialize)]
 struct Handover {
     /// The version the program before ran.

@@ -23,25 +23,41 @@ const VERSION_WAIT: Duration = Duration::from_secs(5);
 /// How long a `--version` that overran gets after SIGTERM, before SIGKILL.
 const VERSION_GRACE: Duration = Duration::from_secs(1);
 
-/// The version of the fawkes binary at `bin`, which must start and say it is fawkes; else why not, for the caller to
-/// put in its refusal.
+/// The version of the fawkes binary at `bin`, which must start, say it is fawkes, and know `reexec`; else why not, for
+/// the caller to put in its refusal. A fawkes from before `reexec` has no `--handover` either: executed with one, it
+/// would end at once and leave the app without its daemon.
 pub fn installed_version(bin: &Path) -> Result<String, String> {
     let what = format!("`{} --version`", bin.display());
-    let mut command = Command::new(bin);
-    command
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let finished = process::run_bounded(&mut command, VERSION_WAIT, VERSION_GRACE, &what, |_| {})?;
-    if !finished.status.success() {
-        return Err(format!("{what} failed ({})", finished.status));
-    }
-    let printed = finished.stdout.trim();
-    printed
+    let printed = run_installed(bin, &["--version"], &what)?;
+    let version = printed
+        .trim()
         .strip_prefix("fawkes ")
         .filter(|version| !version.is_empty() && !version.contains(char::is_whitespace))
         .map(String::from)
-        .ok_or_else(|| format!("{what} printed {printed:?}, not `fawkes <version>`"))
+        .ok_or_else(|| {
+            format!(
+                "{what} printed {:?}, not `fawkes <version>`",
+                printed.trim()
+            )
+        })?;
+    let what = format!("`{} reexec --help`", bin.display());
+    run_installed(bin, &["reexec", "--help"], &what)
+        .map_err(|why| format!("{why}: fawkes {version} cannot take a running daemon over"))?;
+    Ok(version)
+}
+
+/// What `bin <args>` printed, when it succeeded within `VERSION_WAIT`.
+fn run_installed(bin: &Path, args: &[&str], what: &str) -> Result<String, String> {
+    let mut command = Command::new(bin);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let finished = process::run_bounded(&mut command, VERSION_WAIT, VERSION_GRACE, what, |_| {})?;
+    if !finished.status.success() {
+        return Err(format!("{what} failed ({})", finished.status));
+    }
+    Ok(finished.stdout)
 }
 
 /// Own descriptor `fd`, which the program before kept open across the exec, and make it close-on-exec again, so no
@@ -139,4 +155,87 @@ pub fn exec_with_handover(
         let _ = inherited(*fd, false);
     }
     failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stand-in for an installed fawkes: a shell script running `body`.
+    fn script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The exec is only worth it to a fawkes that can take the daemon over: one from before `reexec` would end at
+    /// once on `--handover`, and leave the app without its daemon.
+    #[test]
+    fn the_installed_binary_must_say_it_is_fawkes_and_know_reexec() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = script(
+            dir.path(),
+            "current",
+            r#"[ "$1" = --version ] && echo "fawkes 0.2.0"; exit 0"#,
+        );
+        assert_eq!(installed_version(&current).as_deref(), Ok("0.2.0"));
+
+        let older = script(
+            dir.path(),
+            "older",
+            r#"[ "$1" = --version ] && echo "fawkes 0.1.3" && exit 0; exit 2"#,
+        );
+        let why = installed_version(&older).unwrap_err();
+        assert!(why.contains("reexec --help` failed"), "{why}");
+        assert!(
+            why.contains("fawkes 0.1.3 cannot take a running daemon over"),
+            "{why}"
+        );
+
+        let other = script(dir.path(), "other", "echo something 1.0");
+        let why = installed_version(&other).unwrap_err();
+        assert!(why.contains("not `fawkes <version>`"), "{why}");
+
+        let broken = script(dir.path(), "broken", "exit 1");
+        let why = installed_version(&broken).unwrap_err();
+        assert!(why.contains("--version` failed"), "{why}");
+    }
+
+    /// The program after an exec owns only what it was handed: the lock file at the path, still locked, and the
+    /// socket bound where it serves. A wrong number in `--handover` is refused, never used.
+    #[test]
+    fn only_the_lock_and_the_socket_handed_over_are_taken() {
+        let dir = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let lock_path = dir.path().join("lock");
+        let other_path = dir.path().join("other");
+        let socket = dir.path().join("s.sock");
+
+        let held = File::create(&lock_path).unwrap();
+        flock(&held, FlockOperation::NonBlockingLockExclusive).unwrap();
+        let other = File::create(&other_path).unwrap();
+        let why = take_lock(other.into_raw_fd(), &lock_path, "state lock", "").unwrap_err();
+        assert!(why.contains("is not"), "{why}");
+
+        // Another open file of the lock is refused while the one handed over holds it.
+        let elsewhere = File::open(&lock_path).unwrap();
+        let why = take_lock(elsewhere.into_raw_fd(), &lock_path, "state lock", "held").unwrap_err();
+        assert!(
+            why.contains("the state lock handed over is not held"),
+            "{why}"
+        );
+        assert!(take_lock(held.into_raw_fd(), &lock_path, "state lock", "").is_ok());
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let file = File::open(&other_path).unwrap();
+        let why = take_listener(file.into_raw_fd(), &socket).unwrap_err();
+        assert!(why.contains("is not the socket"), "{why}");
+        let another = UnixListener::bind(dir.path().join("another.sock")).unwrap();
+        let why = take_listener(another.into_raw_fd(), &socket).unwrap_err();
+        assert!(why.contains("is not the socket"), "{why}");
+        assert!(take_listener(listener.into_raw_fd(), &socket).is_ok());
+
+        assert!(take_fd(2).is_err());
+    }
 }

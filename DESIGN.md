@@ -104,10 +104,15 @@ stays, the app stays its child and keeps running, and nothing stops or rolls bac
 while a transaction is under way (`txn` is `switching`, `pending` or `rolling_back`; the message names the generation
 and says to run `fawkes reexec` again once `fawkes wait` reports it decided) and during a crash backoff, and `busy`
 while either slot is taken (a stage, test, prune, start, stop, restart, switch or rollback, or the daemon's own
-work) or the health check after a start of the live app still runs. The live app may be running and healthy, stopped
-or given up on (`failed`). The daemon first runs `<binary> --version`, bounded at 5 s: unless it exits 0 and prints
-`fawkes <version>`, `reexec` fails `start_failed`, names the binary and what it did, and nothing changes. Then it
-answers (`pid`, `from`, `to`), waits up to 2 s for the other requests it is serving to send their answers, as a
+work) or the health check after a start of the live app still runs. The new program loads the manifest again, so the
+manifest on disk must be one `reload` would take: one that does not load is refused `usage`, and one that changes a
+field a reload refuses (`name`, `repo`, `state_dir`, `home`, or `port` while the app runs) `invalid_state`, with
+reload's message and the advice to put the manifest back. The live app may be running and healthy, stopped or given up
+on (`failed`). The daemon first runs `<binary> --version` and `<binary> reexec --help`, each bounded at 5 s: unless
+both exit 0 and the first prints `fawkes <version>` (a fawkes from before `reexec` fails the second, and could not
+take the handover), `reexec` fails `start_failed`, names the binary and what it did, and nothing changes. Then it
+stops accepting (a connection it accepts from then on is closed, as the exec would close it), answers (`pid`, `from`,
+`to`), so the `status` that confirms it reaches only the program after the exec, waits up to 2 s for the other requests it is serving to send their answers, as a
 shutdown does (streams are cut, and their clients reconnect with `since`), lets stderr's writer catch up (bounded at
 1 s), and holds the state and the event log, so no write of `state.json` or `events.jsonl` is cut short, while it
 executes the binary with the arguments `up` was given (`--manifest`, and `--socket` when given) plus a hidden
@@ -879,9 +884,12 @@ its lock, the exec) counts as a failure.
   `{"name", "daemon_pid", "stopped"}`, `daemon_pid` null when no daemon answered (none ran; one of its own still
   starting is sent `SIGTERM`). The app stays down either way. The wait is bounded by the daemon's own shutdown (the
   `ExitTimeOut` below without its margin) plus 5 s.
-- `reexec`: as the daemon's (Reexec): checks `--version` of the binary installed at its path, answers `{"pid",
+- `reexec`: as the daemon's (Reexec): checks the binary installed at its path (`--version`, `reexec --help`), answers `{"pid",
   "from", "to"}`, then executes it with the same pid, handing over the lock, the socket and the daemons it started,
-  which stay its children. Refused with `busy` while a `start` or `down` is at work.
+  which stay its children. Refused with `busy` while a `start`, `down` or another `reexec` is at work, and `start` and
+  `down` are refused with `busy` while a `reexec` is. A `status` asked meanwhile waits, and is answered by the
+  program after the exec (its connection is cut by the exec, and the client asks again) or by this one when the
+  `reexec` gives up.
 
 On `SIGTERM` or `SIGINT` it sends `SIGTERM` to every daemon of its own and waits for them, for at most the longest of
 their shutdowns plus 5 s, then exits 0. Those exits mark nothing, so the next supervisor starts the same apps. Attached
