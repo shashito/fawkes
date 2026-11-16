@@ -390,11 +390,13 @@ run, `status` and `watch` reach the daemon meanwhile (`busy` names the stage, th
 A failure of any of them (the port, the stage, the test) is logged as an `error` event and starts nothing. The
 daemon then ends through its ordinary shutdown, as after a `SIGTERM` (the socket and its `run/` link removed),
 with exit code 1 and a last line on stderr that says what failed, that nothing was started and the home is
-untouched, and to start the app as before, or fix it and run `fawkes up` again; a failed test names its log. The
-generation stays as the step left it (`test_failed` after a failed test), so the next start tests the same one again
-while HEAD has not moved. Under the supervisor a daemon that failed is started again after its backoff (Supervisor), so
-the adoption is retried, at most 30 s apart, until it passes. A `SIGTERM` during the adoption ends it like any stage or test
-and the daemon exits as usual; the next start adopts again. A daemon that dies once `permanent` is written runs the
+untouched, and to start the app as before, or fix it and run `fawkes up` again (a supervisor tries again by itself, at
+most 30 s apart, until `fawkes down`); a failed test names its log. A taken port says instead to stop the app there,
+then run `fawkes up` again, with the same note on the supervisor. The generation stays as the step left it
+(`test_failed` after a failed test), so the next start tests the same one again while HEAD has not moved. Under the
+supervisor a daemon that exits 1 is started again after its backoff (Supervisor), never marked down, so the adoption
+is retried, at most 30 s apart, until it passes or `fawkes down` stops it. A `SIGTERM` during the adoption ends it
+like any stage or test and the daemon exits as usual; the next start adopts again. A daemon that dies once `permanent` is written runs the
 adopted generation at its next start, like any permanent one.
 
 ## Manifest
@@ -859,11 +861,12 @@ leaves it be and looks again every 2 s.
 
 What comes after a daemon of its own exits:
 
-- exit 0, while the supervisor is not shutting down: the daemon ended by itself (`fawkes down` sent to the daemon, or
-  a failed adoption's clean end), so the app is marked down, durably, and stays down until `fawkes up`;
+- exit 0, while the supervisor is not shutting down: the daemon ended by itself (`fawkes down` sent to the daemon),
+  so the app is marked down, durably, and stays down until `fawkes up`;
 - exit 2 (its manifest is invalid): `broken`, started again once the manifest's modification time changes;
 - any other exit or a signal: `backoff`, started again after 1, 2, 4, 8, 16, then 30 s for every failure in a row; a
-  daemon that ran for 60 s before it failed starts the count over;
+  daemon that ran for 60 s before it failed starts the count over. A failed adoption exits 1 (Adopt), so it is retried
+  this way until it passes;
 - an exit the supervisor asked for (its shutdown, its `down`) marks nothing.
 
 A manifest the supervisor cannot load is `broken` too, and a start that fails before the daemon runs (its directory,

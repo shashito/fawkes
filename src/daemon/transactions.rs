@@ -857,7 +857,7 @@ impl Daemon {
                 ErrorCode::PortInUse,
                 format!(
                     "port {} is in use: stop the app running there first (fawkes tests HEAD of {} and then starts it \
-                     on that port), then run `fawkes up` again",
+                     on that port), then run `fawkes up` again {SUPERVISOR_RETRIES}",
                     m.port,
                     m.repo.display()
                 ),
@@ -1394,14 +1394,21 @@ fn left_to_next_start(id: &str, permanent: &str) -> Error {
     .about(id)
 }
 
+/// How a failed adoption goes on under the supervisor: the daemon exits 1, which the supervisor counts as a failure
+/// and starts it again after its backoff (Supervisor in DESIGN.md), so the next start adopts again with no `fawkes up`.
+const SUPERVISOR_RETRIES: &str =
+    "(a supervisor tries again by itself, at most 30 s apart, until `fawkes down`)";
+
 /// What a daemon whose adoption failed says on its way out, its last line on stderr: what failed, that nothing was
 /// started, and how to go on.
 pub(super) fn not_adopted(e: &Error) -> String {
     // A taken live port says what to do in its own message; it is the only failure about no generation.
     let next = if e.code == ErrorCode::PortInUse && e.generation.is_none() {
-        ""
+        String::new()
     } else {
-        "; start the app as before, or fix it and run `fawkes up` again"
+        format!(
+            "; start the app as before, or fix it and run `fawkes up` again {SUPERVISOR_RETRIES}"
+        )
     };
     format!(
         "not adopted: {}; nothing was started and the home is untouched{next}",

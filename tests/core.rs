@@ -304,7 +304,8 @@ fn a_first_daemon_start_adopts_head_once_its_test_passes() {
     assert_eq!(messages_starting(&h, "daemon", "adopting HEAD").len(), 1);
 }
 
-/// An adoption whose test fails ends the daemon with exit 1, through its ordinary shutdown, and starts nothing: the
+/// An adoption whose test fails ends the daemon with exit 1, through its ordinary shutdown, and starts nothing: exit 1,
+/// not 0, is what makes the supervisor start it again after its backoff instead of marking the app down. The
 /// live port stays free, the home stays as it was, and the generation stays `test_failed` for the next start to test
 /// again.
 #[test]
@@ -326,7 +327,7 @@ fn a_failed_adoption_ends_the_daemon_and_starts_nothing() {
             && last.contains(&format!("see {app_log}"))
             && last.ends_with(
                 "nothing was started and the home is untouched; start the app as before, or fix it and run \
-                 `fawkes up` again"
+                 `fawkes up` again (a supervisor tries again by itself, at most 30 s apart, until `fawkes down`)"
             ),
         "{stderr}"
     );
