@@ -46,14 +46,18 @@ not, stop and say so instead of releasing another one. `just release yes` ends b
    origin/main and the tag does not exist yet. A tag that exists
    means that version is out: shipping newer commits starts with a version bump in `Cargo.toml`, which is a
    change to land like any other.
-3. After the Release run succeeds, install it:
+3. After the Release run succeeds, start a rehearsal of the move with the fawkes-hosts skill's `rehearse.sh`: `sh
+   .ultimate/skills/fawkes-hosts/rehearse.sh up 2 --from ~/.local/bin/fawkes` runs sample apps in a throwaway home on
+   a copy of the binary the fleet runs now. Then install the release:
 
    ```sh
    curl -LsSf https://github.com/shashito/fawkes/releases/latest/download/install.sh | FAWKES_REQUIRE_ATTESTATION=1 sh
    ```
 
 4. Move the supervisor (the launchd agent `dev.fawkes`, running `fawkes up --all`) and every daemon onto the new
-   binary: `fawkes reexec --all`. Each process keeps its pid and every app keeps running, so it may run from
+   binary: `fawkes reexec --all`. Rehearse it first: `rehearse.sh reexec --to ~/.local/bin/fawkes` must print every
+   pid kept, then `rehearse.sh down`. When it does not, stop there: leave the live fleet on its old binary (it keeps
+   running it), and give the user the lines it printed and its logs before `down` removes them. Each process keeps its pid and every app keeps running, so it may run from
    inside an app, this conversation's included. A daemon with a pending switch or a step at work is skipped
    (the script marks it busy) and the command exits 1: run it again once that ends. Never `fawkes service
    restart` for this: it restarts every app and rolls back a pending switch.

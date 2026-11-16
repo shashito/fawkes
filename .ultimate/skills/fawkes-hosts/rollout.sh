@@ -2,7 +2,7 @@
 # Roll one Ultimate ref across the Ultimate hosts Fawkes runs on this machine, one host at a time: the canary first,
 # the host the caller runs on last, and stop at the first host whose upgrade does not confirm.
 #
-#   rollout.sh [--plan] [--hosts A,B] [--canary NAME] [--self NAME] [--repo DIR] <ref>
+#   rollout.sh [--plan] [--hosts A,B] [--canary NAME] [--self NAME] [--repo DIR] [--precheck CMD | --no-precheck] <ref>
 #
 # The ref is resolved once, in the Ultimate clone (--repo, default ~/Code/ultimate), and every host is upgraded to
 # that commit. The hosts are the apps of `fawkes status --all` (or, from a fawkes without it, the manifests in
@@ -12,7 +12,17 @@
 #
 # The pre-checks run in the foreground and print one line per app: its generation, its commit and its place in the
 # order. A host that no daemon answers, or with a switch pending or a step running, refuses the whole rollout before
-# anything moves. --plan stops there. Otherwise the rollout goes on in the background, in a session of its own, so
+# anything moves. --plan stops there, with a line on the precheck it would run.
+#
+# Then the precheck (default ~/Code/ultimate-extensions/fleet/precheck, which type-checks every user extension
+# against the Ultimate given in $ULTIMATE): the clone lends a throwaway worktree of the commit (`git worktree add`,
+# nothing else in the clone moves), the command runs in it with $ULTIMATE set to its path and $REF to the ref, and
+# the worktree is removed whatever the outcome. A failing precheck stops the rollout before any host moves and keeps
+# its log. Uncommitted changes in the extensions tree ($PRECHECK_EXTENSIONS, default ~/Code/ultimate-extensions),
+# which every host loads live and the precheck would check in place of the ref, refuse the rollout as their own cause.
+# --no-precheck skips both.
+#
+# Otherwise the rollout goes on in the background, in a session of its own, so
 # that the switch of the caller's own host, which stops that app's whole process group, does not end it; the command
 # prints its status file and returns. The rollout rewrites that file every few seconds: its first line is
 # `state: running`, `done` or `failed`, then one line per host (before → after, the outcome, how long it took), and
@@ -23,8 +33,8 @@
 # 3 s. The first failure stops the rollout and adds the failed step, the error's code, cause and message, and the end
 # of the generation's log to the status file; the hosts before it stay on the new commit.
 #
-# It reads the clone with git rev-parse only: it never fetches, merges or pulls. Needs fawkes, git, jq, and setsid
-# or perl.
+# It reads the clone with git rev-parse and lends the precheck's worktree from it: it never fetches, merges, pulls
+# or checks out there. Needs fawkes, git, jq, and setsid or perl.
 
 set -eu
 
@@ -33,7 +43,7 @@ script=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
 poll=3
 
 usage() {
-	echo "usage: rollout.sh [--plan] [--hosts A,B] [--canary NAME] [--self NAME] [--repo DIR] <ref>" >&2
+	echo "usage: rollout.sh [--plan] [--hosts A,B] [--canary NAME] [--self NAME] [--repo DIR] [--precheck CMD | --no-precheck] <ref>" >&2
 	exit 2
 }
 
@@ -204,22 +214,107 @@ if [ "${1:-}" = --roll ]; then
 	exit 0
 fi
 
+# ------------------------------------------------ the precheck
+
+# The uncommitted changes of the extensions tree, one `git status --short` line each; empty when it is clean or is
+# not a git tree.
+unsaved() {
+	# No optional locks: an agent may be committing there right now.
+	git --no-optional-locks -C "$extensions" status --porcelain 2>/dev/null || true
+}
+
+# Take the precheck's worktree back from the clone. A worktree git cannot remove is deleted, and git told to forget it.
+return_worktree() {
+	[ -d "$lent" ] || return 0
+	if ! git -C "$clone" worktree remove --force "$lent" >/dev/null 2>&1; then
+		rm -rf "$lent"
+		git -C "$clone" worktree prune >/dev/null 2>&1 || true
+	fi
+}
+
+# Run the precheck against the target in a worktree of it, and stop here unless it passes.
+run_precheck() {
+	changes=$(unsaved)
+	if [ -n "$changes" ]; then
+		echo "refused, nothing moved: $extensions has uncommitted changes, which every host loads live and the precheck would check in place of $(short "$target"):"
+		printf '%s\n' "$changes" | head -n 10 | sed 's/^/  /'
+		echo "next: commit or drop them in $extensions (an agent may be editing it: ask first), then: $command"
+		exit 1
+	fi
+	folder=$(mktemp -d "${tmp%/}/fawkes-precheck.XXXXXX")
+	lent=$folder/ultimate
+	# Cut short, the precheck leaves nothing behind; only a failed one keeps its log.
+	trap 'return_worktree; rm -rf "$folder"' EXIT
+	trap 'exit 1' HUP INT TERM
+	if ! git -c core.hooksPath=/dev/null -C "$clone" worktree add --quiet --detach "$lent" "$target" >"$folder/log" 2>&1; then
+		sed 's/^/  /' "$folder/log"
+		die "git worktree add of $(short "$target") in $clone failed, so the precheck could not run; nothing moved"
+	fi
+	echo "precheck: $precheck, against $(short "$target") in $lent"
+	began=$(date +%s)
+	if (cd "$lent" && ULTIMATE=$lent REF=$ref sh -c "$precheck") >>"$folder/log" 2>&1; then
+		check=0
+	else
+		check=$?
+	fi
+	took=$(duration $(($(date +%s) - began)))
+	return_worktree
+	trap - EXIT HUP INT TERM
+	if [ "$check" = 0 ]; then
+		rm -rf "$folder"
+		echo "precheck passed in $took"
+		return 0
+	fi
+	echo "refused, nothing moved: the precheck failed (exit $check, $took); last lines of $folder/log:"
+	tail -n 15 "$folder/log" | sed 's/^/  /'
+	echo "next: fix what it names (or the ref), then: $command; --no-precheck skips it"
+	exit 1
+}
+
+# The precheck takes a while: a host that started a step or a switch meanwhile, or stopped answering, refuses the
+# rollout as it would have before the precheck.
+recheck() {
+	# shellcheck disable=SC2086 # names and commits, one word each
+	set -- $order
+	while [ $# -ge 2 ]; do
+		if ! status=$(fk --json status --manifest "$1" 2>/dev/null); then
+			note="no daemon answers any more"
+		else
+			note=$(printf '%s\n' "$status" | jq -r 'if .step then "a switch is in flight (step \(.step))" elif .busy then "\(.busy) is running" else empty end')
+		fi
+		if [ -n "$note" ]; then
+			echo "refused, nothing moved: during the precheck, $1 changed: $note"
+			echo "next: \`fawkes status --manifest $1\`, then once it is free: $command"
+			exit 1
+		fi
+		shift 2
+	done
+}
+
 # ------------------------------------------------ pre-checks
 
 plan=no hosts='' canary=xana self='' repo=$HOME/Code/ultimate ref=''
+precheck=$HOME/Code/ultimate-extensions/fleet/precheck
+extensions=${PRECHECK_EXTENSIONS:-$HOME/Code/ultimate-extensions}
+tmp=${TMPDIR:-/tmp}
 command="sh $script"
 while [ $# -gt 0 ]; do
 	case $1 in
 	--plan) plan=yes ;;
-	--hosts | --canary | --self | --repo)
+	--no-precheck)
+		precheck=
+		command="$command $1"
+		;;
+	--hosts | --canary | --self | --repo | --precheck)
 		[ $# -ge 2 ] || usage
 		case $1 in
 		--hosts) hosts=$(printf '%s' "$2" | tr ',' ' ') ;;
 		--canary) canary=$2 ;;
 		--self) self=$2 ;;
 		--repo) repo=$2 ;;
+		--precheck) precheck=$2 ;;
 		esac
-		command="$command $1 '$2'"
+		command="$command $1 '$(printf '%s' "$2" | sed "s/'/'\\\\''/g")'"
 		shift
 		;;
 	-*) usage ;;
@@ -344,11 +439,21 @@ while [ $# -ge 2 ]; do
 done
 echo "order:$names${first:+ (canary ${first%% *})}${last:+ (self ${last%% *})}"
 if [ "$plan" = yes ]; then
+	if [ -z "$precheck" ]; then
+		echo "precheck: none (--no-precheck)"
+	elif [ -n "$(unsaved)" ]; then
+		echo "precheck: refused now, $extensions has uncommitted changes (\`git -C $extensions status\` lists them)"
+	else
+		echo "precheck: $precheck, against $(short "$target") in a throwaway worktree, before any host moves"
+	fi
 	echo "next: $command"
 	exit 0
 fi
+if [ -n "$precheck" ]; then
+	run_precheck
+	recheck
+fi
 
-tmp=${TMPDIR:-/tmp}
 out=$(mktemp -d "${tmp%/}/fawkes-hosts.XXXXXX")
 printf '%s\n' "$command" >"$out/command"
 printf 'rollout of %s (%s), starting, files in %s\n' "$ref" "$(short "$target")" "$out" >"$out/about"
