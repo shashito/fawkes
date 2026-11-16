@@ -219,7 +219,8 @@ fi
 # The uncommitted changes of the extensions tree, one `git status --short` line each; empty when it is clean or is
 # not a git tree.
 unsaved() {
-	git -C "$extensions" status --porcelain 2>/dev/null || true
+	# No optional locks: an agent may be committing there right now.
+	git --no-optional-locks -C "$extensions" status --porcelain 2>/dev/null || true
 }
 
 # Take the precheck's worktree back from the clone. A worktree git cannot remove is deleted, and git told to forget it.
@@ -242,7 +243,8 @@ run_precheck() {
 	fi
 	folder=$(mktemp -d "${tmp%/}/fawkes-precheck.XXXXXX")
 	lent=$folder/ultimate
-	trap return_worktree EXIT
+	# Cut short, the precheck leaves nothing behind; only a failed one keeps its log.
+	trap 'return_worktree; rm -rf "$folder"' EXIT
 	trap 'exit 1' HUP INT TERM
 	if ! git -c core.hooksPath=/dev/null -C "$clone" worktree add --quiet --detach "$lent" "$target" >"$folder/log" 2>&1; then
 		sed 's/^/  /' "$folder/log"
@@ -269,6 +271,26 @@ run_precheck() {
 	exit 1
 }
 
+# The precheck takes a while: a host that started a step or a switch meanwhile, or stopped answering, refuses the
+# rollout as it would have before the precheck.
+recheck() {
+	# shellcheck disable=SC2086 # names and commits, one word each
+	set -- $order
+	while [ $# -ge 2 ]; do
+		if ! status=$(fk --json status --manifest "$1" 2>/dev/null); then
+			note="no daemon answers any more"
+		else
+			note=$(printf '%s\n' "$status" | jq -r 'if .step then "a switch is in flight (step \(.step))" elif .busy then "\(.busy) is running" else empty end')
+		fi
+		if [ -n "$note" ]; then
+			echo "refused, nothing moved: during the precheck, $1 changed: $note"
+			echo "next: \`fawkes status --manifest $1\`, then once it is free: $command"
+			exit 1
+		fi
+		shift 2
+	done
+}
+
 # ------------------------------------------------ pre-checks
 
 plan=no hosts='' canary=xana self='' repo=$HOME/Code/ultimate ref=''
@@ -292,7 +314,7 @@ while [ $# -gt 0 ]; do
 		--repo) repo=$2 ;;
 		--precheck) precheck=$2 ;;
 		esac
-		command="$command $1 '$2'"
+		command="$command $1 '$(printf '%s' "$2" | sed "s/'/'\\\\''/g")'"
 		shift
 		;;
 	-*) usage ;;
@@ -427,7 +449,10 @@ if [ "$plan" = yes ]; then
 	echo "next: $command"
 	exit 0
 fi
-[ -z "$precheck" ] || run_precheck
+if [ -n "$precheck" ]; then
+	run_precheck
+	recheck
+fi
 
 out=$(mktemp -d "${tmp%/}/fawkes-hosts.XXXXXX")
 printf '%s\n' "$command" >"$out/command"

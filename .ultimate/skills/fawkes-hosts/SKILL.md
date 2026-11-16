@@ -38,7 +38,8 @@ ref, and the worktree is removed whatever the outcome. The default, `~/Code/ulti
 type-checks every user extension and Xana's phone extension against the commit, so a ref that would break them on
 every host stops here. Its outcomes, each before anything moves:
 
-- `precheck passed in 0m15s`: the rollout goes on.
+- `precheck passed in 0m15s`: the hosts' state is checked again (one that started a step meanwhile refuses the
+  rollout as before), and the rollout goes on.
 - `refused, nothing moved: the precheck failed`: its last lines (one `FAIL <extension>` line per broken extension)
   and the path of its whole log, which is kept. Tell the user which extension breaks on that ref, or fix it in its
   own repository; don't skip the precheck to get past it.
@@ -113,7 +114,8 @@ sh ~/Code/fawkes/.ultimate/skills/fawkes-hosts/rehearse.sh down
 `up` copies its binary into the rehearsal, so the install does not change it, and returns once every app runs.
 `reexec` installs `--to` at the rehearsal's binary path, runs `reexec --all`, and prints one line per process,
 version before → after and `pid … kept` or `CHANGED`; it exits 1 when a pid changed or a version is not the new one.
-Both binaries default to this repository's `target/debug/fawkes`. `down` stops the supervisor it recorded (which
+Both binaries default to this repository's `target/debug/fawkes`, else `fawkes` on `PATH`; a `--to` that is the
+very file the rehearsal runs already gets a note, since it proves only the handover. `down` stops the supervisor it recorded (which
 stops its daemons and apps), kills by pid any of its own that survived, and removes its exact directory. One
 rehearsal at a time: `up` is refused while one is recorded in `/tmp/fawkes-rehearse`.
 

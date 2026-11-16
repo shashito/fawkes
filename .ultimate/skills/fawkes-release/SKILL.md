@@ -56,7 +56,8 @@ not, stop and say so instead of releasing another one. `just release yes` ends b
 
 4. Move the supervisor (the launchd agent `dev.fawkes`, running `fawkes up --all`) and every daemon onto the new
    binary: `fawkes reexec --all`. Rehearse it first: `rehearse.sh reexec --to ~/.local/bin/fawkes` must print every
-   pid kept, then `rehearse.sh down`. Each process keeps its pid and every app keeps running, so it may run from
+   pid kept, then `rehearse.sh down`. When it does not, stop there: leave the live fleet on its old binary (it keeps
+   running it), and give the user the lines it printed and its logs before `down` removes them. Each process keeps its pid and every app keeps running, so it may run from
    inside an app, this conversation's included. A daemon with a pending switch or a step at work is skipped
    (the script marks it busy) and the command exits 1: run it again once that ends. Never `fawkes service
    restart` for this: it restarts every app and rolls back a pending switch.

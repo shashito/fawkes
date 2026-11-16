@@ -25,7 +25,7 @@
 # every FAWKES_* variable is dropped on entry and FAWKES_HOME is the rehearsal's directory in every fawkes call.
 #
 # BINARY defaults to target/debug/fawkes of the repository this script is in, else `fawkes` on PATH; the output says
-# which. Needs git, jq, nc, node and perl (for the time bounds and the session).
+# which. Needs git, jq, nc, node, lsof and perl (for the time bounds and the session).
 
 set -eu
 
@@ -68,11 +68,6 @@ wait_until() {
 		[ "$(date +%s)" -lt "$deadline" ] || return 1
 		sleep 1
 	done
-}
-
-# fawkes towards the rehearsal and nothing else.
-fk() {
-	FAWKES_HOME=$dir "$dir/bin/fawkes" "$@"
 }
 
 status_json() {
@@ -303,11 +298,15 @@ reexec() {
 	[ -x "$dir/bin/fawkes" ] || die "$dir/bin/fawkes is missing; \`sh $0 down\`, then \`sh $0 up\`"
 	pick_binary "$to"
 	expected=${version#fawkes }
+	# The same file proves only that a reexec onto itself keeps the pids: an install forgotten or failed, say.
+	if cmp -s "$chosen" "$dir/bin/fawkes"; then
+		echo "note: $chosen is the very binary the rehearsal runs already, so this checks the handover, not a new fawkes"
+	fi
 
 	status_json >"$dir/before.json" || die "\`fawkes status --all\` fails or takes over 30 s; \`sh $0 down\` and \`up\` again"
 	targets <"$dir/before.json" >"$dir/before.tsv"
 	grep -q "^supervisor$tab" "$dir/before.tsv" || die "no supervisor answers in $dir; $dir/supervisor.log says why"
-	[ "$(wc -l <"$dir/before.tsv")" -ge 2 ] || die "no app has a daemon in $dir; \`sh $0 down\`, then \`sh $0 up\`"
+	awk -F"$tab" '$1 != "supervisor" && $2 != "-"' "$dir/before.tsv" | grep -q . || die "no app has a daemon in $dir; \`sh $0 down\`, then \`sh $0 up\`"
 
 	cp "$chosen" "$dir/bin/.fawkes.new"
 	mv "$dir/bin/.fawkes.new" "$dir/bin/fawkes"
@@ -353,6 +352,14 @@ pid_alive() {
 	kill -0 "$1" 2>/dev/null
 }
 
+# Whether pid $1 is the rehearsal's: a daemon runs its bin/fawkes, an app runs in one of its worktrees.
+ours() {
+	base=$(basename "$dir")
+	case $(ps -o command= -p "$1" 2>/dev/null) in *"$base"/*) return 0 ;; esac
+	case $(lsof -a -p "$1" -d cwd -Fn 2>/dev/null) in *"$base"/*) return 0 ;; esac
+	return 1
+}
+
 # Whether none of the pids in $survivors lives.
 none_alive() {
 	for pid in $survivors; do
@@ -395,7 +402,16 @@ down() {
 	else
 		: >"$dir/down.tsv"
 	fi
-	survivors=$(awk -F"$tab" '$1 != "supervisor" { for (i = 2; i <= 3; i++) if ($i ~ /^[0-9]+$/) print $i }' "$dir/down.tsv")
+	recorded=$(awk -F"$tab" '$1 != "supervisor" { for (i = 2; i <= 3; i++) if ($i ~ /^[0-9]+$/) print $i }' "$dir/down.tsv")
+	# An old look's pid may belong to another process by now: only one of the rehearsal's is ever signalled.
+	survivors=''
+	for pid in $recorded; do
+		if ! pid_alive "$pid" || ours "$pid"; then
+			survivors="$survivors $pid"
+		else
+			echo "pid $pid is alive but is not the rehearsal's any more (the pid was reused); leaving it alone"
+		fi
+	done
 
 	supervisor=$(cat "$dir/supervisor.pid" 2>/dev/null) || supervisor=''
 	if [ -n "$supervisor" ] && pid_alive "$supervisor"; then
@@ -428,7 +444,7 @@ down() {
 			fi
 		done
 	fi
-	[ -z "$survivors" ] || echo "recorded pids gone: $(echo "$survivors" | tr '\n' ' ')"
+	[ -z "$survivors" ] || echo "recorded pids gone:$survivors"
 	rm -rf "$dir"
 	rm -f "$state"
 	echo "removed $dir and $state"
