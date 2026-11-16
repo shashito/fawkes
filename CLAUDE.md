@@ -14,6 +14,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+Run `cargo fmt` in its own tool round, and clippy and the tests only after it returned: never all three in one
+batch of parallel calls, where fmt rewrites the files the others are building.
+
 All three are clean on `main`. Treat any warning or failure as yours: don't assume it was already there.
 `scripts/check` runs these, clippy again for Linux (`--target x86_64-unknown-linux-gnu`, right after the macOS
 clippy: it catches lints in code behind a cfg for one OS; rustup installs the target from `rust-toolchain.toml`),
@@ -54,10 +57,11 @@ Several branches, workers and test suites share one Mac with little free disk.
 
 - **Kill only what you started.** Stop processes by the pid or process group your own run recorded. Never kill
   machine-wide (`pkill -f`, `killall`): another suite's processes look the same as yours.
-- **Clean up before you finish.** Run `cargo clean` in your worktree and remove every `/tmp` folder you created
-  (sandboxes, VM images, scratch clones), each by its exact path. A finished worktree's `target/` is about 2 GB.
-  Never delete by glob in `/tmp` (`rm -rf /tmp/fk*`): it matches other suites' running test folders and fails
-  them. The harness removes its own `/tmp/fk<port>` when a test ends.
+- **Clean up before you finish.** Remove every `/tmp` folder you created (sandboxes, VM images, scratch clones),
+  each by its exact path. The lander frees a landed worktree; when the disk runs low (under about 10 GB free, or
+  ENOSPC), free space with the `free-disk` skill (`.ultimate/skills/free-disk`). Never delete by glob in `/tmp`
+  (`rm -rf /tmp/fk*`): it matches other suites' running test folders and fails them. The harness removes its own
+  `/tmp/fk<port>` when a test ends.
 - **Short socket paths.** A unit test that binds a Unix socket makes its directory with
   `tempfile::Builder::new().tempdir_in("/tmp")`, not under `$TMPDIR`: the lander's `$TMPDIR` is long enough to
   exceed the socket path limit.

@@ -45,9 +45,28 @@ sleep 30; cat <status file>
 
 Its first line is `state: running`, `done` or `failed`, then one line per host (before → after, the outcome or the
 step it is in, how long it took), and its last line the next command. A host's test can take 15 minutes; keep
-polling. When your own host's turn comes, its switch restarts this Ultimate and this conversation with it. The
-rollout runs in a session of its own and goes on; after the restart, read the same status file again (its path is in
-the output above).
+polling.
+
+## Your own host
+
+The switch of your own host (the `--self` one, `fawkes` on 4747 for this project) restarts the Ultimate this
+conversation runs on, and interrupts every tool call in flight there: yours and every other busy conversation's.
+So roll it separately, from another host:
+
+1. Leave it out of the rollout: `--hosts` with every other host's name, then poll that rollout to `done`.
+2. List the conversations it would interrupt, and give them to the user with the hand-over:
+
+   ```js
+   (await ultimate.conversations()).filter((c) => c.busy).map((c) => `#${c.id} ${c.title}`)
+   ```
+
+3. Hand the move to Ultimate's @ultimate (the `ultimate` host's, which does not restart with yours): ask your
+   @ultimate (`message`, `reply: true`) to relay it, with the commit the plan resolved, the busy list, and the
+   command, `sh ~/Code/fawkes/.ultimate/skills/fawkes-hosts/rollout.sh --hosts <your host> <commit>`, to run once
+   those conversations are idle and to report the status file's lines back.
+
+If your host's switch does run under you, the rollout runs in a session of its own and goes on; after the restart,
+read the same status file again (its path is in the output above).
 
 ## The report
 

@@ -4,7 +4,7 @@
 #   release-state.sh
 #
 # Reads only: `git fetch` updates origin/main, and everything else asks git, GitHub (gh) and the local daemons
-# (`fawkes status`). It never pushes, tags, releases, installs or restarts; the commands it prints are the
+# (`fawkes status`). It never pushes, tags, releases, installs or re-executes; the commands it prints are the
 # user's to run.
 #
 # The checkout is the one this script sits in: run it from the host project, ~/Code/fawkes, where `just
@@ -85,8 +85,8 @@ installed=
 if have fawkes; then installed=$(fk --version | sed 's/^fawkes //'); fi
 field Binary "$(if have fawkes; then echo "$(command -v fawkes) $installed"; else echo none; fi)"
 
-# One line per manifest: name, the daemon's version, and a pending switch or a step in progress, which a
-# restart would roll back or cut short.
+# One line per manifest: name, the daemon's version, and a pending switch or a step in progress, during which
+# `reexec` refuses to move the daemon.
 stale=
 echo "Daemons:"
 for manifest in "$fawkes_home"/*.toml; do
@@ -126,16 +126,7 @@ if [ -n "$latest_tag" ] && [ "$latest_tag" != "v$installed" ]; then
 	next "curl -LsSf https://github.com/$repo/releases/latest/download/install.sh | FAWKES_REQUIRE_ATTESTATION=1 sh"
 fi
 if [ -n "$stale" ]; then
-	if fk reexec --help >/dev/null 2>&1; then
-		next "fawkes reexec --all   # daemons on another version:$stale"
-	else
-		for name in $stale; do
-			case $name in
-			*'(busy)') next "${name%(busy)}: wait until its switch or step ends, then restart it" ;;
-			*) next "fawkes service restart --manifest $name   # from a terminal, not inside the app; restarts the app too" ;;
-			esac
-		done
-	fi
+	next "fawkes reexec --all   # daemons on another version:$stale; a (busy) one is skipped, run it again once its switch or step ends"
 fi
 if [ "$step" -eq 0 ]; then echo "  nothing: $tag is pushed, released, installed and running"; fi
 if [ "$tag_origin" = yes ] && [ -n "$since" ] && [ "$since" -gt 0 ]; then
