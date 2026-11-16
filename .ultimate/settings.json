@@ -21,7 +21,7 @@
       { "command": "cargo clippy --all-targets -- -D warnings", "timeout": 300 },
       { "command": "cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings", "timeout": 300 },
       {
-        "command": "d=$(mktemp -d /tmp/fkl.XXXXXX) && TMPDIR=\"$d\" cargo test; s=$?; rm -rf \"$d\"; exit $s",
+        "command": "d=$(mktemp -d /tmp/fkl.XXXXXX) && TMPDIR=\"$d\" cargo test -q; s=$?; rm -rf \"$d\"; exit $s",
         "timeout": 600
       }
     ]
