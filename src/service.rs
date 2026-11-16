@@ -13,7 +13,7 @@ pub enum Action {
     /// Stop the supervisor and the daemons it runs, and remove its plist; the state directories stay
     Uninstall,
     /// Stop the supervisor and every app's daemon it runs gracefully and start them again from the plist; each daemon's
-    /// start rolls a pending switch back, as at any start. `fawkes reexec` picks up a new binary without stopping anything
+    /// start rolls a pending switch back, as at any start. `fawkes reexec --all` picks up a new binary without stopping anything
     Restart,
 }
 

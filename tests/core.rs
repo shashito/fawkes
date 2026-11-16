@@ -3973,6 +3973,20 @@ fn fk_at(h: &Harness, manifest: &std::path::Path, args: &[&str]) -> (i32, Value,
     (output.status.code().unwrap(), json, stdout)
 }
 
+/// `fawkes <args>` with the harness's `FAWKES_HOME` and no app named: the exit code and stdout. `FAWKES_MANIFEST` and
+/// `FAWKES_SOCKET` point at an app that is not there, for `--all` to ignore.
+fn fk_all(h: &Harness, args: &[&str]) -> (i32, String) {
+    let output = common::fawkes()
+        .args(args)
+        .env("FAWKES_HOME", &h.dir)
+        .env("FAWKES_MANIFEST", h.dir.join("none.toml"))
+        .env("FAWKES_SOCKET", h.dir.join("none.sock"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    (output.status.code().unwrap(), stdout)
+}
+
 /// The final line the supervisor of the harness's `FAWKES_HOME` answers to `command` with `args`.
 fn ask_supervisor(h: &Harness, command: &str, args: &Value) -> Value {
     let mut stream = UnixStream::connect(h.dir.join("supervisor.sock")).unwrap();
@@ -4253,4 +4267,129 @@ fn the_supervisor_reexecs_keeping_its_pid_its_daemons_and_their_apps() {
         code == 0 && status["daemon_pid"] != daemons[1].as_raw_nonzero().get()
     });
     assert_eq!(supervised(&h, "u")["state"], "running");
+}
+
+/// A supervisor with apps `t` and `u` of `FAWKES_HOME`, each running v1: the supervisor, the daemons, and the apps
+/// with the pids they recorded. Both daemons are ended when the `EndDaemons` is dropped, after the supervisor.
+fn a_fleet(h: &Harness) -> (EndDaemons<'_>, Supervisor, [Pid; 2], [Pid; 2]) {
+    h.commit("v1", "confirm");
+    let u = second_app(h, "u", 5);
+    let t = h.manifest().to_path_buf();
+    let end = EndDaemons(h, vec![t.clone(), u.clone()]);
+    let supervisor = Supervisor::start(h);
+    let daemons = [daemon_pid(h, &t), daemon_pid(h, &u)];
+    make_permanent(h, "v1", "g1");
+    for step in [["stage", "v1"], ["test", "g1"], ["switch", "g1"]] {
+        let (code, answer, _) = fk_at(h, &u, &step);
+        assert_eq!(code, 0, "{step:?}: {answer}");
+    }
+    h.wait("u's g1 to confirm itself", 15, || {
+        fk_at(h, &u, &["status"]).1["permanent"] == "g1"
+    });
+    let apps = ["s/app.pid", "us/app.pid"].map(|file| read_pid(h.dir.join(file)));
+    (end, supervisor, daemons, apps)
+}
+
+/// `status --all` shows the supervisor and each of its apps with its daemon's status, whatever `FAWKES_MANIFEST` says.
+#[test]
+fn status_all_shows_the_supervisor_and_every_app_with_its_status() {
+    let h = Harness::new("");
+    let (_end, supervisor, daemons, apps) = a_fleet(&h);
+    let pid = supervisor.pid().as_raw_nonzero().get();
+
+    let (code, stdout) = fk_all(&h, &["status", "--all", "--json"]);
+    assert_eq!(code, 0, "{stdout}");
+    let view: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(view["supervisor"]["pid"], pid, "{view}");
+    let fleet = view["apps"].as_array().unwrap();
+    let names: Vec<&str> = fleet
+        .iter()
+        .map(|app| app["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["t", "u"], "{view}");
+    for ((app, daemon), process) in fleet.iter().zip(daemons).zip(apps) {
+        assert_eq!(app["error"], Value::Null, "{app}");
+        assert_eq!(app["supervisor"]["state"], "running", "{app}");
+        assert_eq!(
+            app["status"]["daemon_pid"],
+            daemon.as_raw_nonzero().get(),
+            "{app}"
+        );
+        let running = &app["status"]["process"];
+        assert_eq!(running["pid"], process.as_raw_nonzero().get(), "{app}");
+    }
+
+    let (code, text) = fk_all(&h, &["status", "--all"]);
+    assert_eq!(code, 0, "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!(
+            "supervisor pid {pid}, fawkes {}, 2 apps",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(lines.len(), 3, "{text}");
+    for (line, (name, process)) in lines[1..].iter().zip(["t", "u"].into_iter().zip(apps)) {
+        let process = process.as_raw_nonzero();
+        assert!(
+            line.starts_with(&format!("  {name}  running  g1  pid {process}")),
+            "{text}"
+        );
+        assert!(line.ends_with("  supervised"), "{text}");
+    }
+}
+
+/// `reexec --all` moves the supervisor and then each daemon onto the installed binary: every pid stays, the supervisor's,
+/// the daemons' and their apps'.
+#[test]
+fn reexec_all_moves_the_supervisor_and_every_daemon_keeping_every_pid() {
+    let h = Harness::new("");
+    let (_end, supervisor, daemons, apps) = a_fleet(&h);
+    let pid = supervisor.pid().as_raw_nonzero().get();
+
+    // g1 may confirm itself before the health check of its switch has finished, and a daemon refuses `reexec` with
+    // `busy` until then.
+    let mut all = Value::Null;
+    h.wait("reexec --all to move everything", 30, || {
+        let (code, stdout) = fk_all(&h, &["reexec", "--all", "--json"]);
+        all = serde_json::from_str(&stdout).unwrap();
+        let errors = all["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|app| &app["error"]);
+        assert!(
+            errors.filter(|e| !e.is_null()).all(|e| e["code"] == "busy"),
+            "{all}"
+        );
+        code == 0
+    });
+    assert_eq!(all["supervisor"]["error"], Value::Null, "{all}");
+    assert_eq!(all["supervisor"]["result"]["pid"], pid, "{all}");
+    assert_eq!(all["supervisor"]["result"]["to"], env!("CARGO_PKG_VERSION"));
+    let moved = all["apps"].as_array().unwrap();
+    let names: Vec<&str> = moved
+        .iter()
+        .map(|app| app["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["t", "u"], "{all}");
+    for (app, daemon) in moved.iter().zip(daemons) {
+        assert_eq!(app["error"], Value::Null, "{app}");
+        assert_eq!(app["result"]["pid"], daemon.as_raw_nonzero().get(), "{app}");
+    }
+
+    assert_eq!(supervisor_status(&h)["pid"], pid);
+    let manifests = [h.manifest().to_path_buf(), h.dir.join("u.toml")];
+    assert_eq!(manifests.each_ref().map(|m| daemon_pid(&h, m)), daemons);
+    let files = ["s/app.pid", "us/app.pid"];
+    assert_eq!(files.map(|file| read_pid(h.dir.join(file))), apps);
+    for (manifest, app) in manifests.iter().zip(apps) {
+        let (_, status, _) = fk_at(&h, manifest, &["status"]);
+        assert_eq!(
+            status["process"]["pid"],
+            app.as_raw_nonzero().get(),
+            "{status}"
+        );
+    }
 }

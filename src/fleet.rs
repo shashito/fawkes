@@ -61,8 +61,9 @@ const START_WAIT: Duration = Duration::from_secs(30);
 /// How often `start` looks again meanwhile, and how often it looks whether a daemon `down` ended has exited.
 const POLL: Duration = Duration::from_millis(100);
 
-/// How long a daemon has to answer a `status` the supervisor asks.
-const ANSWER_WAIT: Duration = Duration::from_secs(2);
+/// How long a daemon has to answer a `status` the supervisor asks, and the supervisor or a daemon one that
+/// `fawkes status --all` asks: an answer it waits longer for would hold up the whole fleet's screen.
+pub const ANSWER_WAIT: Duration = Duration::from_secs(2);
 
 /// What the supervisor adds to a daemon's own bound (`Manifest::daemon_stop_wait`) when it waits for it to end: its
 /// answer, and its exit after it. launchd's `ExitTimeOut` leaves more (`fawkes service`).
@@ -1226,7 +1227,7 @@ impl Fleet {
 }
 
 /// What the supervisor in `home` answers to `request`, waiting `timeout` (none: as long as it takes) for each line:
-/// none when no supervisor answers there. For the CLI's `up` and `down` of an app in `home`.
+/// none when no supervisor answers there. For the CLI's `up` and `down` of an app in `home`, and its `--all`.
 pub fn request(
     home: &Path,
     request: &FleetRequest,

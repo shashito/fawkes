@@ -1249,6 +1249,47 @@ pub struct FleetDownResult {
     pub stopped: Option<String>,
 }
 
+/// The result of `fawkes status --all`, which the client puts together: the supervisor's `status`, null when none
+/// answers, and every app of `<fawkes_home>` by name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetView {
+    pub supervisor: Option<FleetStatus>,
+    pub apps: Vec<FleetAppView>,
+}
+
+/// One app of `status --all`: what the supervisor knows of it (null when it is not one of the supervisor's, or none
+/// answers), and its daemon's `status`, or the error that took its place (`daemon_unreachable`, `no_answer`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetAppView {
+    pub name: String,
+    pub supervisor: Option<FleetApp>,
+    pub status: Option<Status>,
+    pub error: Option<Error>,
+}
+
+/// The result of `fawkes reexec --all`: the supervisor's `reexec`, null when none answers, then each app's whose daemon
+/// answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetReexec {
+    pub supervisor: Option<SupervisorReexec>,
+    pub apps: Vec<AppReexec>,
+}
+
+/// The supervisor's part of `reexec --all`: its result once it answers on the new binary, or why it did not move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorReexec {
+    pub result: Option<ReexecResult>,
+    pub error: Option<Error>,
+}
+
+/// One app's part of `reexec --all`: its daemon's result once it answers on the new binary, or why it did not move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppReexec {
+    pub name: String,
+    pub result: Option<ReexecResult>,
+    pub error: Option<Error>,
+}
+
 /// The result of any command, as the daemon or the supervisor sends it.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]

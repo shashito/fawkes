@@ -65,10 +65,10 @@ $ fawkes up
 
 `init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
 and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
-to roll back to. To update Fawkes, run the `curl` line again, then restart each daemon once no switch is pending (a
-restart rolls a pending switch back): `fawkes service restart`, which restarts every app's daemon, under launchd, else
-`fawkes down` and `fawkes up`. The extension checks for a new release once a day and says so in its status-line popover, with these
-commands; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off. It also
+to roll back to. To update Fawkes, run the `curl` line again, then `fawkes reexec --all`: the supervisor and every
+daemon move onto the new binary with their apps still running. An app with a pending switch is skipped until the
+switch is decided; run it again then. The extension checks for a new release once a day and says so in its status-line
+popover, with the commands to run; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off. It also
 fetches your Ultimate clone every 15 minutes to show new commits; set `"fawkes": { "fetchEvery": "5m" }` (or `"off"`)
 in `~/.ultimate/settings.json` to change that.
 

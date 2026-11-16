@@ -222,9 +222,13 @@ apps.
 from a shell outside the app: `down` from inside the app it supervises is refused (`invalid_state`), since it would stop
 you and leave nothing to start the app again. For an app of the supervisor, both go through it: `down` marks the app
 down, so the supervisor does not start it again, and `fawkes up --manifest <name>` asks the supervisor to start it and
-returns once its daemon answers. To restart only the app, `fawkes restart`. After a new Fawkes install, `fawkes reexec`
-moves the running daemon onto the new binary with the same pid while the app keeps running (you included, so it may
-run from inside the app); it is refused while a switch is pending or a step runs.
+returns once its daemon answers. To restart only the app, `fawkes restart`.
+
+To upgrade Fawkes itself: install the new release, then `fawkes reexec --all`. It moves the supervisor, then every
+daemon, onto the new binary with the same pids while every app keeps running (you included, so it may run from inside
+the app). A daemon with a pending switch or a step at work refuses and is skipped (`<app> skipped: …`, exit 1) while
+the others move: run it again once that app's switch is decided. `fawkes reexec` moves only your own daemon.
+`fawkes status --all` shows the supervisor and every app, one line each, with each daemon's version.
 
 ## Storage rolls back only through the app's hooks
 

@@ -602,7 +602,7 @@ whose storage is worth a snapshot is never tested on an empty home.
 ```
 fawkes up       [--all]
 fawkes down
-fawkes reexec
+fawkes reexec   [--all]
 fawkes start
 fawkes stop
 fawkes restart
@@ -614,7 +614,7 @@ fawkes wait     [<gen>]
 fawkes confirm  [<gen>]
 fawkes rollback [--keep-storage]
 fawkes prune
-fawkes status
+fawkes status   [--all]
 fawkes log      [-n, --limit N] [--since N] [--follow]
 fawkes history
 fawkes reload
@@ -653,6 +653,43 @@ binary, the command ends once `status` answers with the same `daemon_pid` and th
 after 30 s (the `error` event of a failed exec says why). Its text names the app, the daemon's pid, both versions and
 the app that keeps running: `xana's daemon (pid 812) re-executed: fawkes 0.1.4 → 0.1.5; g5 keeps running (pid
 4657)`; under `--json` it prints the result. Unlike `down` it may run from inside the app, which it never stops.
+
+`status --all` and `reexec --all` take the whole fleet of `$FAWKES_HOME`: the supervisor, when one answers on
+`$FAWKES_HOME/supervisor.sock`, and the apps by name, the union of the supervisor's `status` apps, the `run/*.sock`
+links and the manifests `$FAWKES_HOME/*.toml` (Finding the app). An app's daemon is reached on its manifest's
+socket, else through its link. `--manifest` and `--socket` are usage errors with `--all`, and `$FAWKES_SOCKET` and
+`$FAWKES_MANIFEST` are ignored.
+
+`status --all` asks the supervisor and every daemon at once, each within 2 s, and exits 0 whatever they answer: a
+daemon that does not answer is part of the picture. Its text is one line for the supervisor, `supervisor pid 812,
+fawkes 0.1.5, 6 apps`, or `no supervisor runs; `fawkes service install` or `fawkes up --all` starts one`, then one
+aligned line per app: name, state, generation, the app's pid, port, the daemon's version and what the supervisor
+does with it, `-` for what is not known:
+
+```
+supervisor pid 812, fawkes 0.1.5, 3 apps
+  docs      no answer  -   -          -          -             supervised
+  ultimate  down       -   -          -          -             down
+  xana      running    g3  pid 71568  port 4749  fawkes 0.3.0  supervised
+```
+
+The state is the process's (`running`, `stopped`, `failed`), or, without an answer, `down` (the supervisor keeps the
+app down), `no daemon` (none listens) or `no answer`. The supervision is `supervised` (the daemon is the supervisor's
+child), `attached`, `backoff`, `down` or `broken`, and `-` without a supervisor or for an app that is not one of its
+own. Under `--json`: `{"supervisor": <supervisor status>|null, "apps": [{"name", "supervisor": <its app in the
+supervisor's status>|null, "status": <the daemon's status>|null, "error": <error>|null}]}`, `error` the one that took
+the status's place (`daemon_unreachable`, `no_answer`).
+
+`reexec --all` is what follows an install of a new fawkes. It sends the supervisor `reexec` first, so that the daemons
+it starts from then on run the new binary too, and confirms it as `reexec` does a daemon's: its `status` answers with
+the same pid and the new version within 30 s, or it is `no_answer`. Then it re-executes each app's daemon that
+answers, one at a time, as `reexec` does; an app with no daemon is left out. A refusal (`invalid_state` for a pending
+switch, `busy`, `start_failed`) or a failure is recorded and the rest go on, so one app's pending switch keeps no other
+on the old binary. Its text is one line per target, the supervisor's `the supervisor (pid 812) re-executed: fawkes
+0.1.4 → 0.1.5; 6 daemons keep running`, each daemon's as `reexec` prints it, and `xana skipped: <message>` for one
+that did not move. It exits 1 when any target was skipped, else 0. Under `--json`: `{"supervisor": {"result":
+<reexec result>|null, "error": <error>|null}|null, "apps": [{"name", "result": <reexec result>|null, "error":
+<error>|null}]}`. As `reexec`, it may run from inside an app, and is refused in a test run.
 `start`, `stop` and `restart` act on the app's process and leave the daemon running.
 
 In text, `log` and `history` print nothing, not a blank line, when there are no events or generations to show (`log -n 0`
@@ -683,7 +720,8 @@ A client command reaches its daemon by the first of:
 name: `<fawkes_home>/<APP>.toml`, which must exist. An empty variable counts as unset. There is no guess beyond this:
 not finding the app is a `usage` error (exit 2), and a running daemon is never picked because it is the only one.
 `up`, which needs a manifest, takes steps 2, 4, 5 and 6; `watch` takes steps 1 to 4 and otherwise follows every
-daemon (see Watch). `up --all` and `service` take no app: they act on every manifest in `$FAWKES_HOME`.
+daemon (see Watch). `up --all`, `status --all`, `reexec --all` and `service` take no app: they act on every app in
+`$FAWKES_HOME` (see CLI for whom `--all` counts).
 
 This order puts the flags before the environment, which **changes the earlier contract**, where `$FAWKES_SOCKET`
 beat `--manifest` and only `./fawkes.toml` was read: an app Fawkes runs that names another app's manifest now
@@ -902,7 +940,7 @@ Result: `{"label", "plist", "removed"}`, where `removed` is false when there was
 **restart** boots the agent out (a SIGTERM, which stops every daemon the supervisor runs, and the wait for a graceful
 stop) and bootstraps the existing plist, which launchd reads afresh. Without a plist it fails with `not_found`:
 `install` first. Each daemon starts as at any start, so a pending switch is rolled back (see Daemon start). Result:
-`{"label", "plist"}`. `fawkes reexec` picks up a new binary without stopping anything.
+`{"label", "plist"}`. `fawkes reexec --all` picks up a new binary without stopping anything.
 
 `launchctl` runs through `run_bounded` with `ExitTimeOut` plus 30 s.
 
@@ -1280,8 +1318,8 @@ Then it installs:
 
 Each is copied beside its place and renamed into it (the extension's folder in two renames, missing for that
 moment), so running it again upgrades both, and a running daemon keeps the binary it started from until `fawkes
-reexec` moves it onto the new one, with its app still running, or until it restarts (`down` and `up`, or `service
-restart`), which rolls a pending switch back. It never needs root and never changes a
+reexec --all` moves the supervisor and every daemon onto the new one, with their apps still running, or until it
+restarts (`down` and `up`, or `service restart`), which rolls a pending switch back. It never needs root and never changes a
 shell startup file: it says when the install directory is not on `PATH`, or when another `fawkes` comes first there. `FAWKES_DOWNLOAD_URL`
 replaces the release's download folder (a mirror, or a `file://` folder of archives for a test).
 

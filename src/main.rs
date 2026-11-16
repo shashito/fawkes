@@ -17,15 +17,17 @@ use clap::{Parser, Subcommand};
 use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
-    ErrorCode, FleetDownResult, FleetRequest, Generation, Line, REQUEST_TIMEOUT, ReexecResult,
-    Request, StageResult, StartResult, Status, UpgradeResult, UpgradeStep, err, read_line,
-    timed_out,
+    AppReexec, ErrorCode, FleetAppView, FleetDownResult, FleetReexec, FleetRequest, FleetStatus,
+    FleetView, Generation, Line, REQUEST_TIMEOUT, ReexecResult, Request, StageResult, StartResult,
+    Status, SupervisorReexec, UpgradeResult, UpgradeStep, err, read_line, timed_out,
 };
 use render::{
-    render_decided, render_event, render_progress, render_reexec, render_result, render_switch,
+    render_decided, render_event, render_fleet, render_progress, render_reexec, render_result,
+    render_supervisor_reexec, render_switch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Display;
 use std::io::{BufRead, BufReader, Write};
@@ -61,7 +63,8 @@ const LONG_HELP_END: &str = concat!(
      $FAWKES_MANIFEST, else the nearest fawkes.toml from the current directory up to the repository root (the first \
      directory with a .git), else the manifest in $FAWKES_HOME (default ~/.fawkes) whose repo holds the current \
      directory; when several do, name one. --manifest and $FAWKES_MANIFEST take a path (a value with a / or ending \
-     in .toml) or an app name, for $FAWKES_HOME/<APP>.toml.\n\n",
+     in .toml) or an app name, for $FAWKES_HOME/<APP>.toml. --all (up, status, reexec) takes every app in \
+     $FAWKES_HOME instead, and ignores $FAWKES_SOCKET and $FAWKES_MANIFEST.\n\n",
     "JSON: stdout carries one document, the result or the error object {\"code\", \"message\"}, and progress goes to \
      stderr as JSON lines. A result only ever gains fields. The streams differ: `log --follow` prints one event per \
      line, `watch` one {\"name\", \"event\"} document per event. `up` prints text only.\n\n",
@@ -71,6 +74,8 @@ const LONG_HELP_END: &str = concat!(
      fawkes upgrade main                stage, test and switch to main\n  \
      fawkes wait                        until the switch confirms or rolls back\n  \
      fawkes status --json               what runs, and the commands accepted now\n  \
+     fawkes status --all                the supervisor and every app\n  \
+     fawkes reexec --all                after an install, every daemon onto it\n  \
      fawkes rollback                    undo the pending switch\n  \
      fawkes --manifest xana log -n 20   the last 20 events of xana, from anywhere\n  \
      fawkes down                        stop the app and its daemon\n  \
@@ -153,10 +158,20 @@ enum Command {
     /// its child, and nothing rolls back. This is how a new Fawkes install reaches a running daemon. It is refused
     /// while a switch is pending or a step runs (stage, test, prune, start, restart, the health check of a start).
     /// Answers once the daemon answers `status` again on the new binary.
+    ///
+    /// With --all, the supervisor goes first, when one answers, then each app's daemon that answers, one at a time.
+    /// One that refuses or fails is skipped and the rest go on; the exit code is 1 when any was skipped.
     #[command(after_long_help = "Examples:\n  \
                                  fawkes reexec\n  \
-                                 fawkes reexec --manifest xana --json")]
-    Reexec,
+                                 fawkes reexec --manifest xana --json\n  \
+                                 fawkes reexec --all")]
+    Reexec {
+        #[arg(
+            long,
+            help = "Re-execute the supervisor, then every app's daemon in $FAWKES_HOME"
+        )]
+        all: bool,
+    },
     /// Run the current generation (pending, else permanent)
     Start,
     /// Stop the app
@@ -245,7 +260,22 @@ enum Command {
     /// Remove old generations beyond the manifest's `keep`
     Prune,
     /// Show the app, its process and the pending switch
-    Status,
+    #[command(
+        long_about = "Show the app, its process and the pending switch\n\n\
+                      With --all, one line for the supervisor and one per app: the supervisor's apps, the daemons \
+                      linked in $FAWKES_HOME/run/ and the manifests in $FAWKES_HOME. Each daemon has 2 s to answer, \
+                      and one that does not is shown as such.",
+        after_long_help = "Examples:\n  \
+                           fawkes status\n  \
+                           fawkes status --all --json"
+    )]
+    Status {
+        #[arg(
+            long,
+            help = "Show the supervisor and every app in $FAWKES_HOME, one line each"
+        )]
+        all: bool,
+    },
     /// Show the generations
     History,
     /// Read the manifest again, as SIGHUP does
@@ -314,11 +344,11 @@ impl Command {
             Command::Reload => Some("reload"),
             Command::Up { .. } => Some("up"),
             Command::Down => Some("down"),
-            Command::Reexec => Some("reexec"),
+            Command::Reexec { .. } => Some("reexec"),
             // A test run may confirm its own generation, which is never pending; `run_confirm` refuses the rest once it
             // knows which daemon the confirm reaches (DESIGN.md, Refusals).
             Command::Confirm { .. }
-            | Command::Status
+            | Command::Status { .. }
             | Command::History
             | Command::Log { .. }
             | Command::Watch { .. }
@@ -404,7 +434,8 @@ fn main() -> ExitCode {
         Command::Down => with_endpoint(&cli, &given, out, |endpoint, out| {
             run_down(&cli, &endpoint, out)
         }),
-        Command::Reexec => with_endpoint(&cli, &given, out, |endpoint, out| {
+        Command::Reexec { all: true } => run_reexec_all(&cli, out),
+        Command::Reexec { all: false } => with_endpoint(&cli, &given, out, |endpoint, out| {
             run_reexec(&cli, &endpoint, out)
         }),
         Command::Wait { generation } => with_endpoint(&cli, &given, out, |endpoint, out| {
@@ -433,7 +464,8 @@ fn main() -> ExitCode {
             keep_storage: *keep_storage,
         }),
         Command::Prune => request(Request::Prune),
-        Command::Status => request(Request::Status),
+        Command::Status { all: true } => run_status_all(&cli, out),
+        Command::Status { all: false } => request(Request::Status),
         Command::History => request(Request::History),
         Command::Reload => request(Request::Reload),
         Command::Log {
@@ -615,16 +647,25 @@ const REEXEC_POLL: Duration = Duration::from_millis(100);
 /// `fawkes reexec`: the daemon answers before it replaces its program, so the command ends once `status` answers
 /// with the same pid and the version it named. Returns the exit code.
 fn run_reexec(cli: &Cli, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
-    let outcome = exchange(cli, &Request::Reexec, endpoint, REQUEST_TIMEOUT, out).and_then(|raw| {
-        let result = ReexecResult::deserialize(&raw).map_err(|e| {
-            let message = format!("the daemon's reexec result could not be read: {e}");
-            Failure::new(ErrorCode::Internal, message)
-        })?;
-        let status = reexecuted(cli, &result, endpoint)?;
-        let text = render_reexec(&result, &status);
-        Ok((raw, text))
-    });
+    let outcome = reexec_daemon(cli, endpoint, out)
+        .map(|(raw, result, status)| (raw, render_reexec(&result, &status)));
     finish(cli, out, outcome)
+}
+
+/// `reexec` of the daemon on `endpoint`, once it answers on its new binary: the result as it sent it and as read, and
+/// the status it answered with.
+fn reexec_daemon(
+    cli: &Cli,
+    endpoint: &Endpoint,
+    out: &mut dyn Write,
+) -> Result<(Value, ReexecResult, Status), Failure> {
+    let raw = exchange(cli, &Request::Reexec, endpoint, REQUEST_TIMEOUT, out)?;
+    let result = ReexecResult::deserialize(&raw).map_err(|e| {
+        let message = format!("the daemon's reexec result could not be read: {e}");
+        Failure::new(ErrorCode::Internal, message)
+    })?;
+    let status = reexecuted(cli, &result, endpoint)?;
+    Ok((raw, result, status))
 }
 
 /// The status of the daemon once it answers as process `result.pid` on fawkes `result.to`, within `REEXEC_WAIT`.
@@ -658,6 +699,249 @@ fn reexecuted(cli: &Cli, result: &ReexecResult, endpoint: &Endpoint) -> Result<S
         }
         std::thread::sleep(REEXEC_POLL);
     }
+}
+
+/// `--all`'s `$FAWKES_HOME`; `--manifest` and `--socket` with it are a usage error, since it takes every app there.
+fn fleet_home(cli: &Cli, command: &str) -> Result<PathBuf, String> {
+    if cli.manifest.is_some() || cli.socket.is_some() {
+        return Err(format!(
+            "`fawkes {command} --all` takes the supervisor and every app in $FAWKES_HOME, so --manifest and --socket \
+             do not apply; `fawkes {command} --manifest <app>` takes one app"
+        ));
+    }
+    manifest::fawkes_home()
+}
+
+/// One app of `<fawkes_home>` as `--all` finds it: what the supervisor knows of it, and where its daemon answers, or
+/// why that cannot be known.
+struct Member {
+    name: String,
+    supervisor: Option<protocol::FleetApp>,
+    endpoint: Result<Endpoint, protocol::Error>,
+}
+
+/// The supervisor's `status`, when one answers on `<home>/supervisor.sock` within `fleet::ANSWER_WAIT`.
+fn supervisor_status(home: &Path, wait: Duration) -> Option<FleetStatus> {
+    let status = fleet::request(home, &FleetRequest::Status, Some(wait))?.ok()?;
+    FleetStatus::deserialize(&status).ok()
+}
+
+/// Every app of `home`, by name: the supervisor's, the daemons linked in `<home>/run`, and the manifests in `home`.
+/// A daemon is reached on its manifest's socket, else through its link, which is all there is of a daemon started
+/// from a manifest elsewhere.
+fn members(home: &Path, supervisor: Option<&FleetStatus>) -> Vec<Member> {
+    #[derive(Default)]
+    struct Found {
+        supervisor: Option<protocol::FleetApp>,
+        manifest: Option<PathBuf>,
+        link: Option<PathBuf>,
+    }
+    let mut found: BTreeMap<String, Found> = BTreeMap::new();
+    for app in supervisor.iter().flat_map(|s| &s.apps) {
+        let entry = found.entry(app.name.clone()).or_default();
+        entry.manifest = Some(app.manifest.clone());
+        entry.supervisor = Some(app.clone());
+    }
+    for (name, path) in discovery::manifests(home) {
+        found.entry(name).or_default().manifest.get_or_insert(path);
+    }
+    for (name, link) in discovery::run_links(&home.join("run")) {
+        found.entry(name).or_default().link = Some(link);
+    }
+    found
+        .into_iter()
+        .map(|(name, found)| {
+            let loaded = found.manifest.as_deref().map(Manifest::load);
+            let socket = match (loaded, found.link) {
+                (Some(Ok(manifest)), _) => Ok(manifest.paths().socket()),
+                (_, Some(link)) => Ok(link),
+                (Some(Err(why)), None) => Err(why),
+                (None, None) => Err("it has no manifest".into()),
+            };
+            let endpoint = socket
+                .map(|socket| Endpoint {
+                    socket,
+                    manifest: found.manifest.map(|path| (path, name.clone())),
+                    own: false,
+                })
+                .map_err(|why| {
+                    let message = format!("no daemon of {name} can be found: {why}");
+                    err(ErrorCode::DaemonUnreachable, message)
+                });
+            Member {
+                name,
+                supervisor: found.supervisor,
+                endpoint,
+            }
+        })
+        .collect()
+}
+
+/// The `status` of a member's daemon, within `fleet::ANSWER_WAIT`.
+fn member_status(cli: &Cli, member: &Member) -> Result<Status, protocol::Error> {
+    let endpoint = member.endpoint.as_ref().map_err(Clone::clone)?;
+    let quiet = &mut std::io::sink();
+    let raw = exchange(cli, &Request::Status, endpoint, fleet::ANSWER_WAIT, quiet)
+        .map_err(|failure| failure.error)?;
+    Status::deserialize(&raw).map_err(|e| {
+        let message = format!("{}'s status could not be read: {e}", member.name);
+        err(ErrorCode::Internal, message)
+    })
+}
+
+/// `fawkes status --all`: the supervisor and every app, each daemon asked at once, so the slowest bounds the wait and
+/// not their sum. A daemon that does not answer is part of the picture, not a failure. Returns the exit code.
+fn run_status_all(cli: &Cli, out: &mut dyn Write) -> u8 {
+    let home = match fleet_home(cli, "status") {
+        Ok(home) => home,
+        Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
+    };
+    let supervisor = supervisor_status(&home, fleet::ANSWER_WAIT);
+    let members = members(&home, supervisor.as_ref());
+    let answers: Vec<Result<Status, protocol::Error>> = std::thread::scope(|scope| {
+        let asks: Vec<_> = members
+            .iter()
+            .map(|member| scope.spawn(|| member_status(cli, member)))
+            .collect();
+        asks.into_iter()
+            .map(|ask| {
+                ask.join()
+                    .unwrap_or_else(|_| Err(err(ErrorCode::Internal, "the status query panicked")))
+            })
+            .collect()
+    });
+    let apps = members
+        .into_iter()
+        .zip(answers)
+        .map(|(member, answer)| {
+            let (status, error) = match answer {
+                Ok(status) => (Some(status), None),
+                Err(error) => (None, Some(error)),
+            };
+            FleetAppView {
+                name: member.name,
+                supervisor: member.supervisor,
+                status,
+                error,
+            }
+        })
+        .collect();
+    let view = FleetView { supervisor, apps };
+    let text = render_fleet(&view);
+    finish(cli, out, Ok((view, text)))
+}
+
+/// `reexec` of the supervisor in `home`, once it answers `status` as the same pid on the version it named, within
+/// `REEXEC_WAIT`: its result and that status.
+fn reexec_supervisor(home: &Path) -> Result<(ReexecResult, FleetStatus), protocol::Error> {
+    let socket = fleet::socket(home);
+    let answer = fleet::request(home, &FleetRequest::Reexec, Some(REQUEST_TIMEOUT)).unwrap_or_else(|| {
+        let message = format!(
+            "the supervisor on {} did not answer `reexec`; `fawkes status --all` shows whether it runs",
+            socket.display()
+        );
+        Err(err(ErrorCode::NoAnswer, message))
+    })?;
+    let result = ReexecResult::deserialize(&answer).map_err(|e| {
+        let message = format!("the supervisor's reexec result could not be read: {e}");
+        err(ErrorCode::Internal, message)
+    })?;
+    let until = Instant::now() + REEXEC_WAIT;
+    loop {
+        // A status asked while the supervisor executes waits in its socket's backlog for the next program.
+        let left = until.saturating_duration_since(Instant::now());
+        if let Some(status) = supervisor_status(home, left.clamp(REEXEC_POLL, REQUEST_TIMEOUT))
+            && status.pid == result.pid
+            && status.version == result.to
+        {
+            return Ok((result, status));
+        }
+        if Instant::now() >= until {
+            let message = format!(
+                "the supervisor on {} took `reexec` but did not answer as fawkes {} within {} s; its stderr \
+                 ({}/supervisor.log under `fawkes service`) says why",
+                socket.display(),
+                result.to,
+                REEXEC_WAIT.as_secs(),
+                home.display()
+            );
+            return Err(err(ErrorCode::NoAnswer, message));
+        }
+        std::thread::sleep(REEXEC_POLL);
+    }
+}
+
+/// `fawkes reexec --all`: the supervisor first, so the daemons it starts from then on run the new binary too, then each
+/// app's daemon that answers, one at a time. One that refuses or fails is recorded and skipped, and the rest go on: a
+/// pending switch in one app must not keep every other on the old binary. Returns the exit code: 1 when any was
+/// skipped.
+fn run_reexec_all(cli: &Cli, out: &mut dyn Write) -> u8 {
+    let home = match fleet_home(cli, "reexec") {
+        Ok(home) => home,
+        Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
+    };
+    let mut lines = Vec::new();
+    let mut fleet = supervisor_status(&home, fleet::ANSWER_WAIT);
+    let supervisor = fleet.is_some().then(|| match reexec_supervisor(&home) {
+        Ok((result, status)) => {
+            lines.push(render_supervisor_reexec(&result, &status));
+            fleet = Some(status);
+            SupervisorReexec {
+                result: Some(result),
+                error: None,
+            }
+        }
+        Err(error) => {
+            lines.push(format!("supervisor skipped: {}", error.message));
+            SupervisorReexec {
+                result: None,
+                error: Some(error),
+            }
+        }
+    });
+    let mut apps = Vec::new();
+    for member in members(&home, fleet.as_ref()) {
+        let Ok(endpoint) = &member.endpoint else {
+            continue;
+        };
+        let (result, error) = match reexec_daemon(cli, endpoint, &mut std::io::sink()) {
+            // No daemon: nothing runs an old binary.
+            Err(failure) if failure.error.code == ErrorCode::DaemonUnreachable => continue,
+            Ok((_, result, status)) => {
+                lines.push(render_reexec(&result, &status));
+                (Some(result), None)
+            }
+            Err(failure) => {
+                lines.push(format!(
+                    "{} skipped: {}",
+                    member.name, failure.error.message
+                ));
+                (None, Some(failure.error))
+            }
+        };
+        apps.push(AppReexec {
+            name: member.name,
+            result,
+            error,
+        });
+    }
+    let all = FleetReexec { supervisor, apps };
+    let skipped = all.supervisor.iter().any(|s| s.error.is_some())
+        || all.apps.iter().any(|app| app.error.is_some());
+    if cli.json {
+        say(out, serde_json::to_string(&all).unwrap_or_default());
+    } else if lines.is_empty() {
+        say(
+            out,
+            format!(
+                "no supervisor or daemon answers in {}; nothing to re-execute",
+                home.display()
+            ),
+        );
+    } else {
+        say(out, lines.join("\n"));
+    }
+    if skipped { EXIT_FAILED } else { 0 }
 }
 
 /// `fawkes skill`: the agent skill built into this binary. Returns the exit code.
@@ -1232,7 +1516,10 @@ mod tests {
             assert!(cli.json, "{args}");
             assert_eq!(cli.manifest, Some("f.toml".into()), "{args}");
             assert_eq!(cli.socket, Some("s.sock".into()), "{args}");
-            assert!(matches!(cli.command, Command::Status), "{args}");
+            assert!(
+                matches!(cli.command, Command::Status { all: false }),
+                "{args}"
+            );
         }
         let up = parse("up --manifest f.toml");
         assert!(matches!(
@@ -1246,7 +1533,18 @@ mod tests {
             parse("up --all").command,
             Command::Up { all: true, .. }
         ));
-        assert!(matches!(parse("reexec").command, Command::Reexec));
+        assert!(matches!(
+            parse("reexec").command,
+            Command::Reexec { all: false }
+        ));
+        assert!(matches!(
+            parse("reexec --all --json").command,
+            Command::Reexec { all: true }
+        ));
+        assert!(matches!(
+            parse("status --all").command,
+            Command::Status { all: true }
+        ));
         assert_eq!(up.manifest, Some("f.toml".into()));
         let upgrade = parse("upgrade main --deadline 60");
         assert!(
@@ -1421,7 +1719,7 @@ mod tests {
             json,
             manifest: None,
             socket: Some(socket.clone()),
-            command: Command::Status,
+            command: Command::Status { all: false },
         };
 
         let mut out = Vec::new();
@@ -1460,7 +1758,7 @@ mod tests {
             json: true,
             manifest: None,
             socket: Some(socket.clone()),
-            command: Command::Status,
+            command: Command::Status { all: false },
         };
         for _ in 0..rounds {
             let mut out = Vec::new();
@@ -1530,7 +1828,7 @@ mod tests {
             json: true,
             manifest: None,
             socket: Some(socket.clone()),
-            command: Command::Status,
+            command: Command::Status { all: false },
         };
         let request = Request::Log {
             limit: None,

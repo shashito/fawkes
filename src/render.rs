@@ -2,9 +2,9 @@
 //! functions from the typed records of `protocol` to strings; `--json` prints the daemon's own documents instead.
 
 use crate::protocol::{
-    DownResult, Event, Events, GenState, Generation, History, Process, ProcessState, PruneResult,
-    ReexecResult, ReloadResult, ReportResult, Request, RollbackResult, StageResult, Status, Step,
-    SwitchResult,
+    AppState, DownResult, ErrorCode, Event, Events, FleetStatus, FleetView, GenState, Generation,
+    History, Process, ProcessState, PruneResult, ReexecResult, ReloadResult, ReportResult, Request,
+    RollbackResult, StageResult, Status, Step, SwitchResult,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -63,6 +63,110 @@ fn aligned_rows(rows: &[(&str, &str)], indent: &str, min_width: usize) -> Vec<St
     rows.iter()
         .map(|(label, value)| format!("{indent}{label:<width$}{value}"))
         .collect()
+}
+
+/// `rows` as lines of `indent` and cells, each column as wide as its widest cell and two spaces from the next; the last
+/// column is not padded, so no line ends in spaces.
+fn aligned_columns(rows: &[Vec<String>], indent: &str) -> Vec<String> {
+    let mut widths: Vec<usize> = Vec::new();
+    for row in rows {
+        for (column, cell) in row.iter().enumerate() {
+            let width = cell.chars().count();
+            match widths.get_mut(column) {
+                Some(widest) => *widest = (*widest).max(width),
+                None => widths.push(width),
+            }
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let last = row.len().saturating_sub(1);
+            let cells = row.iter().enumerate().map(|(column, cell)| {
+                if column == last {
+                    cell.clone()
+                } else {
+                    format!("{cell:<width$}", width = widths[column])
+                }
+            });
+            format!("{indent}{}", cells.collect::<Vec<_>>().join("  "))
+        })
+        .collect()
+}
+
+/// What `fawkes status --all` prints: the supervisor, then one line per app with its process, its daemon's version and
+/// what the supervisor does with it. An app whose daemon does not answer says so in place of the process's state.
+pub fn render_fleet(view: &FleetView) -> String {
+    let head = match &view.supervisor {
+        Some(s) => format!(
+            "supervisor pid {}, fawkes {}, {} app{}",
+            s.pid,
+            s.version,
+            s.apps.len(),
+            if s.apps.len() == 1 { "" } else { "s" }
+        ),
+        None => {
+            "no supervisor runs; `fawkes service install` or `fawkes up --all` starts one".into()
+        }
+    };
+    let rows: Vec<Vec<String>> = view
+        .apps
+        .iter()
+        .map(|app| {
+            let supervised = app.supervisor.as_ref().map(|s| s.state);
+            let state = match (&app.status, supervised, &app.error) {
+                (Some(status), ..) => status.process.state.as_str(),
+                (None, Some(AppState::Down), _) => "down",
+                (None, _, Some(e)) if e.code == ErrorCode::DaemonUnreachable => "no daemon",
+                (None, ..) => "no answer",
+            };
+            let status = app.status.as_ref();
+            let process = status.map(|s| &s.process);
+            let version = status.map(|s| s.version.as_str()).filter(|v| !v.is_empty());
+            vec![
+                app.name.clone(),
+                state.into(),
+                or_dash(process.and_then(|p| p.generation.as_deref())),
+                or_dash(process.and_then(|p| p.pid).map(|pid| format!("pid {pid}"))),
+                or_dash(process.map(|p| format!("port {}", p.port))),
+                or_dash(version.map(|v| format!("fawkes {v}"))),
+                or_dash(supervised.map(supervision)),
+            ]
+        })
+        .collect();
+    let lines = std::iter::once(head).chain(aligned_columns(&rows, "  "));
+    lines.collect::<Vec<_>>().join("\n")
+}
+
+/// What the supervisor does with an app, in a word: `supervised` when its daemon is the supervisor's child.
+fn supervision(state: AppState) -> &'static str {
+    match state {
+        AppState::Running => "supervised",
+        AppState::Attached => "attached",
+        AppState::Backoff => "backoff",
+        AppState::Down => "down",
+        AppState::Broken => "broken",
+        AppState::Unknown => "unknown",
+    }
+}
+
+/// What `fawkes reexec --all` prints for the supervisor once it answers `status` on its new binary.
+pub fn render_supervisor_reexec(r: &ReexecResult, s: &FleetStatus) -> String {
+    let daemons = s
+        .apps
+        .iter()
+        .filter(|app| app.state == AppState::Running)
+        .count();
+    format!(
+        "the supervisor (pid {}) re-executed: fawkes {} → {}; {daemons} {}",
+        r.pid,
+        r.from,
+        r.to,
+        if daemons == 1 {
+            "daemon keeps running"
+        } else {
+            "daemons keep running"
+        }
+    )
 }
 
 /// What `up` prints to its terminal after the live app turned healthy, so the operator sees where it is. Framed by a
@@ -515,6 +619,107 @@ mod tests {
         );
         status.process.state = ProcessState::Stopped;
         assert!(render_reexec(&result, &status).ends_with("; no app runs"));
+    }
+
+    /// One line for the supervisor, then one per app in columns; an app whose daemon does not answer says why in its
+    /// state.
+    #[test]
+    fn the_fleet_is_a_line_for_the_supervisor_and_an_aligned_line_per_app() {
+        use crate::protocol::{ErrorCode, FleetApp, FleetAppView, err};
+        let supervised = |name: &str, state| FleetApp {
+            name: name.into(),
+            manifest: format!("/h/{name}.toml").into(),
+            state,
+            daemon_pid: None,
+            restart_at: None,
+            failures: 0,
+        };
+        let app =
+            |name: &str, state: Option<AppState>, status: Option<Status>, code| FleetAppView {
+                name: name.into(),
+                supervisor: state.map(|state| supervised(name, state)),
+                error: status.is_none().then(|| err(code, "m")),
+                status,
+            };
+        let unreachable = ErrorCode::DaemonUnreachable;
+        let mut view = FleetView {
+            supervisor: Some(FleetStatus {
+                pid: 812,
+                version: "0.1.5".into(),
+                socket: "/h/supervisor.sock".into(),
+                apps: vec![
+                    supervised("docs", AppState::Running),
+                    supervised("ultimate", AppState::Down),
+                    supervised("xana", AppState::Running),
+                ],
+            }),
+            apps: vec![
+                app("docs", Some(AppState::Running), None, ErrorCode::NoAnswer),
+                app("sample", None, Some(status_in(None, false)), unreachable),
+                app("ultimate", Some(AppState::Down), None, unreachable),
+                app(
+                    "xana",
+                    Some(AppState::Running),
+                    Some(running_status(false)),
+                    unreachable,
+                ),
+            ],
+        };
+        assert_eq!(
+            render_fleet(&view),
+            [
+                "supervisor pid 812, fawkes 0.1.5, 3 apps",
+                "  docs      no answer  -   -          -          -             supervised",
+                "  sample    stopped    g2  -          port 4790  fawkes 0.3.0  -",
+                "  ultimate  down       -   -          -          -             down",
+                "  xana      running    g3  pid 71568  port 4749  fawkes 0.3.0  supervised",
+            ]
+            .join("\n")
+        );
+
+        // Without a supervisor nothing is supervised, and a daemon that is not there is said apart from a silent one.
+        view.supervisor = None;
+        view.apps = vec![
+            app("docs", None, None, ErrorCode::NoAnswer),
+            app("ultimate", None, None, unreachable),
+        ];
+        assert_eq!(
+            render_fleet(&view),
+            [
+                "no supervisor runs; `fawkes service install` or `fawkes up --all` starts one",
+                "  docs      no answer  -  -  -  -  -",
+                "  ultimate  no daemon  -  -  -  -  -",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn the_supervisor_s_reexec_says_how_many_daemons_keep_running() {
+        let result = ReexecResult {
+            pid: 812,
+            from: "0.1.4".into(),
+            to: "0.1.5".into(),
+        };
+        let mut status = FleetStatus {
+            pid: 812,
+            version: "0.1.5".into(),
+            socket: "/h/supervisor.sock".into(),
+            apps: Vec::new(),
+        };
+        assert_eq!(
+            render_supervisor_reexec(&result, &status),
+            "the supervisor (pid 812) re-executed: fawkes 0.1.4 → 0.1.5; 0 daemons keep running"
+        );
+        status.apps.push(crate::protocol::FleetApp {
+            name: "xana".into(),
+            manifest: "/h/xana.toml".into(),
+            state: AppState::Running,
+            daemon_pid: Some(4657),
+            restart_at: None,
+            failures: 0,
+        });
+        assert!(render_supervisor_reexec(&result, &status).ends_with("; 1 daemon keeps running"));
     }
 
     #[test]
