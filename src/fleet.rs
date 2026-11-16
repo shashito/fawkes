@@ -8,8 +8,8 @@
 //! for a daemon (its socket answering, its exit). A daemon's spawn and the exec of `reexec` happen while it is held, so
 //! no daemon inherits the descriptors that `reexec` keeps open across its exec; the one other spawn, the installed
 //! binary's version check, comes before those are made inheritable, and one `reexec` at a time (`reexecing`).
-//! `wake` is taken last, with nothing taken
-//! while it is held. Lines for stderr go through `Echo`'s thread, so whoever holds `apps` never blocks on a terminal.
+//! `wake` is taken last, with nothing taken while it is held. Lines for stderr go through `Echo`'s thread, so whoever
+//! holds `apps` never blocks on a terminal.
 //!
 //! The daemons outlive the supervisor: each runs in its own process group, so a Ctrl-C reaches the supervisor alone,
 //! and one that dies (SIGKILL, a panic, which aborts) leaves them running, for the next to find attached.

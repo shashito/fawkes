@@ -112,10 +112,10 @@ on (`failed`). The daemon first runs `<binary> --version` and `<binary> reexec -
 both exit 0 and the first prints `fawkes <version>` (a fawkes from before `reexec` fails the second, and could not
 take the handover), `reexec` fails `start_failed`, names the binary and what it did, and nothing changes. Then it
 stops accepting (a connection it accepts from then on is closed, as the exec would close it), answers (`pid`, `from`,
-`to`), so the `status` that confirms it reaches only the program after the exec, waits up to 2 s for the other requests it is serving to send their answers, as a
-shutdown does (streams are cut, and their clients reconnect with `since`), lets stderr's writer catch up (bounded at
-1 s), and holds the state and the event log, so no write of `state.json` or `events.jsonl` is cut short, while it
-executes the binary with the arguments `up` was given (`--manifest`, and `--socket` when given) plus a hidden
+`to`), so the `status` that confirms it reaches only the program after the exec, waits up to 2 s for the other
+requests it is serving to send their answers, as a shutdown does (streams are cut, and their clients reconnect with
+`since`), lets stderr's writer catch up (bounded at 1 s), and holds the state and the event log, so no write of
+`state.json` or `events.jsonl` is cut short, while it executes the binary with the arguments `up` was given (`--manifest`, and `--socket` when given) plus a hidden
 `--handover <json>`. The handover carries the descriptors of the state lock and the listening socket, kept open
 across the exec, the live app (pid, generation, `started_at`, uptime, reported info) or whether it was given up on,
 and the restart count, the last start and the last exit, which `state.json` does not hold. An exec that fails is an
@@ -884,8 +884,8 @@ its lock, the exec) counts as a failure.
   `{"name", "daemon_pid", "stopped"}`, `daemon_pid` null when no daemon answered (none ran; one of its own still
   starting is sent `SIGTERM`). The app stays down either way. The wait is bounded by the daemon's own shutdown (the
   `ExitTimeOut` below without its margin) plus 5 s.
-- `reexec`: as the daemon's (Reexec): checks the binary installed at its path (`--version`, `reexec --help`), answers `{"pid",
-  "from", "to"}`, then executes it with the same pid, handing over the lock, the socket and the daemons it started,
+- `reexec`: as the daemon's (Reexec): checks the binary installed at its path (`--version`, `reexec --help`),
+  answers `{"pid", "from", "to"}`, then executes it with the same pid, handing over the lock, the socket and the daemons it started,
   which stay its children. Refused with `busy` while a `start`, `down` or another `reexec` is at work, and `start` and
   `down` are refused with `busy` while a `reexec` is. A `status` asked meanwhile waits, and is answered by the
   program after the exec (its connection is cut by the exec, and the client asks again) or by this one when the
