@@ -42,24 +42,15 @@ export const upgradeCommand = (repo: string | undefined, quote: (word: string) =
   repo ? `cd ${quote(repo)} && git pull && cargo install --path . --locked` : INSTALL_LINE
 
 /**
- * The daemon restart that runs the installed binary: its launchd agent's when it has one (the agent names the binary
- * itself), else `down` and `up` with the daemon's own binary `bin`, since another `fawkes` may come first on PATH.
+ * The command that moves the supervisor and every daemon onto the installed binary without stopping an app, with the
+ * daemon's own binary `bin`, since another `fawkes` may come first on PATH.
  */
-export function restartCommand(
-  manifest: string,
-  launchd: boolean,
-  bin: string | undefined,
-  quote: (word: string) => string,
-) {
-  const named = `--manifest ${quote(manifest)}`
-  if (launchd) return `fawkes service restart ${named}`
-  const fawkes = bin ? quote(bin) : 'fawkes'
-  return `${fawkes} down ${named} && ${fawkes} up ${named}`
-}
+export const reexecCommand = (bin: string | undefined, quote: (word: string) => string) =>
+  `${bin ? quote(bin) : 'fawkes'} reexec --all`
 
 /**
  * What to tell the user, or nothing: a release newer than what is installed (`available`), else an installed binary
- * newer than the daemon that runs (`restart`). The daemon's version stands in for an installed one that could not be
+ * newer than the daemon that runs (`reexec`). The daemon's version stands in for an installed one that could not be
  * read.
  */
 export function releaseNote(release: Release | undefined, status: Status | undefined) {
@@ -69,22 +60,22 @@ export function releaseNote(release: Release | undefined, status: Status | undef
   const latest = release.latest?.replace(/^v/, '')
   if (latest && newer(latest, installed) && newer(latest, daemon))
     return { kind: 'available' as const, version: latest, daemon }
-  if (newer(installed, daemon)) return { kind: 'restart' as const, version: installed, daemon }
+  if (newer(installed, daemon)) return { kind: 'reexec' as const, version: installed, daemon }
   return undefined
 }
 
 /**
- * Why the restart waits and where it runs: it stops this Ultimate, so it comes from a shell outside it, and a daemon
- * restart rolls a pending switch back.
+ * When the re-exec runs: every app keeps running, so this Ultimate may run it itself, but a daemon with a switch pending
+ * refuses until it is decided.
  */
-export const RESTART_WHEN = 'from a shell outside this Ultimate, once no switch is pending (a daemon restart rolls it back)'
+export const REEXEC_WHEN = 'once no switch is pending; every app keeps running'
 
 /** The note in one line, for an agent. */
 export function releaseText(release: Release | undefined, status: Status | undefined) {
   const note = releaseNote(release, status)
   if (!note || !release) return undefined
-  const restart = `restart the daemon ${RESTART_WHEN}: \`${release.restart}\``
+  const reexec = `move the daemons onto it ${REEXEC_WHEN}: \`${release.reexec}\``
   return note.kind === 'available'
-    ? `Fawkes ${note.version} is available (the daemon runs ${note.daemon}): upgrade with \`${release.command}\`, then ${restart}.`
-    : `Fawkes ${note.version} is installed but the daemon still runs ${note.daemon}: ${restart}.`
+    ? `Fawkes ${note.version} is available (the daemon runs ${note.daemon}): upgrade with \`${release.command}\`, then ${reexec}.`
+    : `Fawkes ${note.version} is installed but the daemon still runs ${note.daemon}: ${reexec}.`
 }

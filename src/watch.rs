@@ -5,6 +5,7 @@
 //! `fawkes wait` follows the same stream of one daemon, for the pictures it sends instead of the events, until one
 //! generation is decided.
 
+use crate::discovery;
 use crate::protocol::{
     Error, ErrorCode, Event, GenState, Generation, History, Line, Request, Status, Step, err,
     invalid_state, not_found, read_line, timed_out,
@@ -98,9 +99,8 @@ fn scan(dir: &Path, start: Start, json: bool, tx: &SyncSender<Msg>) {
     let mut following = HashSet::new();
     let mut said = false;
     loop {
-        let links = std::fs::read_dir(dir).into_iter().flatten().flatten();
-        for path in links.map(|link| link.path()) {
-            if path.extension().is_some_and(|e| e == "sock") && following.insert(path.clone()) {
+        for (_, path) in discovery::run_links(dir) {
+            if following.insert(path.clone()) {
                 let reader = Reader::new(&path, false, start, json, tx.clone());
                 std::thread::spawn(move || reader.run());
             }

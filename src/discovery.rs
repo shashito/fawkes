@@ -209,8 +209,8 @@ fn registry(home: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// Every `<fawkes_home>/<name>.toml`, sorted by name.
-fn manifests(home: &Path) -> Vec<(String, PathBuf)> {
+/// Every `<fawkes_home>/<name>.toml`, sorted by name: the apps a supervisor (`fleet`) runs as well.
+pub(crate) fn manifests(home: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(home) else {
         return Vec::new();
     };
@@ -218,6 +218,22 @@ fn manifests(home: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension() == Some(OsStr::new("toml")) && path.is_file())
+        .filter_map(|path| {
+            let name = path.file_stem()?.to_str()?.to_string();
+            Some((name, path))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Every `<name>.sock` link in `run_dir` (`<fawkes_home>/run`), by name, whatever it points at: a daemon that was
+/// killed leaves its link behind, so a link is where a daemon may answer, not proof that one runs.
+pub(crate) fn run_links(run_dir: &Path) -> Vec<(String, PathBuf)> {
+    let links = std::fs::read_dir(run_dir).into_iter().flatten().flatten();
+    let mut found: Vec<(String, PathBuf)> = links
+        .map(|link| link.path())
+        .filter(|path| path.extension() == Some(OsStr::new("sock")))
         .filter_map(|path| {
             let name = path.file_stem()?.to_str()?.to_string();
             Some((name, path))

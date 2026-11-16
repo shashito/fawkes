@@ -186,17 +186,17 @@ clone was last fetched (when the comparison ran, before the first fetch). Check 
 The live generation checks for a newer Fawkes 30 s after it starts and then every hour (`release.ts`):
 
 - `$FAWKES_BIN --version`: the binary the daemon was started from, as it is installed now. `install.sh` renames the
-  new binary into that path, so it says what a daemon restart would run.
+  new binary into that path, so it says what `fawkes reexec` would run.
 - Once a day, the tag GitHub's `releases/latest` redirect names (a `HEAD` request, not the API, which limits clients
   without a token to 60 requests an hour). No release yet redirects to the releases page instead. A check that fails
   (offline, a timeout of 10 s) keeps the last answer and runs again at the next tick.
 
 When that release is newer than the installed binary and the daemon, the popover shows it with two commands to copy:
 the upgrade (the `curl` line of `install.sh`, or `git pull` and `cargo install` in the checkout when this folder is
-one), then the daemon's restart (`fawkes service restart` when it has a launchd agent, else `fawkes down` and
-`fawkes up` with the daemon's own binary, which may not be the first `fawkes` on `PATH`), to run from a shell outside
-this Ultimate once no switch is pending, since a daemon restart rolls a pending switch back. When only the installed
-binary is newer than the daemon, it shows the restart alone. The `fawkes` tool's `status` says the same. Versions
+one), then `fawkes reexec --all` with the daemon's own binary (which may not be the first `fawkes` on `PATH`): it moves
+the supervisor and every daemon onto the new binary while every app, this Ultimate included, keeps running, so this
+Ultimate may run it itself. A daemon with a switch pending refuses until the switch is decided. When only the
+installed binary is newer than the daemon, it shows the re-exec alone. The `fawkes` tool's `status` says the same. Versions
 compare as numbers, a prerelease before its release. Check now asks GitHub at once, after a check already under way.
 
 `FAWKES_NO_UPDATE_CHECK` (set and not empty), in the daemon's environment or the manifest's `[env]`, turns the check

@@ -17,7 +17,7 @@ its confirm deadline, Fawkes rolls back to the permanent generation, code and st
 back at most once and is never started again. `DESIGN.md` in the Fawkes repository is the full contract; this file
 is what you need to act.
 
-Every command but `up` (the supervisor itself, in the foreground) takes `--json`. Then stdout is one JSON document,
+Every command but `up` (a daemon or the supervisor itself, in the foreground) takes `--json`. Then stdout is one JSON document,
 the result or an error object `{"code": "...", "message": "..."}`, and progress lines go to stderr. The two streams are the exception:
 `log --follow --json` prints one event per line, and `watch --json` one `{"name", "event"}` per line, for as long as
 they run. Exit codes: `0` ok, `1` the command failed, `2` usage error, `3` no daemon answers.
@@ -63,7 +63,7 @@ None of them set: Fawkes does not run you. Run from the app's repository, or pas
 In the `test` phase your home is a copy of the live storage (or empty), and the live app may be running beside you.
 Serve your health check and nothing else: no confirm, no upgrade, no work with effects outside your home (messages
 sent, jobs run, remote writes), since your code is not trusted yet. Fawkes enforces part of it: with `FAWKES_PHASE=test`
-every command that changes something (`up`, `down`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
+every command that changes something (`up`, `down`, `reexec`, `stage`, `test`, `switch`, `upgrade`, `rollback`, `prune`,
 `start`, `stop`, `restart`, `reload`) fails with `test_phase`, whichever app it names, and so does a `confirm` of any generation but your
 own `$FAWKES_GENERATION` towards your own daemon. `status`, `history`, `log`, `wait` and `watch` still work.
 
@@ -199,27 +199,36 @@ gives the events after the `seq` N you saw last.
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
 | `rolled_back` | `fawkes wait`: the generation rolled back. Produced by the client. | Read its `cause` and `fawkes history`. |
 | `test_phase` | A command that changes something, run with `FAWKES_PHASE=test`. Produced by the client. | Nothing: a test run serves its health check only. |
-| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes up --manifest APP`, or, from a shell outside the app, `fawkes service restart` when it runs as a launchd agent. |
+| `daemon_unreachable` | No daemon answers on the socket (exit 3). Produced by the client. | Do what the message says: `fawkes up --manifest APP`. |
 | `no_answer` | The daemon took a quick request and did not answer within 30 s. Produced by the client. | Check `fawkes status`; the daemon may be stuck. |
-| `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; from a shell outside the app, `fawkes service install` again replaces the plist and reloads it. |
+| `service_failed` | `launchctl` refused a `fawkes service` command; the message carries what it said. Produced by the client. | Read the message; from a shell outside the apps, `fawkes service install` again replaces the plist and reloads it. |
 
 A code not in this table comes from a newer Fawkes: treat it as a failed command and read its message.
 
-## On a server: `fawkes service`
+## On a server: the supervisor and `fawkes service`
 
-On macOS the daemon may run as a launchd agent (`fawkes service install`, plist
-`~/Library/LaunchAgents/dev.fawkes.<name>.plist`, its stderr in `<state_dir>/daemon.log`). Nothing changes for you:
-the same commands reach it over the same socket. `fawkes service` (`install`, `restart` or `uninstall`) run from inside
-the app it supervises is refused (`invalid_state`): each stops the daemon and the app, you with it, and a pending
-switch rolls back; a client that dies before its `bootstrap` leaves the agent unloaded until someone logs in. Ask a
-person to run it from a shell outside the app.
+`fawkes up --all` runs *the supervisor*: one process that runs the daemon of every manifest `~/.fawkes/<name>.toml`
+(`$FAWKES_HOME`) as its child, and starts a daemon that fails again after a backoff (1 s doubling to 30 s). On macOS
+launchd runs it as the agent `dev.fawkes` (`fawkes service install`, plist `~/Library/LaunchAgents/dev.fawkes.plist`,
+its stderr in `~/.fawkes/supervisor.log`; each daemon's output stays in its `<state_dir>/daemon.log`). Nothing changes
+for you: each app keeps its own daemon, and the same commands reach it over the same socket. `fawkes service`
+(`install`, `restart` or `uninstall`) run from inside an app is refused (`invalid_state`): each stops the supervisor and
+every daemon it runs, you with them, and a pending switch rolls back. Ask a person to run it from a shell outside the
+apps.
 
 ## Up and down
 
-`fawkes up` runs the supervisor of one app in the foreground; `fawkes down` stops the app and its supervisor, and a
-launchd agent's daemon then stays down until the next login or `fawkes service restart`. People run them, from a
-shell outside the app: `down` from inside the app it supervises is refused (`invalid_state`), since it would stop you
-and leave nothing to start the app again. To restart only the app, `fawkes restart`.
+`fawkes up` runs the daemon of one app in the foreground; `fawkes down` stops the app and its daemon. People run them,
+from a shell outside the app: `down` from inside the app it supervises is refused (`invalid_state`), since it would stop
+you and leave nothing to start the app again. For an app of the supervisor, both go through it: `down` marks the app
+down, so the supervisor does not start it again, and `fawkes up --manifest <name>` asks the supervisor to start it and
+returns once its daemon answers. To restart only the app, `fawkes restart`.
+
+To upgrade Fawkes itself: install the new release, then `fawkes reexec --all`. It moves the supervisor, then every
+daemon, onto the new binary with the same pids while every app keeps running (you included, so it may run from inside
+the app). A daemon with a pending switch or a step at work refuses and is skipped (`<app> skipped: …`, exit 1) while
+the others move: run it again once that app's switch is decided. `fawkes reexec` moves only your own daemon.
+`fawkes status --all` shows the supervisor and every app, one line each, with each daemon's version.
 
 ## Storage rolls back only through the app's hooks
 

@@ -38,7 +38,7 @@ fn fawkes_home_from(
 }
 
 /// A manifest in `home` must be `<name>.toml`: `--manifest <name>` finds an app there by its file name, and
-/// everything else (`watch`, `status`, the state directory, the service label) shows its `name`, so the two must agree.
+/// everything else (`watch`, `status`, the state directory, the supervisor's apps) shows its `name`, so the two must agree.
 fn named_after_its_file(path: &Path, name: &str, home: &Path) -> Result<(), String> {
     let (Some(dir), Ok(home)) = (path.parent(), home.canonicalize()) else {
         return Ok(());
@@ -671,6 +671,12 @@ impl Manifest {
     /// launchd's `ExitTimeOut` is derived from it, so the two cannot drift apart.
     pub fn shutdown_wait(&self) -> Duration {
         self.stop_timeout * 2 + Duration::from_secs(5)
+    }
+
+    /// The longest the daemon takes to end after SIGTERM: `shutdown_wait`, then `stop_timeout` of grace for the app.
+    /// launchd's `ExitTimeOut` and the supervisor's wait for its daemons on its way out are derived from it.
+    pub fn daemon_stop_wait(&self) -> Duration {
+        self.shutdown_wait() + self.stop_timeout
     }
 
     /// The files of `state_dir`.

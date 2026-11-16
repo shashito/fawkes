@@ -293,7 +293,7 @@ impl Daemon {
         let app = inner.take_running()?;
         let ran = app.started.elapsed();
         let m = self.manifest();
-        let pgid = app.child.id();
+        let pgid = app.process.id();
         let exit = LastExit::new(Some(status), false);
         // The crash count and the decision to roll back are one save. A reason decided earlier (a failed health
         // check) stays the reason.
@@ -356,7 +356,9 @@ impl Daemon {
     }
 
     fn is_running(&self, pid: u32) -> bool {
-        self.inner().running().is_some_and(|a| a.child.id() == pid)
+        self.inner()
+            .running()
+            .is_some_and(|a| a.process.id() == pid)
     }
 
     /// Start generation `id` on the live port. The caller holds `inner`, so nothing sees a half-started app.
@@ -417,6 +419,7 @@ impl Daemon {
         }
         inner.last_started = Some(id.into());
         inner.live = Live::Running(App::new(child, id));
+        inner.checking = Some(pid);
         self.update(&mut inner.store, |state| {
             if why != Why::Crash
                 && let Some(g) = state.find_mut(id)
@@ -468,6 +471,11 @@ impl Daemon {
                     daemon.event(EventKind::Unhealthy, Some(&id), e);
                 }
                 Err(_) => {}
+            }
+            let mut inner = daemon.inner();
+            // A later start's check is that start's to end.
+            if inner.checking == Some(pid) {
+                inner.checking = None;
             }
         });
         Ok(())
@@ -564,7 +572,7 @@ impl Daemon {
         // ended the check, and `reap` judges it with its own reason.
         if inner
             .running_mut()
-            .is_none_or(|app| app.child.id() != pid || app.exit_status().is_some())
+            .is_none_or(|app| app.process.id() != pid || app.exit_status().is_some())
         {
             return false;
         }
@@ -608,7 +616,7 @@ impl Daemon {
     /// Stop an app Fawkes owns and record that Fawkes asked for it.
     pub(super) fn stop_app(&self, mut app: App) {
         let m = self.manifest();
-        let status = process::stop_group(app.child.id(), m.stop_timeout, Some(&mut app.child));
+        let status = process::stop_group(app.process.id(), m.stop_timeout, Some(&mut app.process));
         self.forget_pid_file();
         self.inner().last_exit = Some(LastExit::new(status, true));
     }
@@ -629,7 +637,7 @@ impl Daemon {
             Live::Running(app) => (
                 ProcessState::Running,
                 Some(app.generation.clone()),
-                Some(app.child.id()),
+                Some(app.process.id()),
                 Some(app.started_at.clone()),
                 Some(tenths(app.started.elapsed())),
                 app.info.clone(),

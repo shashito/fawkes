@@ -27,7 +27,7 @@ import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent
 import { cloneGitDir, fawkesSettings, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
-import { parseVersion, RELEASES, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
+import { parseVersion, reexecCommand, RELEASES, releaseText, tagOf, upgradeCommand } from './release.ts'
 import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
@@ -102,7 +102,7 @@ type Shared = {
   upgrade?: Upgrade
   confirming?: Confirming
   behind?: Extract<FawkesState, { supervised: true }>['behind']
-  release?: Omit<Release, 'restart'>
+  release?: Omit<Release, 'reexec'>
   releaseRun?: Promise<void>
   /** When a scheduled fetch was last tried: a failed one (offline) is retried an interval later, not every tick. */
   fetchTried?: number
@@ -140,15 +140,8 @@ function state(host: ExtensionHost): Extract<FawkesState, { supervised: true }> 
     upgrade: s.upgrade,
     confirming: s.confirming,
     behind: s.behind,
-    release: s.release && s.status && { ...s.release, restart: daemonRestart(host, s.status) },
+    release: s.release && s.status && { ...s.release, reexec: reexecCommand(process.env.FAWKES_BIN, shellWord) },
   }
-}
-
-/** The command that restarts this daemon: its launchd agent's when `fawkes service install` wrote one, as `fawkes down` says. */
-function daemonRestart(host: ExtensionHost, status: Status) {
-  const plist = join(host.userHome, 'Library', 'LaunchAgents', `dev.fawkes.${status.name}.plist`)
-  const launchd = process.platform === 'darwin' && existsSync(plist)
-  return restartCommand(status.manifest ?? status.name, launchd, process.env.FAWKES_BIN, shellWord)
 }
 
 /**

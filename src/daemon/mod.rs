@@ -2,10 +2,10 @@
 //!
 //! Locking: `inner` holds everything that changes (state.json, the live process, the busy slots). It is never held
 //! across a slow step; stages, tests and stops run unlocked and take `inner` again to record their outcome.
-//! Lock order is `inner` before `manifest` before `log` before `hub` and `echo` (`step_pgids` and `downs` are only
-//! ever taken alone, and `wake` last, with nothing taken while it is held), and nothing waits for another thread while
-//! holding one. Events go to the hub and to stderr's queue while `log` is held, so every subscriber sees them once and
-//! in `seq` order. No thread that may hold a lock writes stderr: a thread of its own does (`Echo`).
+//! Lock order is `inner` before `manifest` before `log` before `hub` and `echo` (`step_pgids`, `downs` and `reexec`
+//! are only ever taken alone, and `wake` last, with nothing taken while it is held), and nothing waits for another
+//! thread while holding one. Events go to the hub and to stderr's queue while `log` is held, so every subscriber sees
+//! them once and in `seq` order. No thread that may hold a lock writes stderr: a thread of its own does (`Echo`).
 //!
 //! Neither the accept loop nor the supervisor polls: the accept loop sleeps in `poll(2)` on the socket and a pipe the
 //! signal handlers write to, and the supervisor sleeps on `wake` until something changes or its next timer runs out.
@@ -15,14 +15,15 @@
 //! switch, so no thread ever carries on past a broken invariant and no mutex is ever poisoned.
 
 mod lifecycle;
-mod server;
+mod reexec;
+pub(crate) mod server;
 mod supervisor;
 mod transactions;
 
 use server::{Admission, bind, refuse, register};
 
 use crate::manifest::{Manifest, Vars};
-use crate::process;
+use crate::process::{self, ChildPid, Waitable};
 use crate::protocol::{
     DaemonAction, DownResult, Error, ErrorCode, Event, EventKind, Facts, LastExit, Out, Pending, R,
     ReloadResult, RollbackCause, err,
@@ -39,7 +40,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -47,7 +48,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 /// Lock a mutex. Under `panic = "abort"` no mutex is ever poisoned, so the error arm cannot run.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|_| std::process::abort())
 }
 
@@ -60,7 +61,7 @@ fn tenths(duration: Duration) -> f64 {
 
 /// The app process Fawkes started and owns.
 struct App {
-    child: Child,
+    process: ChildPid,
     generation: String,
     started: Instant,
     started_at: String,
@@ -70,9 +71,9 @@ struct App {
 }
 
 impl App {
-    fn new(child: Child, generation: &str) -> App {
+    fn new(process: impl Into<ChildPid>, generation: &str) -> App {
         App {
-            child,
+            process: process.into(),
             generation: generation.into(),
             started: Instant::now(),
             started_at: now(),
@@ -86,7 +87,7 @@ impl App {
     /// without a status would be one nothing ever handles, while a pending generation that counts as running still
     /// rolls back at its deadline, or on a failed health check under `rollback_on_unhealthy`.
     fn exit_status(&mut self) -> Option<ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        self.process.try_wait().ok().flatten()
     }
 }
 
@@ -129,6 +130,8 @@ struct Inner {
     busy: Option<String>,
     /// A step that moves the live process (switch, rollback, start, stop, restart): one at a time.
     moving: Option<String>,
+    /// The pid of the live app whose health check after its start still runs, on a thread a `reexec` would end.
+    checking: Option<u32>,
 }
 
 impl Inner {
@@ -142,6 +145,7 @@ impl Inner {
             restarts: 0,
             busy: None,
             moving: None,
+            checking: None,
         }
     }
 
@@ -268,7 +272,7 @@ const LOG_BYTES: u64 = 10 << 20;
 const LOG_BYTES: u64 = 64;
 
 /// The longest request line a client may send, in bytes.
-const MAX_REQUEST: u64 = 64 * 1024;
+pub(crate) const MAX_REQUEST: u64 = 64 * 1024;
 
 /// How many messages a subscriber may fall behind before it is dropped.
 const SUBSCRIBER_QUEUE: usize = 1024;
@@ -297,20 +301,40 @@ const ECHO_QUEUE: usize = 1024;
 /// that fails (a closed terminal, a `| tee` that died) end it. Best effort: a line that cannot be written, or finds
 /// the queue full, is dropped, since `events.jsonl` is the record.
 ///
-/// When stderr is `<state_dir>/daemon.log` (a launchd service's, or a redirect to it), the thread also keeps that file
+/// When stderr is `<state_dir>/daemon.log` (the supervisor's, or a redirect to it), the thread also keeps that file
 /// under `LOG_BYTES`, as the supervisor does `app.log`. It is the file's only writer, so a line is never lost to the
-/// cap. Whoever started the daemon decides where stderr goes; the daemon only looks at what it is.
-struct Echo(SyncSender<String>);
+/// cap. Whoever started the daemon decides where stderr goes; the daemon only looks at what it is. The supervisor
+/// (`fleet`) writes its stderr through one too, capping `supervisor.log` the same way.
+#[derive(Clone)]
+pub(crate) struct Echo(SyncSender<Echoed>);
+
+/// What `Echo`'s thread is sent.
+pub(crate) enum Echoed {
+    Line(String),
+    /// Answer once every line queued before this one is written (`Daemon::flush_echo`).
+    Flush(mpsc::Sender<()>),
+}
 
 impl Echo {
     /// Start the thread that writes to `to`, capping it when it is the file `log`. It ends once the `Echo` is gone and
     /// what was queued is written, which disconnects the returned receiver.
-    fn start(mut to: impl Write + AsFd + Send + 'static, log: PathBuf) -> (Echo, Receiver<()>) {
-        let (lines, queued) = mpsc::sync_channel::<String>(ECHO_QUEUE);
+    pub(crate) fn start(
+        mut to: impl Write + AsFd + Send + 'static,
+        log: PathBuf,
+    ) -> (Echo, Receiver<()>) {
+        let (lines, queued) = mpsc::sync_channel::<Echoed>(ECHO_QUEUE);
         let (finished, ended) = mpsc::channel();
         thread::spawn(move || {
             let _finished = finished;
-            for line in queued {
+            for echoed in queued {
+                let line = match echoed {
+                    Echoed::Line(line) => line,
+                    Echoed::Flush(written) => {
+                        // The flusher may have given up waiting.
+                        let _ = written.send(());
+                        continue;
+                    }
+                };
                 // A failed write is no reason to stop: a terminal on hold takes lines again once it is released.
                 let _ = writeln!(to, "{line}");
                 // Best effort like the line itself: a log that cannot be capped goes on growing, and the next line
@@ -321,13 +345,23 @@ impl Echo {
         (Echo(lines), ended)
     }
 
-    fn line(&self, line: String) {
+    pub(crate) fn line(&self, line: String) {
         // Full only while stderr is stuck; the line is in `events.jsonl`.
-        let _ = self.0.try_send(line);
+        let _ = self.0.try_send(Echoed::Line(line));
+    }
+
+    /// Wait, for at most `FLUSH_FOR`, until the writer has written the lines queued so far. The caller holds no lock:
+    /// the writer may be stuck on a terminal on hold.
+    pub(crate) fn flush(&self) {
+        let (written, flushed) = mpsc::channel();
+        // A full queue means stderr is stuck: what is queued is in events.jsonl.
+        if self.0.try_send(Echoed::Flush(written)).is_ok() {
+            let _ = flushed.recv_timeout(FLUSH_FOR);
+        }
     }
 }
 
-/// When `to` is the file at `log` and has grown past `LOG_BYTES`, copy it to `daemon.log.1` (replacing the one before)
+/// When `to` is the file at `log` and has grown past `LOG_BYTES`, copy it to `<log>.1` (replacing the one before)
 /// and empty it. The seek puts the next line at the start whether or not the descriptor appends. A duplicate of the
 /// descriptor shares its offset, so it truncates and seeks `to` itself.
 fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
@@ -351,30 +385,30 @@ fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
 /// act on, and so do an exit of the live app, the start of shutdown and, during shutdown, the end of a connection
 /// (`Admission`). A waiter reads the count before it looks at the state, so a change made after the look ends the
 /// wait, and none is lost in between.
-struct Wake {
+pub(crate) struct Wake {
     count: Mutex<u64>,
     moved: Condvar,
 }
 
 impl Wake {
-    fn new() -> Wake {
+    pub(crate) fn new() -> Wake {
         Wake {
             count: Mutex::new(0),
             moved: Condvar::new(),
         }
     }
 
-    fn seen(&self) -> u64 {
+    pub(crate) fn seen(&self) -> u64 {
         *lock(&self.count)
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         *lock(&self.count) += 1;
         self.moved.notify_all();
     }
 
     /// Sleep until the count has moved past `seen`, or `timeout` has passed (without one, for as long as it takes).
-    fn wait(&self, seen: u64, timeout: Option<Duration>) {
+    pub(crate) fn wait(&self, seen: u64, timeout: Option<Duration>) {
         let count = lock(&self.count);
         let unmoved = |count: &mut u64| *count == seen;
         // Under `panic = "abort"` the mutex is never poisoned.
@@ -415,6 +449,12 @@ pub struct Daemon {
     downs: Mutex<Vec<Out>>,
     /// Connections that hold a place (`Admission`): every one but a stream's still owes its client an answer.
     open: AtomicUsize,
+    /// Whether `up` was given `--socket`, which a `reexec` passes on.
+    socket_given: bool,
+    /// A `reexec` that waits for `run` to replace the program; dropped when `run` gives up on it.
+    reexec: Mutex<Option<reexec::Reexec>>,
+    /// Set while `reexec_now` waits for the requests in flight, so that the end of each wakes it.
+    draining: AtomicBool,
 }
 
 /// How long a daemon shutting down waits, once its app has stopped, for the requests it is serving to send their
@@ -425,7 +465,7 @@ const ANSWER_WAIT: Duration = Duration::from_secs(2);
 /// How long the accept loop pauses after a failed `accept` or `poll`, so an error that persists does not spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
-/// How long a daemon on its way out waits for stderr to take its last lines.
+/// How long a daemon on its way out, or about to `reexec`, waits for stderr to take its last lines.
 const FLUSH_FOR: Duration = Duration::from_secs(1);
 
 /// Lets stderr's writer finish the queued lines (the last of them `stopped`, or why startup failed) when `run`
@@ -467,8 +507,13 @@ impl Drop for Published {
 // ------------------------------------------------------------ startup
 
 impl Daemon {
-    /// Run the daemon until SIGTERM or SIGINT.
-    pub fn run(manifest_path: PathBuf, socket: Option<PathBuf>) -> Result<(), String> {
+    /// Run the daemon until SIGTERM or SIGINT. `handover` is the JSON an earlier program of this process passed
+    /// before it re-executed (`reexec`): its state lock, socket and app are taken over instead of taken anew.
+    pub fn run(
+        manifest_path: PathBuf,
+        socket: Option<PathBuf>,
+        handover: Option<&str>,
+    ) -> Result<(), String> {
         // First of all, so a SIGTERM during startup still ends in `shutdown`'s cleanup. signal-hook installs them
         // with sigaction and SA_RESTART; the handlers set a flag, then write a byte to `signals` to wake the accept
         // loop. Actions run in the order they were registered, so a woken loop that has drained the pipe finds the
@@ -485,18 +530,26 @@ impl Daemon {
         }
         // `status` names it, and a reload reads it again whatever the working directory is by then.
         let manifest_path = std::path::absolute(manifest_path).map_err(|e| e.to_string())?;
+        let handover = handover.map(reexec::Handover::read).transpose()?;
         let manifest = Manifest::load(&manifest_path)?;
         let owner = rustix::process::geteuid().as_raw();
         let mut paths = manifest.paths();
         paths.root = private_state_dir(&paths.root, owner)?;
         owned_dir(&manifest.home, "home", owner)?;
-        let state_lock = lock_state_dir(&paths)?;
+        let state_lock = match &handover {
+            Some(handover) => handover.state_lock(&paths)?,
+            None => lock_state_dir(&paths)?,
+        };
         let log = EventLog::open(paths.events())
             .map_err(|e| format!("cannot open the event log: {e}"))?;
         log_panics(paths.events(), log.sequence());
+        let socket_given = socket.is_some();
         let socket = std::path::absolute(socket.unwrap_or_else(|| paths.socket()))
             .map_err(|e| e.to_string())?;
-        let listener = bind(&socket)?;
+        let listener = match &handover {
+            Some(handover) => handover.listener(&socket)?,
+            None => bind(&socket)?,
+        };
         // From here on every way out of `run`, a failed startup included, removes the socket and the run link.
         let mut published = Published {
             socket: socket.clone(),
@@ -524,26 +577,15 @@ impl Daemon {
             signalled,
             downs: Mutex::new(Vec::new()),
             open: AtomicUsize::new(0),
+            socket_given,
+            reexec: Mutex::new(None),
+            draining: AtomicBool::new(false),
         });
         let flush = Flush {
             daemon: daemon.clone(),
             finished: echo_finished,
         };
-        daemon.event_with(
-            EventKind::Daemon,
-            None,
-            format!(
-                "started, pid {}, socket {}",
-                std::process::id(),
-                daemon.socket.display()
-            ),
-            Facts {
-                action: Some(DaemonAction::Started),
-                pid: Some(std::process::id()),
-                version: Some(env!("CARGO_PKG_VERSION").into()),
-                ..Facts::default()
-            },
-        );
+        let taken_over = daemon.begin_program(handover.as_ref());
         if let Some(warning) = recovered {
             daemon.event(EventKind::Error, None, warning);
             // Write state.json again from its copy at once: until the next change the copy would be the only
@@ -551,37 +593,7 @@ impl Daemon {
             daemon.update(&mut daemon.inner().store, |_| ());
         }
 
-        // A crashed daemon leaves its app, and the install, test or hook it was running, behind. The state lock proves
-        // that daemon is gone, so what it started has no other supervisor; `leftover` makes sure the pid still names
-        // it. The steps go before the sweep removes the directory they run in, and a hook before the rollback below
-        // runs the restore again.
-        for (what, pid_file) in [
-            ("the app", daemon.paths.app_pid()),
-            (
-                "the install, test or test_copy hook",
-                daemon.paths.step_pid(),
-            ),
-            ("the snapshot or restore hook", daemon.paths.hook_pid()),
-        ] {
-            if let Some(pid) = process::leftover(&pid_file) {
-                process::stop_group(pid, daemon.manifest().stop_timeout, None);
-                daemon.event_with(
-                    EventKind::Daemon,
-                    None,
-                    format!("stopped {what} (pid {pid}) left by an earlier daemon"),
-                    Facts {
-                        action: Some(DaemonAction::CleanedUp),
-                        pid: Some(pid),
-                        ..Facts::default()
-                    },
-                );
-            }
-        }
-        // Each was stopped or is stale. The app's goes before `start_permanent` writes a new one.
-        daemon.forget_pid_file();
-        daemon.forget_step_pid_file();
-        // Best effort, as for `step.pid`: `leftover` never mistakes a stale file for a live hook.
-        let _ = std::fs::remove_file(daemon.paths.hook_pid());
+        daemon.clean_up_leftovers();
         daemon.sweep_generations();
 
         // What the last daemon was doing when it ended, from the step it saved before each side effect. A
@@ -597,6 +609,8 @@ impl Daemon {
         match txn {
             // Adopted below, once the socket serves.
             None if adopt => {}
+            // Running, stopped or given up on, as the program before this one left it.
+            None if taken_over => {}
             None => daemon.start_permanent(),
             Some(Txn::Switching { generation, .. }) => {
                 daemon.event_with(
@@ -629,7 +643,16 @@ impl Daemon {
             daemon.adopt_beside_serve(not_adopted.clone());
         }
 
-        daemon.serve(&listener, signals)?;
+        loop {
+            daemon.serve(&listener, &signals)?;
+            // Taken before a shutdown, which waits for the live slot that `reexec` holds until this is dropped.
+            let reexec = lock(&daemon.reexec).take();
+            let Some(reexec) = reexec.filter(|_| !daemon.shutting_down()) else {
+                break;
+            };
+            // Returns only when the exec failed; the daemon then serves on.
+            daemon.reexec_now(&reexec, &state_lock, &listener);
+        }
         let down = daemon.shutdown();
         let downs = std::mem::take(&mut *lock(&daemon.downs));
         // `down` is answered once stderr has its last lines and the socket, its run link and the state lock are let
@@ -648,6 +671,11 @@ impl Daemon {
     /// shutdown and the cleanup on the way out of `run` are those of any other end.
     fn end(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.wake_serve();
+    }
+
+    /// End `serve`'s sleep, so it looks at the flags again.
+    fn wake_serve(&self) {
         // A pipe too full to take the byte holds others that wake `serve` as well.
         let _ = (&self.signalled).write_all(&[0]);
     }
@@ -684,19 +712,21 @@ impl Daemon {
         });
     }
 
-    /// Accept clients and act on SIGHUP until SIGTERM or SIGINT, asleep in `poll` in between.
+    /// Accept clients and act on SIGHUP until SIGTERM or SIGINT, or a `reexec` that has answered, asleep in `poll` in
+    /// between.
     fn serve(
         self: &Arc<Self>,
         listener: &UnixListener,
-        mut signals: UnixStream,
+        signals: &UnixStream,
     ) -> Result<(), String> {
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         signals.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let mut pipe = signals;
         loop {
             // Drained before the flags are read: a signal that comes after the drain leaves a byte that ends the
             // next `poll` at once.
-            while signals.read(&mut [0; 64]).is_ok_and(|n| n > 0) {}
-            if self.shutting_down() {
+            while pipe.read(&mut [0; 64]).is_ok_and(|n| n > 0) {}
+            if self.shutting_down() || lock(&self.reexec).is_some() {
                 return Ok(());
             }
             if self.reload.swap(false, Ordering::SeqCst) {
@@ -705,6 +735,12 @@ impl Daemon {
             }
             let failed = match listener.accept() {
                 Ok((stream, _)) => {
+                    if lock(&self.reexec).is_some() {
+                        // Accepted after a `reexec` answered, so maybe the `status` that confirms it, which only the
+                        // program after the exec may answer: closed, as the exec would, and its client asks again.
+                        drop(stream);
+                        return Ok(());
+                    }
                     // Taken before anything is read, so a client that sends nothing still holds its place.
                     match Admission::take(self) {
                         Some(admitted) => {
@@ -718,7 +754,7 @@ impl Daemon {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     let mut ready = [
                         PollFd::new(listener, PollFlags::IN),
-                        PollFd::new(&signals, PollFlags::IN),
+                        PollFd::new(signals, PollFlags::IN),
                     ];
                     match poll(&mut ready, None) {
                         Ok(_) | Err(rustix::io::Errno::INTR) => None,
@@ -1095,6 +1131,73 @@ impl Daemon {
         }
     }
 
+    /// Log how this program of the daemon began. One that re-executed carries on with what the one before had
+    /// (`take_over`), and true says it did, so it starts no app; the rest of startup is that of any other.
+    fn begin_program(self: &Arc<Self>, handover: Option<&reexec::Handover>) -> bool {
+        if let Some(handover) = handover {
+            return self.take_over(handover);
+        }
+        self.event_with(
+            EventKind::Daemon,
+            None,
+            format!(
+                "started, pid {}, socket {}",
+                std::process::id(),
+                self.socket.display()
+            ),
+            Facts {
+                action: Some(DaemonAction::Started),
+                pid: Some(std::process::id()),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+                ..Facts::default()
+            },
+        );
+        false
+    }
+
+    /// A crashed daemon leaves its app, and the install, test or hook it was running, behind. The state lock proves
+    /// that daemon is gone, so what it started has no other supervisor; `leftover` makes sure the pid still names it.
+    /// The steps go before the sweep removes the directory they run in, and a hook before the rollback at startup runs
+    /// the restore again. An app taken over is this daemon's own, and its pid file stays.
+    fn clean_up_leftovers(&self) {
+        let kept_app = self.inner().running().is_some();
+        let apps = (!kept_app).then(|| ("the app", self.paths.app_pid()));
+        for (what, pid_file) in apps.into_iter().chain([
+            ("the install, test or test_copy hook", self.paths.step_pid()),
+            ("the snapshot or restore hook", self.paths.hook_pid()),
+        ]) {
+            if let Some(pid) = process::leftover(&pid_file) {
+                process::stop_group(pid, self.manifest().stop_timeout, None);
+                self.event_with(
+                    EventKind::Daemon,
+                    None,
+                    format!("stopped {what} (pid {pid}) left by an earlier daemon"),
+                    Facts {
+                        action: Some(DaemonAction::CleanedUp),
+                        pid: Some(pid),
+                        ..Facts::default()
+                    },
+                );
+            }
+        }
+        // Each was stopped or is stale. The app's goes before `start_permanent` writes a new one.
+        if !kept_app {
+            self.forget_pid_file();
+        }
+        self.forget_step_pid_file();
+        // Best effort, as for `step.pid`: `leftover` never mistakes a stale file for a live hook.
+        let _ = std::fs::remove_file(self.paths.hook_pid());
+    }
+
+    /// Wait, for at most `FLUSH_FOR`, until stderr's writer has written the lines queued so far. Nothing is held
+    /// meanwhile: the writer may be stuck on a terminal on hold.
+    fn flush_echo(&self) {
+        let echo = lock(&self.echo).clone();
+        if let Some(echo) = echo {
+            echo.flush();
+        }
+    }
+
     /// An `error` event for a failure that has an `ErrorCode`, which it carries as `error_code`.
     fn error_event(&self, error: &Error) {
         self.event_with(
@@ -1220,6 +1323,9 @@ mod tests {
             signalled: UnixStream::pair().unwrap().0,
             downs: Mutex::new(Vec::new()),
             open: AtomicUsize::new(0),
+            socket_given: false,
+            reexec: Mutex::new(None),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -1256,7 +1362,7 @@ mod tests {
     }
 
     /// `daemon.log` as the daemon's stderr moves to `daemon.log.1` past the cap, whole, and starts over, whether its
-    /// descriptor appends (launchd's) or not (`2> daemon.log`); a stderr that is another file is left alone.
+    /// descriptor appends (the supervisor's) or not (`2> daemon.log`); a stderr that is another file is left alone.
     #[test]
     fn a_daemon_log_over_the_cap_moves_to_daemon_log_1_and_starts_over() {
         let temp = tempfile::tempdir().unwrap();

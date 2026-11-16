@@ -35,7 +35,7 @@ impl Daemon {
         if let Some(app) = inner.running() {
             return Err(invalid_state(format!(
                 "{id} is already running (pid {}); `fawkes restart` restarts it",
-                app.child.id()
+                app.process.id()
             ))
             .about(&id));
         }

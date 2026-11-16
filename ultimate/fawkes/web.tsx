@@ -14,7 +14,7 @@ import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { actionRef, api, cn, defineWebExtension, formatAgo, useAction, useNow } from '@/sdk'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
-import { releaseNote, RESTART_WHEN } from './release.ts'
+import { REEXEC_WHEN, releaseNote } from './release.ts'
 import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
 import type { FawkesState, Generation, SetupPreview, SetupStep, Upgrade } from './types.ts'
 
@@ -162,7 +162,7 @@ function Command({ text }: { text: string }) {
   )
 }
 
-/** A newer Fawkes: the command that installs it, then the daemon restart that runs it; or only the restart. */
+/** A newer Fawkes: the command that installs it, then the re-exec that runs it; or only the re-exec. */
 function ReleaseRow({ state }: { state: Supervised }) {
   const note = releaseNote(state.release, state.status)
   if (!note || !state.release) return null
@@ -175,9 +175,9 @@ function ReleaseRow({ state }: { state: Supervised }) {
       </div>
       {note.kind === 'available' && <Command text={state.release.command} />}
       <div className="mt-1 text-muted-foreground">
-        {note.kind === 'available' ? 'Then restart' : 'Restart'} the daemon {RESTART_WHEN}:
+        {note.kind === 'available' ? 'Then move' : 'Move'} the daemons onto it {REEXEC_WHEN}:
       </div>
-      <Command text={state.release.restart} />
+      <Command text={state.release.reexec} />
     </div>
   )
 }

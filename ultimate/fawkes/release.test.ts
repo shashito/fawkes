@@ -1,10 +1,10 @@
 /**
  * The release check decided from the tag GitHub's redirect names and the daemon's and the installed binary's
- * versions: when a release is newer, when only a restart is due, and when there is nothing to say.
+ * versions: when a release is newer, when only a re-exec is due, and when there is nothing to say.
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { INSTALL_LINE, newer, releaseNote, releaseText, restartCommand, tagOf, upgradeCommand } from './release.ts'
+import { INSTALL_LINE, newer, reexecCommand, releaseNote, releaseText, tagOf, upgradeCommand } from './release.ts'
 import { shellWord } from './setup.ts'
 import type { Release, Status } from './types.ts'
 
@@ -15,7 +15,7 @@ const release = (latest: string | null, installed?: string): Release => ({
   latest,
   installed,
   command: INSTALL_LINE,
-  restart: 'fawkes down --manifest /Users/me/.fawkes/xana.toml && fawkes up --manifest /Users/me/.fawkes/xana.toml',
+  reexec: 'fawkes reexec --all',
   checkedAt: 1,
 })
 
@@ -45,20 +45,20 @@ test('a newer release than the installed binary names the command, then the rest
   })
   assert.equal(
     releaseText(release('v0.2.0', '0.1.0'), status('0.1.0')),
-    `Fawkes 0.2.0 is available (the daemon runs 0.1.0): upgrade with \`${INSTALL_LINE}\`, then restart the daemon from a shell outside this Ultimate, once no switch is pending (a daemon restart rolls it back): \`fawkes down --manifest /Users/me/.fawkes/xana.toml && fawkes up --manifest /Users/me/.fawkes/xana.toml\`.`,
+    `Fawkes 0.2.0 is available (the daemon runs 0.1.0): upgrade with \`${INSTALL_LINE}\`, then move the daemons onto it once no switch is pending; every app keeps running: \`fawkes reexec --all\`.`,
   )
   // Without the installed version, the daemon's stands in.
   assert.equal(releaseNote(release('v0.2.0'), status('0.1.0'))?.kind, 'available')
 })
 
-test('an installed binary newer than the daemon asks only for the restart', () => {
+test('an installed binary newer than the daemon asks only for the re-exec', () => {
   assert.deepEqual(releaseNote(release('v0.2.0', '0.2.0'), status('0.1.0')), {
-    kind: 'restart',
+    kind: 'reexec',
     version: '0.2.0',
     daemon: '0.1.0',
   })
   // Offline: GitHub never answered, the installed binary still says it.
-  assert.equal(releaseNote(release(null, '0.2.0'), status('0.1.0'))?.kind, 'restart')
+  assert.equal(releaseNote(release(null, '0.2.0'), status('0.1.0'))?.kind, 'reexec')
 })
 
 test('nothing to say when up to date, without a release, or ahead of it', () => {
@@ -69,19 +69,13 @@ test('nothing to say when up to date, without a release, or ahead of it', () => 
   assert.equal(releaseNote(undefined, status('0.1.0')), undefined)
 })
 
-test('the commands fit the install: curl or a rebuild, launchd or down and up', () => {
+test('the commands fit the install: curl or a rebuild, then the re-exec with the daemon binary', () => {
   assert.equal(upgradeCommand(undefined, shellWord), INSTALL_LINE)
   assert.equal(
     upgradeCommand('/Users/me/Code/my fawkes', shellWord),
     "cd '/Users/me/Code/my fawkes' && git pull && cargo install --path . --locked",
   )
-  assert.equal(
-    restartCommand('/m/xana.toml', true, '/u/.local/bin/fawkes', shellWord),
-    'fawkes service restart --manifest /m/xana.toml',
-  )
-  assert.equal(
-    restartCommand('xana', false, '/u/.local/bin/fawkes', shellWord),
-    '/u/.local/bin/fawkes down --manifest xana && /u/.local/bin/fawkes up --manifest xana',
-  )
-  assert.equal(restartCommand('xana', false, undefined, shellWord), 'fawkes down --manifest xana && fawkes up --manifest xana')
+  assert.equal(reexecCommand('/u/.local/bin/fawkes', shellWord), '/u/.local/bin/fawkes reexec --all')
+  assert.equal(reexecCommand('/u/my bin/fawkes', shellWord), "'/u/my bin/fawkes' reexec --all")
+  assert.equal(reexecCommand(undefined, shellWord), 'fawkes reexec --all')
 })

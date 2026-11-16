@@ -227,6 +227,8 @@ pub enum Request {
     /// Stop the app and end the daemon, as SIGTERM does; answered once the daemon has let go of its socket and state
     /// lock.
     Down,
+    /// Run the daemon on the binary installed at its path, in place (same pid), keeping the app running.
+    Reexec,
 }
 
 /// What a client sends, before its arguments are checked.
@@ -282,6 +284,7 @@ impl Request {
                 since: optional_count(&args, "since")?,
             },
             "down" => Request::Down,
+            "reexec" => Request::Reexec,
             other => {
                 return Err(err(ErrorCode::Usage, format!("unknown command `{other}`")));
             }
@@ -307,6 +310,7 @@ impl Request {
             Request::Log { .. } => "log",
             Request::Subscribe { .. } => "subscribe",
             Request::Down => "down",
+            Request::Reexec => "reexec",
         }
     }
 
@@ -369,9 +373,73 @@ impl Serialize for Request {
             | Request::Status
             | Request::History
             | Request::Reload
-            | Request::Down => json!({}),
+            | Request::Down
+            | Request::Reexec => json!({}),
         };
         let mut envelope = serializer.serialize_struct("Request", 2)?;
+        envelope.serialize_field("command", self.command())?;
+        envelope.serialize_field("args", &args)?;
+        envelope.end()
+    }
+}
+
+/// A request to the supervisor (`fawkes up --all`) on `<fawkes_home>/supervisor.sock`, in the same envelope as
+/// `Request`, answered with the same lines: `{"command": "start", "args": {"app": "xana"}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetRequest {
+    /// The supervisor and every app it knows.
+    Status,
+    /// Clear the app's down mark and start its daemon unless it runs; answered once the daemon answers.
+    Start { app: String },
+    /// Mark the app down, then end its daemon (`Request::Down`).
+    Down { app: String },
+    /// Run the supervisor on the binary installed at its path, in place, keeping every daemon running.
+    Reexec,
+}
+
+impl FleetRequest {
+    /// Read one request line; every failure is a `usage` error, as for `Request::parse`.
+    pub fn parse(line: &str) -> R<FleetRequest> {
+        let Envelope { command, args } = serde_json::from_str(line)
+            .map_err(|e| err(ErrorCode::Usage, format!("malformed request: {e}")))?;
+        Ok(match command.as_str() {
+            "status" => FleetRequest::Status,
+            "start" => FleetRequest::Start {
+                app: required(&args, "app")?,
+            },
+            "down" => FleetRequest::Down {
+                app: required(&args, "app")?,
+            },
+            "reexec" => FleetRequest::Reexec,
+            other => {
+                return Err(err(
+                    ErrorCode::Usage,
+                    format!(
+                        "the supervisor has no command `{other}`; it takes status, start, down and reexec"
+                    ),
+                ));
+            }
+        })
+    }
+
+    /// The `command` of the request on the wire.
+    pub fn command(&self) -> &'static str {
+        match self {
+            FleetRequest::Status => "status",
+            FleetRequest::Start { .. } => "start",
+            FleetRequest::Down { .. } => "down",
+            FleetRequest::Reexec => "reexec",
+        }
+    }
+}
+
+impl Serialize for FleetRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let args = match self {
+            FleetRequest::Start { app } | FleetRequest::Down { app } => json!({ "app": app }),
+            FleetRequest::Status | FleetRequest::Reexec => json!({}),
+        };
+        let mut envelope = serializer.serialize_struct("FleetRequest", 2)?;
         envelope.serialize_field("command", self.command())?;
         envelope.serialize_field("args", &args)?;
         envelope.end()
@@ -805,6 +873,8 @@ pub enum DaemonAction {
     Deferred,
     /// A first daemon start stages and tests HEAD to adopt it (`adopt` in the manifest).
     Adopting,
+    /// The daemon runs on a new binary in the same process (`reexec`), with the app it had.
+    Reexecuted,
     /// An action a newer daemon logs that this client does not know. Decode-only.
     #[serde(other)]
     Unknown,
@@ -830,7 +900,7 @@ pub enum StorageOutcome {
 /// of the JSON when absent, so an old reader ignores what it does not know and a line written before still loads.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Facts {
-    /// `started`, `daemon` (`started`): the process id.
+    /// `started`, `daemon` (`started`, `reexecuted`): the process id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     /// `started`, `tested`, `test_failed`.
@@ -881,7 +951,7 @@ pub struct Facts {
     /// `daemon`: what happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<DaemonAction>,
-    /// `daemon` (`started`): the daemon's version.
+    /// `daemon` (`started`, `reexecuted`): the daemon's version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     /// `daemon` (`reloaded`): the manifest fields that changed.
@@ -1102,6 +1172,15 @@ pub struct DownResult {
     pub stopped: Option<String>,
 }
 
+/// The result of `reexec`, sent before the daemon replaces its program: the daemon's pid, which stays, and the
+/// versions of the binary it ran and of the one it moves onto.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReexecResult {
+    pub pid: u32,
+    pub from: String,
+    pub to: String,
+}
+
 /// The result of `prune`: the generation ids removed (oldest first) and those kept.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PruneResult {
@@ -1109,7 +1188,109 @@ pub struct PruneResult {
     pub kept: Vec<String>,
 }
 
-/// The result of any command, as the daemon sends it.
+/// What the supervisor knows of one app's daemon (`FleetApp::state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppState {
+    /// Its daemon runs as the supervisor's child.
+    Running,
+    /// Its daemon runs, but not as the supervisor's child: another process holds its state lock.
+    Attached,
+    /// Its daemon failed and starts again at `restart_at`.
+    Backoff,
+    /// It was brought down (`fawkes down`, or its daemon ended by itself) and stays down until `fawkes up`.
+    Down,
+    /// Its manifest is invalid; it starts once the manifest changes.
+    Broken,
+    /// A state a newer supervisor reports that this client does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One app of the supervisor's `status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetApp {
+    pub name: String,
+    pub manifest: PathBuf,
+    pub state: AppState,
+    /// The daemon's pid, running or attached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid: Option<u32>,
+    /// When a daemon in backoff starts again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_at: Option<String>,
+    /// The failed exits since the daemon last ran for a minute.
+    pub failures: u32,
+}
+
+/// The result of the supervisor's `status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetStatus {
+    pub pid: u32,
+    pub version: String,
+    pub socket: PathBuf,
+    pub apps: Vec<FleetApp>,
+}
+
+/// The result of the supervisor's `start`: the daemon that answers, and whether it ran already.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartResult {
+    pub app: String,
+    pub daemon_pid: u32,
+    pub already: bool,
+}
+
+/// The result of the supervisor's `down`: the daemon's own `DownResult`, with `daemon_pid` null when no daemon
+/// answered (it was not running). The app stays down either way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetDownResult {
+    pub name: String,
+    pub daemon_pid: Option<u32>,
+    pub stopped: Option<String>,
+}
+
+/// The result of `fawkes status --all`, which the client puts together: the supervisor's `status`, null when none
+/// answers, and every app of `<fawkes_home>` by name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetView {
+    pub supervisor: Option<FleetStatus>,
+    pub apps: Vec<FleetAppView>,
+}
+
+/// One app of `status --all`: what the supervisor knows of it (null when it is not one of the supervisor's, or none
+/// answers), and its daemon's `status`, or the error that took its place (`daemon_unreachable`, `no_answer`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetAppView {
+    pub name: String,
+    pub supervisor: Option<FleetApp>,
+    pub status: Option<Status>,
+    pub error: Option<Error>,
+}
+
+/// The result of `fawkes reexec --all`: the supervisor's `reexec`, null when none answers, then each app's whose daemon
+/// answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetReexec {
+    pub supervisor: Option<SupervisorReexec>,
+    pub apps: Vec<AppReexec>,
+}
+
+/// The supervisor's part of `reexec --all`: its result once it answers on the new binary, or why it did not move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorReexec {
+    pub result: Option<ReexecResult>,
+    pub error: Option<Error>,
+}
+
+/// One app's part of `reexec --all`: its daemon's result once it answers on the new binary, or why it did not move.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppReexec {
+    pub name: String,
+    pub result: Option<ReexecResult>,
+    pub error: Option<Error>,
+}
+
+/// The result of any command, as the daemon or the supervisor sends it.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum Reply {
@@ -1125,6 +1306,10 @@ pub enum Reply {
     Reload(ReloadResult),
     Report(ReportResult),
     Down(DownResult),
+    Reexec(ReexecResult),
+    Fleet(FleetStatus),
+    Start(StartResult),
+    FleetDown(FleetDownResult),
     /// A stream (`log --follow`, `subscribe`) has ended: its result is null.
     Streamed,
 }
@@ -1152,6 +1337,10 @@ reply_from!(
     Reload(ReloadResult),
     Report(ReportResult),
     Down(DownResult),
+    Reexec(ReexecResult),
+    Fleet(FleetStatus),
+    Start(StartResult),
+    FleetDown(FleetDownResult),
 );
 
 /// One line of a response. The daemon writes it with `T` the `Reply`; a client reads it with `T` a `Value` and
@@ -1381,6 +1570,7 @@ mod tests {
             ("status", Request::Status),
             ("history", Request::History),
             ("down", Request::Down),
+            ("reexec", Request::Reexec),
         ] {
             for args in ["", r#","args":null"#, r#","args":{}"#, r#","args":{"x":1}"#] {
                 let line = format!(r#"{{"command":"{name}"{args}}}"#);
@@ -1662,6 +1852,7 @@ mod tests {
         );
         assert_eq!(wire(Request::Reload), r#"{"command":"reload","args":{}}"#);
         assert_eq!(wire(Request::Down), r#"{"command":"down","args":{}}"#);
+        assert_eq!(wire(Request::Reexec), r#"{"command":"reexec","args":{}}"#);
         // What is written is read back as the same request.
         for request in [
             Request::Confirm { generation: None },
