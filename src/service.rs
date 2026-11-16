@@ -17,9 +17,6 @@ pub enum Action {
     Restart,
 }
 
-/// The agent's label.
-pub const LABEL: &str = "dev.fawkes";
-
 /// Do `action` for the supervisor of the apps in `home`: the JSON result, and its text for a person.
 #[cfg(not(target_os = "macos"))]
 pub fn run(
@@ -38,7 +35,7 @@ pub use launchd::run;
 
 #[cfg(target_os = "macos")]
 mod launchd {
-    use super::{Action, LABEL};
+    use super::Action;
     use crate::discovery;
     use crate::fleet;
     use crate::manifest::Manifest;
@@ -53,6 +50,8 @@ mod launchd {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    /// The agent's label.
+    const LABEL: &str = "dev.fawkes";
     /// Slack on top of the supervisor's `ExitTimeOut` for `launchctl`, which `bootout` makes wait until it is gone.
     const LAUNCHCTL_SLACK: u64 = 30;
     /// How long a daemon may take to stop beyond its own bound (`Manifest::daemon_stop_wait`) before launchd sends the
