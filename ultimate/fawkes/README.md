@@ -281,7 +281,10 @@ from fields), `release.test.ts` (versions, the redirect's tag and what the popov
 `fetchEvery` setting and the shared `FETCH_HEAD` gate, on a clone with a local bare `origin`), `tasks.test.ts` (the
 `afterUpgrade` and `autofix` settings, claims and locks, the install time, the reviewed tips on a real repository, the autofix
 decision, the texts and who owns an extension's folder) and the rest, and
-type-checks both facets against the clone in `$ULTIMATE` (default `~/Code/ultimate`).
+type-checks both facets against an Ultimate checkout: `$ULTIMATE`, else `ultimateCheck` in the repository's
+`.ultimate/settings.json` (a path, or `live` for the generation the reachable Fawkes daemon runs, falling back to
+`~/Code/ultimate` with a note), else `~/Code/ultimate`; `ultimate/check --which` prints it. The lander and
+`scripts/check` run it when `ultimate/` differs from `main`.
 
 ## Storage hooks
 

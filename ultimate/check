@@ -1,11 +1,63 @@
 #!/bin/sh
 # Checks the Ultimate extension in ultimate/fawkes: runs its tests, then type-checks its server and web facets against
-# the Ultimate clone it runs in ($ULTIMATE, default ~/Code/ultimate). Ultimate's own checks never see this folder, so
-# run it after changing the extension and before an upgrade. Exits non-zero on the first failure.
+# an Ultimate checkout with node_modules. Ultimate's own checks never see this folder, so run it after changing the
+# extension and before an upgrade. Exits non-zero on the first failure.
+#
+#   ultimate/check           run the checks
+#   ultimate/check --which   print the Ultimate it would check against, and run nothing
+#
+# The Ultimate is $ULTIMATE when it is set, else "ultimateCheck" in .ultimate/settings.json (scripts/check and the
+# lander read it from there too): a path ("~/" allowed), or "live" for the generation the Fawkes daemon this shell
+# reaches runs (`fawkes status --json`, its <state_dir>/current), which falls back to ~/Code/ultimate with a note when
+# that daemon or folder is not there. Without either, ~/Code/ultimate.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
-ultimate=${ULTIMATE:-$HOME/Code/ultimate}
-[ -d "$ultimate/node_modules" ] || { echo "No Ultimate clone with node_modules at $ultimate; set ULTIMATE" >&2; exit 1; }
+
+# The configured Ultimate, notes on stderr.
+target() {
+	if [ -n "${ULTIMATE:-}" ]; then
+		echo "$ULTIMATE"
+		return
+	fi
+	clone=$HOME/Code/ultimate
+	setting=$(node -e '
+		const fs = require("fs")
+		try { process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).ultimateCheck ?? "") }
+		catch (error) { if (error.code !== "ENOENT") throw error }' "$here/../.ultimate/settings.json")
+	case $setting in
+	"") echo "$clone" ;;
+	live)
+		state_dir=$("${FAWKES_BIN:-fawkes}" status --json 2>/dev/null | node -e '
+			let text = ""
+			process.stdin.on("data", (chunk) => (text += chunk)).on("end", () => {
+				try { process.stdout.write(JSON.parse(text).state_dir ?? "") } catch {}
+			})') || true
+		if [ -n "$state_dir" ] && [ -d "$state_dir/current/node_modules" ]; then
+			echo "$state_dir/current"
+		else
+			echo "No live Fawkes generation with node_modules (fawkes status --json); checking $clone" >&2
+			echo "$clone"
+		fi
+		;;
+	\~/*) echo "$HOME/${setting#\~/}" ;;
+	*) echo "$setting" ;;
+	esac
+}
+
+ultimate=$(target)
+case ${1:-} in
+"") ;;
+--which)
+	echo "$ultimate"
+	exit 0
+	;;
+*)
+	echo "usage: ultimate/check [--which]" >&2
+	exit 2
+	;;
+esac
+[ -d "$ultimate/node_modules" ] || { echo "No Ultimate with node_modules at $ultimate; set ULTIMATE or ultimateCheck in .ultimate/settings.json" >&2; exit 1; }
+echo "== against $ultimate"
 
 echo "== tests"
 ULTIMATE="$ultimate" node --test "$here"/fawkes/*.test.ts
