@@ -1,5 +1,6 @@
 {
   "extensions": { "disable": ["sentry"] },
+  "ultimateCheck": "~/Code/ultimate",
   "isolates": {
     "worktree": {
       "setup": [
@@ -13,6 +14,10 @@
       { "command": "cargo fmt --check", "timeout": 60 },
       { "command": "scripts/lint", "timeout": 60 },
       { "command": "cargo deny check", "timeout": 120 },
+      {
+        "command": "if git diff --quiet main HEAD -- ultimate/; then echo 'ultimate/ unchanged from main: skipped'; else ultimate/check; fi",
+        "timeout": 120
+      },
       { "command": "cargo clippy --all-targets -- -D warnings", "timeout": 300 },
       {
         "command": "d=$(mktemp -d /tmp/fkl.XXXXXX) && TMPDIR=\"$d\" cargo test; s=$?; rm -rf \"$d\"; exit $s",

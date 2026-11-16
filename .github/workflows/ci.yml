@@ -2,7 +2,7 @@
 # before it builds.
 #
 # Left out: ultimate/check, the Ultimate extension's tests and type checks, which need a full Ultimate clone with its
-# node_modules.
+# node_modules. scripts/check skips it here without one; the lander runs it when ultimate/ changes.
 
 name: CI
 
