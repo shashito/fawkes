@@ -171,10 +171,10 @@ export type SetupPreview = {
 /**
  * The last release check (`release.ts`): the newest release's tag (null when there is none, or GitHub has not answered
  * yet), the version of the binary the daemon was started from as it is installed now (absent when it could not be run),
- * the command that upgrades this install, the one that restarts the daemon, and when GitHub last answered (0 before it
+ * the command that upgrades this install, the one that moves the daemons onto it (`fawkes reexec --all`), and when GitHub last answered (0 before it
  * has).
  */
-export type Release = { latest: string | null; installed?: string; command: string; restart: string; checkedAt: number }
+export type Release = { latest: string | null; installed?: string; command: string; reexec: string; checkedAt: number }
 
 /** One thing the user does in a terminal; `command` has a copy button. */
 export type SetupStep = { label: string; command?: string }
