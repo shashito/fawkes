@@ -1,4 +1,4 @@
-# The lander's checks (fmt, scripts, deny, clippy, test) through scripts/check, on macOS and Linux. release.yml runs them too,
+# The lander's checks (fmt, scripts, deny, clippy, Linux clippy, test) through scripts/check, on macOS and Linux. release.yml runs them too,
 # before it builds.
 #
 # Left out: ultimate/check, the Ultimate extension's tests and type checks, which need a full Ultimate clone with its

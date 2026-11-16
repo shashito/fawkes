@@ -15,11 +15,13 @@ cargo test
 ```
 
 All three are clean on `main`. Treat any warning or failure as yours: don't assume it was already there.
-`scripts/check` runs these, `cargo deny check` and `scripts/lint` (shellcheck on every shell script, actionlint on
-the workflows; skipped without the tools) in the lander's order, keeps cargo's exit code and prints only a
-failing step's output; `scripts/check --only <test>` runs fmt, clippy and one test. When `ultimate/` differs from
-`main`, both also run `ultimate/check` (the Ultimate extension's tests and type checks; `scripts/check` skips it
-without an Ultimate, as in CI). It checks against `$ULTIMATE`, else `ultimateCheck` in `.ultimate/settings.json`: a
+`scripts/check` runs these, clippy again for Linux (`--target x86_64-unknown-linux-gnu`, right after the macOS
+clippy: it catches lints in code behind a cfg for one OS; rustup installs the target from `rust-toolchain.toml`),
+`cargo deny check` and `scripts/lint` (shellcheck on every shell script, actionlint on the workflows; skipped
+without the tools) in the lander's order, keeps cargo's exit code and prints only a failing step's output;
+`scripts/check --only <test>` runs fmt, both clippies and one test. When `ultimate/` differs from `main`, both
+also run `ultimate/check` (the Ultimate extension's tests and type checks; `scripts/check` skips it without an
+Ultimate, as in CI). It checks against `$ULTIMATE`, else `ultimateCheck` in `.ultimate/settings.json`: a
 path (`~/Code/ultimate`), or `live` for the generation the hosts run; `ultimate/check --which` prints the choice.
 
 - Run the narrowest test first (`cargo test --test core <name>`, `cargo test watch::`), then the whole suite.

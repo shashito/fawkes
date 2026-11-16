@@ -1,14 +1,19 @@
 #!/bin/sh
 # Run the lander's checks, in the lander's order, and print one line per step.
 #
-#   scripts/check                   fmt, scripts, deny, ultimate, clippy, test
-#   scripts/check --only <test>     fmt, clippy, and only the tests matching <test>
+#   scripts/check                   fmt, scripts, deny, ultimate, clippy, linux, test
+#   scripts/check --only <test>     fmt, clippy, linux, and only the tests matching <test>
 #
 # A failing step prints only its relevant output (for the tests, the failing tests and their panics) and the
 # script exits with that step's exit code, so nothing needs to be piped through grep or tail.
 #
 # The tests run with TMPDIR set to a short directory under /tmp: a test that binds a Unix socket under a long
 # TMPDIR exceeds the socket path limit (104 bytes on macOS).
+#
+# The linux step runs clippy for x86_64-unknown-linux-gnu, so code behind a cfg for one OS cannot leave the other's
+# build with a lint (dead code, unused imports). Clippy only type-checks, so no Linux linker is needed; the target's
+# standard library is, and rustup installs it from rust-toolchain.toml. Without it the step is skipped with a note; on
+# that target the clippy step already covered it. The lander runs it and fails without the target.
 #
 # The scripts step (scripts/lint) is skipped, with a note, on a machine without shellcheck or actionlint; CI
 # installs both.
@@ -91,6 +96,14 @@ if [ -z "$only" ]; then
 	fi
 fi
 step clippy cargo clippy --all-targets -- -D warnings
+linux=x86_64-unknown-linux-gnu
+if rustc -vV | grep -qx "host: $linux"; then
+	printf '%-8s skipped        (the host is %s: clippy covered it)\n' linux "$linux"
+elif [ ! -d "$(rustc --print sysroot)/lib/rustlib/$linux" ]; then
+	printf '%-8s skipped        (needs rustup target add %s)\n' linux "$linux"
+else
+	step linux cargo clippy --all-targets --target "$linux" -- -D warnings
+fi
 if [ -n "$only" ]; then
 	step test env TMPDIR="$scratch" cargo test "$only"
 else

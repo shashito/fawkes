@@ -1,5 +1,10 @@
 # Tracks stable rather than a fixed release, so no extra toolchain has to be installed; Cargo.toml's `rust-version`
 # is the floor. A `rustup update` can bring new lints, which `cargo clippy -- -D warnings` then reports.
+#
+# The Linux target is listed so rustup installs its standard library on any machine, and scripts/check and the lander
+# can run clippy for Linux on a Mac (it type-checks without linking). Installing it on an older `stable` updates that
+# toolchain first.
 [toolchain]
 channel = "stable"
 components = ["clippy", "rustfmt"]
+targets = ["x86_64-unknown-linux-gnu"]
