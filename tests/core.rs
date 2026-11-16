@@ -119,16 +119,17 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
     assert_eq!(h.ok(&["test", "g2"])["state"], "tested");
     let switched = h.ok(&["switch", "g2", "--deadline", "5"]);
     assert_eq!(switched["previous"], "g1");
-    // v2 writes its row before it listens, so serving means both.
-    h.wait("v2 to serve", 5, || h.get().as_deref() == Some("v2"));
-    assert!(h.versions().contains(&"v2".to_string()));
-    assert_eq!(h.status()["pending"]["generation"], "g2");
-    assert_eq!(h.status()["step"], "pending");
-    let actions = h.status()["actions"].clone();
+    // The switch records the pending step before it answers, so the status right after it shows that step however
+    // slowly the app starts; anything slow before it would race the deadline on a loaded machine.
+    let status = h.status();
+    assert_eq!(status["pending"]["generation"], "g2", "{status}");
+    assert_eq!(status["step"], "pending", "{status}");
+    let actions = &status["actions"];
     assert!(
         actions.as_array().unwrap().contains(&"confirm g2".into()),
         "a pending switch can be confirmed: {actions}"
     );
+    h.wait("v2 to serve", 5, || h.get().as_deref() == Some("v2"));
 
     h.wait("the deadline to roll g2 back", 20, || {
         h.generation("g2")["state"] == "rolled_back"
@@ -139,6 +140,13 @@ fn upgrade_confirms_and_a_missed_deadline_rolls_back_code_and_storage() {
         "reason: {g2}"
     );
     assert_eq!(g2["rollback_cause"], "deadline", "{g2}");
+    // v2 writes its row before it listens, so its storage had the row the restore below must have removed.
+    assert!(
+        g2["log_tail"]
+            .as_str()
+            .is_some_and(|t| t.contains("v2 listening on")),
+        "{g2}"
+    );
     // The facts are fields of the events, so nobody reads them out of the message.
     let switched_event = &event_of(&h, "switched", "g2");
     assert_eq!(switched_event["previous"], "g1", "{switched_event}");
