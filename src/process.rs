@@ -829,7 +829,10 @@ mod tests {
                 let mut open = Vec::new();
                 for answer in answers {
                     let (mut stream, _) = listener.accept().unwrap();
-                    write!(stream, "HTTP/1.1 {answer}\r\nContent-Length: 1000\r\n\r\n").unwrap();
+                    // One write: `write!` sends its pieces one by one, and a check that has its status line
+                    // closes, which resets the connection under the next piece.
+                    let head = format!("HTTP/1.1 {answer}\r\nContent-Length: 1000\r\n\r\n");
+                    stream.write_all(head.as_bytes()).unwrap();
                     open.push(stream);
                 }
                 open
