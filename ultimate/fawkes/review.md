@@ -55,7 +55,14 @@ For each extension:
 
 Ground each item in the diff and the extension's file and line. Leave out what you could not tie to a commit.
 
-## 5. The report
+## 5. Fawkes's own check
+
+When your project has the `ultimate-impact` skill (`.ultimate/skills/ultimate-impact/SKILL.md` in its root, as the
+Fawkes project does), run it too, with `<from>..<to>` as its `<old>..<new>`: it checks what Fawkes depends on beyond
+the extension API (the modules `init.ts` loads, how Ultimate starts, storage, the menu bar app). Its findings join the
+Fawkes project's section of the report. Without that skill, skip this step.
+
+## 6. The report
 
 One report, one section per owning project (an extension in no project gets a section under its folder), each item:
 
@@ -64,9 +71,10 @@ One report, one section per owning project (an extension in no project gets a se
 - the proposal, in one or two sentences;
 - its size (a line, an afternoon, a branch of its own), and whether it breaks now.
 
-Start with the breaks. When nothing applies, say what you checked: the range, the paths of step 2 and the extensions.
+Start with the breaks. When nothing applies, say what you checked: the range, the paths of step 2, the extensions and
+whether step 5 ran.
 
-## 6. After the report
+## 7. After the report
 
 Ask the user which items to build. Once they say which, send each owning project its items as branch prompts with
 `ultimate.tell({ project, text })`: one message per project, each item with its commit, file, proposal and how to verify

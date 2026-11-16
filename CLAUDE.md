@@ -93,6 +93,10 @@ not built yet. Don't start one unless asked.
   CLI share the typed requests, records and results in `protocol.rs`; don't read the wire with `value["key"]`.
 - **CLI exit codes** (`main.rs`): 0 ok, 1 failed, 2 usage, 3 no daemon answers. Every command but `up`
   supports `--json`, and under it every failure, the client's own included, prints one error object.
+- **Report values:** `ultimate/fawkes/report.ts` strips every character the daemon's `report` refuses (`hidden` in
+  `protocol.rs`), or the host's reports are refused. A change to either side changes the other, with a test on each.
+- **The docs are claims:** `DESIGN.md` and `README.md` must say what the code does. When a change alters behaviour,
+  grep both for the old wording.
 
 ## Releases
 
