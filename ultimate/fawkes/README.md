@@ -246,11 +246,12 @@ first host to run them: an upgrade or failure from before it is the state the ex
 
 - **Success:** `reviewed` holds the reviewed Ultimate commits, one tip a line, newest first, written under
   `review.lock`. A generation confirmed after `installed` whose commit has commits in none of them sends a review of
-  those (`review.md`, the procedure, beside this file, which also runs a project's `ultimate-impact` skill when it has
-  one), with every extension the host loads beyond the built-in ones and the project owning its folder, then records
-  its commit as a tip and drops the tips it contains. A commit they already hold sends nothing, so a restart of the same generation or a host on an older commit is quiet. The first
-  run only writes `reviewed`. A set of tips rather than one commit: a reviewed branch the lander rebases never becomes
-  an ancestor of main, and with one mark every later review would repeat the main line since.
+  those (`review.md`, the procedure, beside this file, which also runs the receiving project's `ultimate-impact` skill
+  when it has one), with every extension the host loads beyond the built-in ones and the project owning its folder,
+  then records its commit as a tip and drops the tips it contains. A commit they already hold sends nothing, so a
+  restart of the same generation or a host on an older commit is quiet. The first run only writes `reviewed`. A set of
+  tips rather than one commit: a reviewed branch the lander rebases never becomes an ancestor of main, and with one mark
+  every later review would repeat the main line since.
 - **Failure:** a failed test, a failed stage, or the latest switch rolled back for a cause other than `requested` or
   `daemon_restart`, of the last 24 hours and after `installed`. The claim `failure-<commit>` makes it one investigation per failed commit
   (`failure-<host>-<generation>` for a stage, whose generation is removed). Its facts: what happened, the cause and

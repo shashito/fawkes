@@ -62,6 +62,11 @@ Fawkes project does), run it too, with `<from>..<to>` as its `<old>..<new>`: it 
 the extension API (the modules `init.ts` loads, how Ultimate starts, storage, the menu bar app). Its findings join the
 Fawkes project's section of the report. Without that skill, skip this step.
 
+The facts replace the skill's own range section: no `git fetch`, and the clone is the one they name. Run its
+`ultimate/check` as `ULTIMATE=<state_dir>/current sh ultimate/check` from your project's root (`fawkes status
+--manifest <manifest> --json` names the `state_dir`): `current` is the live generation's worktree, already at `<to>`
+with its packages installed, so nothing is checked out or added to the clone.
+
 ## 6. The report
 
 One report, one section per owning project (an extension in no project gets a section under its folder), each item:
