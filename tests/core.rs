@@ -1,7 +1,9 @@
 //! The happy path and the safety net, against the real binary and its socket:
 //! stage → test → switch → confirm, the lifecycle commands, then a switch that is never confirmed and rolls back.
 
-#![expect(
+// `allow` rather than `expect`: clippy 1.100 counts this crate's helpers as test code under `allow-unwrap-in-tests`
+// and 1.99 (the `rust-version` floor) does not, so an expectation is unfulfilled on one of them.
+#![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "a panic fails the test, which is what a helper that cannot proceed should do"

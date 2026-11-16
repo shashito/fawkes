@@ -420,8 +420,7 @@ pub fn render_result(request: &Request, result: &Value) -> String {
                     let reason = g
                         .rollback_reason
                         .as_ref()
-                        .map(|s| format!("  ({s})"))
-                        .unwrap_or_default();
+                        .map_or_default(|s| format!("  ({s})"));
                     format!("{}{reason}", render_generation(g))
                 })
                 .collect::<Vec<_>>()
