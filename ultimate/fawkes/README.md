@@ -219,6 +219,10 @@ off. A test run never checks.
 - `setupPreview` (no arguments): the terminal steps that set this host up (the `init.ts` command while a piece is
   missing), the reasons `init.ts` would refuse, and the manifest that already sets the host up.
 - `rollback` (user-only): roll the pending generation back now.
+- `projectProgress` (no arguments, read-only): the step of this app's transaction for Ultimate's `status` extension,
+  out of `stage → test → switch → confirm`: `switch` (2 of 4) while the switch runs, then `confirm`, `rollback` or
+  `restore failed` (3 of 4); `null` outside a switch and outside the live generation. It reads the typed `step` of the
+  daemon's status alone, so a stage or test (which only `busy` names) shows none.
 
 ## For agents
 
@@ -289,7 +293,8 @@ environment against the clone's own preview helpers, so a change in Ultimate tha
 from fields), `release.test.ts` (versions, the redirect's tag and what the popover says), `fetch.test.ts` (the
 `fetchEvery` setting and the shared `FETCH_HEAD` gate, on a clone with a local bare `origin`), `tasks.test.ts` (the
 `afterUpgrade` and `autofix` settings, claims and locks, the install time, the reviewed tips on a real repository, the autofix
-decision, the texts and who owns an extension's folder) and the rest, and
+decision, the texts and who owns an extension's folder), `fleet.test.ts` (the `fleet` action's call, its environment
+and its view), `step.test.ts` (`projectProgress` from `step` alone) and the rest, and
 type-checks both facets against an Ultimate checkout: `$ULTIMATE`, else `ultimateCheck` in the repository's
 `.ultimate/settings.json` (a path, or `live` for the generation the reachable Fawkes daemon runs, falling back to
 `~/Code/ultimate` with a note), else `~/Code/ultimate`; `ultimate/check --which` prints it. The lander and

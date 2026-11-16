@@ -39,6 +39,23 @@ export function outdated(status: Status | undefined) {
 export const switching = (status: Status | undefined) =>
   status?.step === 'switching' || !!status?.busy?.startsWith('switch ')
 
+/** A transaction's steps as the `projectProgress` action counts them (`stage → test → switch → confirm`). */
+const PROGRESS: Partial<Record<string, { label: string; index: number }>> = {
+  switching: { label: 'switch', index: 2 },
+  pending: { label: 'confirm', index: 3 },
+  rolling_back: { label: 'rollback', index: 3 },
+  restore_failed: { label: 'restore failed', index: 3 },
+}
+
+/**
+ * Where the transaction is, for Ultimate's `status` extension (`projectProgress`), or null outside one. Only the typed
+ * `step` counts: `busy` is a sentence for people, and a step this extension does not know shows nothing.
+ */
+export function progress(status: Status | undefined): { label: string; index: number; total: number } | null {
+  const step = status?.step ? PROGRESS[status.step] : undefined
+  return step ? { ...step, total: 4 } : null
+}
+
 /** Whether the daemon accepts `command` (`rollback`, `confirm g3`) right now, from `status.actions`. */
 export const allows = (status: Status | undefined, command: string) => !!status?.actions?.includes(command)
 

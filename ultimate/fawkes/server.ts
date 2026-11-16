@@ -32,7 +32,7 @@ import { parseVersion, reexecCommand, RELEASES, releaseText, tagOf, upgradeComma
 import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
-import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
+import { awaitingConfirm, outdated, progress, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import {
   claim,
   installedAt,
@@ -777,6 +777,13 @@ export const actions = {
   async state(_args: unknown, { host }: { host: ExtensionHost }) {
     return fawkes.kind === 'inert' ? inertState(host) : state(host)
   },
+  /**
+   * No arguments → the step of this app's transaction for Ultimate's `status` extension, `{ label, index, total }`, or
+   * null outside one and outside the live generation. Read-only.
+   */
+  async projectProgress(_args: unknown, { host }: { host: ExtensionHost }) {
+    return fawkes.kind === 'live' ? progress(shared(host).status) : null
+  },
   /** No arguments → fetch the clone and count the commits an upgrade would bring. */
   async check(_args: unknown, { host }: { host: ExtensionHost }) {
     liveSocket()
@@ -809,8 +816,8 @@ export const actions = {
     return state(host)
   },
 }
-/** The status line polls it. */
-export const pollActions = ['state']
+/** The status line polls `state`, and Ultimate's `status` extension `projectProgress`. */
+export const pollActions = ['state', 'projectProgress']
 /** Moving the live process is the user's call. */
 export const userActions = ['upgrade', 'confirm', 'rollback']
 
