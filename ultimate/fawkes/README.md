@@ -225,7 +225,9 @@ off. A test run never checks.
 A live generation adds a prompt section (the generation's folder is the running host and is never edited; landed
 changes go live only through an upgrade; `restart` reboots the same generation), which never changes between turns
 so the prompt stays cached, and the `fawkes` tool: `status` (the generations, how the latest switch ended, what
-`status.actions` allows, recent events), or `upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
+`status.actions` allows, recent events), `fleet` (`fawkes status --all --json`, without the host's `FAWKES_SOCKET` and
+`FAWKES_MANIFEST`: the supervisor and every app in the Fawkes home, one line each, this host's marked), or
+`upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
 rollback of the last hour with its cause, a daemon that is too old) comes as a note with its next input, only when it
 changed since that conversation last heard, and once more when it no longer applies.
 

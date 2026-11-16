@@ -25,6 +25,7 @@ import { request, subscribe } from './client.ts'
 import { facetRefusal, failedFacets, ignoredText, mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { cloneGitDir, fawkesSettings, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
+import { describeFleet, fleet } from './fleet.ts'
 import { deferRelease, releaseHold } from './hold.ts'
 import { extensionFolder, inspect, resolveClone, setupSteps } from './init.ts'
 import { parseVersion, reexecCommand, RELEASES, releaseText, tagOf, upgradeCommand } from './release.ts'
@@ -919,9 +920,9 @@ export default function fawkesExtension(host: ExtensionHost) {
         name: 'fawkes',
         replay: 'unsafe',
         description:
-          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. upgrade {ref?}: `fawkes upgrade` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
+          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. fleet: `fawkes status --all`, the supervisor and every app on this machine, one line each (state, generation, pid, port, fawkes version, a switch under way, supervision). upgrade {ref?}: `fawkes upgrade` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
         parameters: obj({
-          action: oneOf(['status', 'upgrade']),
+          action: oneOf(['status', 'fleet', 'upgrade']),
           ref: opt(str({ description: 'Git ref to upgrade to; default origin/main' })),
         }),
         async execute(args) {
@@ -929,6 +930,11 @@ export default function fawkesExtension(host: ExtensionHost) {
             const ref = validRef(args.ref)
             upgrade(host, daemon.socket, ref)
             return text(`Upgrading to ${ref}; follow it with status.\n${describe(state(host))}`)
+          }
+          if (args.action === 'fleet') {
+            const bin = process.env.FAWKES_BIN
+            if (!bin) throw new Error('FAWKES_BIN is not set, though Fawkes sets it for every app it starts')
+            return text(describeFleet(await fleet(bin), s.status?.name))
           }
           await check(host, false).catch(() => undefined)
           return text(describe(state(host)))
