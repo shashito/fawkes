@@ -63,7 +63,7 @@ commit_of() {
 
 # The repo a manifest names, resolved; empty when it names none or it does not exist.
 repo_of() {
-	repo=$(sed -n 's/^repo *= *"\([^"]*\)".*/\1/p' "$1" | head -n 1)
+	repo=$(sed -n -e 's/^repo *= *"\([^"]*\)".*/\1/p' -e "s/^repo *= *'\([^']*\)'.*/\1/p" "$1" | head -n 1)
 	case $repo in
 	'') return 0 ;;
 	\~/*) repo=$HOME/${repo#"~/"} ;;
@@ -102,7 +102,8 @@ follow() {
 	"$@" >"$out/$name.$step.json" 2>"$out/$name.$step.log" &
 	pid=$!
 	while kill -0 "$pid" 2>/dev/null; do
-		doing=$(fk --json status --manifest "$name" 2>/dev/null | jq -r '.busy // .step // "waiting"') || doing="no answer"
+		doing=$(fk --json status --manifest "$name" 2>/dev/null | jq -r 'if .code then "no answer" else .busy // .step // "waiting" end') ||
+			doing="no answer"
 		row "$index" "$name" "$before" "" "$step: ${doing:-no answer}" $(($(date +%s) - started))
 		render running "$polling"
 		sleep "$poll"
@@ -118,6 +119,7 @@ failure() {
 	[ -n "$error" ] || error="the client printed no answer; $out/$name.$1.log has its output"
 	at=$(jq -r '.step // empty' "$json" 2>/dev/null) || at=
 	cause=$(jq -r '.cause // empty' "$json" 2>/dev/null) || cause=
+	[ -n "$gen" ] || gen=$(jq -r '.generation // empty' "$json" 2>/dev/null) || gen=
 	history=$(fk --json history --manifest "$name" 2>/dev/null) || history='{}'
 	# The generation the upgrade made: the one the switch answered with, else the newest of the commit.
 	record=$(printf '%s\n' "$history" | jq -c --arg g "$gen" --arg c "$target" \
@@ -163,7 +165,7 @@ roll() {
 	state=running
 	# A rollout that stops for any other reason (a missing tool, a kill) says so, instead of running forever.
 	trap 'if [ "$state" = running ]; then render failed "the rollout stopped before it ended ($out/roll.log may say why); \`fawkes status --all\` shows where the hosts are, and the same command again goes on: $(cat "$out/command")"; fi' EXIT
-	trap 'exit 1' HUP INT TERM
+	trap 'exit 1' HUP TERM
 	printf 'rollout of %s (%s) by pid %s, files in %s\n' "$ref" "$(short "$target")" "$$" "$out" >"$out/about"
 	count=0
 	while [ $# -ge 2 ]; do
@@ -252,8 +254,11 @@ done
 # The daemon reports its socket with the directories resolved.
 self_socket=
 if [ -z "$self" ] && [ -n "${FAWKES_SOCKET:-}" ]; then
-	self_socket=$(cd "$(dirname "$FAWKES_SOCKET")" 2>/dev/null && pwd -P)/$(basename "$FAWKES_SOCKET") ||
+	if folder=$(cd "$(dirname "$FAWKES_SOCKET")" 2>/dev/null && pwd -P); then
+		self_socket=$folder/$(basename "$FAWKES_SOCKET")
+	else
 		self_socket=$FAWKES_SOCKET
+	fi
 fi
 
 echo "$ref is $(short "$target") in $clone"
