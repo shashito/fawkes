@@ -89,10 +89,15 @@ release-dry-run:
     sleep 5
     gh run watch --exit-status "$(gh run list --workflow release.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')"
 
-# Tag v<version in Cargo.toml> on main and push it, which publishes the release once its checks pass. Asks first.
-release:
+# Tag v<version in Cargo.toml> on main and push it, which publishes the release once its checks pass. Asks first, unless `yes`.
+release answer="":
     #!/bin/sh
     set -eu
+    answer={{ quote(answer) }}
+    case $answer in
+        '' | yes) ;;
+        *) echo "usage: just release [yes]" >&2; exit 2 ;;
+    esac
     version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
     tag=v$version
     [ "$(git branch --show-current)" = main ] || { echo "release from main" >&2; exit 1; }
@@ -101,9 +106,11 @@ release:
     [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] ||
         { echo "main is not origin/main; push or pull first, so the tag names a commit GitHub has" >&2; exit 1; }
     if git rev-parse --quiet --verify "refs/tags/$tag" >/dev/null; then echo "$tag exists already" >&2; exit 1; fi
-    printf 'Tag %s at %s and push it, which publishes Fawkes %s? [y/N] ' "$tag" "$(git rev-parse --short HEAD)" "$version"
-    read -r answer
-    [ "$answer" = y ] || exit 1
+    if [ "$answer" != yes ]; then
+        printf 'Tag %s at %s and push it, which publishes Fawkes %s? [y/N] ' "$tag" "$(git rev-parse --short HEAD)" "$version"
+        read -r answer
+        [ "$answer" = y ] || exit 1
+    fi
     git tag -m "Fawkes $version" "$tag"
     git push origin "$tag"
     sleep 5

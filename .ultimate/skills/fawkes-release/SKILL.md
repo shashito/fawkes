@@ -31,11 +31,19 @@ The skill only reads. Pushing, tagging and releasing belong to the user: give th
 Run one yourself only when the user handed it over in this conversation ("you can release", "push it"), and only
 what they handed over.
 
+Once the user says to release in words ("release v0.1.6", "you can release"), that is the confirmation: run
+`just release yes` in `~/Code/fawkes`, which skips only the recipe's question and keeps every refusal. Never tag or
+push a tag by hand (`git tag`, `git push origin v…`), and never work around a refusal: report it with the **Next**
+command that clears it. When the user names a version, check that it is main's `Cargo.toml` version first; if it is
+not, stop and say so instead of releasing another one. `just release yes` ends by following the Release run with
+`gh run watch`: start it in the background, or stop it once the tag is pushed, and poll as below.
+
 ## The commands, in order
 
 1. `git push origin main`, when main has local commits.
 2. `just release`, in `~/Code/fawkes`: it tags `v<version>` from `Cargo.toml` and pushes the tag, which publishes
-   once the checks pass. It asks first and refuses unless main is clean and matches origin/main. A tag that exists
+   once the checks pass. It asks first (`just release yes` does not) and refuses unless main is clean and matches
+   origin/main and the tag does not exist yet. A tag that exists
    means that version is out: shipping newer commits starts with a version bump in `Cargo.toml`, which is a
    change to land like any other.
 3. After the Release run succeeds, install it:
