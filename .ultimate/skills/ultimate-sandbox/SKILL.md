@@ -5,15 +5,24 @@ description: Check the Fawkes Ultimate extension (ultimate/fawkes) end to end on
 
 # Ultimate sandbox
 
-The live hosts (`~/Code/ultimate`, `~/.ultimate`, `~/.fawkes`, ports 4747–4749 and xana's spare ports 4790–4799)
-are never touched. `sandbox.sh`, next to this file, builds a whole Ultimate in one folder and runs every process
+The live hosts (`~/Code/ultimate`, `~/.ultimate`, `~/.fawkes`, and every live app's port and spare ports) are never
+touched. `sandbox.sh`, next to this file, builds a whole Ultimate in one folder and runs every process
 there under `env -i` with its own `HOME`, `ULTIMATE_USER_HOME` and `FAWKES_HOME`, because an agent's shell inherits
 the live host's `ULTIMATE_*` and `FAWKES_*` variables.
 
 ## Steps
 
-1. **Build the binary under test** in your worktree (`cargo build`) and check ports 4870–4879 are free
-   (`lsof -nP -iTCP:4870-4879 -sTCP:LISTEN`).
+1. **Build the binary under test** in your worktree (`cargo build`) and **pick the sandbox's ports** clear of the
+   live ones. The apps and their ports are in `fawkes status --all`; their spare ports only in their manifests:
+
+   ```sh
+   env -u FAWKES_SOCKET -u FAWKES_MANIFEST fawkes status --all
+   grep -H -E '^(port|spare_ports) =' ~/.fawkes/*.toml
+   ```
+
+   Take a block of ten ports (the host's port and nine after it) that overlaps none of them, and check nothing
+   listens there either: `lsof -nP -iTCP:<from>-<to> -sTCP:LISTEN` prints nothing. The steps below write it
+   4870–4879.
 2. **Make the sandbox** (about 15 s, about 1 GB in `/tmp/fxs`; `SANDBOX=/tmp/other` for a second one):
 
    ```sh
@@ -37,11 +46,16 @@ the live host's `ULTIMATE_*` and `FAWKES_*` variables.
    folder as a user would run it: `sandbox.sh start daemon fawkes up`; the CLI: `sandbox.sh run fawkes status`.
 4. **Moving a host under Fawkes**, as a user does it: run `init.ts` once (the `fawkes · set up` card shows this
    command and writes nothing), stop the host (`sandbox.sh stop host`), start the daemon. The sandbox's Fawkes home
-   cannot see `~/.fawkes`, so `init.ts` would pick xana's spare ports 4790–4799: first write a stand-in manifest
-   that claims them, `/tmp/fxs/fh/xana.toml` with `name = "xana"`, `port = 4749` and `spare_ports = [4790, 4799]`
-   (plus `repo`, `home` and `start`, which nothing runs), so the run takes the next free block:
+   cannot see `~/.fawkes`, so `init.ts` would pick spare ports a live app holds (it starts at 4790, xana's): first
+   write one stand-in manifest per live app, claiming its port and spare ports (with a `repo`, `home` and `start`
+   that nothing runs), so the run takes the next free block:
 
    ```sh
+   for live in ~/.fawkes/*.toml; do
+     name=$(basename "$live" .toml)
+     { printf 'name = "%s"\nrepo = "/nonexistent"\nhome = "/nonexistent"\nstart = "true"\n' "$name"
+       grep -E '^(port|spare_ports) =' "$live"; } >"/tmp/fxs/fh/$name.toml"
+   done
    sh .ultimate/skills/ultimate-sandbox/sandbox.sh run node /tmp/fxs/ext/init.ts /tmp/fxs/proj --ultimate /tmp/fxs/ultimate --port 4870
    sh .ultimate/skills/ultimate-sandbox/sandbox.sh start daemon fawkes up
    ```

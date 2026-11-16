@@ -1,13 +1,14 @@
 ---
 name: free-disk
-description: Free disk space taken by Fawkes work on this Mac: cargo-clean idle worktrees and lander checkouts and list stale /tmp test folders to remove. Use after every landing, when the disk runs low (under about 10 GB free, or a build or test fails with ENOSPC), or when asked to free space.
+description: Free disk space taken by Fawkes work on this Mac: cargo-clean idle worktrees and lander checkouts and list stale /tmp test folders to remove. Use only when the disk runs low (under about 10 GB free, or a build or test fails with ENOSPC), or when asked to free space.
 ---
 
 # Free disk
 
-Disk is tight on this Mac: one Fawkes `target/` is about 2 GB, and the disk once fell under 1 GB free. Run this
-after every landing, not only when space runs out. `free-disk.sh` sits next to this file, in the host project at
-`~/Code/fawkes/.ultimate/skills/free-disk/free-disk.sh`.
+Disk is tight on this Mac: one Fawkes `target/` is about 2 GB, and the disk once fell under 1 GB free. The lander
+frees a landed branch's checkout, so run this only when space runs low: `df -h /` shows under about 10 GB free, or
+a build or test failed with ENOSPC. A clean costs every idle worktree its next build. `free-disk.sh` sits next to
+this file, in the host project at `~/Code/fawkes/.ultimate/skills/free-disk/free-disk.sh`.
 
 ## Steps
 

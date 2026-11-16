@@ -52,11 +52,11 @@ not, stop and say so instead of releasing another one. `just release yes` ends b
    curl -LsSf https://github.com/shashito/fawkes/releases/latest/download/install.sh | FAWKES_REQUIRE_ATTESTATION=1 sh
    ```
 
-4. Move the daemons onto the new binary: `fawkes reexec --all` once the single supervisor (#55852) has landed;
-   the script prints it when `fawkes reexec` exists. Until then, `fawkes service restart --manifest <name>` for
-   each daemon on an older version, from a terminal: it is refused inside the app, it restarts the app with the
-   daemon, and it rolls back a pending switch, so never while one is pending or a step runs (the script lists
-   those as busy). The `fawkes` manifest's app is the Ultimate host on 4747 that runs this conversation.
+4. Move the supervisor (the launchd agent `dev.fawkes`, running `fawkes up --all`) and every daemon onto the new
+   binary: `fawkes reexec --all`. Each process keeps its pid and every app keeps running, so it may run from
+   inside an app, this conversation's included. A daemon with a pending switch or a step at work is skipped
+   (the script marks it busy) and the command exits 1: run it again once that ends. Never `fawkes service
+   restart` for this: it restarts every app and rolls back a pending switch.
 
 ## Waiting for a Release run
 
