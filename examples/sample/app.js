@@ -46,7 +46,9 @@ if (mode === 'crash-confirm' && phase === 'live') {
 }
 
 const db = new DatabaseSync(path.join(process.env.APP_HOME, 'app.sqlite'));
-db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS starts (version TEXT, phase TEXT)');
+// The busy timeout comes first: the test_copy hook may hold the database while this start opens it (a test run right
+// after a switch), and without it the start fails with "database is locked".
+db.exec('PRAGMA busy_timeout = 10000; PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS starts (version TEXT, phase TEXT)');
 db.prepare('INSERT INTO starts VALUES (?, ?)').run(version, phase);
 
 const server = http.createServer((req, res) => {
