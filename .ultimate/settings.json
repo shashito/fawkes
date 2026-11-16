@@ -1,4 +1,5 @@
 {
+  "extensions": { "disable": ["sentry"] },
   "isolates": {
     "worktree": {
       "setup": [
