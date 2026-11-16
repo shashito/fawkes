@@ -136,7 +136,9 @@ export function buildManifest(input: SetupInput): string {
     'adopt = true',
     'install = "pnpm install --frozen-lockfile"',
     'reuse = ["node_modules"]',
-    'keep = 5',
+    // A generation is mostly node_modules, hundreds of MB: keep the current one and one to switch back to. An automatic
+    // rollback never needs a pruned one, since prune keeps the rollback target.
+    'keep = 2',
     `start = ${command('start.ts', shellWord(project))}`,
     'deadline = 120',
     'stop_timeout = 30',

@@ -538,7 +538,9 @@ Ultimate preview (README there), and its `storage.ts` is the three hooks for Ult
 extension holds Ultimate's task scheduler in a test run and in a new live generation until that generation has
 confirmed itself: no agent work runs on code that may still roll back. Its `health.command` passes a test run only
 once that hold is in place. Its `project` is the project the host serves, so `fawkes up` run there finds the
-manifest, and `adopt` makes the Ultimate that already runs its first generation.
+manifest, and `adopt` makes the Ultimate that already runs its first generation. A generation is mostly
+`node_modules`, hundreds of MB, so it keeps 2: the current generation and one to switch back to. An automatic
+rollback never needs a pruned one, since `prune` keeps the rollback target.
 
 ```toml
 name = "ultimate"
@@ -550,7 +552,7 @@ port = 4747
 spare_ports = [4790, 4799]
 install = "pnpm install --frozen-lockfile"
 reuse = ["node_modules"]
-keep = 5
+keep = 2
 start = "node /path/to/fawkes/ultimate/fawkes/start.ts /path/to/my-app"
 deadline = 120
 stop_timeout = 30
