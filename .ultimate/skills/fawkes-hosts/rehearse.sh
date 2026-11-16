@@ -271,6 +271,8 @@ up() {
 	echo "rehearsal in $dir: supervisor pid $(cat "$dir/supervisor.pid"), $count apps, port blocks of ten from$ports"
 	wait_until 120 all_running ||
 		die "not every app runs after 120 s; $dir/supervisor.log and \`FAWKES_HOME=$dir $dir/bin/fawkes status --all\` say why; \`sh $0 down\` cleans up"
+	# The pids `down` stops when nothing answers any more.
+	targets <"$dir/status.json" >"$dir/up.tsv"
 	bounded 30 env FAWKES_HOME="$dir" "$dir/bin/fawkes" status --all
 	echo "next: sh $0 reexec [--to BINARY]"
 }
@@ -382,11 +384,14 @@ down() {
 	fi
 	need jq perl
 
-	# The pids to check afterwards: the daemons' and the apps', from what answers now, else from the last look.
+	# The pids to check afterwards: the daemons' and the apps', from what answers now, else from the last look (after
+	# a reexec, else at up).
 	if [ -x "$dir/bin/fawkes" ] && status_json >"$dir/down.json" 2>/dev/null; then
 		targets <"$dir/down.json" >"$dir/down.tsv"
-	elif [ -f "$dir/after.tsv" ]; then
+	elif [ -s "$dir/after.tsv" ]; then
 		cp "$dir/after.tsv" "$dir/down.tsv"
+	elif [ -f "$dir/up.tsv" ]; then
+		cp "$dir/up.tsv" "$dir/down.tsv"
 	else
 		: >"$dir/down.tsv"
 	fi
