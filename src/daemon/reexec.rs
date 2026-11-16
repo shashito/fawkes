@@ -9,30 +9,20 @@ use crate::protocol::{
     DaemonAction, ErrorCode, EventKind, Facts, LastExit, Out, R, ReexecResult, Reply, err,
     invalid_state,
 };
+use crate::reexec::{exec_with_handover, installed_version, take_listener, take_lock};
 use crate::state::{Paths, Txn};
-use rustix::fs::{FlockOperation, flock};
-use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// How long the installed binary has to print its version before `reexec` gives up on it.
-const VERSION_WAIT: Duration = Duration::from_secs(5);
-
-/// How long a `--version` that overran gets after SIGTERM, before SIGKILL.
-const VERSION_GRACE: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------- handover
 
@@ -75,102 +65,15 @@ impl Handover {
     /// Take over the state lock: the descriptor must be `<state_dir>/lock` and hold its lock, or this daemon has no
     /// right to the state directory.
     pub(super) fn state_lock(&self, paths: &Paths) -> Result<File, String> {
-        let file = File::from(take_fd(self.state_lock)?);
-        let path = paths.lock();
-        let same = match (file.metadata(), std::fs::metadata(&path)) {
-            (Ok(held), Ok(named)) => (held.dev(), held.ino()) == (named.dev(), named.ino()),
-            _ => false,
-        };
-        if !same {
-            return Err(format!(
-                "descriptor {} handed over is not {}",
-                self.state_lock,
-                path.display()
-            ));
-        }
-        // The same open file locks again at once when it holds the lock, and fails when another one does.
-        flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            format!(
-                "the state lock handed over is not held ({e}); another daemon runs for {}",
-                paths.root.display()
-            )
-        })?;
-        Ok(file)
+        let elsewhere = format!("another daemon runs for {}", paths.root.display());
+        take_lock(self.state_lock, &paths.lock(), "state lock", &elsewhere)
     }
 
     /// Take over the listening socket, which must be the one bound at `socket`. Its file and run link stay as they
     /// are.
     pub(super) fn listener(&self, socket: &Path) -> Result<UnixListener, String> {
-        let listener = UnixListener::from(take_fd(self.listener)?);
-        let bound = listener.local_addr().ok();
-        if bound.as_ref().and_then(|addr| addr.as_pathname()) != Some(socket) {
-            return Err(format!(
-                "descriptor {} handed over is not the socket {}",
-                self.listener,
-                socket.display()
-            ));
-        }
-        Ok(listener)
+        take_listener(self.listener, socket)
     }
-}
-
-/// Own descriptor `fd`, which the program before kept open across the exec, and make it close-on-exec again, so no
-/// app or step inherits it.
-fn take_fd(fd: RawFd) -> Result<OwnedFd, String> {
-    // 0 to 2 are stdio, never handed over.
-    if fd < 3 {
-        return Err(format!("descriptor {fd} cannot be handed over"));
-    }
-    // SAFETY: the program before kept `fd` open across the exec for this one to own. Nothing here has opened or
-    // closed it before: an open descriptor's number is not handed out again, and each handed number is taken once.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    if let Err(e) = inherited(owned.as_fd(), false) {
-        // Not open after all, and not ours to close then.
-        let _ = owned.into_raw_fd();
-        return Err(format!("descriptor {fd} handed over is unusable: {e}"));
-    }
-    Ok(owned)
-}
-
-/// Let `fd` stay open across an exec, or close it there (std's default for every descriptor it opens).
-fn inherited(fd: BorrowedFd<'_>, keep: bool) -> rustix::io::Result<()> {
-    let flags = fcntl_getfd(fd)?;
-    fcntl_setfd(
-        fd,
-        if keep {
-            flags.difference(FdFlags::CLOEXEC)
-        } else {
-            flags.union(FdFlags::CLOEXEC)
-        },
-    )
-}
-
-/// Replace this process's program with `bin <args> --handover <handover>`, keeping `keep` open across the exec. The pid
-/// stays, and with it every child. Returns only when the exec failed, why, with `keep` close-on-exec again.
-pub(super) fn exec_with_handover(
-    bin: &Path,
-    args: &[OsString],
-    keep: &[BorrowedFd<'_>],
-    handover: &Handover,
-) -> String {
-    let json = match serde_json::to_string(handover) {
-        Ok(json) => json,
-        Err(e) => return format!("cannot write the handover: {e}"),
-    };
-    let failed = match keep.iter().try_for_each(|fd| inherited(*fd, true)) {
-        Ok(()) => Command::new(bin)
-            .args(args)
-            .arg("--handover")
-            .arg(json)
-            .exec()
-            .to_string(),
-        Err(e) => format!("cannot keep the state lock and the socket open across the exec: {e}"),
-    };
-    for fd in keep {
-        // Fails only for a descriptor that is not open, which inherits nothing.
-        let _ = inherited(*fd, false);
-    }
-    failed
 }
 
 // ------------------------------------------------------------- daemon
@@ -247,38 +150,16 @@ impl Daemon {
 
     /// The version of the binary the exec would run, which must start and say it is fawkes.
     fn installed_version(&self) -> R<String> {
-        let bin = self.bin.display();
-        let what = format!("`{bin} --version`");
-        let refused = |why: String| {
+        installed_version(&self.bin).map_err(|why| {
             err(
                 ErrorCode::StartFailed,
                 format!(
-                    "{why}; the daemon carries on as fawkes {VERSION}; install a working fawkes at {bin} and run \
-                     `fawkes reexec` again"
+                    "{why}; the daemon carries on as fawkes {VERSION}; install a working fawkes at {} and run \
+                     `fawkes reexec` again",
+                    self.bin.display()
                 ),
             )
-        };
-        let mut command = Command::new(&self.bin);
-        command
-            .arg("--version")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let finished =
-            process::run_bounded(&mut command, VERSION_WAIT, VERSION_GRACE, &what, |_| {})
-                .map_err(refused)?;
-        if !finished.status.success() {
-            return Err(refused(format!("{what} failed ({})", finished.status)));
-        }
-        let printed = finished.stdout.trim();
-        printed
-            .strip_prefix("fawkes ")
-            .filter(|version| !version.is_empty() && !version.contains(char::is_whitespace))
-            .map(String::from)
-            .ok_or_else(|| {
-                refused(format!(
-                    "{what} printed {printed:?}, not `fawkes <version>`"
-                ))
-            })
+        })
     }
 
     /// Replace the program, once `reexec_command` has answered: the requests in flight get their answers first

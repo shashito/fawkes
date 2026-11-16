@@ -16,7 +16,7 @@
 
 mod lifecycle;
 mod reexec;
-mod server;
+pub(crate) mod server;
 mod supervisor;
 mod transactions;
 
@@ -48,7 +48,7 @@ use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 /// Lock a mutex. Under `panic = "abort"` no mutex is ever poisoned, so the error arm cannot run.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|_| std::process::abort())
 }
 
@@ -272,7 +272,7 @@ const LOG_BYTES: u64 = 10 << 20;
 const LOG_BYTES: u64 = 64;
 
 /// The longest request line a client may send, in bytes.
-const MAX_REQUEST: u64 = 64 * 1024;
+pub(crate) const MAX_REQUEST: u64 = 64 * 1024;
 
 /// How many messages a subscriber may fall behind before it is dropped.
 const SUBSCRIBER_QUEUE: usize = 1024;
@@ -301,13 +301,15 @@ const ECHO_QUEUE: usize = 1024;
 /// that fails (a closed terminal, a `| tee` that died) end it. Best effort: a line that cannot be written, or finds
 /// the queue full, is dropped, since `events.jsonl` is the record.
 ///
-/// When stderr is `<state_dir>/daemon.log` (a launchd service's, or a redirect to it), the thread also keeps that file
+/// When stderr is `<state_dir>/daemon.log` (the supervisor's, or a redirect to it), the thread also keeps that file
 /// under `LOG_BYTES`, as the supervisor does `app.log`. It is the file's only writer, so a line is never lost to the
-/// cap. Whoever started the daemon decides where stderr goes; the daemon only looks at what it is.
-struct Echo(SyncSender<Echoed>);
+/// cap. Whoever started the daemon decides where stderr goes; the daemon only looks at what it is. The supervisor
+/// (`fleet`) writes its stderr through one too, capping `supervisor.log` the same way.
+#[derive(Clone)]
+pub(crate) struct Echo(SyncSender<Echoed>);
 
 /// What `Echo`'s thread is sent.
-enum Echoed {
+pub(crate) enum Echoed {
     Line(String),
     /// Answer once every line queued before this one is written (`Daemon::flush_echo`).
     Flush(mpsc::Sender<()>),
@@ -316,7 +318,10 @@ enum Echoed {
 impl Echo {
     /// Start the thread that writes to `to`, capping it when it is the file `log`. It ends once the `Echo` is gone and
     /// what was queued is written, which disconnects the returned receiver.
-    fn start(mut to: impl Write + AsFd + Send + 'static, log: PathBuf) -> (Echo, Receiver<()>) {
+    pub(crate) fn start(
+        mut to: impl Write + AsFd + Send + 'static,
+        log: PathBuf,
+    ) -> (Echo, Receiver<()>) {
         let (lines, queued) = mpsc::sync_channel::<Echoed>(ECHO_QUEUE);
         let (finished, ended) = mpsc::channel();
         thread::spawn(move || {
@@ -340,13 +345,23 @@ impl Echo {
         (Echo(lines), ended)
     }
 
-    fn line(&self, line: String) {
+    pub(crate) fn line(&self, line: String) {
         // Full only while stderr is stuck; the line is in `events.jsonl`.
         let _ = self.0.try_send(Echoed::Line(line));
     }
+
+    /// Wait, for at most `FLUSH_FOR`, until the writer has written the lines queued so far. The caller holds no lock:
+    /// the writer may be stuck on a terminal on hold.
+    pub(crate) fn flush(&self) {
+        let (written, flushed) = mpsc::channel();
+        // A full queue means stderr is stuck: what is queued is in events.jsonl.
+        if self.0.try_send(Echoed::Flush(written)).is_ok() {
+            let _ = flushed.recv_timeout(FLUSH_FOR);
+        }
+    }
 }
 
-/// When `to` is the file at `log` and has grown past `LOG_BYTES`, copy it to `daemon.log.1` (replacing the one before)
+/// When `to` is the file at `log` and has grown past `LOG_BYTES`, copy it to `<log>.1` (replacing the one before)
 /// and empty it. The seek puts the next line at the start whether or not the descriptor appends. A duplicate of the
 /// descriptor shares its offset, so it truncates and seeks `to` itself.
 fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
@@ -370,30 +385,30 @@ fn cap_daemon_log(to: &impl AsFd, log: &Path) -> std::io::Result<()> {
 /// act on, and so do an exit of the live app, the start of shutdown and, during shutdown, the end of a connection
 /// (`Admission`). A waiter reads the count before it looks at the state, so a change made after the look ends the
 /// wait, and none is lost in between.
-struct Wake {
+pub(crate) struct Wake {
     count: Mutex<u64>,
     moved: Condvar,
 }
 
 impl Wake {
-    fn new() -> Wake {
+    pub(crate) fn new() -> Wake {
         Wake {
             count: Mutex::new(0),
             moved: Condvar::new(),
         }
     }
 
-    fn seen(&self) -> u64 {
+    pub(crate) fn seen(&self) -> u64 {
         *lock(&self.count)
     }
 
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         *lock(&self.count) += 1;
         self.moved.notify_all();
     }
 
     /// Sleep until the count has moved past `seen`, or `timeout` has passed (without one, for as long as it takes).
-    fn wait(&self, seen: u64, timeout: Option<Duration>) {
+    pub(crate) fn wait(&self, seen: u64, timeout: Option<Duration>) {
         let count = lock(&self.count);
         let unmoved = |count: &mut u64| *count == seen;
         // Under `panic = "abort"` the mutex is never poisoned.
@@ -1171,13 +1186,9 @@ impl Daemon {
     /// Wait, for at most `FLUSH_FOR`, until stderr's writer has written the lines queued so far. Nothing is held
     /// meanwhile: the writer may be stuck on a terminal on hold.
     fn flush_echo(&self) {
-        let Some(queue) = lock(&self.echo).as_ref().map(|echo| echo.0.clone()) else {
-            return;
-        };
-        let (written, flushed) = mpsc::channel();
-        // A full queue means stderr is stuck: what is queued is in events.jsonl.
-        if queue.try_send(Echoed::Flush(written)).is_ok() {
-            let _ = flushed.recv_timeout(FLUSH_FOR);
+        let echo = lock(&self.echo).clone();
+        if let Some(echo) = echo {
+            echo.flush();
         }
     }
 
@@ -1345,7 +1356,7 @@ mod tests {
     }
 
     /// `daemon.log` as the daemon's stderr moves to `daemon.log.1` past the cap, whole, and starts over, whether its
-    /// descriptor appends (launchd's) or not (`2> daemon.log`); a stderr that is another file is left alone.
+    /// descriptor appends (the supervisor's) or not (`2> daemon.log`); a stderr that is another file is left alone.
     #[test]
     fn a_daemon_log_over_the_cap_moves_to_daemon_log_1_and_starts_over() {
         let temp = tempfile::tempdir().unwrap();

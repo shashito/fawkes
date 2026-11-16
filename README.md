@@ -66,8 +66,8 @@ $ fawkes up
 `init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
 and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
 to roll back to. To update Fawkes, run the `curl` line again, then restart each daemon once no switch is pending (a
-restart rolls a pending switch back): `fawkes service restart --manifest <app>` for a launchd agent, else `fawkes down`
-and `fawkes up`. The extension checks for a new release once a day and says so in its status-line popover, with these
+restart rolls a pending switch back): `fawkes service restart`, which restarts every app's daemon, under launchd, else
+`fawkes down` and `fawkes up`. The extension checks for a new release once a day and says so in its status-line popover, with these
 commands; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off. It also
 fetches your Ultimate clone every 15 minutes to show new commits; set `"fawkes": { "fetchEvery": "5m" }` (or `"off"`)
 in `~/.ultimate/settings.json` to change that.
@@ -116,7 +116,8 @@ $ fawkes down       # stop the app and Fawkes
 
 ### Keep it up on a server
 
-On a Mac that has to run without a terminal, launchd starts Fawkes at login and again whenever it fails:
+On a Mac that has to run without a terminal, launchd starts the supervisor at login and again whenever it fails, and
+the supervisor runs the daemon of every app in `~/.fawkes`, starting one again when it fails:
 
 ```console
 $ fawkes service install

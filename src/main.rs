@@ -1,10 +1,13 @@
-//! `fawkes`: the daemon (`fawkes up`) and the thin command-line client of its socket.
+//! `fawkes`: an app's daemon (`fawkes up`), the supervisor of every app's daemon (`fawkes up --all`), and the thin
+//! command-line client of their sockets.
 
 mod daemon;
 mod discovery;
+mod fleet;
 mod manifest;
 mod process;
 mod protocol;
+mod reexec;
 mod render;
 mod service;
 mod state;
@@ -14,8 +17,9 @@ use clap::{Parser, Subcommand};
 use discovery::{Given, Target};
 use manifest::Manifest;
 use protocol::{
-    ErrorCode, Generation, Line, REQUEST_TIMEOUT, ReexecResult, Request, StageResult, Status,
-    UpgradeResult, UpgradeStep, err, read_line, timed_out,
+    ErrorCode, FleetDownResult, FleetRequest, Generation, Line, REQUEST_TIMEOUT, ReexecResult,
+    Request, StageResult, StartResult, Status, UpgradeResult, UpgradeStep, err, read_line,
+    timed_out,
 };
 use render::{
     render_decided, render_event, render_progress, render_reexec, render_result, render_switch,
@@ -62,13 +66,14 @@ const LONG_HELP_END: &str = concat!(
      stderr as JSON lines. A result only ever gains fields. The streams differ: `log --follow` prints one event per \
      line, `watch` one {\"name\", \"event\"} document per event. `up` prints text only.\n\n",
     "Examples:\n  \
-     fawkes up                          run this project's app, in the foreground\n  \
+     fawkes up                          run this project's app's daemon\n  \
+     fawkes up --all                    run the supervisor of every app's daemon\n  \
      fawkes upgrade main                stage, test and switch to main\n  \
      fawkes wait                        until the switch confirms or rolls back\n  \
      fawkes status --json               what runs, and the commands accepted now\n  \
      fawkes rollback                    undo the pending switch\n  \
      fawkes --manifest xana log -n 20   the last 20 events of xana, from anywhere\n  \
-     fawkes down                        stop the app and its supervisor\n  \
+     fawkes down                        stop the app and its daemon\n  \
      fawkes skill                       how an agent uses Fawkes, for this version\n\n",
     exit_codes!()
 );
@@ -107,23 +112,37 @@ struct Cli {
 /// What the command line asks for: one of the two local programs, or a request to a daemon.
 #[derive(Subcommand)]
 enum Command {
-    /// Run the app under supervision, in the foreground
-    ///
-    /// The supervisor (the app's daemon) starts the app, serves every other command on its socket and prints its
-    /// events on stderr, text only. It runs until `fawkes down`, SIGTERM or Ctrl-C, and stops the app on its way out.
-    #[command(after_long_help = "Examples:\n  \
-                                 fawkes up\n  \
-                                 fawkes up --manifest xana")]
+    /// Run the app's daemon, or the supervisor of every app's daemon
+    #[command(
+        long_about = "Run the app's daemon, or the supervisor of every app's daemon\n\n\
+                      The app's daemon starts the app, serves every other command on its socket and prints its events \
+                      on stderr, text only. It runs in the foreground until `fawkes down`, SIGTERM or Ctrl-C, and \
+                      stops the app on its way out. When the supervisor runs and the app is one of its own (a \
+                      manifest $FAWKES_HOME/<APP>.toml), `up` has the supervisor start the daemon instead, and \
+                      returns once it answers.\n\n\
+                      With --all, the supervisor runs in the foreground: it runs the daemon of every manifest in \
+                      $FAWKES_HOME as its child, starts one that fails again, and stops them all on SIGTERM or \
+                      Ctrl-C. `fawkes service install` runs it under launchd.",
+        after_long_help = "Examples:\n  \
+                           fawkes up\n  \
+                           fawkes up --manifest xana\n  \
+                           fawkes up --all"
+    )]
     Up {
-        /// What the daemon's earlier program hands over when it re-executes (`fawkes reexec`)
+        #[arg(
+            long,
+            help = "Run the supervisor of every app's daemon in $FAWKES_HOME"
+        )]
+        all: bool,
+        /// What the earlier program hands over when it re-executes (`fawkes reexec`)
         #[arg(long, hide = true, value_name = "JSON")]
         handover: Option<String>,
     },
-    /// Stop the app and its supervisor
+    /// Stop the app and its daemon
     ///
     /// Answers once the daemon has let go of its socket and state lock, so `fawkes up` can follow at once. A daemon
-    /// run by `fawkes service` stays down until the next login or `fawkes service restart`. Run it from a shell
-    /// outside the app: from inside, it would end the caller and leave nothing to bring the app back.
+    /// the supervisor runs stays down, across the supervisor's restarts too, until `fawkes up` names it again. Run it
+    /// from a shell outside the app: from inside, it would end the caller and leave nothing to bring the app back.
     #[command(after_long_help = "Examples:\n  \
                                  fawkes down\n  \
                                  fawkes down --manifest xana --json")]
@@ -259,9 +278,13 @@ enum Command {
         #[arg(long, value_name = "N")]
         since: Option<u64>,
     },
-    /// Run the app's daemon as a launchd user agent (macOS only)
-    ///
-    /// The agent runs the daemon on the manifest's own socket, so --socket is not accepted.
+    /// Run the supervisor of every app's daemon as a launchd user agent (macOS only)
+    #[command(
+        long_about = "Run the supervisor of every app's daemon as a launchd user agent (macOS only)\n\n\
+                      The agent dev.fawkes runs `fawkes up --all`, which runs the daemon of every manifest in \
+                      $FAWKES_HOME, so --manifest and --socket are not accepted. Run it from a shell outside the \
+                      apps."
+    )]
     Service {
         #[command(subcommand)]
         action: service::Action,
@@ -362,10 +385,17 @@ fn main() -> ExitCode {
         })
     };
     let code = match &cli.command {
-        Command::Up { handover } => run_up(&given, cli.socket.clone(), handover.as_deref()),
+        Command::Up {
+            all: true,
+            handover,
+        } => run_supervisor(&cli, handover.as_deref()),
+        Command::Up {
+            all: false,
+            handover,
+        } => run_up(&given, cli.socket.clone(), handover.as_deref()),
         Command::Skill => run_skill(&cli, out),
         Command::Watch { since } => run_watch(&cli, &given, *since, out),
-        Command::Service { action } => run_service(&cli, &given, *action, out),
+        Command::Service { action } => run_service(&cli, *action, out),
         Command::Upgrade { git_ref, deadline } => {
             with_endpoint(&cli, &given, out, |endpoint, out| {
                 run_upgrade(&cli, git_ref, *deadline, &endpoint, out)
@@ -419,7 +449,26 @@ fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// `fawkes up`: the supervisor of one app, in the foreground. Returns the exit code.
+/// `fawkes up --all`: the supervisor of every app's daemon, in the foreground. Returns the exit code.
+fn run_supervisor(cli: &Cli, handover: Option<&str>) -> u8 {
+    if cli.manifest.is_some() || cli.socket.is_some() {
+        warn(
+            "error: `fawkes up --all` runs the daemon of every manifest in $FAWKES_HOME, so --manifest and --socket \
+             do not apply; `fawkes up --manifest <app>` runs one app's daemon",
+        );
+        return EXIT_USAGE;
+    }
+    match fleet::run(handover) {
+        Ok(()) => 0,
+        Err(message) => {
+            warn(format!("error: {message}"));
+            EXIT_FAILED
+        }
+    }
+}
+
+/// `fawkes up`: the app's daemon, in the foreground, or a request to the supervisor that runs it. Returns the exit
+/// code.
 fn run_up(given: &Given, socket: Option<PathBuf>, handover: Option<&str>) -> u8 {
     // A manifest that cannot be found or loaded is a usage error here as for every other command; the rest of the
     // daemon's startup failures are not.
@@ -434,6 +483,14 @@ fn run_up(given: &Given, socket: Option<PathBuf>, handover: Option<&str>) -> u8 
         warn(format!("error: {message}"));
         return EXIT_USAGE;
     }
+    // A daemon re-executing (`--handover`) is the daemon already, and one given its own socket is not the
+    // supervisor's.
+    if handover.is_none()
+        && socket.is_none()
+        && let Some(code) = start_under_supervisor(&manifest_path)
+    {
+        return code;
+    }
     match daemon::Daemon::run(manifest_path, socket, handover) {
         Ok(()) => 0,
         Err(message) => {
@@ -443,23 +500,110 @@ fn run_up(given: &Given, socket: Option<PathBuf>, handover: Option<&str>) -> u8 
     }
 }
 
-/// `fawkes down`: the app and its daemon, which answers once it has let go of its socket and state lock. Returns the
-/// exit code.
+/// The exit code of an `up` the supervisor answered for the app of `manifest_path`, when it is one of the supervisor's
+/// apps (`<fawkes_home>/<name>.toml`) and a supervisor answers; none when this process should run the daemon itself.
+/// The supervisor's own child is one such `up`: its parent is the supervisor that answers.
+fn start_under_supervisor(manifest_path: &Path) -> Option<u8> {
+    let home = manifest::fawkes_home().ok()?;
+    let name = fleet::app_in_home(manifest_path, &home)?;
+    let status = fleet::request(&home, &FleetRequest::Status, Some(REQUEST_TIMEOUT))?.ok()?;
+    let supervisor = protocol::FleetStatus::deserialize(&status).ok()?;
+    if rustix::process::getppid()
+        .is_some_and(|parent| parent.as_raw_pid().unsigned_abs() == supervisor.pid)
+    {
+        return None;
+    }
+    let request = FleetRequest::Start { app: name.clone() };
+    // `start` waits up to 30 s for the daemon to answer; a line more covers that.
+    let answer = fleet::request(&home, &request, Some(REQUEST_TIMEOUT * 2));
+    let failure = match answer {
+        Some(Ok(result)) => {
+            let Ok(started) = StartResult::deserialize(&result) else {
+                let message = format!("the supervisor's start result could not be read: {result}");
+                warn(format!("error: {message}"));
+                return Some(EXIT_FAILED);
+            };
+            say(
+                &mut std::io::stdout(),
+                format!(
+                    "{name}'s daemon runs under the supervisor (pid {}); `fawkes watch` follows it",
+                    started.daemon_pid
+                ),
+            );
+            return Some(0);
+        }
+        Some(Err(error)) => error,
+        None => err(
+            ErrorCode::DaemonUnreachable,
+            format!(
+                "the supervisor on {} took `start` for {name} but did not answer; `fawkes up --manifest {name}` asks \
+                 again",
+                fleet::socket(&home).display()
+            ),
+        ),
+    };
+    warn(format!("error: {}", failure.message));
+    Some(exit_code(failure.code))
+}
+
+/// `fawkes down`: the app and its daemon, which answers once it has let go of its socket and state lock; through the
+/// supervisor when it runs the app, so the app stays down. Returns the exit code.
 fn run_down(cli: &Cli, endpoint: &Endpoint, out: &mut dyn Write) -> u8 {
-    // From inside the app it ends, the caller goes with it, and no supervisor is left to start the app again.
+    // From inside the app it ends, the caller goes with it, and no daemon is left to start the app again.
     if endpoint.own && std::env::var_os("FAWKES_PHASE").is_some() {
         let message = "`fawkes down` stops this daemon and its app, this process with it, and nothing would start \
                        them again; run it from a shell outside the app"
             .into();
         return fail(cli.json, out, ErrorCode::InvalidState, message);
     }
-    // The text ends with how to start it again, which for a launchd agent is its service, not a terminal's `up`.
+    if let Some(outcome) = down_under_supervisor(cli, endpoint) {
+        return finish(cli, out, outcome);
+    }
     let outcome = exchange(cli, &Request::Down, endpoint, REQUEST_TIMEOUT, out).map(|result| {
         let text = render_result(&Request::Down, &result);
         let text = format!("{text}; {}", endpoint.start_hint());
         (result, text)
     });
     finish(cli, out, outcome)
+}
+
+/// `fawkes down` through the supervisor, when the app the endpoint reaches is one of its apps and a supervisor answers:
+/// it marks the app down first, so it stays down. None when the daemon is to be asked itself.
+fn down_under_supervisor(
+    cli: &Cli,
+    endpoint: &Endpoint,
+) -> Option<Result<(Value, String), Failure>> {
+    let home = manifest::fawkes_home().ok()?;
+    if !fleet::socket(&home).exists() {
+        return None;
+    }
+    // A socket named outright: its daemon says which manifest it runs.
+    let manifest = if let Some((path, _)) = &endpoint.manifest {
+        path.clone()
+    } else {
+        let quiet = &mut std::io::sink();
+        let raw = exchange(cli, &Request::Status, endpoint, REQUEST_TIMEOUT, quiet).ok()?;
+        Status::deserialize(&raw).ok()?.manifest
+    };
+    let name = fleet::app_in_home(&manifest, &home)?;
+    // The supervisor bounds the daemon's shutdown by its manifest, as a `down` sent to the daemon is not bounded.
+    let answer = fleet::request(&home, &FleetRequest::Down { app: name.clone() }, None)?;
+    Some(answer.map_err(Failure::of).map(|raw| {
+        let back = format!("`fawkes up --manifest {name}` brings it back under the supervisor");
+        let text = match FleetDownResult::deserialize(&raw) {
+            Ok(FleetDownResult {
+                daemon_pid: Some(pid),
+                stopped,
+                ..
+            }) => {
+                let stopped = stopped.map_or_else(String::new, |id| format!("{id} and "));
+                format!("stopped {stopped}the daemon of {name} (pid {pid}); it stays down: {back}")
+            }
+            Ok(_) => format!("{name}'s daemon was not running; it stays down: {back}"),
+            Err(_) => raw.to_string(),
+        };
+        (raw, text)
+    }))
 }
 
 /// How long `fawkes reexec` waits for the daemon to answer on its new binary.
@@ -568,7 +712,7 @@ fn run_confirm(
 /// The refusal of `fawkes {command}` in a test run, which serves its health check and nothing else; `why`, when not
 /// empty, follows the command.
 fn test_run_message(command: &str, why: &str) -> String {
-    // The live app may not end its own supervisor either (`run_down`), nor start a second one.
+    // The live app may not end its own daemon either (`run_down`), nor start a second one.
     let who = if matches!(command, "up" | "down") {
         "a shell outside the app"
     } else {
@@ -648,20 +792,12 @@ impl Endpoint {
         })
     }
 
-    /// How to start the daemon that does not answer: its launchd agent's when one is installed, which a daemon started
-    /// from a terminal would only contend with for the state lock.
+    /// How to start the daemon that does not answer. The same `up` asks the supervisor to start it when the supervisor
+    /// runs the app.
     fn start_hint(&self) -> String {
-        let Some((path, name)) = &self.manifest else {
-            return "start one with `fawkes up --manifest <app>`".into();
-        };
-        let path = path.display();
-        if service::plist(name).is_some_and(|plist| plist.exists()) {
-            format!(
-                "it is installed as a launchd agent; from outside the app, `fawkes service restart --manifest {path}` \
-                 starts it again"
-            )
-        } else {
-            format!("start one with `fawkes up --manifest {path}`")
+        match &self.manifest {
+            Some((path, _)) => format!("start one with `fawkes up --manifest {}`", path.display()),
+            None => "start one with `fawkes up --manifest <app>`".into(),
         }
     }
 }
@@ -709,48 +845,37 @@ fn run_watch(cli: &Cli, given: &Given, since: Option<u64>, out: &mut dyn Write) 
     }
 }
 
-/// `fawkes service`: the service of the manifest's daemon, which it reaches by its own socket. Returns the exit code.
-fn run_service(cli: &Cli, given: &Given, action: service::Action, out: &mut dyn Write) -> u8 {
-    if cli.socket.is_some() {
-        let message =
-            "the service runs the daemon on the manifest's own socket, so --socket does not apply"
-                .into();
+/// `fawkes service`: the launchd agent of the supervisor of every app in `$FAWKES_HOME`. Returns the exit code.
+fn run_service(cli: &Cli, action: service::Action, out: &mut dyn Write) -> u8 {
+    if cli.manifest.is_some() || cli.socket.is_some() {
+        let message = "the service runs the supervisor of every app in $FAWKES_HOME, so --manifest and --socket do \
+                       not apply"
+            .into();
         return fail(cli.json, out, ErrorCode::Usage, message);
     }
-    let manifest_path = match given.manifest() {
-        Ok(path) => path,
-        Err(message) => return fail(cli.json, out, ErrorCode::Usage, message),
-    };
-    // `restart` stops the daemon and its app, this process with them; `install` and `uninstall` act on the same agent.
-    if let Ok(manifest) = Manifest::load(&manifest_path)
-        && inside_its_app(
-            std::env::var_os("FAWKES_PHASE").is_some(),
-            given.socket_env.as_deref().map(Path::new),
-            &manifest.paths().socket(),
-        )
-    {
-        let name = match action {
-            service::Action::Install => "install",
-            service::Action::Uninstall => "uninstall",
-            service::Action::Restart => "restart",
-        };
-        let message = format!(
-            "`fawkes service {name}` stops this daemon and its app, this process with it; run it from a shell \
-             outside the app"
-        );
+    if let Some(message) = service_refusal(action, std::env::var_os("FAWKES_PHASE").is_some()) {
         return fail(cli.json, out, ErrorCode::InvalidState, message);
     }
-    finish(
-        cli,
-        out,
-        service::run(action, &manifest_path).map_err(Failure::of),
-    )
+    let outcome = manifest::fawkes_home()
+        .map_err(|e| Failure::new(ErrorCode::Usage, e))
+        .and_then(|home| service::run(action, &home).map_err(Failure::of));
+    finish(cli, out, outcome)
 }
 
-/// Whether the caller is a process of the app whose daemon listens on `socket`: Fawkes started it (`FAWKES_PHASE` is
-/// set) and its `FAWKES_SOCKET` is that very socket file.
-fn inside_its_app(phase_set: bool, own_socket: Option<&Path>, socket: &Path) -> bool {
-    phase_set && own_socket.is_some_and(|own| same_file(socket, own))
+/// Why `fawkes service` is refused, when the caller is a process Fawkes started (`FAWKES_PHASE` is set): each action
+/// stops the supervisor and every daemon it runs, which is the caller's own or one beside it.
+fn service_refusal(action: service::Action, phase_set: bool) -> Option<String> {
+    let name = match action {
+        service::Action::Install => "install",
+        service::Action::Uninstall => "uninstall",
+        service::Action::Restart => "restart",
+    };
+    phase_set.then(|| {
+        format!(
+            "`fawkes service {name}` stops the supervisor and every app's daemon it runs, this app's with them; run \
+             it from a shell outside the apps"
+        )
+    })
 }
 
 /// Whether the command line has `--json` before any `--`, for an error clap found before it could say.
@@ -1078,30 +1203,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("`{args}`: {e}"))
     }
 
-    /// `fawkes service` is refused only to a process of the app it would act on: one Fawkes started whose
-    /// `FAWKES_SOCKET` is the manifest's own socket, however the path is spelt.
+    /// `fawkes service` stops the supervisor and every daemon it runs, so any process Fawkes started is refused it,
+    /// whichever app it belongs to.
     #[test]
-    fn the_service_is_refused_only_from_inside_its_own_app() {
-        let dir = tempfile::tempdir().unwrap();
-        // Plain files: `same_file` compares inodes, and a socket bound under a long temp directory would exceed the
-        // socket path limit.
-        let socket = dir.path().join("fawkes.sock");
-        std::fs::write(&socket, "").unwrap();
-        let other = dir.path().join("other.sock");
-        std::fs::write(&other, "").unwrap();
-        let spelt_otherwise = dir.path().join(".").join("fawkes.sock");
-
-        assert!(inside_its_app(true, Some(&socket), &socket));
-        assert!(inside_its_app(true, Some(&spelt_otherwise), &socket));
-        assert!(
-            !inside_its_app(false, Some(&socket), &socket),
-            "not started by Fawkes"
-        );
-        assert!(
-            !inside_its_app(true, Some(&other), &socket),
-            "another app's process"
-        );
-        assert!(!inside_its_app(true, None, &socket));
+    fn the_service_is_refused_whenever_fawkes_phase_is_set() {
+        for action in [
+            service::Action::Install,
+            service::Action::Uninstall,
+            service::Action::Restart,
+        ] {
+            assert!(service_refusal(action, false).is_none());
+            let refused = service_refusal(action, true).unwrap();
+            assert!(
+                refused.contains("from a shell outside the apps"),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -1118,7 +1235,17 @@ mod tests {
             assert!(matches!(cli.command, Command::Status), "{args}");
         }
         let up = parse("up --manifest f.toml");
-        assert!(matches!(up.command, Command::Up { handover: None }));
+        assert!(matches!(
+            up.command,
+            Command::Up {
+                all: false,
+                handover: None
+            }
+        ));
+        assert!(matches!(
+            parse("up --all").command,
+            Command::Up { all: true, .. }
+        ));
         assert!(matches!(parse("reexec").command, Command::Reexec));
         assert_eq!(up.manifest, Some("f.toml".into()));
         let upgrade = parse("upgrade main --deadline 60");

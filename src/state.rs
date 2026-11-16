@@ -255,8 +255,9 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
 }
 
 /// `write_in_place`, then `sync_directory`. A failure of the second step is an error too: this is for files whose
-/// only meaning is being durable (`state.json.bak`), where the caller has no earlier state to agree with.
-fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// only meaning is being durable (`state.json.bak`, the supervisor's `supervisor.json`), where the caller has no
+/// earlier state to agree with.
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     write_in_place(path, bytes)?;
     sync_directory(path)
 }

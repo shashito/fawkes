@@ -209,8 +209,8 @@ fn registry(home: &Path, cwd: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// Every `<fawkes_home>/<name>.toml`, sorted by name.
-fn manifests(home: &Path) -> Vec<(String, PathBuf)> {
+/// Every `<fawkes_home>/<name>.toml`, sorted by name: the apps a supervisor (`fleet`) runs as well.
+pub(crate) fn manifests(home: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(home) else {
         return Vec::new();
     };

@@ -366,6 +366,24 @@ HOOKS_FAIL_WHILE = "{{state}}/hooks-fail"
         )
     }
 
+    /// `fawkes up --all`, the supervisor of every app in this harness's `FAWKES_HOME`, with its stderr appended to
+    /// `<dir>/supervisor.err`. The daemons it starts inherit its environment, git's isolation included.
+    pub fn supervisor(&self) -> Command {
+        let stderr = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("supervisor.err"))
+            .unwrap();
+        let mut command = fawkes();
+        command
+            .args(["up", "--all"])
+            .env("FAWKES_HOME", &self.fawkes_home)
+            .stdin(Stdio::null())
+            .stderr(stderr);
+        isolate_git(&mut command);
+        command
+    }
+
     /// `fawkes up` for this manifest, with its `run/` links kept inside the test directory.
     fn daemon_command(&self) -> Command {
         let mut command = fawkes();

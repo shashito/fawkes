@@ -2840,30 +2840,6 @@ fn the_client_finds_the_app_from_where_it_runs() {
     );
 }
 
-/// A daemon that does not answer but has a launchd agent installed is started again through the service, not from a
-/// terminal, where it would contend with the agent for the state lock.
-#[cfg(target_os = "macos")]
-#[test]
-fn an_unreachable_daemon_with_an_installed_agent_points_at_the_service() {
-    let h = Harness::new("");
-    let home = h.dir.join("user");
-    let hint = || {
-        let output = h.cli().arg("status").env("HOME", &home).output().unwrap();
-        assert_eq!(output.status.code(), Some(3));
-        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-        error["message"].as_str().unwrap().to_string()
-    };
-    assert!(hint().contains("start one with `fawkes up --manifest "));
-    let agents = home.join("Library/LaunchAgents");
-    std::fs::create_dir_all(&agents).unwrap();
-    std::fs::write(agents.join("dev.fawkes.t.plist"), "").unwrap();
-    let message = hint();
-    assert!(
-        message.contains("`fawkes service restart --manifest ") && !message.contains("fawkes up"),
-        "{message}"
-    );
-}
-
 #[test]
 fn the_binary_prints_its_version_and_its_skill() {
     let run = |args: &[&str]| {
@@ -3642,23 +3618,35 @@ esac
     bin
 }
 
-/// `fawkes --json service <action>` with a `HOME` and a `launchctl` of the test's own; the exit code, the JSON document
-/// and the `launchctl` calls it made.
+/// `fawkes --json service <action>` with a `HOME`, a `FAWKES_HOME` (`<dir>/fh`) and a `launchctl` of the test's own;
+/// the exit code, the JSON document and the `launchctl` calls it made.
 #[cfg(target_os = "macos")]
 fn service(h: &Harness, binary: &std::path::Path, action: &str) -> (i32, Value, Vec<String>) {
+    service_with(h, binary, &["service", action], |_| {})
+}
+
+/// `service` with the arguments `args` and the command as `adjust` leaves it.
+#[cfg(target_os = "macos")]
+fn service_with(
+    h: &Harness,
+    binary: &std::path::Path,
+    args: &[&str],
+    adjust: impl FnOnce(&mut std::process::Command),
+) -> (i32, Value, Vec<String>) {
     let path = format!(
         "{}:{}",
         h.dir.join("fakebin").display(),
         std::env::var("PATH").unwrap()
     );
-    let output = h
-        .cli_with(common::fawkes_at(binary))
-        .args(["service", action])
+    let mut command = common::fawkes_at(binary);
+    command
+        .arg("--json")
+        .args(args)
         .env("HOME", h.dir.join("home"))
         .env("PATH", path)
-        .env("FAWKES_HOME", h.dir.join("fh"))
-        .output()
-        .unwrap();
+        .env("FAWKES_HOME", h.dir.join("fh"));
+    adjust(&mut command);
+    let output = command.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
     let calls = std::fs::read_to_string(h.dir.join("calls")).unwrap_or_default();
@@ -3670,6 +3658,8 @@ fn service(h: &Harness, binary: &std::path::Path, action: &str) -> (i32, Value, 
     )
 }
 
+/// The one agent, `dev.fawkes`, runs the supervisor of every app in `FAWKES_HOME`, and its `ExitTimeOut` leaves time
+/// for the slowest of their daemons to stop.
 #[cfg(target_os = "macos")]
 #[test]
 fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
@@ -3681,9 +3671,34 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     std::fs::copy(Harness::binary(), &binary).unwrap();
     let uid = rustix::process::getuid().as_raw();
     let d = h.dir.display();
-    let plist = format!("{d}/home/Library/LaunchAgents/dev.fawkes.t.plist");
-    let target = format!("gui/{uid}/dev.fawkes.t");
+    // The app's daemon would take 20 s to stop (`stop_timeout = 5`); an invalid manifest counts for nothing.
+    std::fs::create_dir(h.dir.join("fh")).unwrap();
+    std::fs::copy(h.manifest(), h.dir.join("fh/t.toml")).unwrap();
+    std::fs::write(h.dir.join("fh/broken.toml"), "stop_timeout = 600").unwrap();
+    let plist = format!("{d}/home/Library/LaunchAgents/dev.fawkes.plist");
+    let target = format!("gui/{uid}/dev.fawkes");
     let bootstrap = format!("bootstrap gui/{uid} {plist}");
+
+    // The agent runs every app, so naming one is a usage error; and a process Fawkes started may not touch it.
+    for flag in ["--manifest", "--socket"] {
+        let (exit, error, calls) =
+            service_with(&h, &binary, &["service", "install", flag, "x"], |_| {});
+        assert_eq!(
+            (exit, error["code"].as_str()),
+            (2, Some("usage")),
+            "{error}"
+        );
+        assert_eq!(calls, Vec::<String>::new());
+    }
+    let (exit, error, calls) = service_with(&h, &binary, &["service", "restart"], |command| {
+        command.env("FAWKES_PHASE", "live");
+    });
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (1, Some("invalid_state")),
+        "{error}"
+    );
+    assert_eq!(calls, Vec::<String>::new());
 
     let (exit, error, calls) = service(&h, Harness::binary(), "install");
     assert_eq!(
@@ -3700,14 +3715,12 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     assert_eq!(
         installed,
         serde_json::json!({
-            "label": "dev.fawkes.t",
+            "label": "dev.fawkes",
             "plist": plist,
-            "log": format!("{d}/s/daemon.log"),
+            "log": format!("{d}/fh/supervisor.log"),
             "replaced": false,
         })
     );
-    let state_dir = std::fs::metadata(h.dir.join("s")).unwrap();
-    assert_eq!(state_dir.permissions().mode() & 0o777, 0o700);
     let path = format!(
         "{d}/fakebin:{}",
         std::env::var("PATH").unwrap().replace('&', "&amp;")
@@ -3718,13 +3731,12 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>dev.fawkes.t</string>
+	<string>dev.fawkes</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{}</string>
 		<string>up</string>
-		<string>--manifest</string>
-		<string>{d}/t.toml</string>
+		<string>--all</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -3743,7 +3755,7 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 	<key>ExitTimeOut</key>
 	<integer>30</integer>
 	<key>StandardErrorPath</key>
-	<string>{d}/s/daemon.log</string>
+	<string>{d}/fh/supervisor.log</string>
 </dict>
 </plist>
 "#,
@@ -3769,7 +3781,7 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     assert_eq!(exit, 0, "{restarted}");
     assert_eq!(
         restarted,
-        serde_json::json!({"label": "dev.fawkes.t", "plist": plist})
+        serde_json::json!({"label": "dev.fawkes", "plist": plist})
     );
     assert_eq!(calls, [&bootout[..], &[bootstrap]].concat());
 
@@ -3778,13 +3790,33 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
     assert_eq!(removed["removed"], true);
     assert_eq!(calls, bootout);
     assert!(!std::path::Path::new(&plist).exists());
-    assert!(h.dir.join("s").exists());
+    assert!(h.dir.join("fh/t.toml").exists());
     let (exit, removed, _) = service(&h, &binary, "uninstall");
     assert_eq!((exit, &removed["removed"]), (0, &Value::Bool(false)));
 
     let (exit, missing, calls) = service(&h, &binary, "restart");
     assert_eq!((exit, missing["code"].as_str()), (1, Some("not_found")));
     assert_eq!(calls, Vec::<String>::new());
+
+    // A supervisor that answers and is not the agent's (`fawkes up --all` from a terminal) holds the lock the agent's
+    // would need, so the install is refused before launchd is told anything.
+    let _supervisor =
+        std::os::unix::net::UnixListener::bind(h.dir.join("fh/supervisor.sock")).unwrap();
+    let (exit, error, calls) = service(&h, &binary, "install");
+    assert_eq!(
+        (exit, error["code"].as_str()),
+        (1, Some("invalid_state")),
+        "{error}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("a supervisor already runs on "),
+        "{error}"
+    );
+    assert_eq!(calls, Vec::<String>::new());
+    assert!(!std::path::Path::new(&plist).exists());
 }
 
 /// Without launchd, every `fawkes service` command is a usage error that says what to run instead.
@@ -3793,7 +3825,13 @@ fn service_installs_restarts_and_uninstalls_a_launchd_agent() {
 fn service_is_refused_without_launchd() {
     let h = Harness::new("");
     for action in ["install", "uninstall", "restart"] {
-        let (exit, error) = h.fk(&["service", action]);
+        let output = common::fawkes()
+            .args(["--json", "service", action])
+            .env("FAWKES_HOME", &h.dir)
+            .output()
+            .unwrap();
+        let exit = output.status.code().unwrap();
+        let error: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(
             (exit, error["code"].as_str()),
             (2, Some("usage")),
@@ -3801,7 +3839,7 @@ fn service_is_refused_without_launchd() {
         );
         let message = error["message"].as_str().unwrap();
         assert!(
-            message.contains("macOS only") && message.contains("fawkes up --manifest"),
+            message.contains("macOS only") && message.contains("fawkes up --all"),
             "{message}"
         );
     }
@@ -3878,4 +3916,341 @@ fn the_live_app_reports_its_url_and_up_prints_where_it_is() {
             .to_string()
             .contains("output   ")
     );
+}
+
+// ------------------------------------------------ the supervisor
+
+/// A second app, `name`, beside the harness's own in its `FAWKES_HOME`: the same manifest with its own name, state
+/// directory, home and ports (`port + offset` live, the next two spare).
+fn second_app(h: &Harness, name: &str, offset: u16) -> std::path::PathBuf {
+    let d = h.dir.display();
+    let port = h.port;
+    let mut text = std::fs::read_to_string(h.manifest()).unwrap();
+    for (from, to) in [
+        (r#"name = "t""#.to_string(), format!(r#"name = "{name}""#)),
+        (
+            format!(r#"state_dir = "{d}/s""#),
+            format!(r#"state_dir = "{d}/{name}s""#),
+        ),
+        (
+            format!(r#"home = "{d}/home""#),
+            format!(r#"home = "{d}/{name}home""#),
+        ),
+        (
+            format!("\nport = {port}\n"),
+            format!("\nport = {}\n", port + offset),
+        ),
+        (
+            format!("spare_ports = [{}, {}]", port + 1, port + 9),
+            format!(
+                "spare_ports = [{}, {}]",
+                port + offset + 1,
+                port + offset + 2
+            ),
+        ),
+    ] {
+        assert!(text.contains(&from), "{from:?} is not in the manifest");
+        text = text.replacen(&from, &to, 1);
+    }
+    let path = h.dir.join(format!("{name}.toml"));
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// `fawkes <args>` for the app of `manifest`, with the harness's `FAWKES_HOME`, so the supervisor there is the one it
+/// finds; the exit code, the JSON document (`--json`, unless `args` is an `up`) and stdout as printed.
+fn fk_at(h: &Harness, manifest: &std::path::Path, args: &[&str]) -> (i32, Value, String) {
+    let output = common::fawkes()
+        .arg("--json")
+        .arg("--manifest")
+        .arg(manifest)
+        .args(args)
+        .env("FAWKES_HOME", &h.dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let json = serde_json::from_str(&stdout).unwrap_or(Value::Null);
+    (output.status.code().unwrap(), json, stdout)
+}
+
+/// The final line the supervisor of the harness's `FAWKES_HOME` answers to `command` with `args`.
+fn ask_supervisor(h: &Harness, command: &str, args: &Value) -> Value {
+    let mut stream = UnixStream::connect(h.dir.join("supervisor.sock")).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"command": command, "args": args})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"))
+}
+
+/// The supervisor's `status`, once it answers.
+fn supervisor_status(h: &Harness) -> Value {
+    h.wait("the supervisor to answer", 10, || {
+        UnixStream::connect(h.dir.join("supervisor.sock")).is_ok()
+    });
+    let answer = ask_supervisor(h, "status", &serde_json::json!({}));
+    assert_eq!(answer["ok"], true, "{answer}");
+    answer["result"].clone()
+}
+
+/// What the supervisor says of app `name`.
+fn supervised(h: &Harness, name: &str) -> Value {
+    let status = supervisor_status(h);
+    status["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|app| app["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("the supervisor does not list {name}: {status}"))
+}
+
+/// The pid of the daemon of `manifest`, once it answers.
+fn daemon_pid(h: &Harness, manifest: &std::path::Path) -> Pid {
+    let give_up = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (code, status, _) = fk_at(h, manifest, &["status"]);
+        if code == 0 {
+            let pid = status["daemon_pid"].as_i64().unwrap();
+            return Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        }
+        assert!(
+            Instant::now() < give_up,
+            "timed out waiting for the daemon of {}: {status}\n{}",
+            manifest.display(),
+            supervisor_logs(h)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// What the supervisor and the daemons of the harness's `FAWKES_HOME` wrote, for a failed assertion.
+fn supervisor_logs(h: &Harness) -> String {
+    ["supervisor.err", "s/daemon.log", "us/daemon.log"]
+        .map(|file| {
+            let text = std::fs::read_to_string(h.dir.join(file)).unwrap_or_default();
+            format!("{file}:\n{text}")
+        })
+        .join("\n")
+}
+
+/// `fawkes up --all` in the background, ended with SIGTERM (then SIGKILL) when dropped.
+struct Supervisor(std::process::Child);
+
+impl Supervisor {
+    fn start(h: &Harness) -> Supervisor {
+        Supervisor(
+            h.supervisor()
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn pid(&self) -> Pid {
+        Pid::from_child(&self.0)
+    }
+
+    /// SIGTERM, and how it exited within `within`; None while it still runs.
+    fn stop(&mut self, within: Duration) -> Option<std::process::ExitStatus> {
+        // Our own child, not reaped yet.
+        let _ = kill_process(self.pid(), Signal::TERM);
+        let give_up = Instant::now() + within;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() >= give_up {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        if self.stop(Duration::from_secs(40)).is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Ends, when dropped, the daemons of `manifests` that still answer: the ones a killed supervisor left running, which
+/// the next one leaves alone (`attached`), and which neither it nor `Harness` would end.
+struct EndDaemons<'a>(&'a Harness, Vec<std::path::PathBuf>);
+
+impl Drop for EndDaemons<'_> {
+    fn drop(&mut self) {
+        for manifest in &self.1 {
+            let (code, status, _) = fk_at(self.0, manifest, &["status"]);
+            let Some(pid) = status["daemon_pid"].as_i64().filter(|_| code == 0) else {
+                continue;
+            };
+            let pid = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+            // The pid the daemon answered with; it stops its app on its way out.
+            let _ = kill_process(pid, Signal::TERM);
+            let give_up = Instant::now() + Duration::from_secs(30);
+            while alive(pid) && Instant::now() < give_up {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// `up --all` runs the daemon of every manifest in `FAWKES_HOME` and starts one that dies again. An app brought down
+/// stays down across the supervisor's restart, and `up` brings it back under the supervisor.
+#[test]
+fn the_supervisor_runs_every_app_restarts_a_dead_daemon_and_keeps_an_app_down() {
+    let h = Harness::new("");
+    let u = second_app(&h, "u", 5);
+    let t = h.manifest().to_path_buf();
+    let _end = EndDaemons(&h, vec![t.clone(), u.clone()]);
+    let mut supervisor = Supervisor::start(&h);
+    let first = daemon_pid(&h, &t);
+    let other = daemon_pid(&h, &u);
+    for (name, pid) in [("t", first), ("u", other)] {
+        let app = supervised(&h, name);
+        assert_eq!(app["state"], "running", "{app}");
+        assert_eq!(app["daemon_pid"], pid.as_raw_nonzero().get(), "{app}");
+    }
+
+    // A daemon that dies is started again, after its backoff.
+    kill_process(first, Signal::KILL).unwrap();
+    h.wait("a new daemon for t", 15, || {
+        let (code, status, _) = fk_at(&h, &t, &["status"]);
+        code == 0 && status["daemon_pid"] != first.as_raw_nonzero().get()
+    });
+    assert_eq!(supervised(&h, "t")["failures"], 1);
+
+    // `down` goes through the supervisor, which keeps the app down.
+    let (code, down, _) = fk_at(&h, &u, &["down"]);
+    assert_eq!(code, 0, "{down}");
+    assert_eq!(down["daemon_pid"], other.as_raw_nonzero().get(), "{down}");
+    assert_eq!(supervised(&h, "u")["state"], "down");
+    assert_eq!(fk_at(&h, &u, &["status"]).0, 3);
+
+    // SIGTERM stops every daemon; the down mark outlives the supervisor.
+    let exited = supervisor.stop(Duration::from_secs(40));
+    assert_eq!(exited.and_then(|status| status.code()), Some(0));
+    assert_eq!(h.fk(&["status"]).0, 3);
+    let marks: Value =
+        serde_json::from_slice(&std::fs::read(h.dir.join("supervisor.json")).unwrap()).unwrap();
+    assert_eq!(marks, serde_json::json!({"down": ["u"]}));
+    drop(supervisor);
+
+    let _supervisor = Supervisor::start(&h);
+    daemon_pid(&h, &t);
+    assert_eq!(supervised(&h, "u")["state"], "down");
+    assert_eq!(fk_at(&h, &u, &["status"]).0, 3);
+
+    let (code, _, text) = fk_at(&h, &u, &["up"]);
+    assert_eq!(code, 0, "{text}");
+    let back = daemon_pid(&h, &u);
+    assert_eq!(
+        text.trim(),
+        format!(
+            "u's daemon runs under the supervisor (pid {back}); `fawkes watch` follows it",
+            back = back.as_raw_nonzero()
+        )
+    );
+    let app = supervised(&h, "u");
+    assert_eq!(app["state"], "running", "{app}");
+    assert_eq!(app["daemon_pid"], back.as_raw_nonzero().get(), "{app}");
+    let marks: Value =
+        serde_json::from_slice(&std::fs::read(h.dir.join("supervisor.json")).unwrap()).unwrap();
+    assert_eq!(marks, serde_json::json!({"down": []}));
+}
+
+/// The daemons outlive a supervisor that is killed, their apps with them, and the next supervisor finds them
+/// `attached` and leaves them be.
+#[test]
+fn a_killed_supervisor_leaves_its_daemons_running_for_the_next_to_find_attached() {
+    let h = Harness::new("");
+    h.commit("v1", "confirm");
+    let u = second_app(&h, "u", 5);
+    let t = h.manifest().to_path_buf();
+    let _end = EndDaemons(&h, vec![t.clone(), u.clone()]);
+    let mut supervisor = Supervisor::start(&h);
+    let daemons = [daemon_pid(&h, &t), daemon_pid(&h, &u)];
+    make_permanent(&h, "v1", "g1");
+    let app = read_pid(h.dir.join("s/app.pid"));
+
+    supervisor.0.kill().unwrap();
+    supervisor.0.wait().unwrap();
+    assert_eq!([daemon_pid(&h, &t), daemon_pid(&h, &u)], daemons);
+    assert!(alive(app));
+    assert_eq!(h.status()["process"]["pid"], app.as_raw_nonzero().get());
+    assert_eq!(h.get().as_deref(), Some("v1"));
+
+    let _next = Supervisor::start(&h);
+    for (name, pid) in [("t", daemons[0]), ("u", daemons[1])] {
+        let app = supervised(&h, name);
+        assert_eq!(app["state"], "attached", "{app}");
+        assert_eq!(app["daemon_pid"], pid.as_raw_nonzero().get(), "{app}");
+    }
+    // A tick later it has still started nothing of its own.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(supervised(&h, "t")["state"], "attached");
+    assert_eq!([daemon_pid(&h, &t), daemon_pid(&h, &u)], daemons);
+    assert_eq!(read_pid(h.dir.join("s/app.pid")), app);
+}
+
+/// `reexec` runs the supervisor on the installed binary in its own process: its pid, its daemons and their apps stay,
+/// and it goes on starting a daemon that dies.
+#[test]
+fn the_supervisor_reexecs_keeping_its_pid_its_daemons_and_their_apps() {
+    let h = Harness::new("");
+    h.commit("v1", "confirm");
+    let u = second_app(&h, "u", 5);
+    let t = h.manifest().to_path_buf();
+    let _end = EndDaemons(&h, vec![t.clone(), u.clone()]);
+    let mut supervisor = Supervisor::start(&h);
+    let daemons = [daemon_pid(&h, &t), daemon_pid(&h, &u)];
+    make_permanent(&h, "v1", "g1");
+    let app = read_pid(h.dir.join("s/app.pid"));
+
+    let answer = ask_supervisor(&h, "reexec", &serde_json::json!({}));
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(
+        answer["result"]["pid"],
+        supervisor.pid().as_raw_nonzero().get()
+    );
+    assert_eq!(answer["result"]["to"], env!("CARGO_PKG_VERSION"));
+    h.wait("the supervisor to re-execute", 20, || {
+        std::fs::read_to_string(h.dir.join("supervisor.err"))
+            .unwrap()
+            .contains("supervisor re-executed from fawkes ")
+    });
+    let status = supervisor_status(&h);
+    assert_eq!(
+        status["pid"],
+        supervisor.pid().as_raw_nonzero().get(),
+        "{status}"
+    );
+    assert_eq!(supervisor.0.try_wait().unwrap(), None);
+    for (name, pid) in [("t", daemons[0]), ("u", daemons[1])] {
+        let app = supervised(&h, name);
+        assert_eq!(app["state"], "running", "{app}");
+        assert_eq!(app["daemon_pid"], pid.as_raw_nonzero().get(), "{app}");
+    }
+    assert_eq!(read_pid(h.dir.join("s/app.pid")), app);
+    assert_eq!(h.status()["process"]["pid"], app.as_raw_nonzero().get());
+    assert_eq!(h.get().as_deref(), Some("v1"));
+
+    // The daemons it was handed are still its children: one that dies is reaped and started again.
+    kill_process(daemons[1], Signal::KILL).unwrap();
+    h.wait("a new daemon for u", 15, || {
+        let (code, status, _) = fk_at(&h, &u, &["status"]);
+        code == 0 && status["daemon_pid"] != daemons[1].as_raw_nonzero().get()
+    });
+    assert_eq!(supervised(&h, "u")["state"], "running");
 }

@@ -43,8 +43,9 @@ pub(super) fn register(name: &str, socket: &Path) -> Result<PathBuf, String> {
 /// leaves room for the terminating nul on both.
 const SOCKET_PATH_LIMIT: usize = 100;
 
-/// Bind the socket. The caller holds the state lock, so a socket file nobody answers on belongs to a dead daemon.
-pub(super) fn bind(socket: &Path) -> Result<UnixListener, String> {
+/// Bind the socket. The caller holds the state lock (the supervisor its own lock), so a socket file nobody answers on
+/// belongs to a dead daemon.
+pub(crate) fn bind(socket: &Path) -> Result<UnixListener, String> {
     if socket.as_os_str().len() >= SOCKET_PATH_LIMIT {
         return Err(format!(
             "socket path {} is too long (limit about {SOCKET_PATH_LIMIT} bytes); use a shorter state_dir",
@@ -77,7 +78,7 @@ pub(super) fn bind(socket: &Path) -> Result<UnixListener, String> {
 
 /// How long a client has to send its whole request line. A local client sends it at once, so this only ends one
 /// that connected and stalled, before it holds a connection slot for long.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How often a streaming client's thread looks whether its client has gone when no event arrives: the longest a
 /// closed `watch` or `log --follow` holds its thread and connection slot.
@@ -133,7 +134,7 @@ pub(super) fn refuse(stream: UnixStream) {
 /// One request line (without its newline) from `stream`: all of it must arrive by `until`, in at most `limit` bytes.
 /// The read timeout is the time left before each `read`, because a timeout alone bounds only each `read`, which a
 /// client sending a byte at a time never exceeds.
-fn read_request(stream: &UnixStream, until: Instant, limit: u64) -> R<String> {
+pub(crate) fn read_request(stream: &UnixStream, until: Instant, limit: u64) -> R<String> {
     let too_slow = || {
         err(
             ErrorCode::Usage,

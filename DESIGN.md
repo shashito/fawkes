@@ -11,18 +11,22 @@ implements all of it except where a section says **later**.
 
 ## Process model
 
-`fawkes up` brings the app up under supervision: the daemon, a long-running foreground process (launchd or systemd
-keeps it alive; on macOS `fawkes service install` sets up launchd, see Service). It is the parent of the app's live
-process and the only writer of the state directory. Every other command (`down`, `reexec`, `start`, `stop`, `restart`,
-`stage`, `test`, `switch`, `upgrade`, `confirm`, `rollback`, `prune`, `status`, `log`, `history`, `reload`, `watch`) is a thin
-client that sends requests over the daemon's Unix socket and renders the answer. One daemon supervises one app; run
-one daemon per manifest.
+`fawkes up` brings the app up under supervision: the app's daemon, a long-running foreground process. It is the
+parent of the app's live process and the only writer of the state directory. Every other command (`down`, `reexec`,
+`start`, `stop`, `restart`, `stage`, `test`, `switch`, `upgrade`, `confirm`, `rollback`, `prune`, `status`, `log`,
+`history`, `reload`, `watch`) is a thin client that sends requests over the daemon's Unix socket and renders the
+answer. One daemon supervises one app; run one daemon per manifest.
+
+`fawkes up --all` runs *the supervisor*: one process that runs the daemon of every manifest in `$FAWKES_HOME` as its
+child and starts one that fails again (see Supervisor). launchd keeps the supervisor alive on macOS (`fawkes service
+install`, see Service). Each daemon stays the one `fawkes up` runs, with its own state lock and socket; the supervisor
+only starts, waits for and signals it, and every command but `up` and `down` talks to the daemon as before.
 
 A step takes one or both of two slots. The *step* slot belongs to the transaction steps: `stage`, `test` and `prune`
 take it alone, `switch` and `rollback` take it together with the live slot, and a second step gets `busy`. The *live*
 slot belongs to whatever moves the live process: `start`, `stop` and `restart`, a `switch` or `rollback`, and the
-supervisor's own work (reaping the app after a crash, restarting it after its backoff, an automatic rollback). So the
-lifecycle commands exclude each other and a switch or rollback, and get `busy` while the supervisor works, but a
+daemon's own work (reaping the app after a crash, restarting it after its backoff, an automatic rollback). So the
+lifecycle commands exclude each other and a switch or rollback, and get `busy` while the daemon works, but a
 `stage`, `test` or `prune` never delays them, and an automatic rollback never waits for a stage or test (it runs
 beside them; a `switch` or `rollback` asked meanwhile gets `busy` from the stage or test). When both slots are
 taken, `busy` names the step in the step slot first, and the live slot's step otherwise. `status`, `log`, `history`,
@@ -30,8 +34,8 @@ taken, `busy` names the step in the step slot first, and the live slot's step ot
 
 The daemon is a few threads and no async runtime: one accepts clients, one per client answers it, one supervises
 the app, one per running child waits for its exit, and short-lived ones run health checks and read a step's output.
-The accept thread sleeps in `poll(2)` on the socket and on a pipe the signal handlers write to; the supervisor
-sleeps until the app exits, a request changes something, or its next timer runs out (a crash restart's backoff, the
+The accept thread sleeps in `poll(2)` on the socket and on a pipe the signal handlers write to; the thread that
+supervises the app sleeps until the app exits, a request changes something, or its next timer runs out (a crash restart's backoff, the
 confirm deadline, and every 10 s while an app runs the `app.log` size cap). An idle daemon without an app or a
 client does not wake at all; a client that follows the log (`subscribe`, as `watch` does, and `log --follow`) has
 its thread look every 500 ms whether the client has gone.
@@ -39,7 +43,7 @@ its thread look every 500 ms whether the client has gone.
 The daemon writes every event to stderr as a line, for whoever watches the terminal. That copy is best effort, from
 a thread of its own: a stderr that blocks or breaks (a closed terminal, a `| tee` that died) never stalls or ends the
 daemon, and lines it cannot take are dropped. `events.jsonl` is the record. When stderr is `<state_dir>/daemon.log`
-(the same file, as a launchd service's is), the thread that writes it keeps it under 10 MiB: past that it copies the
+(the same file, as under the supervisor), the thread that writes it keeps it under 10 MiB: past that it copies the
 file to `daemon.log.1` (replacing the one before) and empties it, between two lines, so none is lost. Whoever starts
 the daemon decides where stderr goes; the daemon only looks at what it is.
 
@@ -47,7 +51,7 @@ The lines are aligned as `fawkes log` prints them (time, kind and generation in 
 healthy start of the live app (the `healthy` event: the daemon's start, a crash restart, a switch, a rollback, an
 adoption), if that process is still the running live app, the daemon also writes a block to stderr, so whoever ran
 `fawkes up` sees where the app is. The block is not an event: it is neither in `events.jsonl` nor sent to
-subscribers, and under `fawkes service` it is in `daemon.log` with the rest of stderr.
+subscribers, and under the supervisor it is in `daemon.log` with the rest of stderr.
 
 ```text
 
@@ -80,7 +84,7 @@ has no one to answer, so `SIGHUP` only logs:
 - `name`, `repo`, `state_dir` and `home` never change by reload; they need a daemon restart. (A changed `home` would
   restore a snapshot into another directory than the one it was taken from.)
 - `port` does not change while the app runs (`stop` it first), nor while a step holds the live process (a switch,
-  restart, rollback or the supervisor's own restart: between stopping the old process and starting the new one no app
+  restart, rollback or the daemon's own restart: between stopping the old process and starting the new one no app
   runs, yet the step announces the port it starts on). The reload is refused whole; reload again once the step
   has finished.
 - Everything else (`start`, `env`, `health`, `hooks`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`,
@@ -99,7 +103,7 @@ which is how a new Fawkes install reaches it: the daemon executes that binary in
 stays, the app stays its child and keeps running, and nothing stops or rolls back. It is refused `invalid_state`
 while a transaction is under way (`txn` is `switching`, `pending` or `rolling_back`; the message names the generation
 and says to run `fawkes reexec` again once `fawkes wait` reports it decided) and during a crash backoff, and `busy`
-while either slot is taken (a stage, test, prune, start, stop, restart, switch or rollback, or the supervisor's own
+while either slot is taken (a stage, test, prune, start, stop, restart, switch or rollback, or the daemon's own
 work) or the health check after a start of the live app still runs. The live app may be running and healthy, stopped
 or given up on (`failed`). The daemon first runs `<binary> --version`, bounded at 5 s: unless it exits 0 and prints
 `fawkes <version>`, `reexec` fails `start_failed`, names the binary and what it did, and nothing changes. Then it
@@ -199,7 +203,7 @@ deadline is cleared. Confirming a generation that is not pending is `invalid_sta
 `confirm <gen>` naming the permanent generation is ok with its record and changes nothing (no event, no write),
 whatever else is going on, so an app whose confirm answer was lost can retry it (it starts no prune either). A bare
 `confirm` with nothing pending stays `invalid_state`. Confirming the pending generation is also `invalid_state` while
-its process is not running (stopped, or exited and about to be rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The supervisor
+its process is not running (stopped, or exited and about to be rolled back) or once its rollback is decided: only a generation that runs can vouch for itself. The daemon
 records a rollback (crash, missed deadline, failed health check) in the same step that learns of it, so a confirm
 never slips in between.
 
@@ -291,8 +295,8 @@ deadline or storage; only `switch`, `confirm` and rollback do.
 - **restart:** stop (with the same grace), then start the same generation. It resets the backoff and does not count
   as a failed start.
 
-`stop` and `restart` of an app that has already exited, before the supervisor has reaped it, are `busy`: the exit is a
-crash for the supervisor to decide (a pending generation gets no retries), never a requested stop.
+`stop` and `restart` of an app that has already exited, before the daemon has reaped it, are `busy`: the exit is a
+crash for the daemon to decide (a pending generation gets no retries), never a requested stop.
 
 A requested stop is never a crash. Every other exit of the app's main process is, and Fawkes then ends the rest of
 its process group (SIGTERM, SIGKILL after 1 s), so nothing the app started lives on unsupervised:
@@ -383,8 +387,8 @@ daemon then ends through its ordinary shutdown, as after a `SIGTERM` (the socket
 with exit code 1 and a last line on stderr that says what failed, that nothing was started and the home is
 untouched, and to start the app as before, or fix it and run `fawkes up` again; a failed test names its log. The
 generation stays as the step left it (`test_failed` after a failed test), so the next start tests the same one again
-while HEAD has not moved. Under `fawkes service` launchd starts a daemon that failed again (`KeepAlive`), so the
-adoption is retried about every 10 s until it passes. A `SIGTERM` during the adoption ends it like any stage or test
+while HEAD has not moved. Under the supervisor a daemon that failed is started again after its backoff (Supervisor), so
+the adoption is retried, at most 30 s apart, until it passes. A `SIGTERM` during the adoption ends it like any stage or test
 and the daemon exits as usual; the next start adopts again. A daemon that dies once `permanent` is written runs the
 adopted generation at its next start, like any permanent one.
 
@@ -474,7 +478,7 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
   number of seconds above 0 and at most 86400;
 - `max_failed_starts` or `keep` is 0;
 - it lies in `<fawkes_home>` under another file name than `<name>.toml`: `--manifest <name>` finds an app there by
-  its file name, and everything else (`status`, `watch`, the state directory, the service label) shows its `name`,
+  its file name, and everything else (`status`, `watch`, the state directory, the supervisor's apps) shows its `name`,
   so the error says to rename the file;
 - `[health]` has both `url` and `command` (having neither is the default `url`), or `url` is not `http://` with an explicit port
   after the host (`:{port}`, or a number from 1 to 65535);
@@ -596,7 +600,7 @@ whose storage is worth a snapshot is never tested on an empty home.
 ## CLI
 
 ```
-fawkes up
+fawkes up       [--all]
 fawkes down
 fawkes reexec
 fawkes start
@@ -626,21 +630,30 @@ command, and exits 0; `help` is not a command, so `fawkes stage help` stages the
 usage error that names the similar commands (`tip: a similar subcommand exists: 'log'`), never one run in its place.
 `fawkes --version` (or `-V`) prints `fawkes <version>` and exits 0.
 
-The two levels are the supervisor and the app's process. `up` brings the app up under supervision: it runs the daemon
-in the foreground, with its events on stderr, until `down`, `SIGTERM` or `SIGINT` (Process model, Daemon start). A
-second `up` of the same app is refused while the first holds the state lock. `down` stops the app and its daemon over
-the socket and answers once the app is stopped and the daemon has let go of its socket and state lock, just before it
-exits, so `fawkes down && fawkes up` never finds the old daemon in the way. Its text names the generation it stopped
-and the daemon's pid, and ends with the command that starts both again: `fawkes up --manifest …`, or `fawkes service
-restart --manifest …` for an app installed as a launchd agent, whose daemon a terminal's `up` would contend with at the
-next login. A `down` that reaches a daemon already on its way out may get no answer and fail `daemon_unreachable`
+The two levels are the app's daemon and the app's process. `up` brings the app up under supervision: it runs the
+daemon in the foreground, with its events on stderr, until `down`, `SIGTERM` or `SIGINT` (Process model, Daemon
+start). A second `up` of the same app is refused while the first holds the state lock. `down` stops the app and its
+daemon over the socket and answers once the app is stopped and the daemon has let go of its socket and state lock,
+just before it exits, so `fawkes down && fawkes up` never finds the old daemon in the way. Its text names the
+generation it stopped and the daemon's pid, and ends with the command that starts both again, `fawkes up --manifest …`.
+
+For an app of the supervisor (a manifest `$FAWKES_HOME/<name>.toml` while a supervisor answers on
+`$FAWKES_HOME/supervisor.sock`), `up` and `down` go through the supervisor (see Supervisor). `up` sends it `start`,
+prints `xana's daemon runs under the supervisor (pid 812); `fawkes watch` follows it` and exits 0 once the daemon
+answers, or fails with the supervisor's error; the daemon is the supervisor's child, not the terminal's. `down` sends it
+`down`, which marks the app down first, so the supervisor does not start it again; its text says the app stays down
+and that `fawkes up --manifest <name>` brings it back under the supervisor. An `up` whose parent is the supervisor (the
+daemon it spawns), or that is given `--socket`, runs the daemon itself. `up --all` runs the supervisor in the
+foreground; `--manifest` and `--socket` are usage errors with it.
+
+A `down` that reaches a daemon already on its way out may get no answer and fail `daemon_unreachable`
 (exit 3): there is no daemon left either way. `reexec` runs the daemon on the fawkes binary installed at its path,
 with the same pid and the app still running (Process model, Reexec); since the daemon answers before it executes the
 binary, the command ends once `status` answers with the same `daemon_pid` and the new `version`, or fails `no_answer`
 after 30 s (the `error` event of a failed exec says why). Its text names the app, the daemon's pid, both versions and
 the app that keeps running: `xana's daemon (pid 812) re-executed: fawkes 0.1.4 → 0.1.5; g5 keeps running (pid
 4657)`; under `--json` it prints the result. Unlike `down` it may run from inside the app, which it never stops.
-`start`, `stop` and `restart` act on the app's process and leave the supervisor running.
+`start`, `stop` and `restart` act on the app's process and leave the daemon running.
 
 In text, `log` and `history` print nothing, not a blank line, when there are no events or generations to show (`log -n 0`
 included); under `--json` the result is `{"events": []}` as ever. `log --since N` is how an agent asks for what came after
@@ -669,8 +682,8 @@ A client command reaches its daemon by the first of:
 `APP`, for `--manifest` and `$FAWKES_MANIFEST`, is a path when it has a `/` or ends in `.toml`, and otherwise an app
 name: `<fawkes_home>/<APP>.toml`, which must exist. An empty variable counts as unset. There is no guess beyond this:
 not finding the app is a `usage` error (exit 2), and a running daemon is never picked because it is the only one.
-`up` and `service`, which need a manifest, take steps 2, 4, 5 and 6; `watch` takes steps 1 to 4 and otherwise
-follows every daemon (see Watch).
+`up`, which needs a manifest, takes steps 2, 4, 5 and 6; `watch` takes steps 1 to 4 and otherwise follows every
+daemon (see Watch). `up --all` and `service` take no app: they act on every manifest in `$FAWKES_HOME`.
 
 This order puts the flags before the environment, which **changes the earlier contract**, where `$FAWKES_SOCKET`
 beat `--manifest` and only `./fawkes.toml` was read: an app Fawkes runs that names another app's manifest now
@@ -724,7 +737,7 @@ that confirmed before `wait` started is waited for by name. The outcomes:
 | `staged`, `tested` or `test_failed`, with no switch to it starting | exit 1, `invalid_state` ("g4 is tested; it is not switched to, so nothing will decide it") |
 
 A generation that is already decided answers at once, so `wait` is safe to retry. It is bounded by the deadline the
-switch set: a generation still `current` more than 30 seconds past `pending.deadline` (the supervisor rolls a missed
+switch set: a generation still `current` more than 30 seconds past `pending.deadline` (the daemon rolls a missed
 deadline back within a second; the rest is slack for a slow machine) fails `no_answer` ("the daemon did not decide g4
 by its deadline …; check `fawkes status`"). Once the rollback is decided, `wait` waits for it to finish, which the
 manifest's timeouts bound. A stream that ends (a daemon restart rolls a pending switch back) is opened again every
@@ -740,8 +753,9 @@ and nothing else. Read-only commands (`status`, `history`, `log`, `watch`, `wait
 only for the test run's own `FAWKES_GENERATION` towards the daemon `FAWKES_SOCKET` names (bare, or naming that
 generation), which is never the pending one (Confirm); a `confirm <gen>` naming another generation, and a bare
 `confirm` that would send no generation (another daemon, or `FAWKES_GENERATION` unset), fail `test_phase` too.
-`fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value) and `FAWKES_SOCKET` naming the socket file of the manifest they would act on fail `invalid_state`: they stop that
-daemon and its app, the caller with it, so they are run from a shell outside the app. So does `down` towards the
+`fawkes service install`, `uninstall` and `restart` with `FAWKES_PHASE` set (to any value) fail `invalid_state`: they
+stop the supervisor and every daemon it runs, the caller's own or one beside it, so they are run from a shell outside
+the apps. So does `down` towards the
 daemon `FAWKES_SOCKET` names with `FAWKES_PHASE` set (`invalid_state`), which would also leave nothing to start the
 app again.
 
@@ -773,65 +787,124 @@ error: g4 was rolled back (missed confirm deadline); g1 runs; `fawkes history` h
 error: no daemon answers on /Users/me/.fawkes/sample/fawkes.sock; start one with `fawkes up --manifest fawkes.toml`
 ```
 
+### Supervisor
+
+`fawkes up --all` runs the supervisor of every app's daemon in the foreground, until `SIGTERM` or `SIGINT`. Its apps
+are the manifests `$FAWKES_HOME/<name>.toml` (Finding the app), read again every 2 s: a new manifest is started, and
+one that is removed is forgotten once its daemon has exited (the daemon runs on until then). There is no reload
+command. With `--manifest` or `--socket` it is a usage error (exit 2); in a test run it fails `test_phase`, as `up`
+does. Its stderr is text only: one line per change of an app (started, exited and what comes next, attached, broken,
+down, gone), with the time; under `fawkes service` it is `<fawkes_home>/supervisor.log`, capped at 10 MiB as
+`daemon.log` is.
+
+In `<fawkes_home>` it keeps:
+
+- `supervisor.lock`: an exclusive `flock` held for the process's life, with its pid written in. A second `up --all`
+  fails with exit 1 and names the pid and the socket of the one that runs.
+- `supervisor.sock`: its socket (mode `0600`), not in `run/`, which lists daemons only. It speaks the daemon's protocol
+  (one JSON request per line, the same envelope, result and error objects).
+- `supervisor.json`: `{"down": [<name>, …]}`, the apps that stay down, written durably (temp file, `fsync`, rename)
+  before the change is answered. A corrupt file stops the supervisor at its start: fix it, or remove it to start every
+  app.
+
+It starts each app's daemon as `<binary> --manifest <path> up`, in a process group of its own (a Ctrl-C reaches the
+supervisor alone), with stdin `/dev/null` and stdout and stderr appended to `<state_dir>/daemon.log`; it creates
+`state_dir` (mode `0700`) first. The daemon inherits the supervisor's environment without `FAWKES_SOCKET`,
+`FAWKES_MANIFEST`, `FAWKES_GENERATION` and `FAWKES_PHASE`. Before every start it tries the app's state lock: one held
+by another process is a daemon that runs, not as the supervisor's child, and the app is `attached`; the supervisor
+leaves it be and looks again every 2 s.
+
+What comes after a daemon of its own exits:
+
+- exit 0, while the supervisor is not shutting down: the daemon ended by itself (`fawkes down` sent to the daemon, or
+  a failed adoption's clean end), so the app is marked down, durably, and stays down until `fawkes up`;
+- exit 2 (its manifest is invalid): `broken`, started again once the manifest's modification time changes;
+- any other exit or a signal: `backoff`, started again after 1, 2, 4, 8, 16, then 30 s for every failure in a row; a
+  daemon that ran for 60 s before it failed starts the count over;
+- an exit the supervisor asked for (its shutdown, its `down`) marks nothing.
+
+A manifest the supervisor cannot load is `broken` too, and a start that fails before the daemon runs (its directory,
+its lock, the exec) counts as a failure.
+
+**Requests** (`command` and `args`, as for the daemon; any other command is `usage`):
+
+- `status`: `{"pid", "version", "socket", "apps": [{"name", "manifest", "state", "daemon_pid"?, "restart_at"?,
+  "failures"}]}`, the apps by name. `state` is `running` (its daemon is the supervisor's child), `attached`, `backoff`
+  (with `restart_at`), `down` or `broken`; it may gain values. `daemon_pid` is the running or attached daemon's.
+- `start {"app"}`: clears the app's down mark and starts its daemon now, whatever backoff or broken wait it is in,
+  then answers once the daemon answers `status`, within 30 s: `{"app", "daemon_pid", "already"}` (`already`: it ran,
+  as the supervisor's child or attached). An app it does not know is `not_found`, listing those it knows; a daemon
+  that exits first, or does not answer in time, is `start_failed` with the daemon's log in `log`. A daemon its `down`
+  is still stopping is waited for, then `busy`.
+- `down {"app"}`: marks the app down, durably, then sends the daemon `down` and, once that daemon has exited (at
+  most 5 s after its answer), answers with its result:
+  `{"name", "daemon_pid", "stopped"}`, `daemon_pid` null when no daemon answered (none ran; one of its own still
+  starting is sent `SIGTERM`). The app stays down either way. The wait is bounded by the daemon's own shutdown (the
+  `ExitTimeOut` below without its margin) plus 5 s.
+- `reexec`: as the daemon's (Reexec): checks `--version` of the binary installed at its path, answers `{"pid",
+  "from", "to"}`, then executes it with the same pid, handing over the lock, the socket and the daemons it started,
+  which stay its children. Refused with `busy` while a `start` or `down` is at work.
+
+On `SIGTERM` or `SIGINT` it sends `SIGTERM` to every daemon of its own and waits for them, for at most the longest of
+their shutdowns plus 5 s, then exits 0. Those exits mark nothing, so the next supervisor starts the same apps. Attached
+daemons are not its own and run on. A supervisor that dies (`SIGKILL`) leaves its daemons and their apps running; the
+next one finds them `attached`.
+
 ### Service
 
-`fawkes service install|uninstall|restart` runs the daemon under launchd as a user LaunchAgent, for a Mac that is a
-server. A desktop user never needs it. It is a client-side convenience: it writes a plist and calls `launchctl`, and the
-daemon cannot tell it was started this way (it has no code for it). macOS only; elsewhere each action is a `usage` error
-(run `fawkes up --manifest …` under the init system; systemd user units are **Later**). The manifest is found as
-for `up` (Finding the app); `--socket` is a usage error, since the service runs the daemon on the manifest's own
-socket.
+`fawkes service install|uninstall|restart` runs the supervisor (`fawkes up --all`), and with it every app's daemon in
+`$FAWKES_HOME`, under launchd as the user LaunchAgent `dev.fawkes`, for a Mac that is a server. A desktop user never
+needs it. It is a client-side convenience: it writes a plist and calls `launchctl`, and the supervisor cannot tell it
+was started this way. macOS only; elsewhere each action is a `usage` error (run `fawkes up --all` under the init
+system; systemd user units are **Later**). It takes no app: `--manifest` and `--socket` are usage errors.
 `--json` applies to all three: one result object, or the usual error object, with the usual exit codes. Run with
-`FAWKES_PHASE` set and `FAWKES_SOCKET` naming this manifest's socket, which is the case from inside the app, they are
-refused before `launchctl` runs (`invalid_state`, see CLI).
+`FAWKES_PHASE` set, which is the case from inside an app, they are refused before `launchctl` runs (`invalid_state`,
+see CLI).
 
-The label is `dev.fawkes.<name>` and the plist `$HOME/Library/LaunchAgents/<label>.plist` (`HOME` must be set and
-absolute; the directory is created), loaded in the domain `gui/<uid>`. `HOME` and `PATH` decide where the plist goes and
-which `launchctl` runs. The plist holds:
+The plist is `$HOME/Library/LaunchAgents/dev.fawkes.plist` (`HOME` must be set and absolute; the directory is
+created), loaded in the domain `gui/<uid>`. `HOME` and `PATH` decide where the plist goes and which `launchctl` runs.
+The plist holds:
 
-- `ProgramArguments`: the canonical path of the running binary, `up --manifest <absolute manifest path>`.
-- `EnvironmentVariables`: the installing process's `PATH` (launchd's own is minimal, and the app's commands need
-  `node`, `git` and the rest), and `FAWKES_HOME` when it is set, because it decides the default `state_dir` and the
-  `run/` links. The paths and variables must be UTF-8.
-- `RunAtLoad` and `KeepAlive { SuccessfulExit = false }`: the daemon starts at login and again after a failed exit, and
-  stays down after a clean one (`fawkes down` or a SIGTERM): the agent stays loaded with no daemon until the next
-  login or `fawkes service restart`, and `uninstall` removes it.
-- `ExitTimeOut`: `3 × stop_timeout + 5`, rounded up, plus 10 s: the longest a daemon's shutdown takes (it waits up
-  to `2 × stop_timeout + 5` s for a switch or rollback in flight, stops the app with `stop_timeout` of grace, then
-  waits up to 2 s for the answers it owes, inside the 10 s).
-  launchd's default of 20 s would SIGKILL it partway, and the next daemon start would have to recover. A changed
-  `stop_timeout` reaches the plist with the next `install`.
-- `StandardErrorPath`: `<state_dir>/daemon.log`, where the daemon's stderr goes. `install` creates `state_dir` (mode
-  `0700`) when it is missing, because launchd opens that file before the daemon exists to create the directory. The
-  daemon caps it at 10 MiB (Process model), but only the lines its own writer writes: a daemon that fails before it
-  gets that far (an invalid manifest) adds its error at every start launchd retries, about every 10 s, uncapped.
+- `ProgramArguments`: the path of the running binary, `up --all`.
+- `EnvironmentVariables`: the installing process's `PATH` (launchd's own is minimal, and the apps' commands need
+  `node`, `git` and the rest), and `FAWKES_HOME` when it is set, because it decides which apps the supervisor runs, the
+  default `state_dir` and the `run/` links. The paths and variables must be UTF-8.
+- `RunAtLoad` and `KeepAlive { SuccessfulExit = false }`: the supervisor starts at login and again after a failed exit,
+  and stays down after a clean one (a SIGTERM): the agent stays loaded until the next login or `fawkes service
+  restart`, and `uninstall` removes it.
+- `ExitTimeOut`: the longest of the apps' daemon shutdowns, `3 × stop_timeout + 5` rounded up, plus 10 s (a daemon
+  waits up to `2 × stop_timeout + 5` s for a switch or rollback in flight, stops the app with `stop_timeout` of grace,
+  then waits up to 2 s for the answers it owes; the supervisor stops them all at once), 10 s without a valid manifest.
+  launchd's default of 20 s would SIGKILL it partway, and the next daemon start would have to recover. It is read from
+  the manifests in `$FAWKES_HOME` at `install`: an app added later, or a changed `stop_timeout`, reaches the plist with
+  the next `install`.
+- `StandardErrorPath`: `<fawkes_home>/supervisor.log`, where the supervisor's stderr goes; each daemon's goes to its
+  own `<state_dir>/daemon.log`. `install` creates `$FAWKES_HOME` (mode `0700`) when it is missing, because launchd
+  opens that file before the supervisor exists to create the directory.
 - The binary is named as it was run, not resolved, so a symlinked install (Homebrew's `bin/fawkes`) keeps working
   after an upgrade removes the version it pointed at; a binary that moved needs `install` again.
 
 **install** refuses a binary with a `CACHEDIR.TAG` in any ancestor directory (`usage`): cargo writes one at the top of
-every target directory, and the next `cargo build` replaces the binary under the running daemon. Install a copy
+every target directory, and the next `cargo build` replaces the binary under the running supervisor. Install a copy
 (`cargo install --path . --locked`) and run `fawkes service install` from it. With a plist, `install` replaces it: it
 boots the old agent out and waits until `launchctl print` no longer finds it (launchd answers a bootout before it has
 let go of the service, and a bootstrap until then fails), writes the new plist beside it and renames it into place,
-then bootstraps. Unless a loaded agent was just booted out, it refuses (`invalid_state`) when a daemon already answers
-on the manifest's socket (one started from a terminal): it holds the state lock, so the agent's daemon would fail at
-every start. Stop it first. A failing `launchctl` is `service_failed` with its message; after a failed
+then bootstraps. Unless a loaded agent was just booted out, it refuses (`invalid_state`) when a supervisor already
+answers on `<fawkes_home>/supervisor.sock` (one started from a terminal): it holds `supervisor.lock`, so the agent's
+would fail at every start. Stop it first. A failing `launchctl` is `service_failed` with its message; after a failed
 bootstrap the plist stays, and running `install` again or `uninstall` cleans up. Result:
 `{"label", "plist", "log", "replaced"}` (`replaced`: the plist existed before).
 
-**uninstall** boots the agent out and removes the plist; the state directory stays. It is idempotent: an agent that is
-not loaded (`launchctl` exits 3, "No such process") is fine. Result: `{"label", "plist", "removed"}`, where `removed`
-is false when there was neither a plist nor a loaded agent.
+**uninstall** boots the agent out, which stops the supervisor and the daemons it runs, and removes the plist; the state
+directories stay. It is idempotent: an agent that is not loaded (`launchctl` exits 3, "No such process") is fine.
+Result: `{"label", "plist", "removed"}`, where `removed` is false when there was neither a plist nor a loaded agent.
 
-**restart** boots the agent out (a SIGTERM and the wait for a graceful stop) and bootstraps the existing plist, which
-launchd reads afresh. Without a plist it fails with `not_found`: `install` first. The daemon starts as at any start, so
-a pending switch is rolled back (see Daemon start). Result: `{"label", "plist"}`.
+**restart** boots the agent out (a SIGTERM, which stops every daemon the supervisor runs, and the wait for a graceful
+stop) and bootstraps the existing plist, which launchd reads afresh. Without a plist it fails with `not_found`:
+`install` first. Each daemon starts as at any start, so a pending switch is rolled back (see Daemon start). Result:
+`{"label", "plist"}`. `fawkes reexec` picks up a new binary without stopping anything.
 
 `launchctl` runs through `run_bounded` with `ExitTimeOut` plus 30 s.
-
-A client command that finds no daemon answering (`daemon_unreachable`) for an app whose plist exists says to start
-it again with `fawkes service restart --manifest …` rather than `fawkes up`, which would only contend with the
-agent's daemon for the state lock.
 
 ## Socket protocol
 
@@ -933,7 +1006,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `started` | the live app's process has been spawned, with its pid and port (a `test` run does not log it) | the generation started |
 | `healthy` | the live app's health check passed | the generation checked |
 | `unhealthy` | the live app's health check gave up and its process is still the live one | the generation checked |
-| `exited` | the supervisor found the live app's process gone without a request from Fawkes; the message says when it restarts, if it does. A stop on request logs `stopped` instead | the generation that ran |
+| `exited` | the daemon found the live app's process gone without a request from Fawkes; the message says when it restarts, if it does. A stop on request logs `stopped` instead | the generation that ran |
 | `failed` | Fawkes gives up the app: `max_failed_starts` starts in a row ended early, or a start of the permanent generation could not spawn the process; nothing restarts it until `start` or a switch | the generation given up |
 | `stopped` | `stop` ended the app, or cancelled the restart a crash had scheduled | the generation stopped |
 | `staged` | `stage` finished: worktree, reuse and install are done | the new generation |
@@ -1038,10 +1111,10 @@ restore that failed; `prune` a `keep` in the manifest. A status without `actions
 | given up (`failed`) | `start`, `restart`, `stage`, … |
 | switching (holds both slots) | none |
 | pending, its app runs, within the deadline | `stop`, `restart`, `stage`, `test` entries, `confirm gN`, `rollback` (no `switch`) |
-| pending, deadline passed | as above without `confirm` (the supervisor rolls it back next) |
+| pending, deadline passed | as above without `confirm` (the daemon rolls it back next) |
 | pending, its app exited and is not reaped yet | `stage`, `test` entries, `rollback` |
 | pending, its app stopped | `start`, `restart`, `stage`, …, `rollback` |
-| `rolling_back` (the supervisor holds the live slot) | `stage`, `test` entries |
+| `rolling_back` (the daemon holds the live slot) | `stage`, `test` entries |
 | `restore_failed` | `stage`, `test` entries, `rollback`, `rollback --keep-storage` |
 | a `stage` or `test` in progress (`busy` names it) | only what does not take the step slot: the lifecycle commands the state allows, and `confirm gN` |
 | `keep` set, step slot free | the list above and `prune` last |
@@ -1054,7 +1127,7 @@ nothing or does not run; the text form prints one line per key after the `proces
 key. `restart_at` is the UTC time of the scheduled crash restart while the app waits out
 its backoff (`state` is `stopped` then), null otherwise. `busy` names the step in progress: a transaction step (`stage`, `test g3`,
 `switch g3`, `rollback`, `prune`), else one that moves the live process (`start`, `stop`, `restart`, or the
-supervisor's `reap`, `restart` and `rollback`).
+daemon's own `reap`, `restart` and `rollback`).
 
 ### Report
 
@@ -1153,8 +1226,17 @@ event log started over`. Until the first `status` line names the app, a note nam
                          10 MiB the live one is copied to app.log.1 and emptied (checked every 10 s; lines
                          written during the copy are lost)
   install-failed.log     install output of the latest stage that failed (its generation is removed)
-  daemon.log             the daemon's stderr under `fawkes service` (launchd writes it); past 10 MiB copied to
-                         daemon.log.1 and emptied by the daemon
+  daemon.log             the daemon's stdout and stderr under the supervisor (it appends them); past 10 MiB copied
+                         to daemon.log.1 and emptied by the daemon
+
+<fawkes_home>/
+  <name>.toml            the manifests of the apps the supervisor runs
+  run/<name>.sock        a link to each running daemon's socket (Discovery)
+  supervisor.lock        flock'ed by the running supervisor; its pid
+  supervisor.sock        the supervisor's socket
+  supervisor.json        {"down": [<name>, …]}, the apps that stay down; durable writes
+  supervisor.log         the supervisor's stderr under `fawkes service` (launchd writes it); past 10 MiB copied to
+                         supervisor.log.1 and emptied by the supervisor
 ```
 
 `state.json` is the source of truth; the deadline is an absolute time so it survives a daemon restart.

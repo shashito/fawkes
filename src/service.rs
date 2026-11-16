@@ -1,43 +1,35 @@
-//! `fawkes service`: run the daemon as a launchd user agent (see DESIGN.md, "Service"). A client-side convenience
-//! that only writes a plist and calls `launchctl`: the daemon cannot tell it was started this way.
+//! `fawkes service`: run the supervisor (`fawkes up --all`), and with it every app's daemon in `$FAWKES_HOME`, as the
+//! launchd user agent `dev.fawkes` (see DESIGN.md, "Service"). A client-side convenience that only writes a plist and
+//! calls `launchctl`: the supervisor cannot tell it was started this way.
 
 use clap::Subcommand;
 
 /// What `fawkes service` does.
 #[derive(Subcommand, Clone, Copy)]
 pub enum Action {
-    /// Install (or reinstall) this app's daemon as a launchd agent, run now, at login and after it fails (macOS only)
+    /// Install (or reinstall) the supervisor as the launchd agent dev.fawkes, run now, at login and after it fails
+    /// (macOS only)
     Install,
-    /// Stop the agent's daemon and remove its plist; the state directory stays
+    /// Stop the supervisor and the daemons it runs, and remove its plist; the state directories stay
     Uninstall,
-    /// Stop the agent's daemon gracefully and start it again from the plist; a daemon start rolls a pending switch
-    /// back, as at any start
+    /// Stop the supervisor and every app's daemon it runs gracefully and start them again from the plist; each daemon's
+    /// start rolls a pending switch back, as at any start. `fawkes reexec` picks up a new binary without stopping anything
     Restart,
 }
 
-/// `$HOME/Library/LaunchAgents/dev.fawkes.<name>.plist`, where `install` writes the agent of the app `name`; none
-/// without an absolute `HOME`, or off macOS, where there is no service.
-pub fn plist(name: &str) -> Option<std::path::PathBuf> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
-    home.is_absolute().then(|| {
-        home.join("Library/LaunchAgents")
-            .join(format!("dev.fawkes.{name}.plist"))
-    })
-}
+/// The agent's label.
+pub const LABEL: &str = "dev.fawkes";
 
-/// Do `action` for the app of the manifest at `manifest_path`: the JSON result, and its text for a person.
+/// Do `action` for the supervisor of the apps in `home`: the JSON result, and its text for a person.
 #[cfg(not(target_os = "macos"))]
 pub fn run(
     _action: Action,
-    _manifest_path: &std::path::Path,
+    _home: &std::path::Path,
 ) -> crate::protocol::R<(serde_json::Value, String)> {
     Err(crate::protocol::err(
         crate::protocol::ErrorCode::Usage,
-        "fawkes service needs launchd, so it runs on macOS only; elsewhere run `fawkes up --manifest …` under \
-         your init system (systemd user units are Later)",
+        "fawkes service needs launchd, so it runs on macOS only; elsewhere run `fawkes up --all` under your init \
+         system (systemd user units are Later)",
     ))
 }
 
@@ -46,7 +38,9 @@ pub use launchd::run;
 
 #[cfg(target_os = "macos")]
 mod launchd {
-    use super::Action;
+    use super::{Action, LABEL};
+    use crate::discovery;
+    use crate::fleet;
     use crate::manifest::Manifest;
     use crate::process::{Finished, run_bounded};
     use crate::protocol::{Error, ErrorCode, R, describe_status, err, invalid_state};
@@ -59,58 +53,50 @@ mod launchd {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// Slack on top of the daemon's `ExitTimeOut` for `launchctl`, which `bootout` makes wait until the daemon is gone.
+    /// Slack on top of the supervisor's `ExitTimeOut` for `launchctl`, which `bootout` makes wait until it is gone.
     const LAUNCHCTL_SLACK: u64 = 30;
-    /// How long the daemon may take to stop beyond the manifest's `stop_timeout` (its own steps around stopping the
-    /// app) before launchd sends SIGKILL.
+    /// How long a daemon may take to stop beyond its own bound (`Manifest::daemon_stop_wait`) before launchd sends the
+    /// supervisor SIGKILL: its 2 s wait for the answers it owes (`ANSWER_WAIT`), the supervisor's wait after it.
     const EXIT_MARGIN: u64 = 10;
 
-    pub fn run(action: Action, manifest_path: &Path) -> R<(Value, String)> {
-        let service = Service::new(manifest_path)?;
+    pub fn run(action: Action, home: &Path) -> R<(Value, String)> {
+        let service = Service::new(home)?;
         match action {
-            Action::Install => service.install(manifest_path),
+            Action::Install => service.install(),
             Action::Uninstall => service.uninstall(),
             Action::Restart => service.restart(),
         }
     }
 
-    /// The agent of one manifest: its label, plist and launchd domain.
+    /// The agent: the supervisor of the apps in `home`, its plist and launchd domain.
     struct Service {
-        manifest: Manifest,
-        label: String,
+        home: PathBuf,
         plist: PathBuf,
         /// `gui/<uid>`, where a user agent lives.
         domain: String,
     }
 
     impl Service {
-        fn new(manifest_path: &Path) -> R<Service> {
-            let manifest = Manifest::load(manifest_path).map_err(|e| err(ErrorCode::Usage, e))?;
-            let plist = super::plist(&manifest.name).ok_or_else(|| {
-                err(
-                    ErrorCode::Usage,
-                    "HOME must be set to an absolute path: the plist goes to $HOME/Library/LaunchAgents",
-                )
-            })?;
-            let label = format!("dev.fawkes.{}", manifest.name);
-            let domain = format!("gui/{}", rustix::process::getuid().as_raw());
+        fn new(home: &Path) -> R<Service> {
+            let user = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .ok_or_else(|| {
+                    err(
+                        ErrorCode::Usage,
+                        "HOME must be set to an absolute path: the plist goes to $HOME/Library/LaunchAgents",
+                    )
+                })?;
             Ok(Service {
-                manifest,
-                label,
-                plist,
-                domain,
+                home: home.to_path_buf(),
+                plist: user.join(format!("Library/LaunchAgents/{LABEL}.plist")),
+                domain: format!("gui/{}", rustix::process::getuid().as_raw()),
             })
         }
 
         // ------------------------------------------------ actions
 
-        fn install(&self, manifest_path: &Path) -> R<(Value, String)> {
-            let manifest_file = std::path::absolute(manifest_path).map_err(|e| {
-                err(
-                    ErrorCode::Usage,
-                    format!("cannot resolve {}: {e}", manifest_path.display()),
-                )
-            })?;
+        fn install(&self) -> R<(Value, String)> {
             // The plist names the binary as it was run, not its resolved path: a symlinked install (Homebrew's
             // `bin/fawkes` into a versioned `Cellar/`) keeps working after an upgrade removes the old version. The
             // build directory check looks at where it really is.
@@ -141,8 +127,7 @@ mod launchd {
                     ),
                 ));
             }
-            let paths = self.manifest.paths();
-            let log = paths.daemon_log();
+            let log = self.home.join("supervisor.log");
             let mut variables = Vec::new();
             for name in ["PATH", "FAWKES_HOME"] {
                 if let Some(value) = std::env::var_os(name) {
@@ -155,56 +140,52 @@ mod launchd {
                     variables.push((name, value));
                 }
             }
-            let plist = render_plist(
-                &self.label,
-                &[
-                    utf8(&binary, "the fawkes binary")?,
-                    "up",
-                    "--manifest",
-                    utf8(&manifest_file, "the manifest path")?,
-                ],
+            let plist = agent_plist(
+                utf8(&binary, "the fawkes binary")?,
                 &variables,
                 self.exit_timeout(),
-                utf8(&log, "the state directory")?,
+                utf8(&log, "$FAWKES_HOME")?,
             );
 
             let replaced = self.plist.exists();
-            // A loaded agent's daemon is the one that answered, and the bootout has stopped it. Any other daemon that
-            // answers (one started from a terminal) holds the state lock, so the agent's would fail at every start and
-            // launchd would retry it for ever.
+            // A loaded agent's supervisor is the one that answered, and the bootout has stopped it. Any other that
+            // answers (one started from a terminal) holds `supervisor.lock`, so the agent's would fail at every start
+            // and launchd would retry it for ever.
             let loaded = replaced && self.bootout()?;
-            let socket = paths.socket();
+            let socket = fleet::socket(&self.home);
             if !loaded && UnixStream::connect(&socket).is_ok() {
                 return Err(invalid_state(format!(
-                    "a daemon for {} already runs on {} (started from a terminal?); stop it with `fawkes down`, then install the service",
-                    self.manifest.name,
+                    "a supervisor already runs on {} (`fawkes up --all` from a terminal?); stop it (Ctrl-C or \
+                     SIGTERM), then install the service",
                     socket.display()
                 )));
             }
             if let Some(dir) = self.plist.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| failed_to("create", dir, &e))?;
             }
-            // launchd opens `StandardErrorPath` before the daemon exists to create the directory.
-            let state_dir = &paths.root;
+            // launchd opens `StandardErrorPath` before the supervisor exists to create the directory; 0700, as the
+            // supervisor makes it.
             DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
-                .create(state_dir)
-                .map_err(|e| failed_to("create", state_dir, &e))?;
+                .create(&self.home)
+                .map_err(|e| failed_to("create", &self.home, &e))?;
             let staged = self.plist.with_extension("plist.tmp");
             std::fs::write(&staged, plist)
                 .and_then(|()| std::fs::rename(&staged, &self.plist))
                 .map_err(|e| failed_to("write", &self.plist, &e))?;
             self.bootstrap()?;
 
-            let (label, plist) = (&self.label, self.plist.display());
             let text = format!(
-                "{} {label} ({plist}); launchd runs the daemon at login and after it fails; its log is {}",
+                "{} {LABEL} ({}); launchd runs the supervisor, and with it every app's daemon in {}, at login and \
+                 after it fails; its log is {}",
                 if replaced { "reinstalled" } else { "installed" },
+                self.plist.display(),
+                self.home.display(),
                 log.display()
             );
             let result = json!({
-                "label": label,
+                "label": LABEL,
                 "plist": self.plist,
                 "log": log,
                 "replaced": replaced,
@@ -221,11 +202,11 @@ mod launchd {
             }
             let removed = existed || loaded;
             let text = if removed {
-                format!("uninstalled {}", self.label)
+                format!("uninstalled {LABEL}")
             } else {
-                format!("{} was not installed", self.label)
+                format!("{LABEL} was not installed")
             };
-            let result = json!({"label": self.label, "plist": self.plist, "removed": removed});
+            let result = json!({"label": LABEL, "plist": self.plist, "removed": removed});
             Ok((result, text))
         }
 
@@ -233,27 +214,31 @@ mod launchd {
             if !self.plist.exists() {
                 return Err(err(
                     ErrorCode::NotFound,
-                    format!(
-                        "{} is not installed; `fawkes service install --manifest <path>` installs it",
-                        self.label
-                    ),
+                    format!("{LABEL} is not installed; `fawkes service install` installs it"),
                 ));
             }
-            // A bootout stops the daemon with a SIGTERM and waits for it; the bootstrap reads the plist afresh.
+            // A bootout stops the supervisor with a SIGTERM, which stops every daemon it runs, and waits for it; the
+            // bootstrap reads the plist afresh.
             self.bootout()?;
             self.bootstrap()?;
-            let result = json!({"label": self.label, "plist": self.plist});
-            Ok((result, format!("restarted {}", self.label)))
+            let result = json!({"label": LABEL, "plist": self.plist});
+            Ok((result, format!("restarted {LABEL}")))
         }
 
         // ------------------------------------------------ launchctl
 
-        /// launchd's `ExitTimeOut`, the longest a daemon's shutdown takes (`Daemon::shutdown`): its wait for a switch
-        /// or rollback in flight, then `stop_timeout` of grace for the app, plus a margin that covers its 2 s wait for
-        /// the answers it owes (`ANSWER_WAIT`). launchd's default of 20 s
-        /// would SIGKILL it partway, and the next start would have to recover.
+        /// launchd's `ExitTimeOut`, the longest the supervisor's shutdown takes: it stops every daemon at once, so the
+        /// longest of their shutdowns (`Daemon::shutdown`: its wait for a switch or rollback in flight, then
+        /// `stop_timeout` of grace for the app), plus a margin. launchd's default of 20 s would SIGKILL it partway, and
+        /// the next start would have to recover. Read from the manifests in `home` at install; an invalid one counts
+        /// for nothing, since its daemon does not run.
         fn exit_timeout(&self) -> u64 {
-            let stop = self.manifest.shutdown_wait() + self.manifest.stop_timeout;
+            let stop = discovery::manifests(&self.home)
+                .iter()
+                .filter_map(|(_, path)| Manifest::load(path).ok())
+                .map(|manifest| manifest.daemon_stop_wait())
+                .max()
+                .unwrap_or_default();
             stop.as_secs() + u64::from(stop.subsec_nanos() > 0) + EXIT_MARGIN
         }
 
@@ -261,7 +246,7 @@ mod launchd {
         /// and a `bootstrap` until then fails with `5: Input/output error`, so it waits until `print` no longer finds
         /// the service.
         fn bootout(&self) -> R<bool> {
-            let target = format!("{}/{}", self.domain, self.label);
+            let target = format!("{}/{LABEL}", self.domain);
             let done = self.launchctl(["bootout", target.as_str()])?;
             if done.status.success() {
                 let until = Instant::now() + Duration::from_secs(self.exit_timeout());
@@ -284,7 +269,7 @@ mod launchd {
             Err(launchctl_failed("bootout", &done))
         }
 
-        /// Load the agent, which starts the daemon (`RunAtLoad`).
+        /// Load the agent, which starts the supervisor (`RunAtLoad`).
         fn bootstrap(&self) -> R<()> {
             let done = self.launchctl([
                 OsStr::new("bootstrap"),
@@ -302,7 +287,7 @@ mod launchd {
             Err(error.with_hint(hint))
         }
 
-        /// `launchctl` from `PATH`, bounded: a `bootout` waits for the daemon to stop.
+        /// `launchctl` from `PATH`, bounded: a `bootout` waits for the supervisor to stop.
         fn launchctl<S: AsRef<OsStr>>(&self, args: impl IntoIterator<Item = S>) -> R<Finished> {
             let mut command = Command::new("launchctl");
             command
@@ -362,6 +347,22 @@ mod launchd {
     }
 
     // ------------------------------------------------ the plist
+
+    /// The plist of the agent: `binary up --all`, with `environment`, its stderr appended to `log`.
+    fn agent_plist(
+        binary: &str,
+        environment: &[(&str, String)],
+        exit_timeout: u64,
+        log: &str,
+    ) -> String {
+        render_plist(
+            LABEL,
+            &[binary, "up", "--all"],
+            environment,
+            exit_timeout,
+            log,
+        )
+    }
 
     /// The plist of an agent that runs `arguments`, restarts only after a failed exit, and gets `exit_timeout` seconds
     /// to stop before launchd kills it. Without an environment the key is left out.
@@ -435,8 +436,33 @@ mod launchd {
         }
 
         #[test]
+        fn the_agent_runs_the_supervisor_and_logs_to_fawkes_home() {
+            let env = [("FAWKES_HOME", "/h/fh".to_string())];
+            let text = agent_plist("/bin/fawkes", &env, 45, "/h/fh/supervisor.log");
+            let has = |lines: &[&str]| {
+                let block = lines.join("\n");
+                assert!(text.contains(&block), "{block}\nnot in\n{text}");
+            };
+            has(&["\t<key>Label</key>", "\t<string>dev.fawkes</string>"]);
+            has(&[
+                "\t<key>ProgramArguments</key>",
+                "\t<array>",
+                "\t\t<string>/bin/fawkes</string>",
+                "\t\t<string>up</string>",
+                "\t\t<string>--all</string>",
+                "\t</array>",
+            ]);
+            has(&["\t\t<key>FAWKES_HOME</key>", "\t\t<string>/h/fh</string>"]);
+            has(&["\t<key>ExitTimeOut</key>", "\t<integer>45</integer>"]);
+            has(&[
+                "\t<key>StandardErrorPath</key>",
+                "\t<string>/h/fh/supervisor.log</string>",
+            ]);
+        }
+
+        #[test]
         fn a_plist_without_an_environment_has_no_environment_key() {
-            let text = render_plist("dev.fawkes.x", &["/bin/fawkes"], &[], 15, "/s/daemon.log");
+            let text = render_plist(LABEL, &["/bin/fawkes"], &[], 15, "/h/supervisor.log");
             assert!(!text.contains("EnvironmentVariables"));
             assert!(text.contains("\t<integer>15</integer>\n"));
         }
