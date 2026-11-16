@@ -26,7 +26,7 @@ import { facetRefusal, failedFacets, ignoredText, mayConfirm } from './confirm.t
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { cloneGitDir, fawkesSettings, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
 import { deferRelease, releaseHold } from './hold.ts'
-import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
+import { extensionFolder, inspect, resolveClone, setupSteps } from './init.ts'
 import { parseVersion, reexecCommand, RELEASES, releaseText, tagOf, upgradeCommand } from './release.ts'
 import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
@@ -64,7 +64,6 @@ import type {
   History,
   Release,
   SetupPreview,
-  SetupStep,
   Status,
   Upgrade,
 } from './types.ts'
@@ -753,15 +752,16 @@ export const actions = {
   async setupPreview(_args: unknown, { host }: { host: ExtensionHost }): Promise<SetupPreview> {
     try {
       if (!canSetup) throw new Error('This Ultimate already runs under Fawkes, or is a preview or test server')
-      const plan = await inspect(initOptions(host))
+      const options = initOptions(host)
+      const plan = await inspect(options)
       const missing = plan.pieces.some((piece) => piece.state !== 'there')
       const refusals = plan.pieces.filter((piece) => piece.state === 'refused')
-      const steps: SetupStep[] = [
-        ...(missing ? [{ label: 'Set up this project (run once)', command: initCommand(host, plan.project) }] : []),
-        ...installSteps(extensionFolder()),
-        { label: 'Stop this Ultimate (Ctrl-C in its terminal)' },
-        { label: 'Start Fawkes in the project', command: `cd ${shellWord(plan.project)} && fawkes up` },
-      ]
+      const steps = await setupSteps({
+        extension: extensionFolder(),
+        fawkesHome: options.fawkesHome,
+        manifest: plan.existing?.file,
+        init: missing ? initCommand(host, plan.project) : undefined,
+      })
       return {
         steps,
         missing,

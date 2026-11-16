@@ -185,7 +185,7 @@ export type FawkesState =
       supervised: false
       /** The host is not under Fawkes and is a real host, not a preview or test server: the setup item shows. */
       setup: boolean
-      /** `init.ts` has nothing left to write: what remains is starting `fawkes up`. */
+      /** `init.ts` has nothing left to write: what remains is stopping this Ultimate and the supervisor (`setupSteps`). */
       ready: boolean
     }
   | {

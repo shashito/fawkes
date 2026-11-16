@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Sets a project up for `fawkes up`, whether or not it ever ran Ultimate. Four pieces, each checked before anything is
+ * Sets a project up for the Fawkes supervisor, whether or not it ever ran Ultimate. Four pieces, each checked before anything is
  * written, each left alone when it is there:
  *
- * - the **manifest** in the Fawkes home (`setup.ts`), which `fawkes up` adopts the running Ultimate from;
+ * - the **manifest** in the Fawkes home (`setup.ts`), from which the project's daemon adopts the running Ultimate;
  * - the **link** `<project>/.ultimate/extensions/fawkes` to this folder, so the project's Ultimate loads the extension;
  * - **`update` off** in `<project>/.ultimate/settings.json`: the built-in `update` would move a clone Fawkes runs
  *   generations from;
@@ -13,7 +13,8 @@
  * written), so the helpers are loaded from the clone at run time, never copied. A piece that cannot be written without
  * overriding something (a link elsewhere, a declined project) is refused, and then nothing at all is written.
  *
- * As a module (`inspect`, `resolveClone`) the extension's server facet shows the same plan on its card. As a program:
+ * As a module (`inspect`, `resolveClone`, `setupSteps`) the extension's server facet shows the same plan and the same
+ * terminal steps on its card. As a program:
  * `node init.ts [--ultimate <clone>] [--port <n>] <project>`; exit 0 done, 1 failed or refused, 2 usage.
  */
 import {
@@ -43,6 +44,7 @@ import type * as Lock from 'ultimate/lib/lock.ts'
 import type * as ProjectPaths from 'ultimate/lib/project-paths.ts'
 import type * as ProjectSetup from 'ultimate/lib/project-setup.ts'
 import type * as Settings from 'ultimate/lib/settings.ts'
+import { request } from './client.ts'
 import { buildManifest, claimedPorts, findExisting, freeName, manifestName, readManifest, shellWord, spareBlock } from './setup.ts'
 import type { ManifestFile } from './setup.ts'
 import type { SetupStep } from './types.ts'
@@ -434,13 +436,76 @@ export function fawkesOnPath(path = process.env.PATH) {
  * The step that puts `fawkes` on PATH; none when one is there. From a Fawkes checkout (`<repo>/ultimate/fawkes`) it
  * installs from it; a release installed by install.sh has `fawkes` in ~/.local/bin, which PATH may lack.
  */
-export function installSteps(extension: string, path = process.env.PATH): SetupStep[] {
+function installSteps(extension: string, path: string | undefined): SetupStep[] {
   if (fawkesOnPath(path)) return []
   const repo = dirname(dirname(extension))
   return [
     existsSync(join(repo, 'Cargo.toml'))
       ? { label: 'Install fawkes', command: `cargo install --path ${shellWord(repo)} --locked` }
       : { label: 'Put fawkes on PATH (install.sh puts it in ~/.local/bin, or $FAWKES_INSTALL_DIR)' },
+  ]
+}
+
+/** The part of the supervisor's `status` (`FleetStatus` in `src/protocol.rs`) the steps read. */
+type Supervised = { apps: { name: string; manifest: string; state: string }[] }
+
+/**
+ * The `status` of the supervisor of `fawkesHome` (`fawkes up --all`, under launchd or in a terminal), or nothing when
+ * none answers on its socket. 5 s: a supervisor that re-executes answers only once it runs its new binary, and taking
+ * it for none would offer the `service install` that restarts every app.
+ */
+const supervisorStatus = (fawkesHome: string) =>
+  request<Supervised>(join(fawkesHome, 'supervisor.sock'), 'status', undefined, { timeout: 5000 }).catch(() => undefined)
+
+export type StepOptions = {
+  extension: string
+  fawkesHome: string
+  /** The manifest that already sets the project up: the supervisor may hold its app down. */
+  manifest?: string
+  /** The command that runs `init.ts`, while it has a piece to write: the card's first step. */
+  init?: string
+  path?: string
+  platform?: NodeJS.Platform
+}
+
+/**
+ * The terminal steps that set a project up, for the card and for `init.ts`'s own last words: `init.ts`, `fawkes` on PATH,
+ * stopping the Ultimate that runs on the project, and the supervisor. The supervisor starts every manifest of the
+ * Fawkes home, a new one within seconds, so with one running nothing is left to start: the project's daemon adopts
+ * the Ultimate once its port is free, retrying at most 30 s apart until then; only an app it holds down since
+ * `fawkes down` waits for `fawkes up`. Without one, `fawkes service install` starts it, once per Mac; only then, since
+ * installing again over a loaded agent restarts every app.
+ */
+export async function setupSteps(o: StepOptions): Promise<SetupStep[]> {
+  const { extension, fawkesHome, init, manifest, path = process.env.PATH, platform = process.platform } = o
+  const supervisor = await supervisorStatus(fawkesHome)
+  const name = manifest && basename(manifest, '.toml')
+  const down = supervisor?.apps.some((app) => app.state === 'down' && (app.manifest === manifest || app.name === name))
+  const start: SetupStep = supervisor
+    ? down
+      ? {
+          label: 'Start this project under the Fawkes supervisor, which holds it down since `fawkes down`',
+          command: `fawkes up --manifest ${shellWord(name!)}`,
+        }
+      : {
+          label:
+            'Nothing to start: the Fawkes supervisor runs, starts this project from its manifest and adopts this Ultimate once it stopped (`fawkes status --all` shows it)',
+        }
+    : platform === 'darwin'
+      ? {
+          label:
+            'Start the Fawkes supervisor, once per Mac: the launchd agent dev.fawkes, which runs `fawkes up --all` (every app in the Fawkes home) at login',
+          command: 'fawkes service install',
+        }
+      : {
+          label: 'Start the Fawkes supervisor, once per machine, under your init system: it runs every app in the Fawkes home',
+          command: 'fawkes up --all',
+        }
+  return [
+    ...(init ? [{ label: 'Set up this project (run once)', command: init }] : []),
+    ...installSteps(extension, path),
+    { label: 'Stop the Ultimate running on this project, if any (Ctrl-C in its terminal)' },
+    start,
   ]
 }
 
@@ -468,14 +533,9 @@ async function main(argv: string[], env: NodeJS.ProcessEnv) {
   try {
     const userHome = env.ULTIMATE_USER_HOME || homedir()
     const clone = resolveClone({ option: parsed.values.ultimate, env, userHome })
-    const plan = await inspect({
-      project,
-      clone,
-      userHome,
-      // Where `fawkes` itself looks: `$FAWKES_HOME`, else `$HOME/.fawkes`.
-      fawkesHome: env.FAWKES_HOME || join(env.HOME || homedir(), '.fawkes'),
-      port,
-    })
+    // Where `fawkes` itself looks: `$FAWKES_HOME`, else `$HOME/.fawkes`.
+    const fawkesHome = env.FAWKES_HOME || join(env.HOME || homedir(), '.fawkes')
+    const plan = await inspect({ project, clone, userHome, fawkesHome, port })
     const refusals = plan.pieces.filter((piece) => piece.state === 'refused')
     if (refusals.length) {
       for (const piece of refusals) console.error(`${piece.name}: ${piece.reason}`)
@@ -492,11 +552,8 @@ async function main(argv: string[], env: NodeJS.ProcessEnv) {
       console.log(`${piece.write ? 'wrote' : 'already'} ${piece.what}`)
       if (piece.write && piece.note) console.log(`  ${piece.note}`)
     }
-    const steps: SetupStep[] = [
-      ...installSteps(extensionFolder(), env.PATH),
-      { label: 'Stop the Ultimate running on this project, if any (Ctrl-C in its terminal)' },
-      { label: 'Start Fawkes in the project', command: `cd ${shellWord(plan.project)} && fawkes up` },
-    ]
+    const manifest = plan.existing?.file
+    const steps = await setupSteps({ extension: extensionFolder(), fawkesHome, manifest, path: env.PATH })
     console.log('\nNext, in a terminal:')
     steps.forEach((step, index) => console.log(`  ${index + 1}. ${step.label}${step.command ? `\n       ${step.command}` : ''}`))
     return 0

@@ -2,12 +2,19 @@ Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes upgrade` stages,
 
 ## Setup
 
-One path for every project, including one that never ran Ultimate. Once, then start Fawkes:
+One path for every project, including one that never ran Ultimate. The steps, as `setupSteps` in `init.ts` lists them
+for the card and for `init.ts`'s own output:
 
-```sh
-node <this folder>/init.ts [--ultimate <clone>] [--port <n>] <project>
-cd <project> && fawkes up        # install fawkes first with `cargo install --path <this repository> --locked`
-```
+1. Set up the project, once: `node <this folder>/init.ts [--ultimate <clone>] [--port <n>] <project>`.
+2. Put `fawkes` on `PATH`, when it is not: `cargo install --path <this repository> --locked` from a Fawkes checkout,
+   else `install.sh`, which puts it in `~/.local/bin`.
+3. Stop the Ultimate running on the project, if any.
+4. Start the Fawkes supervisor, once per Mac, unless one already runs: `fawkes service install` loads the launchd agent
+   `dev.fawkes`, which runs `fawkes up --all`, the daemon of every manifest in the Fawkes home (`fawkes up --all` under
+   the init system elsewhere). A supervisor that runs starts a new manifest within seconds, so with one there is
+   nothing to start: the project's daemon adopts the Ultimate once its port is free, retrying at most 30 s apart until
+   then. `fawkes service install` is offered only when no supervisor answers, since installing again over a loaded
+   agent restarts every app.
 
 `init.ts` first looks at four pieces and writes nothing; if one is refused it exits 1 with the reasons and still writes
 nothing. Otherwise it writes the missing ones, prints `wrote …` or `already …` for each, and the terminal steps left.
@@ -37,8 +44,8 @@ the user's `.ultimate/`.
 
 A host that does not run under Fawkes shows a muted `fawkes · set up` item in its status line (not a preview or a test
 server). Its card writes nothing: it shows the same steps with a copy button each (the `init.ts` command, with
-`--ultimate` only where a terminal would not find this host's clone itself; `cargo install` when no `fawkes` is on
-`PATH`; stop this Ultimate; `fawkes up`), and the manifest that already sets the host up. Once all four pieces are there the
+`--ultimate` only where a terminal would not find this host's clone itself), and the manifest that already sets the
+host up. Once all four pieces are there the
 item reads `fawkes · ready`. `fawkes down`, from a shell outside the app, stops the host and its daemon.
 
 The manifest has `adopt = true`: the first start adopts the version that was running. The daemon stages the clone's
