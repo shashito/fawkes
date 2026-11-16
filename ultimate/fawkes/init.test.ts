@@ -4,11 +4,22 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs'
+import { createServer } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { setupSteps } from './init.ts'
 
 const folder = realpathSync(dirname(fileURLToPath(import.meta.url)))
 const clone = process.env.ULTIMATE ?? join(homedir(), 'Code/ultimate')
@@ -68,4 +79,47 @@ test('init writes the manifest, the link, update off and the trust, and a second
     ['already', 'already', 'already', 'already'],
   )
   assert.deepEqual(files(), written)
+})
+
+test('the steps end with installing the supervisor, or with what is left while one answers', async (t) => {
+  // Under /tmp: the socket path must stay short.
+  const fawkesHome = mkdtempSync('/tmp/fkst-')
+  t.after(() => rmSync(fawkesHome, { recursive: true, force: true }))
+  // `fawkes` on this PATH: no install step.
+  symlinkSync(process.execPath, join(fawkesHome, 'fawkes'))
+  const steps = (platform: NodeJS.Platform) =>
+    setupSteps({ extension: folder, fawkesHome, init: 'node init.ts /p', path: fawkesHome, platform })
+
+  const none = await steps('darwin')
+  assert.deepEqual(
+    none.map((step) => step.command),
+    ['node init.ts /p', undefined, 'fawkes service install'],
+  )
+  assert.match(none[2].label, /launchd agent dev\.fawkes, which runs `fawkes up --all`/)
+  assert.equal((await steps('linux'))[2].command, 'fawkes up --all')
+  // Without fawkes on PATH it is installed first, from the Fawkes checkout this folder is in.
+  const bare = await setupSteps({ extension: folder, fawkesHome, path: join(fawkesHome, 'none') })
+  assert.match(bare[0].command ?? '', /^cargo install --path .* --locked$/)
+  assert.equal(bare.length, 3)
+
+  // A supervisor answers: installing the agent again would restart every app, so nothing is left to start, unless it
+  // holds this project down.
+  const app = { name: 'proj', manifest: join(fawkesHome, 'proj.toml'), state: 'running', failures: 0 }
+  const supervisor = createServer((socket) =>
+    socket.once('data', () => socket.end(`${JSON.stringify({ ok: true, result: { pid: 1, apps: [app] } })}\n`)),
+  )
+  await new Promise<void>((done) => supervisor.listen(join(fawkesHome, 'supervisor.sock'), done))
+  t.after(() => supervisor.close())
+  const running = await steps('darwin')
+  assert.equal(running.length, 3)
+  assert.equal(running[2].command, undefined)
+  assert.match(running[2].label, /^Nothing to start: the Fawkes supervisor runs/)
+  app.state = 'down'
+  const held = await setupSteps({ extension: folder, fawkesHome, manifest: app.manifest, path: fawkesHome })
+  assert.equal(held.at(-1)?.command, 'fawkes up --manifest proj')
+
+  // The README lists the same commands.
+  const readme = readFileSync(join(folder, 'README.md'), 'utf8')
+  for (const command of ['fawkes service install', 'fawkes up --all', 'cargo install --path'])
+    assert.ok(readme.includes(command), command)
 })

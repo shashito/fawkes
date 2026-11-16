@@ -54,18 +54,19 @@ curl -LsSf https://github.com/shashito/fawkes/releases/latest/download/install.s
 It checks the download's sha256 and, when the GitHub CLI is logged in, its build attestation, which you can also
 check by hand: `gh attestation verify fawkes-<target>.tar.gz --repo shashito/fawkes`.
 
-This puts `fawkes` in `~/.local/bin` and its Ultimate extension in `~/.local/share/fawkes`. Then stop the Ultimate of
-your project, set the project up once, and start it:
+This puts `fawkes` in `~/.local/bin` and its Ultimate extension in `~/.local/share/fawkes`. Then set the project up
+once, stop the Ultimate of your project, and start the supervisor, once per Mac:
 
 ```console
 $ node ~/.local/share/fawkes/ultimate/fawkes/init.ts ~/Code/my-app
-$ cd ~/Code/my-app
-$ fawkes up
+$ fawkes service install
 ```
 
 `init.ts` writes a manifest to `~/.fawkes`, links the extension into the project, turns off Ultimate's own `update`
-and trusts the project's setup. The first `fawkes up` tests the Ultimate you were running and keeps it as the version
-to roll back to. To update Fawkes, run the `curl` line again, then `fawkes reexec --all`: the supervisor and every
+and trusts the project's setup, then prints the steps left. `fawkes service install` loads the launchd agent
+`dev.fawkes`, which runs `fawkes up --all`: the daemon of every app in `~/.fawkes`. Once a supervisor runs, skip it for
+the next project: the supervisor starts a new manifest within seconds. The app's first daemon start tests the Ultimate
+you were running and keeps it as the version to roll back to. To update Fawkes, run the `curl` line again, then `fawkes reexec --all`: the supervisor and every
 daemon move onto the new binary with their apps still running. An app with a pending switch is skipped until the
 switch is decided; run it again then. The extension checks for a new release once a day and says so in its status-line
 popover, with the commands to run; `FAWKES_NO_UPDATE_CHECK=1` in the daemon's environment or the manifest's `[env]` turns that off. It also
@@ -80,8 +81,8 @@ cd fawkes
 cargo install --path . --locked
 ```
 
-Then run `init.ts` from the clone (`node ultimate/fawkes/init.ts ~/Code/my-app`), and update with `git pull` and
-`cargo install` again.
+Then run `init.ts` from the clone (`node ultimate/fawkes/init.ts ~/Code/my-app`) and the steps it prints, and update
+with `git pull` and `cargo install` again.
 
 ## Features
 

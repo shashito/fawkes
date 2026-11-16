@@ -25,13 +25,14 @@ import { request, subscribe } from './client.ts'
 import { facetRefusal, failedFacets, ignoredText, mayConfirm } from './confirm.ts'
 import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
 import { cloneGitDir, fawkesSettings, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
+import { describeFleet, fleet } from './fleet.ts'
 import { deferRelease, releaseHold } from './hold.ts'
-import { extensionFolder, inspect, installSteps, resolveClone } from './init.ts'
+import { extensionFolder, inspect, resolveClone, setupSteps } from './init.ts'
 import { parseVersion, reexecCommand, RELEASES, releaseText, tagOf, upgradeCommand } from './release.ts'
 import { INTERVAL, reportInfo, reporter } from './report.ts'
 import { HELD_MARKER, role } from './role.ts'
 import { shellWord } from './setup.ts'
-import { awaitingConfirm, outdated, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
+import { awaitingConfirm, outdated, progress, restoreFailed, rollbackNote, switching, upgradeRefusal } from './step.ts'
 import {
   claim,
   installedAt,
@@ -64,7 +65,6 @@ import type {
   History,
   Release,
   SetupPreview,
-  SetupStep,
   Status,
   Upgrade,
 } from './types.ts'
@@ -753,15 +753,16 @@ export const actions = {
   async setupPreview(_args: unknown, { host }: { host: ExtensionHost }): Promise<SetupPreview> {
     try {
       if (!canSetup) throw new Error('This Ultimate already runs under Fawkes, or is a preview or test server')
-      const plan = await inspect(initOptions(host))
+      const options = initOptions(host)
+      const plan = await inspect(options)
       const missing = plan.pieces.some((piece) => piece.state !== 'there')
       const refusals = plan.pieces.filter((piece) => piece.state === 'refused')
-      const steps: SetupStep[] = [
-        ...(missing ? [{ label: 'Set up this project (run once)', command: initCommand(host, plan.project) }] : []),
-        ...installSteps(extensionFolder()),
-        { label: 'Stop this Ultimate (Ctrl-C in its terminal)' },
-        { label: 'Start Fawkes in the project', command: `cd ${shellWord(plan.project)} && fawkes up` },
-      ]
+      const steps = await setupSteps({
+        extension: extensionFolder(),
+        fawkesHome: options.fawkesHome,
+        manifest: plan.existing?.file,
+        init: missing ? initCommand(host, plan.project) : undefined,
+      })
       return {
         steps,
         missing,
@@ -775,6 +776,13 @@ export const actions = {
   /** No arguments → what the status line shows. */
   async state(_args: unknown, { host }: { host: ExtensionHost }) {
     return fawkes.kind === 'inert' ? inertState(host) : state(host)
+  },
+  /**
+   * No arguments → the step of this app's transaction for Ultimate's `status` extension, `{ label, index, total }`, or
+   * null outside one and outside the live generation. Read-only.
+   */
+  async projectProgress(_args: unknown, { host }: { host: ExtensionHost }) {
+    return fawkes.kind === 'live' ? progress(shared(host).status) : null
   },
   /** No arguments → fetch the clone and count the commits an upgrade would bring. */
   async check(_args: unknown, { host }: { host: ExtensionHost }) {
@@ -808,8 +816,8 @@ export const actions = {
     return state(host)
   },
 }
-/** The status line polls it. */
-export const pollActions = ['state']
+/** The status line polls `state`, and Ultimate's `status` extension `projectProgress`. */
+export const pollActions = ['state', 'projectProgress']
 /** Moving the live process is the user's call. */
 export const userActions = ['upgrade', 'confirm', 'rollback']
 
@@ -919,9 +927,9 @@ export default function fawkesExtension(host: ExtensionHost) {
         name: 'fawkes',
         replay: 'unsafe',
         description:
-          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. upgrade {ref?}: `fawkes upgrade` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
+          'Ultimate under the Fawkes supervisor. status: this generation, how the latest switch ended (a rollback with its cause), the others, recent events and an upgrade in progress. fleet: `fawkes status --all`, the supervisor and every app on this machine, one line each (state, generation, pid, port, fawkes version, a switch under way, supervision). upgrade {ref?}: `fawkes upgrade` ref (default origin/main) in the background, which stages, tests and switches; the switch restarts this Ultimate and the new generation confirms itself, or is rolled back. After the restart, status says which.',
         parameters: obj({
-          action: oneOf(['status', 'upgrade']),
+          action: oneOf(['status', 'fleet', 'upgrade']),
           ref: opt(str({ description: 'Git ref to upgrade to; default origin/main' })),
         }),
         async execute(args) {
@@ -929,6 +937,11 @@ export default function fawkesExtension(host: ExtensionHost) {
             const ref = validRef(args.ref)
             upgrade(host, daemon.socket, ref)
             return text(`Upgrading to ${ref}; follow it with status.\n${describe(state(host))}`)
+          }
+          if (args.action === 'fleet') {
+            const bin = process.env.FAWKES_BIN
+            if (!bin) throw new Error('FAWKES_BIN is not set, though Fawkes sets it for every app it starts')
+            return text(describeFleet(await fleet(bin), s.status?.name))
           }
           await check(host, false).catch(() => undefined)
           return text(describe(state(host)))

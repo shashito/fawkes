@@ -2,12 +2,19 @@ Runs Ultimate's upgrades through the Fawkes supervisor: `fawkes upgrade` stages,
 
 ## Setup
 
-One path for every project, including one that never ran Ultimate. Once, then start Fawkes:
+One path for every project, including one that never ran Ultimate. The steps, as `setupSteps` in `init.ts` lists them
+for the card and for `init.ts`'s own output:
 
-```sh
-node <this folder>/init.ts [--ultimate <clone>] [--port <n>] <project>
-cd <project> && fawkes up        # install fawkes first with `cargo install --path <this repository> --locked`
-```
+1. Set up the project, once: `node <this folder>/init.ts [--ultimate <clone>] [--port <n>] <project>`.
+2. Put `fawkes` on `PATH`, when it is not: `cargo install --path <this repository> --locked` from a Fawkes checkout,
+   else `install.sh`, which puts it in `~/.local/bin`.
+3. Stop the Ultimate running on the project, if any.
+4. Start the Fawkes supervisor, once per Mac, unless one already runs: `fawkes service install` loads the launchd agent
+   `dev.fawkes`, which runs `fawkes up --all`, the daemon of every manifest in the Fawkes home (`fawkes up --all` under
+   the init system elsewhere). A supervisor that runs starts a new manifest within seconds, so with one there is
+   nothing to start: the project's daemon adopts the Ultimate once its port is free, retrying at most 30 s apart until
+   then. `fawkes service install` is offered only when no supervisor answers, since installing again over a loaded
+   agent restarts every app.
 
 `init.ts` first looks at four pieces and writes nothing; if one is refused it exits 1 with the reasons and still writes
 nothing. Otherwise it writes the missing ones, prints `wrote …` or `already …` for each, and the terminal steps left.
@@ -37,8 +44,8 @@ the user's `.ultimate/`.
 
 A host that does not run under Fawkes shows a muted `fawkes · set up` item in its status line (not a preview or a test
 server). Its card writes nothing: it shows the same steps with a copy button each (the `init.ts` command, with
-`--ultimate` only where a terminal would not find this host's clone itself; `cargo install` when no `fawkes` is on
-`PATH`; stop this Ultimate; `fawkes up`), and the manifest that already sets the host up. Once all four pieces are there the
+`--ultimate` only where a terminal would not find this host's clone itself), and the manifest that already sets the
+host up. Once all four pieces are there the
 item reads `fawkes · ready`. `fawkes down`, from a shell outside the app, stops the host and its daemon.
 
 The manifest has `adopt = true`: the first start adopts the version that was running. The daemon stages the clone's
@@ -212,13 +219,19 @@ off. A test run never checks.
 - `setupPreview` (no arguments): the terminal steps that set this host up (the `init.ts` command while a piece is
   missing), the reasons `init.ts` would refuse, and the manifest that already sets the host up.
 - `rollback` (user-only): roll the pending generation back now.
+- `projectProgress` (no arguments, read-only): the step of this app's transaction for Ultimate's `status` extension,
+  out of `stage → test → switch → confirm`: `switch` (2 of 4) while the switch runs, then `confirm`, `rollback` or
+  `restore failed` (3 of 4); `null` outside a switch and outside the live generation. It reads the typed `step` of the
+  daemon's status alone, so a stage or test (which only `busy` names) shows none.
 
 ## For agents
 
 A live generation adds a prompt section (the generation's folder is the running host and is never edited; landed
 changes go live only through an upgrade; `restart` reboots the same generation), which never changes between turns
 so the prompt stays cached, and the `fawkes` tool: `status` (the generations, how the latest switch ended, what
-`status.actions` allows, recent events), or `upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
+`status.actions` allows, recent events), `fleet` (`fawkes status --all --json`, without the host's `FAWKES_SOCKET` and
+`FAWKES_MANIFEST`: the supervisor and every app in the Fawkes home, one line each, this host's marked), or
+`upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
 rollback of the last hour with its cause, a daemon that is too old) comes as a note with its next input, only when it
 changed since that conversation last heard, and once more when it no longer applies.
 
@@ -280,7 +293,8 @@ environment against the clone's own preview helpers, so a change in Ultimate tha
 from fields), `release.test.ts` (versions, the redirect's tag and what the popover says), `fetch.test.ts` (the
 `fetchEvery` setting and the shared `FETCH_HEAD` gate, on a clone with a local bare `origin`), `tasks.test.ts` (the
 `afterUpgrade` and `autofix` settings, claims and locks, the install time, the reviewed tips on a real repository, the autofix
-decision, the texts and who owns an extension's folder) and the rest, and
+decision, the texts and who owns an extension's folder), `fleet.test.ts` (the `fleet` action's call, its environment
+and its view), `step.test.ts` (`projectProgress` from `step` alone) and the rest, and
 type-checks both facets against an Ultimate checkout: `$ULTIMATE`, else `ultimateCheck` in the repository's
 `.ultimate/settings.json` (a path, or `live` for the generation the reachable Fawkes daemon runs, falling back to
 `~/Code/ultimate` with a note), else `~/Code/ultimate`; `ultimate/check --which` prints it. The lander and

@@ -424,7 +424,7 @@ function SetupCard() {
         <div className="section-label">Fawkes</div>
         <div className="text-muted-foreground">
           {preview.data?.steps && !missing
-            ? 'Set up: start Fawkes from a terminal to finish'
+            ? 'Set up: finish from a terminal'
             : 'Run this Ultimate under Fawkes: upgrades that roll back'}
         </div>
       </div>
@@ -462,7 +462,7 @@ function SetupCard() {
 
 /**
  * Muted, like the item of a current generation: a host not under Fawkes offers to be set up, and once `init.ts` has run,
- * says it is ready for `fawkes up`.
+ * says it is ready for the steps left, which its card lists (`setupSteps` in `init.ts`).
  */
 function SetupItem({ ready }: { ready: boolean }) {
   return (
@@ -473,7 +473,7 @@ function SetupItem({ ready }: { ready: boolean }) {
           data-fawkes-setup
           title={
             ready
-              ? 'Set up for Fawkes: start `fawkes up` in a terminal to finish'
+              ? 'Set up for Fawkes: finish in a terminal with the steps on this card'
               : 'Run this Ultimate under the Fawkes supervisor'
           }
           type="button"

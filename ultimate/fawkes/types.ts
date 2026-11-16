@@ -1,6 +1,6 @@
 /**
  * What the Fawkes daemon reports and what the extension shows. Browser-safe. The daemon's side is `src/protocol.rs`
- * (`Status`, `Generation`, `Event`, `GenState`) and DESIGN.md, "Socket protocol": change them together.
+ * (`Status`, `Generation`, `Event`, `GenState`, `FleetView`) and DESIGN.md, "Socket protocol": change them together.
  */
 
 export type GenState =
@@ -69,6 +69,34 @@ export type Status = {
     /** What the live app last reported (`report.ts`), shown by `fawkes up` and `fawkes status`. */
     info?: Record<string, string>
   }
+}
+
+/** What the supervisor knows of one app (`FleetApp`); a newer supervisor may send a state this list lacks. */
+export type FleetApp = {
+  name: string
+  manifest: string
+  state: 'running' | 'attached' | 'backoff' | 'down' | 'broken'
+  /** The daemon's pid, running or attached. */
+  daemon_pid?: number
+  /** When a daemon in backoff starts again. */
+  restart_at?: string
+  /** The failed exits since the daemon last ran for a minute. */
+  failures: number
+}
+
+/**
+ * `fawkes status --all --json` (`FleetView`): the supervisor's status, null when none answers, and every app of the Fawkes
+ * home with what the supervisor knows of it and its daemon's status, or the error in its place.
+ */
+export type FleetView = {
+  supervisor: { pid: number; version: string; socket: string; apps: FleetApp[] } | null
+  apps: {
+    name: string
+    supervisor: FleetApp | null
+    status: Status | null
+    /** Fawkes's error object; only the fields the extension reads. */
+    error: { code: string; message: string } | null
+  }[]
 }
 
 /** An event: the message is for people, the facts of its kind are fields beside it (DESIGN.md, "Events"). */
@@ -185,7 +213,7 @@ export type FawkesState =
       supervised: false
       /** The host is not under Fawkes and is a real host, not a preview or test server: the setup item shows. */
       setup: boolean
-      /** `init.ts` has nothing left to write: what remains is starting `fawkes up`. */
+      /** `init.ts` has nothing left to write: what remains is stopping this Ultimate and the supervisor (`setupSteps`). */
       ready: boolean
     }
   | {
