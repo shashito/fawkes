@@ -123,12 +123,12 @@ test('an event is said from its fields, not from its message', () => {
 })
 
 test('the disk in words, and a low disk beside what else needs attention, never instead of it', () => {
-  const low = { free: 9.2e9, total: 245e9, low: true }
+  const low = { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 }
   assert.equal(diskText(low), '9.2 GB free of 245.0 GB')
   assert.equal(lowDisk(status({ disk: low })), low)
   for (const disk of [{ ...low, low: false }, null, undefined]) assert.equal(lowDisk(status({ disk })), undefined)
 
-  const note = 'the disk is low: 9.2 GB free of 245.0 GB; upgrades are refused below min_free.'
+  const note = 'the disk is low: 9.2 GB free of 245.0 GB; upgrades are refused below 10.0 GB (min_free).'
   assert.equal(attentionText(undefined, status({ disk: low })), note)
   assert.equal(attentionText('g7 awaits its confirm by d.', status({ disk: low })), `g7 awaits its confirm by d. ${note}`)
   assert.equal(attentionText('g7 awaits its confirm by d.', status({ disk: { ...low, low: false } })), 'g7 awaits its confirm by d.')

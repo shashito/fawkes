@@ -10,7 +10,7 @@ import type { FawkesState, Status } from './types.ts'
 
 type Supervised = Extract<FawkesState, { supervised: true }>
 
-const low = { free: 9.2e9, total: 245e9, low: true }
+const low = { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 }
 
 const status = (more: Partial<Status> = {}) =>
   ({ name: 'u', permanent: 'g6', current: 'g6', pending: null, step: null, busy: null, version: '0.4.0', actions: [], ...more }) as Status

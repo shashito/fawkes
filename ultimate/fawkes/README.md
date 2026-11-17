@@ -160,7 +160,7 @@ the status and the latest events. Everything shown is read from fields (`status.
 - `disk low · 9.2 GB free` in the warning colour while `status.disk.low` (the daemon's decision for the volume of the
   state directory), unless something above shows: those keep priority. An older daemon, or a failed measurement,
   sends no `disk` and shows nothing. The popover adds a row, "Disk low: 9.2 GB free of 245.0 GB. Upgrades are
-  refused below the manifest's min_free (10 GB by default); free disk space.", which also explains the missing
+  refused below 10.0 GB (the manifest's min_free); free disk space.", which also explains the missing
   Upgrade button (`stage` leaves `status.actions` while the disk is under `min_free`);
 - `fawkes too old` when the daemon's status has no `version`: it predates the fields this extension reads. The
   generation still holds the scheduler and confirms itself, but upgrades are off until Fawkes is upgraded;
@@ -240,7 +240,7 @@ so the prompt stays cached, and the `fawkes` tool: `status` (the generations, ho
 rollback of the last hour with its cause, a daemon that is too old, and a low disk) comes as a note with its next
 input, only when it changed since that conversation last heard, and once more when it no longer applies. A low disk
 is a sentence of its own after the others ("the disk is low: 9.2 GB free of 245.0 GB; upgrades are refused below
-min_free."), so it hides neither a pending confirm nor a rollback, and they do not hide it.
+10.0 GB (min_free)."), so it hides neither a pending confirm nor a rollback, and they do not hide it.
 
 ## After upgrades and autofix
 

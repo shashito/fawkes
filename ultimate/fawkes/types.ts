@@ -39,7 +39,8 @@ export type Generation = {
 }
 
 /** The volume of the app's state directory, in bytes (decimal GB = 1e9); `low` is the daemon's own decision. */
-export type Disk = { free: number; total: number; low: boolean }
+/** `min_free` is where `stage` starts to refuse, in bytes (0 when the manifest turns disk checks off). */
+export type Disk = { free: number; total: number; low: boolean; min_free: number }
 
 /** Where the daemon's transaction is (`step` of the `status` result). */
 export type Step = 'switching' | 'pending' | 'rolling_back' | 'restore_failed'

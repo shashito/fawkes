@@ -41,7 +41,7 @@ export const lowDisk = (status: Status | undefined) => (status?.disk?.low ? stat
  */
 export function attentionText(upgrade: string | undefined, status: Status | undefined) {
   const disk = lowDisk(status)
-  const note = disk && `the disk is low: ${diskText(disk)}; upgrades are refused below min_free.`
+  const note = disk && `the disk is low: ${diskText(disk)}; upgrades are refused below ${gigabytes(disk.min_free)} (min_free).`
   return [upgrade, note].filter(Boolean).join(' ') || undefined
 }
 

@@ -385,8 +385,8 @@ test('an extension belongs to the project whose root is its repository; one in a
 })
 
 test('a low disk is told once per episode: claim while low and unclaimed, clear once it has room, idle without a measurement', async (t) => {
-  const low = { free: 9.2e9, total: 245e9, low: true }
-  const room = { free: 80e9, total: 245e9, low: false }
+  const low = { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 }
+  const room = { free: 80e9, total: 245e9, low: false, min_free: 10e9 }
   assert.equal(diskStep(low, false), 'claim')
   assert.equal(diskStep(low, true), 'idle')
   assert.equal(diskStep(room, true), 'clear')
@@ -405,12 +405,12 @@ test('the disk-low message names the volume, the space and the rules, and its fa
   const text = diskLowText({
     host: 'ultimate',
     manifest: '/m/fawkes.toml',
-    disk: { free: 9.2e9, total: 245e9, low: true },
+    disk: { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 },
     stateDir: '/Users/a/.fawkes/ultimate',
   })
   assert.match(
     text,
-    /^Fawkes: the disk is low on ultimate: 9\.2 GB free of 245\.0 GB \(the volume of \/Users\/a\/\.fawkes\/ultimate\)\. Upgrades are refused below min_free \(10 GB by default\)\./,
+    /^Fawkes: the disk is low on ultimate: 9\.2 GB free of 245\.0 GB \(the volume of \/Users\/a\/\.fawkes\/ultimate\)\. Upgrades are refused below 10\.0 GB \(the manifest's min_free\)\./,
   )
   assert.match(text, /delete nothing without their go/)
   assert.match(text, /- Host: ultimate, manifest \/m\/fawkes\.toml/)

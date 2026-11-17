@@ -3,7 +3,7 @@
  * user's settings for it, the failures that call for an investigation, the autofix decision, and every text, each
  * naming its facts plainly. Pure: the server facet reads the daemon and the shared files (`store.ts`) and delivers.
  */
-import { diskText, eventLine, outcome, outcomeText, lastSwitched, rollbackEvent, storageText } from './facts.ts'
+import { diskText, eventLine, gigabytes, outcome, outcomeText, lastSwitched, rollbackEvent, storageText } from './facts.ts'
 import { shellWord } from './setup.ts'
 import type { Cause, Disk, FawkesEvent, Generation, History, Status } from './types.ts'
 
@@ -388,7 +388,7 @@ export function giveUpText(facts: HostFacts & { name: string; path: string; erro
 export function diskLowText(facts: HostFacts & { disk: Disk; stateDir: string }) {
   const { host, manifest, disk, stateDir } = facts
   return [
-    `Fawkes: the disk is low on ${host}: ${diskText(disk)} (the volume of ${stateDir}). Upgrades are refused below min_free (10 GB by default). Find what takes the space (large files in $TMPDIR, caches, build folders, old worktrees) and tell the user what you found; delete nothing without their go.`,
+    `Fawkes: the disk is low on ${host}: ${diskText(disk)} (the volume of ${stateDir}). Upgrades are refused below ${gigabytes(disk.min_free)} (the manifest's min_free). Find what takes the space (large files in $TMPDIR, caches, build folders, old worktrees) and tell the user what you found; delete nothing without their go.`,
     '',
     'Facts:',
     `- Host: ${host}, manifest ${manifest}`,

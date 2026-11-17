@@ -247,8 +247,8 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
           <div className="flex items-start gap-1.5 text-warning">
             <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
             <span>
-              Disk low: {diskText(disk)}. Upgrades are refused below the manifest's min_free (10 GB by default); free
-              disk space.
+              Disk low: {diskText(disk)}. Upgrades are refused below {gigabytes(disk.min_free)} (the manifest's min_free);
+              free disk space.
             </span>
           </div>
         )}
