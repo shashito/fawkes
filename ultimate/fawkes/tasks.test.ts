@@ -23,6 +23,8 @@ import {
   AUTOFIX_WAIT,
   autofixBrief,
   autofixStep,
+  diskLowText,
+  diskStep,
   FAILURE_WINDOW,
   failingSince,
   failures,
@@ -380,4 +382,37 @@ test('an extension belongs to the project whose root is its repository; one in a
   assert.deepEqual(await ownerOf(join(other, 'ext'), projects), { path: join(other, 'ext'), repo: other })
   mkdirSync(join(root, 'loose'))
   assert.deepEqual(await ownerOf(join(root, 'loose'), projects), { path: join(root, 'loose') })
+})
+
+test('a low disk is told once per episode: claim while low and unclaimed, clear once it has room, idle without a measurement', async (t) => {
+  const low = { free: 9.2e9, total: 245e9, low: true }
+  const room = { free: 80e9, total: 245e9, low: false }
+  assert.equal(diskStep(low, false), 'claim')
+  assert.equal(diskStep(low, true), 'idle')
+  assert.equal(diskStep(room, true), 'clear')
+  assert.equal(diskStep(room, false), 'idle')
+  // An older daemon or a failed measurement says nothing, so an episode in progress stays told.
+  for (const disk of [null, undefined]) for (const claimed of [false, true]) assert.equal(diskStep(disk, claimed), 'idle')
+
+  // Of two hosts that see the disk low at once, one claims; once its claim is removed (a failed delivery) the next tick claims.
+  const file = join(scratch(t), 'disk-low')
+  assert.deepEqual(await Promise.all([claim(file), claim(file)]), [true, false])
+  rmSync(file)
+  assert.equal(diskStep(low, existsSync(file)), 'claim')
+})
+
+test('the disk-low message names the volume, the space and the rules, and its facts', () => {
+  const text = diskLowText({
+    host: 'ultimate',
+    manifest: '/m/fawkes.toml',
+    disk: { free: 9.2e9, total: 245e9, low: true },
+    stateDir: '/Users/a/.fawkes/ultimate',
+  })
+  assert.match(
+    text,
+    /^Fawkes: the disk is low on ultimate: 9\.2 GB free of 245\.0 GB \(the volume of \/Users\/a\/\.fawkes\/ultimate\)\. Upgrades are refused below min_free \(10 GB by default\)\./,
+  )
+  assert.match(text, /delete nothing without their go/)
+  assert.match(text, /- Host: ultimate, manifest \/m\/fawkes\.toml/)
+  assert.match(text, /- Free: 9200000000 bytes of 245000000000/)
 })

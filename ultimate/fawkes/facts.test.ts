@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { causeText, eventLine, lastSwitched, outcome, outcomeText } from './facts.ts'
+import { attentionText, causeText, diskText, eventLine, lastSwitched, lowDisk, outcome, outcomeText } from './facts.ts'
 import type { Cause, FawkesEvent, Generation, Status } from './types.ts'
 
 const generation = (id: string, state: Generation['state'], more: Partial<Generation> = {}): Generation => ({
@@ -120,4 +120,17 @@ test('an event is said from its fields, not from its message', () => {
   )
   // A kind this extension does not know keeps the daemon's message.
   assert.equal(eventLine(event('teleported', {})), 'a message that says something else')
+})
+
+test('the disk in words, and a low disk beside what else needs attention, never instead of it', () => {
+  const low = { free: 9.2e9, total: 245e9, low: true }
+  assert.equal(diskText(low), '9.2 GB free of 245.0 GB')
+  assert.equal(lowDisk(status({ disk: low })), low)
+  for (const disk of [{ ...low, low: false }, null, undefined]) assert.equal(lowDisk(status({ disk })), undefined)
+
+  const note = 'the disk is low: 9.2 GB free of 245.0 GB; upgrades are refused below min_free.'
+  assert.equal(attentionText(undefined, status({ disk: low })), note)
+  assert.equal(attentionText('g7 awaits its confirm by d.', status({ disk: low })), `g7 awaits its confirm by d. ${note}`)
+  assert.equal(attentionText('g7 awaits its confirm by d.', status({ disk: { ...low, low: false } })), 'g7 awaits its confirm by d.')
+  assert.equal(attentionText(undefined, status()), undefined)
 })

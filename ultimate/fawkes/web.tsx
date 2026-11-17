@@ -13,10 +13,21 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { actionRef, api, cn, defineWebExtension, formatAgo, useAction, useNow } from '@/sdk'
-import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
+import {
+  causeText,
+  diskText,
+  eventLine,
+  gigabytes,
+  lastSwitched,
+  lowDisk,
+  outcomeText,
+  rollbackEvent,
+  storageText,
+} from './facts.ts'
+import { itemOf, lastOutcome, running } from './item.ts'
 import { REEXEC_WHEN, releaseNote } from './release.ts'
 import { allows, awaitingConfirm, outdated, restoreFailed, rollbackNote, upgradeRefusal } from './step.ts'
-import type { FawkesState, Generation, SetupPreview, SetupStep, Upgrade } from './types.ts'
+import type { FawkesState, Generation, SetupPreview, SetupStep } from './types.ts'
 
 type Supervised = Extract<FawkesState, { supervised: true }>
 
@@ -44,35 +55,6 @@ const countdown = (deadline: string, now: number) => {
 
 /** A time the daemon sent, as the user's clock shows it. */
 const clock = (iso: string) => new Date(iso).toLocaleTimeString()
-
-const running = (upgrade: Upgrade | undefined) => upgrade?.state === 'fetching' || upgrade?.state === 'running'
-
-/** How the latest switch ended, once it is decided. */
-function lastOutcome(state: Supervised) {
-  const target = lastSwitched(state.generations)
-  const decided = target && outcome(state.status, state.generations, target.id)
-  return decided && decided.state !== 'waiting' ? { target: target!, decided } : undefined
-}
-
-/** One word for what the status line shows, in order of what matters most. */
-function itemOf(state: Supervised) {
-  const { status, upgrade } = state
-  if (!state.connected) return 'disconnected'
-  if (awaitingConfirm(status)) return 'pending'
-  if (restoreFailed(status)) return 'restore_failed'
-  if (status?.pending && status.step === 'rolling_back') return 'rolling_back'
-  if (outdated(status)) return 'outdated'
-  if (running(upgrade) || status?.busy) return 'upgrading'
-  if (upgrade?.state === 'failed' && Date.now() - upgrade.at < 3_600_000) return 'failed'
-  const last = lastOutcome(state)
-  if (
-    last?.decided.state === 'rolled_back' &&
-    Date.now() - Date.parse(last.target.rolled_back_at ?? '') < 3_600_000
-  )
-    return 'rolled_back'
-  if (state.behind?.count) return 'behind'
-  return 'current'
-}
 
 const genTone: Partial<Record<Generation['state'], string>> = {
   permanent: 'text-success',
@@ -227,6 +209,7 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
   const now = useNow(1000, Boolean(pending))
   const rollbackText = rollbackNote(status)
   const old = outdated(status)
+  const disk = lowDisk(status)
   // Only what the daemon would accept right now (`status.actions`). An older daemon sends no actions: its pending
   // switch keeps both ways out, as the server actions accept them.
   const canConfirm = !!pending && (old ? true : allows(status, `confirm ${pending.generation}`))
@@ -258,6 +241,15 @@ function Popup({ state, act, busy }: { state: Supervised; act: (name: string) =>
           <div className="flex items-start gap-1.5 text-warning">
             <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
             <span>{old}.</span>
+          </div>
+        )}
+        {disk && (
+          <div className="flex items-start gap-1.5 text-warning">
+            <TriangleAlertIcon className="mt-0.5 size-3 shrink-0" />
+            <span>
+              Disk low: {diskText(disk)}. Upgrades are refused below the manifest's min_free (10 GB by default); free
+              disk space.
+            </span>
           </div>
         )}
         {rollbackText && (
@@ -558,6 +550,11 @@ function Fawkes() {
         <TriangleAlertIcon className="size-3" />
         {lastSwitched(data.generations)!.id} rolled back
       </>
+    ) : item === 'disk_low' ? (
+      <>
+        <TriangleAlertIcon className="size-3" />
+        disk low<span className="max-md:hidden"> · {gigabytes(data.status!.disk!.free)} free</span>
+      </>
     ) : item === 'behind' ? (
       <>
         <ArrowDownIcon className="size-3" />
@@ -580,7 +577,7 @@ function Fawkes() {
               ? 'text-muted-foreground/70 hover:text-foreground'
               : ['failed', 'rolled_back', 'restore_failed', 'disconnected'].includes(item)
                 ? 'text-error'
-                : item === 'pending' || item === 'outdated'
+                : item === 'pending' || item === 'outdated' || item === 'disk_low'
                   ? 'text-warning'
                   : 'text-brand',
           )}

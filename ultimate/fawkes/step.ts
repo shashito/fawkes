@@ -3,6 +3,7 @@
  * failed, so only `step` says whether a confirm can still happen, and `actions` names every command the daemon would
  * accept right now. Browser-safe.
  */
+import { diskText, lowDisk } from './facts.ts'
 import type { Status } from './types.ts'
 
 /** The switch that awaits its confirm. An older daemon sends no `step`, and its `pending` does. */
@@ -69,6 +70,10 @@ export function upgradeRefusal(status: Status | undefined) {
   if (old) return old
   if (status.pending) return rollbackNote(status) ?? `${status.pending.generation} still awaits its confirm`
   if (status.step === 'switching') return 'A switch is under way'
-  if (!allows(status, 'stage')) return status.busy ? `Fawkes is busy: ${status.busy}` : 'Fawkes does not take a stage now'
+  if (!allows(status, 'stage')) {
+    const disk = lowDisk(status)
+    if (status.busy) return `Fawkes is busy: ${status.busy}`
+    return disk ? `The disk is low (${diskText(disk)}): free disk space first` : 'Fawkes does not take a stage now'
+  }
   return undefined
 }

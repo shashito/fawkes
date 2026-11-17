@@ -157,6 +157,11 @@ the status and the latest events. Everything shown is read from fields (`status.
   fail;
 - `rolling back g8` while a rollback runs, and `restore failed` in red when its storage restore failed;
 - `g8 rolled back` or `upgrade failed`, in red, for an hour after it happened;
+- `disk low · 9.2 GB free` in the warning colour while `status.disk.low` (the daemon's decision for the volume of the
+  state directory), unless something above shows: those keep priority. An older daemon, or a failed measurement,
+  sends no `disk` and shows nothing. The popover adds a row, "Disk low: 9.2 GB free of 245.0 GB. Upgrades are
+  refused below the manifest's min_free (10 GB by default); free disk space.", which also explains the missing
+  Upgrade button (`stage` leaves `status.actions` while the disk is under `min_free`);
 - `fawkes too old` when the daemon's status has no `version`: it predates the fields this extension reads. The
   generation still holds the scheduler and confirms itself, but upgrades are off until Fawkes is upgraded;
 - `✓ g7 · fawkes 0.2.0` (muted) when a newer Fawkes is out or installed (Releases, below).
@@ -232,8 +237,10 @@ so the prompt stays cached, and the `fawkes` tool: `status` (the generations, ho
 `status.actions` allows, recent events), `fleet` (`fawkes status --all --json`, without the host's `FAWKES_SOCKET` and
 `FAWKES_MANIFEST`: the supervisor and every app in the Fawkes home, one line each, this host's marked), or
 `upgrade {ref?}`. What needs an agent's attention (a pending confirm, a
-rollback of the last hour with its cause, a daemon that is too old) comes as a note with its next input, only when it
-changed since that conversation last heard, and once more when it no longer applies.
+rollback of the last hour with its cause, a daemon that is too old, and a low disk) comes as a note with its next
+input, only when it changed since that conversation last heard, and once more when it no longer applies. A low disk
+is a sentence of its own after the others ("the disk is low: 9.2 GB free of 245.0 GB; upgrades are refused below
+min_free."), so it hides neither a pending confirm nor a rollback, and they do not hide it.
 
 ## After upgrades and autofix
 
@@ -281,7 +288,14 @@ first host to run them: an upgrade or failure from before it is the state the ex
   Once the extension loads again on that host, the record is removed with a notice; removing it by hand starts the
   tries over. A host that does not load the extension leaves it to the hosts that do.
 
-Success, failure and the give-up go to `afterUpgrade.project`, else to the host's own @ultimate. A delivery that fails
+- **Disk low:** one message per low-disk episode, for all hosts on the machine, whatever `afterUpgrade` says (it is no
+  upgrade task, and has no setting). While `status.disk.low`, the first host to create `disk-low` (an exclusive
+  create, written before the delivery since a full disk may take no write after it) tells the coordinator's @ultimate
+  to find what takes the space and report it, deleting nothing without the user's go; a delivery that fails removes
+  the file again, so the next tick retries. While `status.disk` is present and not low, `disk-low` is removed, which
+  ends the episode: the next time the disk runs low, it is told again. Without `disk` nothing changes.
+
+Success, failure, the give-up and the low disk go to `afterUpgrade.project`, else to the host's own @ultimate. A delivery that fails
 (the project's host is down) changes nothing, and the next tick tries again. Each delivery is a notice: "Fawkes: asked
 fawkes's @ultimate to investigate g8's rollback".
 
