@@ -3,9 +3,9 @@
  * user's settings for it, the failures that call for an investigation, the autofix decision, and every text, each
  * naming its facts plainly. Pure: the server facet reads the daemon and the shared files (`store.ts`) and delivers.
  */
-import { eventLine, outcome, outcomeText, lastSwitched, rollbackEvent, storageText } from './facts.ts'
+import { diskText, eventLine, gigabytes, outcome, outcomeText, lastSwitched, rollbackEvent, storageText } from './facts.ts'
 import { shellWord } from './setup.ts'
-import type { Cause, FawkesEvent, Generation, History, Status } from './types.ts'
+import type { Cause, Disk, FawkesEvent, Generation, History, Status } from './types.ts'
 
 // ------------------------------------------------ settings
 
@@ -153,6 +153,26 @@ export function autofixStep(
   if (record.gaveUp) return 'idle'
   if (now - record.lastTry < AUTOFIX_WAIT) return 'wait'
   return record.tries < AUTOFIX_TRIES ? 'try' : 'give-up'
+}
+
+// ------------------------------------------------ low disk
+
+/** The file in the shared folder that says a low-disk episode was told: its claim, removed when the episode ends. */
+export const DISK_LOW = 'disk-low'
+
+export type DiskStep = 'claim' | 'clear' | 'idle'
+
+/**
+ * What a low disk calls for, from the daemon's `status.disk`, the host that claimed the episode (the manifest its claim
+ * file names) and this host's manifest: claim it while the disk is low and nobody has, and end it once the claimer's
+ * own daemon says the disk has room. Only the claimer ends it: daemons can disagree (`min_free = 0`, another volume, a
+ * restarted daemon inside the recovery margin), and a host that sees room must not reopen an episode another host still
+ * sees. No `disk` (an older daemon, or a failed measurement) says nothing about the episode.
+ */
+export function diskStep(disk: Disk | null | undefined, claimer: string | undefined, me: string): DiskStep {
+  if (!disk) return 'idle'
+  if (claimer === undefined) return disk.low ? 'claim' : 'idle'
+  return claimer === me && !disk.low ? 'clear' : 'idle'
 }
 
 // ------------------------------------------------ texts
@@ -363,5 +383,19 @@ export function giveUpText(facts: HostFacts & { name: string; path: string; erro
     `- Error:\n${fenced(facts.error)}`,
     `- Tries: ${facts.tries}, ${AUTOFIX_WAIT / 60_000} minutes apart`,
     `- Fawkes tries no more until it loads again, or until ~/.ultimate/fawkes/autofix-${facts.name}.json is removed`,
+  ].join('\n')
+}
+
+/** The coordinator's message when the disk runs low: find what takes the space and tell the user. */
+export function diskLowText(facts: HostFacts & { disk: Disk; stateDir: string }) {
+  const { host, manifest, disk, stateDir } = facts
+  return [
+    `Fawkes: the disk is low on ${host}: ${diskText(disk)} (the volume of ${stateDir}). Upgrades are refused below ${gigabytes(disk.min_free)} (the manifest's min_free). Find what takes the space (large files in $TMPDIR, caches, build folders, old worktrees) and tell the user what you found; delete nothing without their go.`,
+    '',
+    'Facts:',
+    `- Host: ${host}, manifest ${manifest}`,
+    `- Volume of: ${stateDir}`,
+    `- Free: ${disk.free} bytes of ${disk.total}`,
+    '- Fawkes tells you once per episode, for all hosts on this machine; it tells you again only after the disk has had room.',
   ].join('\n')
 }

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { existsSync, realpathSync, writeFileSync } from 'node:fs'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
@@ -23,7 +23,16 @@ import type { SubagentsApi as SubagentsApiType } from 'ultimate/extensions/subag
 import type { ProjectInfo } from 'ultimate/server/project.ts'
 import { request, subscribe } from './client.ts'
 import { facetRefusal, failedFacets, ignoredText, mayConfirm } from './confirm.ts'
-import { causeText, eventLine, lastSwitched, outcome, outcomeText, rollbackEvent, storageText } from './facts.ts'
+import {
+  attentionText,
+  causeText,
+  eventLine,
+  lastSwitched,
+  outcome,
+  outcomeText,
+  rollbackEvent,
+  storageText,
+} from './facts.ts'
 import { cloneGitDir, fawkesSettings, fetchDue, fetchEvery, fetchRemote, lastFetch } from './fetch.ts'
 import { describeFleet, fleet } from './fleet.ts'
 import { deferRelease, releaseHold } from './hold.ts'
@@ -48,6 +57,9 @@ import {
   AUTOFIX_TRIES,
   autofixBrief,
   autofixStep,
+  DISK_LOW,
+  diskLowText,
+  diskStep,
   failureName,
   failingSince,
   failures,
@@ -430,10 +442,16 @@ function describe(state: FawkesState) {
 }
 
 /**
- * What an agent must know right now: a pending confirm, a rollback of the last hour, an old daemon. Nothing otherwise.
+ * What an agent must know right now: a pending confirm, a rollback of the last hour, an old daemon, and beside any of
+ * them a low disk, as a sentence of its own. Nothing otherwise.
  */
 function attention(state: FawkesState) {
   if (!state.supervised || !state.status) return undefined
+  return attentionText(upgradeAttention(state), state.status)
+}
+
+/** The sentence for what concerns upgrades: a pending confirm, an old daemon, a rollback under way or of the last hour. */
+function upgradeAttention(state: Extract<FawkesState, { supervised: true }>) {
   const pending = awaitingConfirm(state.status)
   if (pending) return `${pending.generation} awaits its confirm by ${pending.deadline}.`
   const target = lastSwitched(state.generations)
@@ -592,6 +610,34 @@ async function investigate(run: TaskRun, failure: Failure, instructions: string 
 }
 
 /**
+ * Tell the coordinator once per low-disk episode, for all hosts: the first to claim `disk-low` delivers, and the file,
+ * naming its manifest, stays until that host's daemon says the disk is not low. The claim comes before the delivery,
+ * since a full disk may take the write after it, and goes again when the delivery fails, so the next tick retries.
+ */
+async function diskLow(run: TaskRun) {
+  const { disk } = run.status
+  const file = join(run.folder, DISK_LOW)
+  const me = run.facts.manifest
+  const claimer = await readFile(file, 'utf8').then(
+    (text) => text.trim(),
+    () => undefined,
+  )
+  const step = diskStep(disk, claimer, me)
+  if (step === 'clear') return rm(file, { force: true })
+  if (step !== 'claim' || !disk) return
+  const at = new Date().toISOString()
+  if (!(await claim(file, `${me}\n`))) return
+  try {
+    const stateDir = run.status.state_dir ?? 'its state directory'
+    await deliver(run, run.coordinator, diskLowText({ ...run.facts, disk, stateDir }), `fawkes-disk-low-${at}`)
+  } catch (error) {
+    await rm(file, { force: true })
+    throw error
+  }
+  run.host.notice(`Fawkes: told ${run.coordinator}'s @ultimate the disk is low`)
+}
+
+/**
  * Keep listed extension `name` loading: a try goes to the project that owns its folder (else to the coordinator, to
  * route it), the next one 30 minutes later, then the coordinator tells the user. One record for all hosts, under its
  * lock. A host that does not load the extension leaves it to those that do.
@@ -683,6 +729,8 @@ async function runTasks(host: ExtensionHost, socket: string, generation: string)
     for (const each of failures(status.name, status, s.generations, s.events, failingSince(installed, Date.now())))
       await collect(() => investigate(run, each, failure))
   for (const name of settings.autofix) await collect(() => autofix(run, name))
+  // Not an upgrade task: it runs whatever `afterUpgrade` says.
+  await collect(() => diskLow(run))
   return problems
 }
 

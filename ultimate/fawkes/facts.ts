@@ -3,7 +3,7 @@
  * text of a message, which is for people and may change. Browser-safe: the status line, the popover, the tool and the
  * prompt section share it.
  */
-import type { Cause, FawkesEvent, Generation, Outcome, Status, StorageOutcome } from './types.ts'
+import type { Cause, Disk, FawkesEvent, Generation, Outcome, Status, StorageOutcome } from './types.ts'
 
 const causes: Record<Cause, string> = {
   deadline: 'missed its confirm deadline',
@@ -26,6 +26,25 @@ const storages: Record<StorageOutcome, string> = {
 }
 
 export const storageText = (storage: string) => storages[storage as StorageOutcome] ?? `storage ${storage}`
+
+/** Rounded down, as the daemon does, so a refused stage never reads as having enough room. */
+export const gigabytes = (bytes: number) => `${(Math.floor(bytes / 1e8) / 10).toFixed(1)} GB`
+
+/** The volume of the state directory in words: "9.2 GB free of 245.0 GB" (decimal GB, as the daemon counts). */
+export const diskText = (disk: Disk) => `${gigabytes(disk.free)} free of ${gigabytes(disk.total)}`
+
+/** The disk, while the daemon says it is low; nothing for an older daemon, a failed measurement or enough room. */
+export const lowDisk = (status: Status | undefined) => (status?.disk?.low ? status.disk : undefined)
+
+/**
+ * What an agent must know: the `upgrade` sentence (a pending confirm, a rollback, an old daemon) and, beside it rather
+ * than instead of it, a low disk as a sentence of its own. Nothing when neither applies.
+ */
+export function attentionText(upgrade: string | undefined, status: Status | undefined) {
+  const disk = lowDisk(status)
+  const note = disk && `the disk is low: ${diskText(disk)}; upgrades are refused below ${gigabytes(disk.min_free)} (min_free).`
+  return [upgrade, note].filter(Boolean).join(' ') || undefined
+}
 
 /**
  * The generation the latest switch went to, whatever became of it. By `switched_at`, not by the order of the history:

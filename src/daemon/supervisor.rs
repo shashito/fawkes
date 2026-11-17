@@ -6,10 +6,11 @@
 
 use super::transactions::{check_abandon, check_prune, check_rollback, check_switch, check_test};
 use super::{App, Daemon, Inner, LOG_BYTES, Live, Slot, Why, tenths};
+use crate::disk::{self, Space};
 use crate::manifest::Check;
 use crate::process;
 use crate::protocol::{
-    DaemonAction, ErrorCode, EventKind, Facts, History, HistoryEntry, LastExit, Out, Process,
+    DaemonAction, Disk, ErrorCode, EventKind, Facts, History, HistoryEntry, LastExit, Out, Process,
     ProcessState, R, ReportResult, RollbackCause, Status, err, invalid_state, not_found,
 };
 use crate::render::{render_info, render_up_block};
@@ -19,6 +20,7 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -72,7 +74,8 @@ fn outcome(failed_starts: u32, pending: bool, max_failed_starts: u32) -> Outcome
 
 // ------------------------------------------------ timers
 
-/// How often the live generation's `logs/app.log` is measured against `LOG_BYTES`.
+/// How often the live generation's `logs/app.log` is measured against `LOG_BYTES`, and the state directory's volume
+/// against `min_free`.
 const CAP_EVERY: Duration = Duration::from_secs(10);
 
 /// The pause after a pass that acted, before the next pass looks again. It bounds a step that keeps failing (a
@@ -129,6 +132,7 @@ impl Daemon {
             let now = Instant::now();
             if now >= next_cap {
                 self.cap_app_log();
+                self.watch_disk();
                 next_cap = now + CAP_EVERY;
             }
             let (seen, sleep) = match pass {
@@ -264,6 +268,42 @@ impl Daemon {
                 );
             }
         }
+    }
+
+    /// Measure the state directory's volume and log a `disk` event when it became low or recovered. A first
+    /// measurement that is fine changes nothing, so it logs nothing. Holds no lock while it measures.
+    pub(super) fn watch_disk(&self) {
+        let Some(space) = Space::measure(&self.paths.root) else {
+            return;
+        };
+        let min_free = self.manifest().min_free;
+        let was_low = self.disk_low.load(Ordering::SeqCst);
+        let low = disk::low(space, min_free, was_low);
+        if low == was_low {
+            return;
+        }
+        self.disk_low.store(low, Ordering::SeqCst);
+        let message = if low {
+            format!(
+                "disk low: {} on {}; stage refuses below {}",
+                space.describe(),
+                self.paths.root.display(),
+                disk::gigabytes(min_free)
+            )
+        } else {
+            format!("disk space recovered: {}", space.describe())
+        };
+        self.event_with(
+            EventKind::Disk,
+            None,
+            message,
+            Facts {
+                free: Some(space.free),
+                total: Some(space.total),
+                low: Some(low),
+                ..Facts::default()
+            },
+        );
     }
 
     fn restart_due(inner: &Inner) -> bool {
@@ -673,8 +713,11 @@ impl Daemon {
     }
 
     pub(super) fn status(&self) -> Status {
+        // Measured before `inner` is taken: a slow volume must not hold up a transaction.
+        let space = Space::measure(&self.paths.root);
+        let min_free = self.manifest().min_free;
         let mut inner = self.inner();
-        let actions = self.actions(&mut inner);
+        let actions = self.actions(&mut inner, space);
         Status {
             name: self.manifest().name.clone(),
             daemon_pid: std::process::id(),
@@ -688,6 +731,12 @@ impl Daemon {
             step: inner.store.state().step(),
             busy: inner.busy.clone().or_else(|| inner.moving.clone()),
             actions,
+            disk: space.map(|space| Disk {
+                free: space.free,
+                total: space.total,
+                low: disk::low(space, min_free, self.disk_low.load(Ordering::SeqCst)),
+                min_free,
+            }),
             process: self.process(&inner),
         }
     }
@@ -696,7 +745,7 @@ impl Daemon {
     /// checks its command makes both pass: the slot `begin` takes and the state check the command runs (the
     /// `check_*` functions), so the list cannot say what the command would refuse. The checks only read, but `try_wait`
     /// on the app needs the guard mutably.
-    fn actions(&self, inner: &mut Inner) -> Vec<String> {
+    fn actions(&self, inner: &mut Inner, space: Option<Space>) -> Vec<String> {
         let mut actions = Vec::new();
         let free = |inner: &Inner, slot| inner.check_slot(slot).is_ok();
         if free(inner, Slot::Live) {
@@ -711,7 +760,9 @@ impl Daemon {
             }
         }
         if free(inner, Slot::Step) {
-            actions.push("stage".into());
+            if self.check_disk(space).is_ok() {
+                actions.push("stage".into());
+            }
             let state = inner.store.state();
             actions.extend(
                 state

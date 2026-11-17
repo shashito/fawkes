@@ -455,6 +455,9 @@ pub struct Daemon {
     reexec: Mutex<Option<reexec::Reexec>>,
     /// Set while `reexec_now` waits for the requests in flight, so that the end of each wakes it.
     draining: AtomicBool,
+    /// Whether the supervision thread last found the state directory's volume low (`watch_disk`): the memory of the
+    /// hysteresis. An atomic of its own, so that measuring the disk never holds `inner`.
+    disk_low: AtomicBool,
 }
 
 /// How long a daemon shutting down waits, once its app has stopped, for the requests it is serving to send their
@@ -580,6 +583,7 @@ impl Daemon {
             socket_given,
             reexec: Mutex::new(None),
             draining: AtomicBool::new(false),
+            disk_low: AtomicBool::new(false),
         });
         let flush = Flush {
             daemon: daemon.clone(),
@@ -1295,7 +1299,7 @@ mod tests {
         std::fs::write(
             &manifest_path,
             format!(
-                "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\n\
+                "name = \"app\"\nrepo = \"repo\"\nstate_dir = \"state\"\nhome = \"home\"\nport = 4790\nmin_free = 0\n\
                  spare_ports = [4791, 4795]\nstart = \"node app.js\"\n{keep}[health]\nurl = \"http://127.0.0.1:{{port}}/\"\n"
             ),
         )
@@ -1326,6 +1330,7 @@ mod tests {
             socket_given: false,
             reexec: Mutex::new(None),
             draining: AtomicBool::new(false),
+            disk_low: AtomicBool::new(false),
         }
     }
 
@@ -1747,6 +1752,67 @@ mod tests {
             drop(inner);
             assert_eq!(daemon.status().actions, row.actions, "{}", row.name);
         }
+    }
+
+    /// A volume below `min_free` makes `stage` refuse with `disk_low`, in the answer and in `actions`; the supervision
+    /// thread logs the change once each way, and a daemon that never saw the disk low logs nothing.
+    #[test]
+    fn a_low_disk_refuses_stage_and_is_logged_once_each_way() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(scratch_daemon(temp.path()));
+        let set_min_free = |min_free: u64| {
+            let mut manifest = (*daemon.manifest()).clone();
+            manifest.min_free = min_free;
+            *lock(&daemon.manifest) = Arc::new(manifest);
+        };
+        let disk_events = || -> Vec<Event> {
+            lock(&daemon.log)
+                .replay(Some(0), None)
+                .into_iter()
+                .filter(|event| event.kind == EventKind::Disk)
+                .collect()
+        };
+
+        daemon.watch_disk();
+        assert!(disk_events().is_empty());
+        assert!(daemon.status().actions.contains(&"stage".to_string()));
+
+        set_min_free(u64::MAX);
+        let status = daemon.status();
+        assert!(!status.actions.contains(&"stage".to_string()));
+        assert!(status.disk.is_some_and(|disk| disk.low && disk.total > 0));
+        let refused = daemon.stage(&mut Out::none(), "HEAD").unwrap_err();
+        assert_eq!(refused.code, ErrorCode::DiskLow);
+        assert!(
+            refused
+                .message
+                .contains("need 18446744073.7 GB (min_free in ")
+                && refused
+                    .message
+                    .ends_with("free disk space, then stage again"),
+            "{}",
+            refused.message
+        );
+        // Adoption stages without the check: it gets as far as the repository, which does not exist here.
+        let adopted = daemon
+            .stage_with(&mut Out::none(), "HEAD", false)
+            .unwrap_err();
+        assert_eq!(adopted.code, ErrorCode::GitFailed);
+
+        daemon.watch_disk();
+        daemon.watch_disk();
+        let events = disk_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].facts.low, Some(true));
+        assert!(events[0].message.starts_with("disk low: "));
+
+        set_min_free(0);
+        daemon.watch_disk();
+        daemon.watch_disk();
+        let events = disk_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1].facts.low, Some(false));
+        assert!(events[1].message.starts_with("disk space recovered: "));
     }
 
     /// `switch` and `rollback` answer `busy` while the daemon shuts down (DESIGN.md → Error codes); `start` does too.

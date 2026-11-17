@@ -1,5 +1,6 @@
 //! The manifest: one TOML file per app (see DESIGN.md, "Manifest").
 
+use crate::disk::gigabytes_to_bytes;
 use crate::state::Paths;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
@@ -78,6 +79,9 @@ pub struct Manifest {
     pub reuse: Vec<String>,
     /// How many generations `prune` keeps; without it nothing is pruned.
     pub keep: Option<u32>,
+    /// Bytes free on the state directory's volume below which `stage` refuses; 0 turns the disk checks off (DESIGN.md
+    /// → Disk).
+    pub min_free: u64,
     pub start: String,
     pub deadline: u64,
     pub stop_timeout: Duration,
@@ -171,6 +175,20 @@ impl Section {
         }
     }
 
+    /// A size in decimal gigabytes, as bytes; `default` when absent. One that is negative or not finite is a problem.
+    fn gigabytes(&mut self, key: &'static str, default: f64) -> u64 {
+        let gigabytes = self.take(key).unwrap_or(default);
+        if gigabytes.is_finite() && gigabytes >= 0.0 {
+            gigabytes_to_bytes(gigabytes)
+        } else {
+            self.problems.push(format!(
+                "{} {gigabytes} must be a number of gigabytes, 0 or more",
+                self.full(key)
+            ));
+            0
+        }
+    }
+
     /// The value of a key the manifest cannot do without: absent is a problem too.
     fn require<T: DeserializeOwned>(&mut self, key: &'static str) -> Option<T> {
         if !self.table.contains_key(key) {
@@ -222,6 +240,7 @@ struct Written {
     install_timeout: Duration,
     reuse: Vec<String>,
     keep: Option<u32>,
+    min_free: u64,
     start: Option<String>,
     deadline: u64,
     stop_timeout: Duration,
@@ -253,6 +272,7 @@ impl Written {
         let install_timeout = top.seconds("install_timeout", 1800.0);
         let reuse = top.take("reuse");
         let keep = top.take("keep");
+        let min_free = top.gigabytes("min_free", DEFAULT_MIN_FREE);
         let start = top.require("start");
         let deadline = top.take("deadline");
         let stop_timeout = top.seconds("stop_timeout", 10.0);
@@ -310,6 +330,7 @@ impl Written {
             install_timeout,
             reuse: reuse.unwrap_or_default(),
             keep,
+            min_free,
             start,
             deadline: deadline.unwrap_or(120),
             stop_timeout,
@@ -353,6 +374,9 @@ impl Written {
         }
     }
 }
+
+/// `min_free` in gigabytes when the manifest leaves it out.
+const DEFAULT_MIN_FREE: f64 = 10.0;
 
 /// How many spare ports follow `port` when `spare_ports` is left out.
 const SPARE_PORTS: u16 = 10;
@@ -570,6 +594,7 @@ impl Manifest {
             install_timeout: written.install_timeout,
             reuse: written.reuse,
             keep: written.keep,
+            min_free: written.min_free,
             start,
             deadline: written.deadline,
             stop_timeout: written.stop_timeout,
@@ -604,6 +629,7 @@ impl Manifest {
             install_timeout,
             reuse,
             keep,
+            min_free,
             start,
             deadline,
             stop_timeout,
@@ -644,6 +670,7 @@ impl Manifest {
             ("install", *install != new.install),
             ("install_timeout", *install_timeout != new.install_timeout),
             ("keep", *keep != new.keep),
+            ("min_free", *min_free != new.min_free),
             ("reuse", *reuse != new.reuse),
             ("start", *start != new.start),
             ("deadline", *deadline != new.deadline),
@@ -983,6 +1010,9 @@ test_copy = "store save {home} {test_home}"
             ),
             ("deadline", with("start =", "deadline = 0\nstart =")),
             ("keep", with("start =", "keep = 0\nstart =")),
+            ("min_free", with("start =", "min_free = -1\nstart =")),
+            ("min_free", with("start =", "min_free = nan\nstart =")),
+            ("min_free", with("start =", "min_free = inf\nstart =")),
             (
                 "install_timeout",
                 with("start =", "install_timeout = 0.0\nstart ="),
@@ -1075,6 +1105,16 @@ test_copy = "store save {home} {test_home}"
             assert!(err.starts_with("invalid manifest "), "{err}");
             assert!(err.contains(field), "{field} not named in {err}");
         }
+    }
+
+    #[test]
+    fn min_free_defaults_to_ten_gigabytes_and_zero_turns_it_off() {
+        let scratch = Scratch::new();
+        assert_eq!(scratch.load(VALID).unwrap().min_free, 10_000_000_000);
+        let text = with("start =", "min_free = 2.5\nstart =");
+        assert_eq!(scratch.load(&text).unwrap().min_free, 2_500_000_000);
+        let text = with("start =", "min_free = 0\nstart =");
+        assert_eq!(scratch.load(&text).unwrap().min_free, 0);
     }
 
     #[test]
@@ -1250,6 +1290,11 @@ A = 1
         );
         let new = scratch.load(&changed).unwrap();
         assert_eq!(old.reload(&new, true), Ok(vec!["start", "env"]));
+
+        let new = scratch
+            .load(&with("start =", "min_free = 3\nstart ="))
+            .unwrap();
+        assert_eq!(old.reload(&new, true), Ok(vec!["min_free"]));
     }
 
     #[test]

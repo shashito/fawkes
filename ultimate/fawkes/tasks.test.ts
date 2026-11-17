@@ -23,6 +23,8 @@ import {
   AUTOFIX_WAIT,
   autofixBrief,
   autofixStep,
+  diskLowText,
+  diskStep,
   FAILURE_WINDOW,
   failingSince,
   failures,
@@ -380,4 +382,42 @@ test('an extension belongs to the project whose root is its repository; one in a
   assert.deepEqual(await ownerOf(join(other, 'ext'), projects), { path: join(other, 'ext'), repo: other })
   mkdirSync(join(root, 'loose'))
   assert.deepEqual(await ownerOf(join(root, 'loose'), projects), { path: join(root, 'loose') })
+})
+
+test('a low disk is told once per episode: claim while low and unclaimed, clear once it has room, idle without a measurement', async (t) => {
+  const low = { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 }
+  const room = { free: 80e9, total: 245e9, low: false, min_free: 10e9 }
+  const [a, b] = ['/h/.fawkes/a.toml', '/h/.fawkes/b.toml']
+  assert.equal(diskStep(low, undefined, a), 'claim')
+  assert.equal(diskStep(low, a, a), 'idle')
+  assert.equal(diskStep(room, a, a), 'clear')
+  assert.equal(diskStep(room, undefined, a), 'idle')
+  // Hosts that disagree (b has min_free = 0, or another volume) keep one episode: b neither ends a's claim nor claims.
+  assert.equal(diskStep(room, a, b), 'idle')
+  assert.equal(diskStep(low, a, b), 'idle')
+  // An older daemon or a failed measurement says nothing, so an episode in progress stays told.
+  for (const disk of [null, undefined])
+    for (const claimer of [undefined, a]) assert.equal(diskStep(disk, claimer, a), 'idle')
+
+  // Of two hosts that see the disk low at once, one claims; once its claim is removed (a failed delivery) the next tick claims.
+  const file = join(scratch(t), 'disk-low')
+  assert.deepEqual(await Promise.all([claim(file), claim(file)]), [true, false])
+  rmSync(file)
+  assert.equal(diskStep(low, existsSync(file) ? a : undefined, b), 'claim')
+})
+
+test('the disk-low message names the volume, the space and the rules, and its facts', () => {
+  const text = diskLowText({
+    host: 'ultimate',
+    manifest: '/m/fawkes.toml',
+    disk: { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 },
+    stateDir: '/Users/a/.fawkes/ultimate',
+  })
+  assert.match(
+    text,
+    /^Fawkes: the disk is low on ultimate: 9\.2 GB free of 245\.0 GB \(the volume of \/Users\/a\/\.fawkes\/ultimate\)\. Upgrades are refused below 10\.0 GB \(the manifest's min_free\)\./,
+  )
+  assert.match(text, /delete nothing without their go/)
+  assert.match(text, /- Host: ultimate, manifest \/m\/fawkes\.toml/)
+  assert.match(text, /- Free: 9200000000 bytes of 245000000000/)
 })

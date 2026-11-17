@@ -1,6 +1,7 @@
 //! The transactions (stage, test, switch, confirm, rollback) and the pruning of old generations.
 
 use super::{Daemon, Inner, Live, Slot, Why, lock, tenths};
+use crate::disk::{self, Space};
 use crate::manifest::Manifest;
 use crate::process;
 use crate::protocol::{
@@ -159,8 +160,42 @@ fn git_within(repo: &Path, args: &[&str], timeout: Duration) -> Result<String, S
 }
 
 impl Daemon {
+    /// What `stage` needs of the disk: that the state directory's volume, as measured in `space`, has `min_free`.
+    /// `status` makes the same check for `actions`. A volume that could not be measured passes: the check is best
+    /// effort, and a stage that then fails for lack of space says so itself.
+    pub(super) fn check_disk(&self, space: Option<Space>) -> R<()> {
+        let m = self.manifest();
+        match space {
+            Some(space) if disk::refuses(space, m.min_free) => Err(err(
+                ErrorCode::DiskLow,
+                format!(
+                    "{} on {}, need {} (min_free in {}); free disk space, then stage again",
+                    space.describe(),
+                    self.paths.root.display(),
+                    disk::gigabytes(m.min_free),
+                    self.manifest_path.display()
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn stage(self: &Arc<Self>, out: &mut Out, git_ref: &str) -> R<StageResult> {
+        self.stage_with(out, git_ref, true)
+    }
+
+    /// `stage`, with or without the disk check. Only the check of a requested stage may refuse: the adoption at a
+    /// daemon start stages without it, since refusing it would leave the app down.
+    pub(super) fn stage_with(
+        self: &Arc<Self>,
+        out: &mut Out,
+        git_ref: &str,
+        check_disk: bool,
+    ) -> R<StageResult> {
         let _busy = self.begin("stage", Slot::Step)?;
+        if check_disk {
+            self.check_disk(Space::measure(&self.paths.root))?;
+        }
         let m = self.manifest();
         let commit = git(
             &m.repo,
@@ -844,8 +879,8 @@ impl Daemon {
     /// Adopt the version the app already runs (`adopt` in the manifest), at a daemon start that found no step in
     /// flight and no permanent generation: stage HEAD of the repository, test it, and make it permanent without a
     /// switch, so the next upgrade has a generation to roll back to. It runs beside the socket, so the test run and
-    /// clients reach the daemon, and through `stage` and `test`, which reuse a generation of the same commit and take
-    /// the step slot. An error leaves the generation as they left it, and nothing is started.
+    /// clients reach the daemon, and through `stage` (without its disk check) and `test`, which reuse a generation of the
+    /// same commit and take the step slot. An error leaves the generation as they left it, and nothing is started.
     pub(super) fn adopt(self: &Arc<Self>) -> R<()> {
         let m = self.manifest();
         // The app runs outside Fawkes on the live port until now, and a start beside it would only crash-loop.
@@ -877,7 +912,7 @@ impl Daemon {
             },
         );
         let mut out = Out::none();
-        let id = self.stage(&mut out, "HEAD")?.generation.id;
+        let id = self.stage_with(&mut out, "HEAD", false)?.generation.id;
         self.test(&mut out, &id).map_err(|e| {
             // The test's own hint (stage again, `fawkes test`) needs a daemon, and this one is about to end.
             if e.code == ErrorCode::PortInUse {

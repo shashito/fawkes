@@ -211,6 +211,7 @@ start = "node app.js"
 deadline = 30
 stop_timeout = 5
 min_uptime = 1
+min_free = 0
 {extra}
 [health]
 url = "http://127.0.0.1:{{port}}/"

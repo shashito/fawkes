@@ -38,6 +38,12 @@ export type Generation = {
   failed_starts: number
 }
 
+/**
+ * The volume of the app's state directory, in bytes (decimal GB = 1e9); `low` is the daemon's own decision, and
+ * `min_free` is where `stage` starts to refuse (0 when the manifest turns disk checks off).
+ */
+export type Disk = { free: number; total: number; low: boolean; min_free: number }
+
 /** Where the daemon's transaction is (`step` of the `status` result). */
 export type Step = 'switching' | 'pending' | 'rolling_back' | 'restore_failed'
 
@@ -55,8 +61,12 @@ export type Status = {
   version?: string
   /** The manifest's absolute path; sent along with `version`. */
   manifest?: string
+  /** The app's state directory; the volume `disk` measures. Sent along with `version`. */
+  state_dir?: string
   /** The commands the daemon accepts right now, as command lines without `fawkes` (`confirm g3`, `rollback`). */
   actions?: string[]
+  /** Null when the measurement failed; absent from an older daemon's status. */
+  disk?: Disk | null
   process: {
     state: 'running' | 'stopped' | 'failed'
     generation: string | null
@@ -124,6 +134,10 @@ export type FawkesEvent = {
   action?: string
   version?: string
   changed?: string[]
+  /** `disk`: the volume's free and total bytes at a crossing of the low-disk line, and which side it crossed to. */
+  free?: number
+  total?: number
+  low?: boolean
   /** `reported`: the info the app now has, its `confirm` key included (`report.ts`). */
   info?: Record<string, string>
 }

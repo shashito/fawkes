@@ -51,6 +51,8 @@ pub enum ErrorCode {
     StorageFailed,
     StartFailed,
     PortInUse,
+    /// `stage` refused: the state directory's volume has less free than the manifest's `min_free`.
+    DiskLow,
     Internal,
     /// Produced by the client only: no daemon answers on the socket, or it closed the connection without answering.
     DaemonUnreachable,
@@ -789,6 +791,8 @@ pub enum EventKind {
     Pruned,
     /// The live app reported different info about itself.
     Reported,
+    /// The state directory's volume became low on space, or recovered from it.
+    Disk,
     Error,
     /// A kind a newer daemon logs that this client does not know. Decode-only; a log written by a newer daemon
     /// replays with it.
@@ -817,6 +821,7 @@ impl EventKind {
             EventKind::RolledBack => "rolled_back",
             EventKind::Pruned => "pruned",
             EventKind::Reported => "reported",
+            EventKind::Disk => "disk",
             EventKind::Error => "error",
             EventKind::Unknown => "unknown",
         }
@@ -957,6 +962,15 @@ pub struct Facts {
     /// `daemon` (`reloaded`): the manifest fields that changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changed: Option<Vec<String>>,
+    /// `disk`: bytes free on the state directory's volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free: Option<u64>,
+    /// `disk`: the volume's size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// `disk`: whether the volume is low now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<bool>,
 }
 
 /// How the app's most recent process ended, and whether Fawkes asked for it.
@@ -1074,7 +1088,23 @@ pub struct Status {
     /// daemon's status.
     #[serde(default)]
     pub actions: Vec<String>,
+    /// The state directory's volume, measured when the status was made; null when it could not be. Absent from an
+    /// older daemon's status.
+    #[serde(default)]
+    pub disk: Option<Disk>,
     pub process: Process,
+}
+
+/// The state directory's volume, in `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Disk {
+    /// Bytes an unprivileged process may still use.
+    pub free: u64,
+    pub total: u64,
+    /// Whether the volume is low on space (DESIGN.md → Disk).
+    pub low: bool,
+    /// The manifest's `min_free` in bytes: where `stage` starts to refuse, 0 when disk checks are off.
+    pub min_free: u64,
 }
 
 impl Status {
@@ -1501,6 +1531,7 @@ mod tests {
         StorageFailed => "storage_failed",
         StartFailed => "start_failed",
         PortInUse => "port_in_use",
+        DiskLow => "disk_low",
         Internal => "internal",
         DaemonUnreachable => "daemon_unreachable",
         NoAnswer => "no_answer",
@@ -1540,6 +1571,7 @@ mod tests {
         RolledBack => "rolled_back",
         Pruned => "pruned",
         Reported => "reported",
+        Disk => "disk",
         Error => "error",
         Unknown => "unknown",
     });
@@ -2003,6 +2035,12 @@ mod tests {
             step: Some(Step::Pending),
             busy: None,
             actions: vec!["confirm g3".into(), "rollback".into()],
+            disk: Some(Disk {
+                free: 12_000_000_000,
+                total: 245_000_000_000,
+                low: true,
+                min_free: 10_000_000_000,
+            }),
             process: Process {
                 state: ProcessState::Running,
                 generation: Some("g3".into()),
@@ -2027,7 +2065,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            r#"{"status":{"name":"sample","daemon_pid":812,"version":"0.3.0","manifest":"/apps/sample/fawkes.toml","state_dir":"/apps/sample/state","socket":"/apps/sample/state/fawkes.sock","permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null,"info":{}}}}"#
+            r#"{"status":{"name":"sample","daemon_pid":812,"version":"0.3.0","manifest":"/apps/sample/fawkes.toml","state_dir":"/apps/sample/state","socket":"/apps/sample/state/fawkes.sock","permanent":"g2","current":"g3","pending":{"generation":"g3","previous":"g2","deadline":"t"},"step":"pending","busy":null,"actions":["confirm g3","rollback"],"disk":{"free":12000000000,"total":245000000000,"low":true,"min_free":10000000000},"process":{"state":"running","generation":"g3","pid":9001,"port":4790,"started_at":"t","uptime":42.5,"restarts":1,"last_exit":{"at":"t","code":null,"signal":15,"requested":true},"restart_at":null,"info":{}}}}"#
         );
         let Line::Status { status } = serde_json::from_str::<Line>(&text).unwrap() else {
             panic!("a status line reads as one");
@@ -2046,6 +2084,15 @@ mod tests {
             panic!("a status line reads as one");
         };
         assert_eq!(status.actions, Vec::<String>::new());
+        // ... and no `disk`, which reads as null.
+        let older = text.replace(
+            r#""disk":{"free":12000000000,"total":245000000000,"low":true,"min_free":10000000000},"#,
+            "",
+        );
+        let Line::Status { status } = serde_json::from_str::<Line>(&older).unwrap() else {
+            panic!("a status line reads as one");
+        };
+        assert!(status.disk.is_none());
         // Final lines: a stream ends with a null result, a failure carries its error.
         assert_eq!(
             serde_json::to_string(&Line::done(Reply::Streamed)).unwrap(),

@@ -1,6 +1,7 @@
 //! The client's text for what the daemon answers and streams: results, status, progress and event lines. Pure
 //! functions from the typed records of `protocol` to strings; `--json` prints the daemon's own documents instead.
 
+use crate::disk::{self, Space};
 use crate::protocol::{
     AppState, DownResult, ErrorCode, Event, Events, FleetStatus, FleetView, GenState, Generation,
     History, Process, ProcessState, PruneResult, ReexecResult, ReloadResult, ReportResult, Request,
@@ -133,8 +134,33 @@ pub fn render_fleet(view: &FleetView) -> String {
             ]
         })
         .collect();
-    let lines = std::iter::once(head).chain(aligned_columns(&rows, "  "));
+    let lines = std::iter::once(head)
+        .chain(fleet_disk_lines(view))
+        .chain(aligned_columns(&rows, "  "));
     lines.collect::<Vec<_>>().join("\n")
+}
+
+/// One line per distinct volume size that has apps on a low disk, naming them: apps share a volume more often than not,
+/// and one warning each would say the same thing. The least free of the apps on it is shown.
+fn fleet_disk_lines(view: &FleetView) -> Vec<String> {
+    let mut volumes: BTreeMap<u64, (u64, Vec<&str>)> = BTreeMap::new();
+    for app in &view.apps {
+        if let Some(disk) = app.status.as_ref().and_then(|s| s.disk).filter(|d| d.low) {
+            let (free, names) = volumes.entry(disk.total).or_insert((disk.free, Vec::new()));
+            *free = (*free).min(disk.free);
+            names.push(&app.name);
+        }
+    }
+    volumes
+        .into_iter()
+        .map(|(total, (free, names))| {
+            format!(
+                "disk low: {} ({})",
+                Space { free, total }.describe(),
+                names.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// What the supervisor does with an app, in a word: `supervised` when its daemon is the supervisor's child.
@@ -291,8 +317,21 @@ fn render_status(s: &Status) -> String {
             s.socket.display()
         )
     };
+    // Only a low disk is worth a line.
+    let disk = match s.disk {
+        Some(disk) if disk.low => format!(
+            "\ndisk low: {}; stage refuses below {}",
+            Space {
+                free: disk.free,
+                total: disk.total
+            }
+            .describe(),
+            disk::gigabytes(disk.min_free)
+        ),
+        _ => String::new(),
+    };
     format!(
-        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nactions: {}\nprocess {}{}",
+        "{}  daemon pid {}  busy: {}\npermanent {}  current {}{}\nactions: {}{}\nprocess {}{}",
         s.name,
         s.daemon_pid,
         or_dash(s.busy.as_deref()),
@@ -304,6 +343,7 @@ fn render_status(s: &Status) -> String {
         } else {
             s.actions.join(", ")
         },
+        disk,
         render_process(&s.process),
         daemon
     )
@@ -490,6 +530,7 @@ mod tests {
             step,
             busy: None,
             actions: Vec::new(),
+            disk: None,
             process: Process {
                 state: ProcessState::Stopped,
                 generation: Some("g2".into()),
@@ -546,6 +587,54 @@ mod tests {
                 && failed.contains("`fawkes rollback --keep-storage` gives it up"),
             "{failed}"
         );
+    }
+
+    #[test]
+    fn a_low_disk_has_a_line_in_status_and_in_the_fleet() {
+        use crate::protocol::{Disk, FleetAppView};
+        let disk = |free: u64, low| Disk {
+            free: free * 100_000_000,
+            total: 2_450_000_000_000,
+            low,
+            min_free: 10_000_000_000,
+        };
+        let mut status = status_in(None, false);
+        status.disk = Some(disk(150, false));
+        assert!(!render_status(&status).contains("disk"));
+        status.disk = Some(disk(92, true));
+        assert!(
+            render_status(&status).contains(
+                "\nactions: none\ndisk low: 9.2 GB free of 2450.0 GB; stage refuses below 10.0 GB\nprocess "
+            ),
+            "{}",
+            render_status(&status)
+        );
+
+        let app = |name: &str, status: Status| FleetAppView {
+            name: name.into(),
+            supervisor: None,
+            error: None,
+            status: Some(status),
+        };
+        let low = |free| Status {
+            disk: Some(disk(free, true)),
+            ..status_in(None, false)
+        };
+        let view = FleetView {
+            supervisor: None,
+            apps: vec![
+                app("xana", low(92)),
+                app("fine", status_in(None, false)),
+                app("ultimate", low(90)),
+            ],
+        };
+        let text = render_fleet(&view);
+        assert_eq!(
+            text.lines().nth(1),
+            Some("disk low: 9.0 GB free of 2450.0 GB (xana, ultimate)"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 5, "{text}");
     }
 
     fn info(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

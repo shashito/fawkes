@@ -3,6 +3,7 @@
 
 mod daemon;
 mod discovery;
+mod disk;
 mod fleet;
 mod manifest;
 mod process;
