@@ -290,10 +290,12 @@ first host to run them: an upgrade or failure from before it is the state the ex
 
 - **Disk low:** one message per low-disk episode, for all hosts on the machine, whatever `afterUpgrade` says (it is no
   upgrade task, and has no setting). While `status.disk.low`, the first host to create `disk-low` (an exclusive
-  create, written before the delivery since a full disk may take no write after it) tells the coordinator's @ultimate
+  create naming its manifest, written before the delivery since a full disk may take no write after it) tells the coordinator's @ultimate
   to find what takes the space and report it, deleting nothing without the user's go; a delivery that fails removes
-  the file again, so the next tick retries. While `status.disk` is present and not low, `disk-low` is removed, which
-  ends the episode: the next time the disk runs low, it is told again. Without `disk` nothing changes.
+  the file again, so the next tick retries. Once the claimer's own daemon says the disk is not low, it removes
+  `disk-low`, which ends the episode: the next time the disk runs low, it is told again. Only the claimer ends it, since
+  daemons can disagree (`min_free = 0`, another volume, a daemon restarted inside the recovery margin). Without `disk`
+  nothing changes; a claimer that is gone for good leaves the file, which is removed by hand.
 
 Success, failure, the give-up and the low disk go to `afterUpgrade.project`, else to the host's own @ultimate. A delivery that fails
 (the project's host is down) changes nothing, and the next tick tries again. Each delivery is a notice: "Fawkes: asked

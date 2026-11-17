@@ -27,7 +27,8 @@ const storages: Record<StorageOutcome, string> = {
 
 export const storageText = (storage: string) => storages[storage as StorageOutcome] ?? `storage ${storage}`
 
-export const gigabytes = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`
+/** Rounded down, as the daemon does, so a refused stage never reads as having enough room. */
+export const gigabytes = (bytes: number) => `${(Math.floor(bytes / 1e8) / 10).toFixed(1)} GB`
 
 /** The volume of the state directory in words: "9.2 GB free of 245.0 GB" (decimal GB, as the daemon counts). */
 export const diskText = (disk: Disk) => `${gigabytes(disk.free)} free of ${gigabytes(disk.total)}`

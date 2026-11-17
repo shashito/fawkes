@@ -38,8 +38,10 @@ export type Generation = {
   failed_starts: number
 }
 
-/** The volume of the app's state directory, in bytes (decimal GB = 1e9); `low` is the daemon's own decision. */
-/** `min_free` is where `stage` starts to refuse, in bytes (0 when the manifest turns disk checks off). */
+/**
+ * The volume of the app's state directory, in bytes (decimal GB = 1e9); `low` is the daemon's own decision, and
+ * `min_free` is where `stage` starts to refuse (0 when the manifest turns disk checks off).
+ */
 export type Disk = { free: number; total: number; low: boolean; min_free: number }
 
 /** Where the daemon's transaction is (`step` of the `status` result). */

@@ -387,18 +387,23 @@ test('an extension belongs to the project whose root is its repository; one in a
 test('a low disk is told once per episode: claim while low and unclaimed, clear once it has room, idle without a measurement', async (t) => {
   const low = { free: 9.2e9, total: 245e9, low: true, min_free: 10e9 }
   const room = { free: 80e9, total: 245e9, low: false, min_free: 10e9 }
-  assert.equal(diskStep(low, false), 'claim')
-  assert.equal(diskStep(low, true), 'idle')
-  assert.equal(diskStep(room, true), 'clear')
-  assert.equal(diskStep(room, false), 'idle')
+  const [a, b] = ['/h/.fawkes/a.toml', '/h/.fawkes/b.toml']
+  assert.equal(diskStep(low, undefined, a), 'claim')
+  assert.equal(diskStep(low, a, a), 'idle')
+  assert.equal(diskStep(room, a, a), 'clear')
+  assert.equal(diskStep(room, undefined, a), 'idle')
+  // Hosts that disagree (b has min_free = 0, or another volume) keep one episode: b neither ends a's claim nor claims.
+  assert.equal(diskStep(room, a, b), 'idle')
+  assert.equal(diskStep(low, a, b), 'idle')
   // An older daemon or a failed measurement says nothing, so an episode in progress stays told.
-  for (const disk of [null, undefined]) for (const claimed of [false, true]) assert.equal(diskStep(disk, claimed), 'idle')
+  for (const disk of [null, undefined])
+    for (const claimer of [undefined, a]) assert.equal(diskStep(disk, claimer, a), 'idle')
 
   // Of two hosts that see the disk low at once, one claims; once its claim is removed (a failed delivery) the next tick claims.
   const file = join(scratch(t), 'disk-low')
   assert.deepEqual(await Promise.all([claim(file), claim(file)]), [true, false])
   rmSync(file)
-  assert.equal(diskStep(low, existsSync(file)), 'claim')
+  assert.equal(diskStep(low, existsSync(file) ? a : undefined, b), 'claim')
 })
 
 test('the disk-low message names the volume, the space and the rules, and its facts', () => {

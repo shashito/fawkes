@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { existsSync, realpathSync, writeFileSync } from 'node:fs'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { BACKGROUND_CONTEXT } from '@earendil-works/chord/context'
@@ -610,18 +610,23 @@ async function investigate(run: TaskRun, failure: Failure, instructions: string 
 }
 
 /**
- * Tell the coordinator once per low-disk episode, for all hosts: the first to claim `disk-low` delivers, and the file
- * stays until the daemon says the disk is not low. The claim comes before the delivery, since a full disk may take
- * the write after it, and goes again when the delivery fails, so the next tick retries.
+ * Tell the coordinator once per low-disk episode, for all hosts: the first to claim `disk-low` delivers, and the file,
+ * naming its manifest, stays until that host's daemon says the disk is not low. The claim comes before the delivery,
+ * since a full disk may take the write after it, and goes again when the delivery fails, so the next tick retries.
  */
 async function diskLow(run: TaskRun) {
   const { disk } = run.status
   const file = join(run.folder, DISK_LOW)
-  const step = diskStep(disk, existsSync(file))
+  const me = run.facts.manifest
+  const claimer = await readFile(file, 'utf8').then(
+    (text) => text.trim(),
+    () => undefined,
+  )
+  const step = diskStep(disk, claimer, me)
   if (step === 'clear') return rm(file, { force: true })
   if (step !== 'claim' || !disk) return
   const at = new Date().toISOString()
-  if (!(await claim(file, `${process.pid} ${at}\n`))) return
+  if (!(await claim(file, `${me}\n`))) return
   try {
     const stateDir = run.status.state_dir ?? 'its state directory'
     await deliver(run, run.coordinator, diskLowText({ ...run.facts, disk, stateDir }), `fawkes-disk-low-${at}`)

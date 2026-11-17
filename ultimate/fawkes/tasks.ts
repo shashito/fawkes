@@ -163,14 +163,16 @@ export const DISK_LOW = 'disk-low'
 export type DiskStep = 'claim' | 'clear' | 'idle'
 
 /**
- * What a low disk calls for, from the daemon's `status.disk` and whether the episode's claim file exists: claim it
- * while the disk is low and nobody has, forget it once the disk is not low. No `disk` (an older daemon, or a failed
- * measurement) says nothing about the episode.
+ * What a low disk calls for, from the daemon's `status.disk`, the host that claimed the episode (the manifest its claim
+ * file names) and this host's manifest: claim it while the disk is low and nobody has, and end it once the claimer's
+ * own daemon says the disk has room. Only the claimer ends it: daemons can disagree (`min_free = 0`, another volume, a
+ * restarted daemon inside the recovery margin), and a host that sees room must not reopen an episode another host still
+ * sees. No `disk` (an older daemon, or a failed measurement) says nothing about the episode.
  */
-export function diskStep(disk: Disk | null | undefined, claimed: boolean): DiskStep {
+export function diskStep(disk: Disk | null | undefined, claimer: string | undefined, me: string): DiskStep {
   if (!disk) return 'idle'
-  if (disk.low) return claimed ? 'idle' : 'claim'
-  return claimed ? 'clear' : 'idle'
+  if (claimer === undefined) return disk.low ? 'claim' : 'idle'
+  return claimer === me && !disk.low ? 'clear' : 'idle'
 }
 
 // ------------------------------------------------ texts

@@ -71,9 +71,12 @@ export function upgradeRefusal(status: Status | undefined) {
   if (status.pending) return rollbackNote(status) ?? `${status.pending.generation} still awaits its confirm`
   if (status.step === 'switching') return 'A switch is under way'
   if (!allows(status, 'stage')) {
+    // Low also covers the warning band above min_free, where stage is still taken: only below it is the disk the cause.
     const disk = lowDisk(status)
     if (status.busy) return `Fawkes is busy: ${status.busy}`
-    return disk ? `The disk is low (${diskText(disk)}): free disk space first` : 'Fawkes does not take a stage now'
+    return disk && disk.free < disk.min_free
+      ? `The disk is low (${diskText(disk)}): free disk space first`
+      : 'Fawkes does not take a stage now'
   }
   return undefined
 }
