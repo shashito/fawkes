@@ -69,6 +69,8 @@ if (!existsSync(command[1])) throw new Error(`${command[1]} is missing: is ${cod
 
 // Fawkes signals the whole process group, so the child gets every SIGTERM itself. This process stays until the child
 // has shut down (Fawkes waits on it, its group leader), cleans up after a test run, and then ends the same way.
+// In the live phase the signal also reaches the core under Ultimate's supervisor, which ignores it and logs "Ignored
+// SIGTERM sent to core pid …": expected, since that supervisor stops its core itself.
 // The manifest's `stop_timeout` must leave room for both before Fawkes's SIGKILL.
 child = spawn(command[0], command.slice(1), { cwd: code, env, stdio: 'inherit' })
 child.on('exit', (exitCode, signal) => {

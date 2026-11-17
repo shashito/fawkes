@@ -883,25 +883,34 @@ export default function fawkesExtension(host: ExtensionHost) {
         .catch(() => undefined)
         .finally(() => (s.checking = false))
     }
-    const first = setTimeout(quiet, 30_000)
-    const timer = setInterval(quiet, 60_000)
     // A listed extension that fails to load is repaired at once, not at the next tick. The callback runs before the
     // host records the error, which the run reads after its first await.
     host.onLoadError(() => follow())
-    // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
-    const reported = setInterval(() => void reports?.tick(), INTERVAL)
     // Hourly, so a reinstall shows within the hour and a check missed while offline or asleep runs soon after; GitHub
     // itself is asked once a day.
     const release = () => void (releaseCheck && checkRelease(host))
-    const firstRelease = setTimeout(release, 30_000)
-    const releases = setInterval(release, 3_600_000)
-    host.onClose(async () => {
-      clearTimeout(first)
-      clearInterval(timer)
-      clearInterval(reported)
-      clearTimeout(firstRelease)
-      clearInterval(releases)
+    // The ticks run tasks that commit, so they run only while the host is open: a shutdown releases, closes the
+    // Harness and only then closes the extensions, and a failed core swap releases and opens again in this process.
+    let stopTimers: (() => void) | undefined
+    host.onOpen(async () => {
+      if (stopTimers) return
+      const first = setTimeout(quiet, 30_000)
+      const timer = setInterval(quiet, 60_000)
+      // The host offers extensions no change notification for its system info (a Tailscale URL appears after startup).
+      const reported = setInterval(() => void reports?.tick(), INTERVAL)
+      const firstRelease = setTimeout(release, 30_000)
+      const releases = setInterval(release, 3_600_000)
+      stopTimers = () => {
+        clearTimeout(first)
+        clearInterval(timer)
+        clearInterval(reported)
+        clearTimeout(firstRelease)
+        clearInterval(releases)
+        stopTimers = undefined
+      }
     })
+    host.onRelease(async () => stopTimers?.())
+    host.onClose(async () => stopTimers?.())
   }
   host.onClose(async () => {
     s.stop?.()
