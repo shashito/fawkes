@@ -156,6 +156,8 @@ machine yourself. While `busy` names a step in progress, the commands it would r
 status again when `busy` is null. An empty list means a step is under way that leaves nothing else to do: wait for it. `step` says where a transaction is: `switching`, `pending` (awaits confirm), `rolling_back`,
 `restore_failed`, or null.
 
+`status.disk` is the state directory's volume: `free` and `total` in bytes, `low` (true once it is nearly full: a `disk` event says so too) and `min_free`, the bytes below which `stage` refuses (`disk_low`; it is then not in `actions`). It is null when the volume cannot be measured.
+
 `status` also says which daemon answered: `version`, `manifest` (the file it loaded), `state_dir` and `socket`. After
 editing the manifest, `fawkes reload --json` applies it and answers `changed` (the fields that changed), or refuses
 (`usage` for an invalid manifest, `invalid_state` for a field that needs a daemon restart or a stopped app).
@@ -196,6 +198,7 @@ gives the events after the `seq` N you saw last.
 | `storage_failed` | A storage hook (`snapshot`, `restore`, `test_copy`) failed or timed out. A failed snapshot means no switch happened; a failed restore leaves the app stopped. | Read the file the error's `log` names. After a failed restore: `fawkes rollback` retries it; `fawkes rollback --keep-storage` gives it up and starts the permanent generation on the storage as it is (it may already be migrated). |
 | `start_failed` | The process could not be started, or no spare port was free for a test. A switch whose target cannot start is rolled back at once. | Check the `start` command and the spare ports. |
 | `port_in_use` | Another process took the test's spare port. The generation is unchanged. | `test` again. |
+| `disk_low` | `stage` refused: the state directory's volume has less free than `min_free` GB (default 10). The message says how much is free and where. | Free disk space, then stage again; nothing else is refused, so a rollback or confirm still works. `status` → `disk` shows the volume. |
 | `internal` | Fawkes could not write its state (disk full, permissions). The message says what was kept. | Fix the disk; retry. |
 | `rolled_back` | `fawkes wait`: the generation rolled back. Produced by the client. | Read its `cause` and `fawkes history`. |
 | `test_phase` | A command that changes something, run with `FAWKES_PHASE=test`. Produced by the client. | Nothing: a test run serves its health check only. |

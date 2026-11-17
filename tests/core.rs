@@ -3988,6 +3988,56 @@ fn the_live_app_reports_its_url_and_up_prints_where_it_is() {
     );
 }
 
+/// A volume with less free than `min_free` refuses `stage` (`disk_low`), leaves `stage` out of `actions`, says so in
+/// `status.disk`, and the supervision thread logs a `disk` event while the app runs. Nothing else is refused.
+#[test]
+fn a_low_disk_refuses_stage_warns_in_status_and_is_logged() {
+    let mut h = Harness::new("");
+    h.commit("v1", "confirm");
+    h.start_daemon();
+    make_permanent(&h, "v1", "g1");
+    assert_eq!(h.status()["disk"]["low"], false);
+
+    // No volume has a million gigabytes free.
+    h.edit_manifest("min_free = 0", "min_free = 1000000");
+    assert_eq!(
+        h.ok(&["reload"])["changed"],
+        serde_json::json!(["min_free"])
+    );
+
+    refused(&h, &["stage", "v1"], "disk_low", "need 1000000.0 GB");
+    refused(
+        &h,
+        &["stage", "v1"],
+        "disk_low",
+        "free disk space, then stage again",
+    );
+    let status = h.status();
+    assert_eq!(status["disk"]["low"], true, "{status}");
+    assert!(status["disk"]["free"].as_u64().unwrap() > 0, "{status}");
+    assert!(status["disk"]["total"].as_u64().unwrap() > 0, "{status}");
+    assert!(
+        !status["actions"].to_string().contains("\"stage\""),
+        "{status}"
+    );
+    // Only stage refuses: the running app, and what is already staged, carry on.
+    assert_eq!(status["process"]["state"], "running", "{status}");
+
+    // The supervision thread looks every 10 s while the app runs.
+    h.wait("the disk event", 25, || {
+        h.ok(&["log", "-n", "1000"])["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "disk" && event["low"] == true)
+    });
+    let message = &messages(&h, "disk")[0];
+    assert!(
+        message.starts_with("disk low: ") && message.contains("; stage refuses below 1000000.0 GB"),
+        "{message}"
+    );
+}
+
 // ------------------------------------------------ the supervisor
 
 /// A second app, `name`, beside the harness's own in its `FAWKES_HOME`: the same manifest with its own name, state

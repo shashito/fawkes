@@ -87,7 +87,7 @@ has no one to answer, so `SIGHUP` only logs:
   restart, rollback or the daemon's own restart: between stopping the old process and starting the new one no app
   runs, yet the step announces the port it starts on). The reload is refused whole; reload again once the step
   has finished.
-- Everything else (`start`, `env`, `health`, `hooks`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`,
+- Everything else (`start`, `env`, `health`, `hooks`, `rollback_on_unhealthy`, `install`, `reuse`, `keep`, `min_free`,
   `spare_ports`, `deadline`, the timeouts and the restart policy) applies from the next stage, test, switch, rollback
   or start on. An invalid manifest is not reloaded.
 - `adopt` and `project` take effect at the next daemon start: only a daemon start adopts, and the daemon never reads
@@ -164,6 +164,31 @@ tested ──adopt (a first daemon start, `adopt = true`)──▶ permanent
   again is allowed (after a new `test`), which is how an agent goes back to an older version on purpose.
 - **rolled_back:** final. A rolled-back generation is never started again, so a broken rollback cannot loop, and
   `stage` never reuses it; stage the same ref again to get a fresh generation.
+
+### Disk
+
+A volume that fills up stops everything on it at once, an app's own writes included, so Fawkes watches the volume
+of the `state_dir` and keeps `stage`, the one step that writes a gigabyte, off a nearly full disk.
+
+- **What is measured:** `statvfs` of the resolved `state_dir`: the bytes an unprivileged process may use (`f_bavail`)
+  and the volume's size (`f_blocks`), in `f_frsize` units. Space the system could purge (APFS) is not counted as free.
+  Sizes are decimal gigabytes (10^9 bytes), and the text shows one decimal, rounded down (`12.0 GB free of 245.0 GB`).
+- **Two thresholds**, from `min_free` (gigabytes, default 10; 0 turns every disk check off):
+  - the volume is **low** when its free space is below the larger of `min_free` and 5 % of its size, so that a large
+    volume warns while there is still room to act (on 245 GB the line is 12.25 GB, on 1 TB 50 GB). A volume that was
+    low stays low until it has 1 GB more than that line, so one hovering at the line does not warn and recover in turn.
+  - `stage` **refuses** when the free space is below `min_free` itself: no share of the volume, no hysteresis. On a
+    large volume the warning therefore comes well before the refusal.
+- **The warning:** the supervision thread measures every 10 s while the app runs (with the app log's cap) and logs a
+  `disk` event when the volume becomes low (`disk low: 9.2 GB free of 245.0 GB on <state_dir>; stage refuses below
+  10.0 GB`) and when it recovers (`disk space recovered: 14.0 GB free of 245.0 GB`), and nothing else: a daemon whose
+  first measurement is fine logs nothing. `status.disk` is measured afresh at every `status` (see Socket protocol).
+- **Only `stage` refuses**, with `disk_low` (exit 1), first thing once it holds the step slot: `9.2 GB free of 245.0 GB
+  on <state_dir>, need 10.0 GB (min_free in <manifest>); free disk space, then stage again`. `upgrade` gets it through
+  its `stage` step. Nothing else looks at the disk: not `test`, `switch`, `confirm`, `rollback`, `restore`, `start`,
+  `prune`, and not the stage of an adoption, which would leave the app down. An upgrade needs about a gigabyte; the
+  floor leaves the machine headroom for itself and for the restore of a rollback, which must never be refused. A volume
+  that cannot be measured does not refuse: the check is best effort.
 
 ### Switch
 
@@ -381,7 +406,8 @@ run, `status` and `watch` reach the daemon meanwhile (`busy` names the stage, th
    not bind or something answers a connect on `127.0.0.1` or `::1`. A listener on another address only (Tailscale
    serve on the tailnet address) leaves it free: an app on the loopback address starts beside it, and one that binds
    all addresses fails its own start on the live port, which its `exited` events and `status` report.
-2. Log a `daemon` event (`action` `adopting`), then stage `HEAD` and test it as `stage` and `test` do: a `staged`,
+2. Log a `daemon` event (`action` `adopting`), then stage `HEAD` and test it as `stage` and `test` do (without the disk
+   check of `stage`, Disk: a refused adoption would leave the app down): a `staged`,
    `tested` or `test_failed` generation of that commit is reused, and the test runs on a spare port with a copy of
    the storage (Hooks), never on the live home.
 3. On a pass, mark the generation `permanent` and write `state.json` before anything starts: no switch, so no
@@ -440,6 +466,7 @@ install = "npm ci"             # run in the worktree after checkout; optional
 install_timeout = 1800         # seconds before a hanging install is stopped and the stage fails
 reuse = ["node_modules"]       # cloned (copy-on-write) from the permanent generation before install; optional
 keep = 5                       # generations `prune` keeps (it runs after every confirm); optional, default all
+min_free = 10                  # GB free on the state_dir's volume below which stage refuses; 0 turns disk checks off
 start = "node app.js"          # run in the worktree via /bin/sh -c
 deadline = 120                 # seconds to confirm after switch; `switch --deadline` overrides
 stop_timeout = 10              # seconds between SIGTERM and SIGKILL
@@ -484,6 +511,7 @@ socket somewhere else than the daemon. Fawkes refuses it with a message saying t
 - `install_timeout`, `stop_timeout`, `min_uptime`, `health.interval`, `health.timeout` or `hooks.timeout` is not a
   number of seconds above 0 and at most 86400;
 - `max_failed_starts` or `keep` is 0;
+- `min_free` is negative or not finite (0 is valid: it turns the disk checks off);
 - it lies in `<fawkes_home>` under another file name than `<name>.toml`: `--manifest <name>` finds an app there by
   its file name, and everything else (`status`, `watch`, the state directory, the supervisor's apps) shows its `name`,
   so the error says to rename the file;
@@ -682,7 +710,9 @@ supervisor pid 812, fawkes 0.1.5, 3 apps
   xana      running    g3  pid 71568  port 4749  fawkes 0.3.0  supervised
 ```
 
-The state is the process's (`running`, `stopped`, `failed`), or, without an answer, `down` (the supervisor keeps the
+When any app's `disk.low` is true, one line follows the supervisor's for each distinct volume size among those apps,
+naming them and the least free space among them: `disk low: 9.2 GB free of 245.0 GB (xana, ultimate)`. Nothing
+is printed while every disk is fine. The state is the process's (`running`, `stopped`, `failed`), or, without an answer, `down` (the supervisor keeps the
 app down), `no daemon` (none listens) or `no answer`. The supervision is `supervised` (the daemon is the supervisor's
 child), `attached`, `backoff`, `down` or `broken`, and `-` without a supervisor or for an app that is not one of its
 own. Under `--json`: `{"supervisor": <supervisor status>|null, "apps": [{"name", "supervisor": <its app in the
@@ -996,7 +1026,8 @@ says the same in words. The client's own errors add two more optional fields: `c
 on `rolled_back`, and `step` (`stage`, `test` or `switch`) on a failure of `upgrade`.
 
 Error codes: `usage`, `not_found`, `invalid_state`, `busy`, `git_failed`, `install_failed`, `health_failed`,
-`storage_failed`, `start_failed`, `port_in_use`, `internal`. (`daemon_unreachable`, `no_answer`, `service_failed`,
+`storage_failed`, `start_failed`, `port_in_use`, `disk_low` (`stage` only: the state directory's volume has less free
+than `min_free`, see Disk), `internal`. (`daemon_unreachable`, `no_answer`, `service_failed`,
 `rolled_back` and `test_phase` are produced by the client only: no daemon answers, or it closed the connection without an answer; the daemon accepted a
 quick request and did not answer in time; `fawkes service` could not write its plist or `launchctl` refused. `rolled_back`
 is produced by `fawkes wait` alone, `test_phase` by the refusal of a change command in a test run; both are described
@@ -1069,6 +1100,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `rolled_back` | a rollback ended: normally, or with its restore failed, with `state.json` unwritable, or with the restore given up by `--keep-storage`; the message says which | the generation rolled back (not the one that runs now) |
 | `pruned` | `prune` removed at least one generation; the message lists them | `null` |
 | `reported` | the live app reported info that differs from what it reported before (a repeat logs nothing); the message is the pairs as `key value` joined by ` · `, `url` first and the rest by key, or `info cleared` | the generation that reported |
+| `disk` | the state directory's volume became low on space or recovered from it (Disk); a daemon whose first measurement is fine logs nothing | `null` |
 | `error` | something failed that no answer to a client reports: a stage that failed (its generation is already removed), a test that lost its spare port, a failed write of `state.json`, a refused reload, a failed `prune`, an unreadable deadline, a failed adoption (the daemon then exits), a `reexec` whose exec failed, a panic | the generation concerned, else `null` |
 
 | Kind | Fields |
@@ -1082,6 +1114,7 @@ with what `generation` holds and the fields each carries (the table below the ki
 | `rolled_back` | `to` (the permanent generation it returns to, absent when none), `reason` (the readable text), `cause` (see Rollback), `storage`: `restored`, `kept` (`--keep-storage`), `restore_failed`, or `none` (no `restore` hook: a code-only rollback) |
 | `pruned` | `removed`: the ids |
 | `reported` | `info`: the info the app now has, an object of strings (empty when it cleared it) |
+| `disk` | `free` and `total` (bytes on the volume), `low` (`true` when it became low, `false` when it recovered) |
 | `error` | `error_code`: the error code of the failure, when it has one (a failed stage, a lost spare port, a failed prune, a failed adoption). Not `code`, which is the exit status of `exited` |
 | `progress`, `healthy`, `unhealthy`, `failed`, `stopped`, `staged`, `adopted` | none |
 
@@ -1118,6 +1151,7 @@ explain its predecessor's rollback with one call. A client reads a missing field
  "state_dir": "/home/me/.fawkes/sample", "socket": "/home/me/.fawkes/sample/fawkes.sock", "permanent": "g2", "current": "g3", "pending": {"generation": "g3",
  "previous": "g2", "deadline": "…"}, "step": "pending", "busy": null,
  "actions": ["stop", "restart", "stage", "confirm g3", "rollback"],
+ "disk": {"free": 12000000000, "total": 245000000000, "low": false, "min_free": 10000000000},
  "process": {"state": "running", "generation": "g3", "pid": 9001, "port": 4790, "started_at": "…",
              "uptime": 42.5, "restarts": 1,
              "last_exit": {"at": "…", "code": null, "signal": 15, "requested": true}, "restart_at": null,
@@ -1132,7 +1166,13 @@ reads `step`, not the presence of `pending`, to know whether a confirm can still
 older daemon's; its `pending` awaits a confirm. The text form of `fawkes status` says `waiting for confirm until …`
 only for `pending`, `rolling back gN to gM` for `rolling_back`, and for `restore_failed` that the storage could not be
 restored and which command retries or gives it up. A line `actions: …` (or `actions: none`) comes before the process,
-and a line `daemon <version>  manifest …  state_dir …  socket …` follows it.
+and a line `daemon <version>  manifest …  state_dir …  socket …` follows it. When the disk is low, the line
+`disk low: 9.2 GB free of 245.0 GB; stage refuses below 10.0 GB` follows `actions`; nothing is printed while it is fine.
+
+`disk` is the state directory's volume (Disk), measured afresh at every `status`: `free` and `total` in bytes, `low`
+(by the rule of Disk, using what the supervision thread last found, which it does not change) and `min_free`, the bytes
+below which `stage` refuses, 0 when the disk checks are off. It is null when the volume cannot be measured. A status
+without `disk` is an older daemon's and reads as null.
 
 `version` is the daemon's build, `manifest` the absolute path it loaded and re-reads on `reload`, `state_dir` the
 resolved state directory and `socket` the socket it listens on: they say which daemon answered, which matters when
@@ -1147,7 +1187,7 @@ the very functions the commands call, so it cannot say what a command would refu
 left out, which means that while `busy` names a step, the commands it would refuse with `busy` are not listed. The
 state checks, in short: `start` needs a current generation and no app running; `stop` an app running that has not
 exited, or a scheduled crash restart to cancel; `restart` a current generation whose app, if any, has not exited;
-`stage` nothing; `test <gen>` a generation that may be tested (`staged`, `test_failed`, `tested`, `retired`);
+`stage` a volume with at least `min_free` free (Disk); `test <gen>` a generation that may be tested (`staged`, `test_failed`, `tested`, `retired`);
 `switch <gen>` a `tested` one, no switch in flight and no failed restore; `confirm <gen>` a pending switch within its
 deadline whose process runs and has not exited (the permanent generation is never listed: confirming it is answered ok
 and changes nothing); `rollback` a pending switch or a rollback that did not finish; `rollback --keep-storage` a
@@ -1156,6 +1196,7 @@ restore that failed; `prune` a `keep` in the manifest. A status without `actions
 | Situation | `actions` |
 |---|---|
 | idle, no generation yet | `stage` |
+| the volume has less than `min_free` free | the list without `stage` |
 | permanent runs | `stop`, `restart`, `stage`, then `test` and `switch` entries for the generations that allow them |
 | permanent stopped | `start`, `restart`, `stage`, … |
 | crash restart scheduled (`restart_at` set) | `start`, `stop`, `restart`, `stage`, … |
