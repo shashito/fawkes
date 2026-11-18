@@ -7,6 +7,9 @@ use std::path::Path;
 /// Decimal gigabytes, as disk vendors and the manifest's `min_free` count them.
 pub const GB: u64 = 1_000_000_000;
 
+/// How far above `min_free` the low line sits, so the warning comes before `stage` refuses.
+const MARGIN: u64 = 2 * GB;
+
 /// How much more than the low line must be free before a volume that was low counts as recovered, so a volume
 /// hovering at the line does not log a warning and a recovery every few seconds.
 const HYSTERESIS: u64 = GB;
@@ -54,14 +57,14 @@ pub fn gigabytes_to_bytes(gigabytes: f64) -> u64 {
     (gigabytes * 1e9).round() as u64
 }
 
-/// Whether the volume is low, for `min_free` bytes (0 turns the watching off): free below the larger of `min_free`
-/// and 5 % of the volume, so a big volume warns while there is still room to act. A volume that was low stays so
-/// until it has `HYSTERESIS` more than that line.
+/// Whether the volume is low, for `min_free` bytes (0 turns the watching off): free below `min_free` plus `MARGIN`,
+/// whatever the volume's size, so it warns shortly before `stage` refuses and not while free space swings with
+/// everyday builds. A volume that was low stays so until it has `HYSTERESIS` more than that line.
 pub fn low(space: Space, min_free: u64, was_low: bool) -> bool {
     if min_free == 0 {
         return false;
     }
-    let line = min_free.max(space.total / 20);
+    let line = min_free.saturating_add(MARGIN);
     let clear = if was_low {
         line.saturating_add(HYSTERESIS)
     } else {
@@ -70,8 +73,8 @@ pub fn low(space: Space, min_free: u64, was_low: bool) -> bool {
     space.free < clear
 }
 
-/// Whether `stage` refuses: free below `min_free` itself, with no share of the volume and no hysteresis, so on a
-/// large volume the warning (`low`) comes first.
+/// Whether `stage` refuses: free below `min_free` itself, with no margin and no hysteresis, so the warning (`low`)
+/// comes first.
 pub fn refuses(space: Space, min_free: u64) -> bool {
     min_free > 0 && space.free < min_free
 }
@@ -89,15 +92,16 @@ mod tests {
     }
 
     #[test]
-    fn low_is_the_larger_of_min_free_and_five_percent() {
+    fn low_is_two_gigabytes_above_min_free_whatever_the_size() {
         let ten = 10 * GB;
         for (free, total, expected) in [
-            (18_000, 245_000, false),
-            (12_000, 245_000, true),
-            (60_000, 1_000_000, false),
-            (40_000, 1_000_000, true),
-            (9_000, 100_000, true),
-            (10_000, 100_000, false),
+            (11_900, 245_000, true),
+            (12_000, 245_000, false),
+            (12_100, 245_000, false),
+            (9_200, 245_000, true),
+            (17_000, 245_000, false),
+            (40_000, 1_000_000, false),
+            (11_000, 100_000, true),
         ] {
             assert_eq!(
                 low(space(free, total), ten, false),
@@ -110,17 +114,18 @@ mod tests {
     #[test]
     fn a_low_volume_stays_low_until_a_gigabyte_above_the_line() {
         let ten = 10 * GB;
-        // The line of a 245 GB volume is 12.25 GB.
         assert!(low(space(12_500, 245_000), ten, true));
         assert!(!low(space(12_500, 245_000), ten, false));
-        assert!(low(space(13_200, 245_000), ten, true));
-        assert!(!low(space(13_300, 245_000), ten, true));
+        assert!(low(space(12_900, 245_000), ten, true));
+        assert!(!low(space(13_000, 245_000), ten, true));
+        assert!(!low(space(13_100, 245_000), ten, true));
     }
 
     #[test]
     fn no_min_free_turns_the_watching_off() {
         assert!(!low(space(0, 245_000), 0, false));
         assert!(!low(space(0, 245_000), 0, true));
+        assert!(!low(space(500_000, 4_000_000), 0, false));
         assert!(!refuses(space(0, 245_000), 0));
     }
 
@@ -130,8 +135,8 @@ mod tests {
         assert!(refuses(space(9_200, 245_000), ten));
         assert!(!refuses(space(10_000, 245_000), ten));
         // Low, with the warning out, but stage still works.
-        assert!(low(space(40_000, 1_000_000), ten, false));
-        assert!(!refuses(space(40_000, 1_000_000), ten));
+        assert!(low(space(11_000, 245_000), ten, false));
+        assert!(!refuses(space(11_000, 245_000), ten));
     }
 
     #[test]

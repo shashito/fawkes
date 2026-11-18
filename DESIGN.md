@@ -174,11 +174,12 @@ of the `state_dir` and keeps `stage`, the one step that writes a gigabyte, off a
   and the volume's size (`f_blocks`), in `f_frsize` units. Space the system could purge (APFS) is not counted as free.
   Sizes are decimal gigabytes (10^9 bytes), and the text shows one decimal, rounded down (`12.0 GB free of 245.0 GB`).
 - **Two thresholds**, from `min_free` (gigabytes, default 10; 0 turns every disk check off):
-  - the volume is **low** when its free space is below the larger of `min_free` and 5 % of its size, so that a large
-    volume warns while there is still room to act (on 245 GB the line is 12.25 GB, on 1 TB 50 GB). A volume that was
-    low stays low until it has 1 GB more than that line, so one hovering at the line does not warn and recover in turn.
-  - `stage` **refuses** when the free space is below `min_free` itself: no share of the volume, no hysteresis. On a
-    large volume the warning therefore comes well before the refusal.
+  - the volume is **low** when its free space is below `min_free` plus 2 GB, whatever its size (12 GB with the
+    default), so it warns shortly before the refusal and not while free space swings with everyday builds. A volume
+    that was low stays low until it has 1 GB more than that line (13 GB with the default), so one hovering at the line
+    does not warn and recover in turn.
+  - `stage` **refuses** when the free space is below `min_free` itself: no margin, no hysteresis. The warning
+    therefore comes 2 GB before the refusal.
 - **The warning:** the supervision thread measures every 10 s while the app runs (with the app log's cap) and logs a
   `disk` event when the volume becomes low (`disk low: 9.2 GB free of 245.0 GB on <state_dir>; stage refuses below
   10.0 GB`) and when it recovers (`disk space recovered: 14.0 GB free of 245.0 GB`), and nothing else: a daemon whose
