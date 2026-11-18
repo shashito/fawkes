@@ -2,9 +2,9 @@
  * Whether a new generation may vouch for itself: every built-in extension's server facet loaded (a facet broken by a
  * changed core or a missing package is exactly what an upgrade must not make permanent), and the public page answers.
  *
- * Only built-in extensions run from the generation's own code. A user or project extension resolves `ultimate/...`
- * through its own folder's `node_modules`, which links to one shared clone's working tree, so it loads or fails alike
- * in every generation on that clone: a rollback cannot mend it, and only costs the storage written since the switch.
+ * Only built-in extensions are part of the generation. A user or project extension imports the generation's
+ * `ultimate/...` (`own-code.ts`), but its own files are shared by every generation and edited live, outside any
+ * upgrade: a rollback cannot mend a fault of its own, and only costs the storage written since the switch.
  */
 import type { ExtensionInfo } from 'ultimate/shared/protocol.ts'
 
@@ -41,7 +41,7 @@ export function judge(extensions: ExtensionInfo[], page: number | string): Verdi
 /** The notice for failed facets that do not block the confirm, or nothing when none failed. */
 export function ignoredText(ignored: string[]) {
   if (!ignored.length) return undefined
-  return `Fawkes: ${ignored.join(', ')} failed to load; a user or project extension loads the same in every generation, so it does not block the confirm`
+  return `Fawkes: ${ignored.join(', ')} failed to load; a user or project extension's files are shared by every generation, so it does not block the confirm`
 }
 
 export async function mayConfirm(host: {

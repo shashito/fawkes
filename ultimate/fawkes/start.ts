@@ -9,6 +9,9 @@
  *   that never pushes and moves only its own branches, and `ULTIMATE_INSTANCE_OWNER`, which turns off what a preview
  *   skips. The fawkes extension holds the scheduler there, so nothing in the copied storage resumes.
  *
+ * Both first link the generation's `node_modules/ultimate` to itself, so extensions load this generation's Ultimate
+ * (`own-code.ts`); a generation that cannot be linked does not start, which fails its test.
+ *
  * Both name the home they prepared in `FAWKES_ULTIMATE_HOME`: the extension acts only in the Ultimate whose home that
  * is, never in a preview or test server that inherited Fawkes's variables from it (`role.ts`).
  *
@@ -20,6 +23,7 @@ import { mkdir, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { linkOwnCode } from './own-code.ts'
 import { testEnv } from './test-env.ts'
 
 const [project] = process.argv.slice(2)
@@ -66,6 +70,7 @@ if (phase === 'test') {
 }
 env.FAWKES_ULTIMATE_HOME = home
 if (!existsSync(command[1])) throw new Error(`${command[1]} is missing: is ${code} an Ultimate worktree?`)
+await linkOwnCode(code)
 
 // Fawkes signals the whole process group, so the child gets every SIGTERM itself. This process stays until the child
 // has shut down (Fawkes waits on it, its group leader), cleans up after a test run, and then ends the same way.

@@ -36,8 +36,8 @@ test('a generation vouches for itself only with every server facet loaded and it
   assert.equal(judge([extension('a')], 'fetch failed').ok, false)
 })
 
-// xana g4 and three other upgrades rolled back on their deadline because the user extension `phone` failed to load: it
-// resolves `ultimate/...` against the shared clone, so the old generation failed it just the same.
+// xana g4 and three other upgrades rolled back on their deadline because the user extension `phone` failed to load: its
+// files are shared by every generation, so the old generation failed it just the same.
 test('a failed user or project facet does not block the confirm, but is named', () => {
   const extensions = [
     extension('a'),

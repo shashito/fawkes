@@ -88,6 +88,13 @@ but run with a home of their own, so they never confirm, upgrade or roll back th
   back), a git guard that never pushes and moves only the preview's own branches, and `ULTIMATE_INSTANCE_OWNER`,
   which turns off what previews skip. The preview's branch and checkouts are removed after the run.
 
+In both phases it first links the generation's `node_modules/ultimate` to the generation itself (`own-code.ts`).
+Ultimate loads extensions through Vite, which resolves every package in the generation's `node_modules` from there
+(`resolve.dedupe` in `server/vite-extensions.ts`), on the server and in the web bundle. So a user or project extension's
+`ultimate/...` imports load the code of the generation that runs it (live, under test, or back after a rollback), not
+the clone its own folder's `node_modules` links to, which then serves only editors and type checks. A generation
+whose `node_modules/ultimate` is a folder rather than a link does not start, and fails its test.
+
 ## The report
 
 The live host tells the daemon where it can be reached (`report.ts`): `url` (the address it serves), `remote` (its
@@ -108,9 +115,9 @@ The server facet holds Pi Durable's scheduler in `onOpen`, before the server res
 
 The pending generation confirms itself (`confirm <its generation>` over the socket) once every enabled built-in
 extension's server facet loaded (a facet broken by a changed core or a missing package is what must not become
-permanent) and its page answers. A user or project extension does not count: it resolves `ultimate/...` through its
-own folder's `node_modules`, which links to one shared clone's working tree, so it loads or fails alike in every
-generation and a rollback cannot mend it; its failure is a notice, once per set of failed names. While the generation
+permanent) and its page answers. A user or project extension does not count: it imports the generation's
+`ultimate/...` (below), but its own files are shared by every generation and edited live, so a rollback cannot mend a
+fault of its own; its failure is a notice, once per set of failed names. While the generation
 waits, each new reason is a notice (the status line, and the generation's `app.log`, whose tail `fawkes history` keeps
 after a rollback) and the `confirm` key of its report (`waiting: server facets failed to load: update`, or
 `refused: …` when the daemon refused the confirm), which the daemon logs as a `reported` event. It lets go of the
